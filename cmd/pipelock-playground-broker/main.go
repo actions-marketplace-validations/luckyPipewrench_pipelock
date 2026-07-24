@@ -71,6 +71,15 @@ const (
 	// warmPoolVMCodeBytes mirrors broker.vmInviteCodeBytes for warm-pool VM
 	// code generation. Kept in sync with the broker constant.
 	warmPoolVMCodeBytes = 18
+
+	// brokerCSPTemplate carries deployment-specific frame-ancestor, script,
+	// connect, and frame sources. Third-party browser origins are never compiled
+	// into the binary. Framing defaults to 'none' and widens only for origins an
+	// operator passes with --embed-origin.
+	brokerCSPTemplate       = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-ancestors %s; script-src 'self' blob: 'wasm-unsafe-eval'%s; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'%s; frame-src %s; form-action 'self'"
+	brokerHSTS              = "max-age=31536000; includeSubDomains"
+	brokerReferrerPolicy    = "strict-origin-when-cross-origin"
+	brokerPermissionsPolicy = "camera=(), microphone=(), geolocation=()"
 )
 
 type serveFlags struct {
@@ -110,9 +119,11 @@ type serveFlags struct {
 	turnstileExpectedAction   string
 	turnstileMaxAge           time.Duration
 	turnstileSitekey          string
+	turnstileOrigin           string
 	sessionTTL                time.Duration
 	deadlineGrace             time.Duration
 	allowOrigin               string
+	embedOrigins              []string
 	publicHosts               []string
 	cfAccessTeamDomain        string
 	cfAccessAUD               string
@@ -204,9 +215,11 @@ func newServeCmd() *cobra.Command {
 	fl.StringVar(&f.turnstileExpectedAction, "turnstile-action", "", "expected action label in the Turnstile Siteverify response; required when Turnstile runs against Cloudflare")
 	fl.DurationVar(&f.turnstileMaxAge, "turnstile-max-age", broker.DefaultTurnstileMaxAge, "max age for a Turnstile challenge_ts before it is rejected (0 disables)")
 	fl.StringVar(&f.turnstileSitekey, "turnstile-sitekey", "", "public Cloudflare Turnstile site key; reported via /health so the viewer renders the widget (the secret is set separately via --turnstile-secret-*)")
+	fl.StringVar(&f.turnstileOrigin, "turnstile-origin", "", "validated browser origin used by the Turnstile widget and added to CSP only when configured")
 	fl.DurationVar(&f.sessionTTL, "session-ttl", defaultSessionTTL, "VM session token TTL")
 	fl.DurationVar(&f.deadlineGrace, "deadline-grace", defaultGrace, "lease teardown grace after VM session expiry")
 	fl.StringVar(&f.allowOrigin, "allow-origin", "", "Access-Control-Allow-Origin for the browser")
+	fl.StringArrayVar(&f.embedOrigins, "embed-origin", nil, "origin permitted to embed the broker in an iframe, as CSP frame-ancestors (repeatable); framing is forbidden when unset")
 	fl.StringArrayVar(&f.publicHosts, "public-host", nil, "allowed public Host header for the broker (repeatable); defaults to the --allow-origin host when set")
 	fl.StringVar(&f.cfAccessTeamDomain, "cf-access-team-domain", "", "Cloudflare Access team domain, e.g. https://team.cloudflareaccess.com; enables origin-side Access JWT validation when set with --cf-access-aud")
 	fl.StringVar(&f.cfAccessAUD, "cf-access-aud", "", "Cloudflare Access application AUD tag expected in Cf-Access-Jwt-Assertion")
@@ -475,6 +488,7 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		handler = cfAccessGuard(handler, cfAccess)
 		_, _ = fmt.Fprintf(out, "broker Cloudflare Access JWT guard enabled for %s\n", cfAccess.issuer)
 	}
+	handler = securityHeaders(handler, f.embedOrigins, f.turnstileOrigin)
 	return srv, handler, reaper.Run, warmPool, nil
 }
 
@@ -542,11 +556,23 @@ func validateFlags(f *serveFlags) error {
 	if err := validateTurnstileFlags(f); err != nil {
 		return err
 	}
+	hasTurnstile := strings.TrimSpace(f.turnstileSecretFile) != "" || strings.TrimSpace(f.turnstileSecretEnv) != ""
+	if hasTurnstile && strings.TrimSpace(f.turnstileOrigin) == "" {
+		return errors.New("--turnstile-origin is required when Turnstile is enabled")
+	}
 	if f.deadlineGrace < 0 {
 		return errors.New("--deadline-grace must be >= 0")
 	}
 	if err := validateAllowOrigin(f.allowOrigin); err != nil {
 		return fmt.Errorf("--allow-origin: %w", err)
+	}
+	for _, origin := range f.embedOrigins {
+		if err := validateAllowOrigin(origin); err != nil {
+			return fmt.Errorf("--embed-origin %q: %w", origin, err)
+		}
+	}
+	if err := validateAllowOrigin(f.turnstileOrigin); err != nil {
+		return fmt.Errorf("--turnstile-origin: %w", err)
 	}
 	if err := validateCFAccessFlags(f); err != nil {
 		return err
@@ -903,8 +929,19 @@ func validateAllowOrigin(raw string) error {
 	if u.Host == "" {
 		return errors.New("host is required")
 	}
-	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
-		return errors.New("must be an origin only, like https://pipelab.org")
+	if strings.HasSuffix(u.Host, ":") {
+		return errors.New("port must not be empty")
+	}
+	if port := u.Port(); port != "" {
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return errors.New("port must be 1-65535")
+		}
+	}
+	if u.User != nil || strings.Contains(u.Hostname(), "*") ||
+		u.RawQuery != "" || u.Fragment != "" || u.Path != "" ||
+		strings.Contains(raw, "?") || strings.HasSuffix(raw, "#") {
+		return errors.New("must be an origin only, like https://site.example")
 	}
 	return nil
 }
@@ -987,7 +1024,35 @@ func normalizePublicHost(raw string) (string, error) {
 func noCacheStatic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// brokerContentSecurityPolicy renders the CSP for the configured embed origins.
+// With none configured the policy forbids framing entirely.
+func brokerContentSecurityPolicy(embedOrigins []string, turnstileOrigin string) string {
+	sources := "'none'"
+	if len(embedOrigins) > 0 {
+		sources = strings.Join(embedOrigins, " ")
+	}
+	thirdPartySource := ""
+	frameSource := "'none'"
+	if turnstileOrigin != "" {
+		thirdPartySource = " " + turnstileOrigin
+		frameSource = turnstileOrigin
+	}
+	return fmt.Sprintf(brokerCSPTemplate, sources, thirdPartySource, thirdPartySource, frameSource)
+}
+
+func securityHeaders(next http.Handler, embedOrigins []string, turnstileOrigin string) http.Handler {
+	csp := brokerContentSecurityPolicy(embedOrigins, turnstileOrigin)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy", csp)
+		h.Set("Strict-Transport-Security", brokerHSTS)
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Referrer-Policy", brokerReferrerPolicy)
+		h.Set("Permissions-Policy", brokerPermissionsPolicy)
 		next.ServeHTTP(w, r)
 	})
 }

@@ -88,6 +88,11 @@ type EntitlementDB struct {
 // after this subscription was already recorded in a terminal state.
 var ErrTerminalEntitlement = errors.New("entitlement is terminal")
 
+// ErrWebhookAlreadyCommitted means another delivery path already admitted this
+// provider message ID. Callers must not perform side effects from freshly built
+// state; they may retry delivery from the persisted record.
+var ErrWebhookAlreadyCommitted = errors.New("webhook already committed")
+
 type entitlementExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
@@ -648,6 +653,12 @@ func (e *EntitlementDB) InsertLicenseIssuance(ctx context.Context, issuance Lice
 // license issuance. It refuses stale active events when the current persisted
 // subscription state is already terminal.
 func (e *EntitlementDB) UpsertWithLicenseIssuance(ctx context.Context, ent *Entitlement, issuance LicenseIssuance) error {
+	return e.UpsertWithLicenseIssuanceAndWebhook(ctx, ent, issuance, "", "")
+}
+
+// UpsertWithLicenseIssuanceAndWebhook atomically records entitlement state,
+// license issuance, and an optional webhook delivery commit marker.
+func (e *EntitlementDB) UpsertWithLicenseIssuanceAndWebhook(ctx context.Context, ent *Entitlement, issuance LicenseIssuance, msgID, eventType string) error {
 	if ent == nil {
 		return errors.New("entitlement is nil")
 	}
@@ -662,6 +673,15 @@ func (e *EntitlementDB) UpsertWithLicenseIssuance(ctx context.Context, ent *Enti
 		}
 	}()
 
+	if msgID != "" {
+		admitted, err := admitWebhook(ctx, tx, msgID, eventType, ent.SubscriptionID)
+		if err != nil {
+			return fmt.Errorf("admit subscription webhook: %w", err)
+		}
+		if !admitted {
+			return ErrWebhookAlreadyCommitted
+		}
+	}
 	terminal, status, err := currentEntitlementTerminal(ctx, tx, ent.SubscriptionID)
 	if err != nil {
 		return err
@@ -677,6 +697,42 @@ func (e *EntitlementDB) UpsertWithLicenseIssuance(ctx context.Context, ent *Enti
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit entitlement issuance transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// UpsertWithWebhook atomically records entitlement state and an optional webhook
+// delivery commit marker for subscription events that do not mint a token.
+func (e *EntitlementDB) UpsertWithWebhook(ctx context.Context, ent *Entitlement, msgID, eventType string) error {
+	if ent == nil {
+		return errors.New("entitlement is nil")
+	}
+	if msgID == "" {
+		return e.Upsert(ctx, ent)
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin entitlement webhook transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	admitted, err := admitWebhook(ctx, tx, msgID, eventType, ent.SubscriptionID)
+	if err != nil {
+		return fmt.Errorf("admit subscription webhook: %w", err)
+	}
+	if !admitted {
+		return ErrWebhookAlreadyCommitted
+	}
+	if err := upsertEntitlement(ctx, tx, ent); err != nil {
+		return fmt.Errorf("upsert entitlement %s: %w", ent.SubscriptionID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit entitlement webhook transaction: %w", err)
 	}
 	committed = true
 	return nil

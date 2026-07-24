@@ -71,11 +71,13 @@ func newTestServer(t *testing.T) *Server {
 	t.Cleanup(emailSrv.Close)
 
 	secret := base64.StdEncoding.EncodeToString([]byte(testServerSecret))
+	cert, rootPub := testServiceIntermediateCert(t, pub)
 	cfg := &Config{
 		PolarWebhookSecret:  "whsec_" + secret,
 		PolarAPIToken:       testPolarAPIToken,
 		PrivateKeyPath:      filepath.Join(t.TempDir(), "test.key"),
-		IntermediateCert:    testServiceIntermediateCert(t, pub),
+		IntermediateCert:    cert,
+		RootPublicKey:       rootPub,
 		CRLPrivateKey:       crlPriv,
 		ResendAPIKey:        "re_" + "test_server_key",
 		DBPath:              ":memory:",
@@ -156,16 +158,20 @@ func TestServer_IntermediateEndpoint(t *testing.T) {
 	}
 }
 
-func TestServer_IntermediateEndpointMissingCert(t *testing.T) {
+func TestServer_IntermediateEndpointUsesVerifiedHandlerCopy(t *testing.T) {
 	srv := newTestServer(t)
+	want := append([]byte(nil), srv.cfg.IntermediateCert...)
 	srv.cfg.IntermediateCert = nil
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/intermediate.json", nil)
 	rr := httptest.NewRecorder()
 	srv.mux.ServeHTTP(rr, req)
 
-	if rr.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d", rr.Code, http.StatusInternalServerError)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(rr.Body.String()); got != string(want) {
+		t.Fatalf("body = %q, want cached intermediate certificate", got)
 	}
 }
 
