@@ -60,6 +60,31 @@ func TestParseSemver(t *testing.T) {
 	}
 }
 
+func TestComparePrerelease_NumericEqualityAndLength(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		a    string
+		b    string
+		want int
+	}{
+		{name: "numeric identifiers equal", a: "beta.01", b: "beta.1", want: 0},
+		{name: "longer prerelease has higher precedence after equal prefix", a: "beta.1.1", b: "beta.1", want: 1},
+		{name: "shorter prerelease has lower precedence after equal prefix", a: "beta.1", b: "beta.1.1", want: -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := comparePrerelease(tc.a, tc.b)
+			if got != tc.want {
+				t.Fatalf("comparePrerelease(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAtomicWriteFile_Success(t *testing.T) {
 	t.Parallel()
 
@@ -158,4 +183,27 @@ func searchSubstring(s, sub string) bool {
 		}
 	}
 	return false
+}
+
+func TestComparePrerelease_NumericVsAlphanumericAndOrdering(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		a    string
+		b    string
+		want int
+	}{
+		{name: "numeric identifiers compare numerically not lexically", a: "beta.2", b: "beta.10", want: -1},
+		{name: "numeric identifier sorts before alphanumeric", a: "beta.1", b: "beta.a", want: -1},
+		{name: "alphanumeric identifier sorts after numeric", a: "beta.a", b: "beta.1", want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := comparePrerelease(tc.a, tc.b); got != tc.want {
+				t.Fatalf("comparePrerelease(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+			}
+		})
+	}
 }

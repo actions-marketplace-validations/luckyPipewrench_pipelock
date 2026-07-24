@@ -269,6 +269,26 @@ func TestVerifyIntegrity_SignedTampered(t *testing.T) {
 	}
 }
 
+func TestVerifyIntegrity_SignedMissingSignatureFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, testBundleFilename)
+	bundleContent := []byte("name: signed-missing-signature\n")
+	if err := os.WriteFile(bundlePath, bundleContent, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+	hash := sha256.Sum256(bundleContent)
+
+	err := VerifyIntegrity(dir, false, "missing-signer", hex.EncodeToString(hash[:]), nil)
+	if err == nil {
+		t.Fatal("expected missing signature to fail closed")
+	}
+	if !strings.Contains(err.Error(), "loading signature") {
+		t.Fatalf("VerifyIntegrity error = %v, want missing signature", err)
+	}
+}
+
 func TestVerifyIntegrity_UnsignedValid(t *testing.T) {
 	t.Parallel()
 
@@ -548,5 +568,32 @@ func TestFindSigner_TrustedKeyPath(t *testing.T) {
 	}
 	if result.SignerFingerprint != hex.EncodeToString(thirdPub) {
 		t.Errorf("SignerFingerprint = %q, want %q", result.SignerFingerprint, hex.EncodeToString(thirdPub))
+	}
+}
+
+func TestVerifyIntegrity_SignedEmptySignatureFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundlePath := filepath.Join(dir, testBundleFilename)
+	bundleContent := []byte("name: signed-empty-signature\n")
+	if err := os.WriteFile(bundlePath, bundleContent, 0o600); err != nil {
+		t.Fatalf("writing bundle: %v", err)
+	}
+	// An EMPTY signature file is a distinct path from a MISSING one: the file
+	// loads but cannot produce a valid signature, so verification must fail.
+	if err := os.WriteFile(bundlePath+signing.SigExtension, []byte{}, 0o600); err != nil {
+		t.Fatalf("writing empty signature: %v", err)
+	}
+	hash := sha256.Sum256(bundleContent)
+
+	err := VerifyIntegrity(dir, false, "some-signer", hex.EncodeToString(hash[:]), nil)
+	if err == nil {
+		t.Fatal("expected empty signature to fail closed")
+	}
+	// Assert the specific empty-signature path (loads but is an invalid-length
+	// signature), not a generic or missing-file failure.
+	if !strings.Contains(err.Error(), "loading signature") {
+		t.Fatalf("VerifyIntegrity error = %v, want a signature-loading failure", err)
 	}
 }

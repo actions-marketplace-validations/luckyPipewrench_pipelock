@@ -4,6 +4,7 @@
 package rules
 
 import (
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
@@ -497,6 +498,78 @@ func TestMergeIntoConfig_IncludeDefaultsFalse_StandardSourceNone(t *testing.T) {
 	}
 	if result.StandardResponse != StandardSourceNone {
 		t.Errorf("expected StandardSourceNone for response, got %s", result.StandardResponse)
+	}
+}
+
+func TestMergeIntoConfig_SignedStandardBundleReplacesCompiledFallback(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating key: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	cfg := config.Defaults()
+	cfg.Rules.RulesDir = t.TempDir()
+	bundleDir := filepath.Join(cfg.Rules.RulesDir, StandardBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("mkdir standard bundle dir: %v", err)
+	}
+	writeSignedBundle(t, bundleDir, testBundle(StandardBundleName, []Rule{
+		func() Rule {
+			r := testDLPRule("dlp-standard", confidenceHigh, StatusStable)
+			r.Name = "Anthropic API Key"
+			return r
+		}(),
+		func() Rule {
+			r := testInjectionRule("inj-standard", confidenceHigh)
+			r.Name = "New Instructions"
+			return r
+		}(),
+	}), pub, priv)
+
+	result := MergeIntoConfig(cfg, testPipelockVersion)
+	if len(result.Errors) != 0 {
+		t.Fatalf("MergeIntoConfig errors: %v", result.Errors)
+	}
+	if result.StandardDLP != StandardSourceBundle {
+		t.Fatalf("StandardDLP = %s, want %s", result.StandardDLP, StandardSourceBundle)
+	}
+	if result.StandardResponse != StandardSourceBundle {
+		t.Fatalf("StandardResponse = %s, want %s", result.StandardResponse, StandardSourceBundle)
+	}
+	if got := countDLPPatternsFromBundle(cfg, StandardBundleName); got != 1 {
+		t.Fatalf("standard bundle DLP patterns = %d, want 1", got)
+	}
+	if got := countResponsePatternsFromBundle(cfg, StandardBundleName); got != 1 {
+		t.Fatalf("standard bundle response patterns = %d, want 1", got)
+	}
+	// Assert each replaced name occurs EXACTLY ONCE across the full merged set
+	// and is the non-compiled bundle entry. A first-match lookup would pass even
+	// if a compiled fallback with the same name survived after the bundle entry.
+	dlpHits := 0
+	for _, p := range cfg.DLP.Patterns {
+		if p.Name == "Anthropic API Key" {
+			dlpHits++
+			if p.Compiled || p.Bundle != StandardBundleName {
+				t.Fatalf("Anthropic API Key entry = %+v, want non-compiled StandardBundleName replacement", p)
+			}
+		}
+	}
+	if dlpHits != 1 {
+		t.Fatalf("Anthropic API Key occurs %d times in merged DLP, want exactly 1 (compiled duplicate leaked)", dlpHits)
+	}
+	respHits := 0
+	for _, p := range cfg.ResponseScanning.Patterns {
+		if p.Name == "New Instructions" {
+			respHits++
+			if p.Compiled || p.Bundle != StandardBundleName {
+				t.Fatalf("New Instructions entry = %+v, want non-compiled StandardBundleName replacement", p)
+			}
+		}
+	}
+	if respHits != 1 {
+		t.Fatalf("New Instructions occurs %d times in merged response patterns, want exactly 1 (compiled duplicate leaked)", respHits)
 	}
 }
 
