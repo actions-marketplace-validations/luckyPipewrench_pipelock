@@ -419,7 +419,6 @@ func TestBrokerSecurityHeaders(t *testing.T) {
 		vmDailyTurnBudget:     10,
 		requireSessionSecrets: false,
 		embedOrigins:          []string{testEmbedOrigin},
-		turnstileOrigin:       "https://challenge.vendor.example",
 	})
 	if err != nil {
 		t.Fatalf("buildServer: %v", err)
@@ -441,7 +440,7 @@ func TestBrokerSecurityHeaders(t *testing.T) {
 			if resp.StatusCode != http.StatusOK {
 				t.Fatalf("GET %s status = %d, want 200", tc.path, resp.StatusCode)
 			}
-			assertBrokerSecurityHeaders(t, resp.Header, "https://challenge.vendor.example")
+			assertBrokerSecurityHeaders(t, resp.Header, "")
 		})
 	}
 }
@@ -662,8 +661,9 @@ func TestBuildServerTurnstileRejectsMissingToken(t *testing.T) {
 		codeBurst:             defaultCodeBurst,
 		globalDailyBudget:     10,
 		turnstileSecretFile:   turnstileSecretFile,
+		turnstileSitekey:      "1x00000000000000000000AA",
 		turnstileVerifyURL:    verifyServer.URL,
-		turnstileOrigin:       "https://challenge.vendor.example",
+		turnstileOrigin:       defaultTurnstileOrigin,
 		sessionTTL:            defaultSessionTTL,
 		deadlineGrace:         defaultGrace,
 		vmDailyTurnBudget:     10,
@@ -814,6 +814,47 @@ func testServeFlags(t *testing.T, warmPoolSize int) *serveFlags {
 		vmDailyTurnBudget:     10,
 		requireSessionSecrets: false,
 		warmPoolSize:          warmPoolSize,
+	}
+}
+
+func TestRunServeCheckConfigDoesNotResolveSecretsOrProvider(t *testing.T) {
+	f := testServeFlags(t, 0)
+	f.checkConfig = true
+	f.flyTokenFile = filepath.Join(t.TempDir(), "missing-fly-token")
+	f.gateSecretFile = filepath.Join(t.TempDir(), "missing-gate-secret")
+	f.staticDir = t.TempDir()
+	if err := os.WriteFile(filepath.Join(f.staticDir, "index.html"), []byte(`<script src="viewer.js"></script>`), 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+
+	providerCalled := false
+	oldFactory := newMachineProvider
+	newMachineProvider = func(_ context.Context, _ *serveFlags, _ string) (broker.MachineProvider, error) {
+		providerCalled = true
+		return nil, errors.New("provider must not be created during check-config")
+	}
+	t.Cleanup(func() { newMachineProvider = oldFactory })
+
+	cmd := newServeCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := runServe(cmd, f); err != nil {
+		t.Fatalf("runServe check-config: %v", err)
+	}
+	if providerCalled {
+		t.Fatal("check-config created the machine provider")
+	}
+	if !strings.Contains(out.String(), "secrets and provider not contacted") {
+		t.Fatalf("check-config output = %q", out.String())
+	}
+
+	invalidHost := *f
+	invalidHost.publicHosts = []string{"bad host"}
+	if err := runServe(cmd, &invalidHost); err == nil || !strings.Contains(err.Error(), "--public-host") {
+		t.Fatalf("check-config invalid public host error = %v", err)
+	}
+	if providerCalled {
+		t.Fatal("invalid check-config created the machine provider")
 	}
 }
 
@@ -1295,14 +1336,39 @@ func TestValidateFlagsBranches(t *testing.T) {
 	turnstileGate.turnstileSecretEnv = "BROKER_TEST_TURNSTILE"
 	turnstileGate.turnstileExpectedHostname = "playground.example"
 	turnstileGate.turnstileExpectedAction = "playground-session"
-	turnstileGate.turnstileOrigin = "https://challenge.vendor.example"
+	turnstileGate.turnstileSitekey = "1x00000000000000000000AA"
+	turnstileGate.turnstileOrigin = defaultTurnstileOrigin
 	if err := validateFlags(&turnstileGate); err != nil {
 		t.Fatalf("turnstile gate should validate: %v", err)
 	}
 	turnstileWithoutOrigin := turnstileGate
 	turnstileWithoutOrigin.turnstileOrigin = ""
-	if err := validateFlags(&turnstileWithoutOrigin); err == nil || !strings.Contains(err.Error(), "--turnstile-origin is required") {
-		t.Fatalf("Turnstile gate without origin error = %v, want required-origin error", err)
+	if err := validateFlags(&turnstileWithoutOrigin); err != nil {
+		t.Fatalf("Turnstile gate without explicit origin should use the Cloudflare default: %v", err)
+	}
+	if got := effectiveTurnstileOrigin(&turnstileWithoutOrigin); got != defaultTurnstileOrigin {
+		t.Fatalf("default Turnstile origin = %q, want %q", got, defaultTurnstileOrigin)
+	}
+	turnstileWithoutSitekey := turnstileGate
+	turnstileWithoutSitekey.turnstileSitekey = ""
+	if err := validateFlags(&turnstileWithoutSitekey); err == nil || !strings.Contains(err.Error(), "--turnstile-sitekey is required") {
+		t.Fatalf("Turnstile gate without sitekey error = %v, want required-sitekey error", err)
+	}
+	sitekeyWithoutSecret := turnstileGate
+	sitekeyWithoutSecret.turnstileSecretEnv = ""
+	sitekeyWithoutSecret.unsafeNoHumanGate = true
+	if err := validateFlags(&sitekeyWithoutSecret); err == nil || !strings.Contains(err.Error(), "--turnstile-sitekey requires") {
+		t.Fatalf("Turnstile sitekey without secret error = %v, want requires-secret error", err)
+	}
+	originWithoutSecret := sitekeyWithoutSecret
+	originWithoutSecret.turnstileSitekey = ""
+	if err := validateFlags(&originWithoutSecret); err == nil || !strings.Contains(err.Error(), "--turnstile-origin requires") {
+		t.Fatalf("Turnstile origin without secret error = %v, want requires-secret error", err)
+	}
+	unsupportedTurnstileOrigin := turnstileGate
+	unsupportedTurnstileOrigin.turnstileOrigin = "https://challenge.vendor.example"
+	if err := validateFlags(&unsupportedTurnstileOrigin); err == nil || !strings.Contains(err.Error(), "--turnstile-origin must be") {
+		t.Fatalf("unsupported Turnstile origin error = %v, want fixed-origin error", err)
 	}
 	if err := validateAllowOrigin("https://site.example:65535"); err != nil {
 		t.Fatalf("maximum valid origin port should validate: %v", err)
@@ -1840,12 +1906,66 @@ func TestBrokerContentSecurityPolicy_DefaultsToNoFraming(t *testing.T) {
 	}
 	for _, want := range []string{
 		"script-src 'self' blob: 'wasm-unsafe-eval' https://challenge.vendor.example;",
+		"script-src-attr 'none';",
 		"connect-src 'self' https://challenge.vendor.example;",
 		"frame-src https://challenge.vendor.example;",
 	} {
 		if !strings.Contains(withOrigin, want) {
 			t.Fatalf("CSP = %q, missing %q", withOrigin, want)
 		}
+	}
+}
+
+func TestValidateStaticUIRejectsCSPIncompatibleMarkup(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "external script", body: `<script src="viewer.js"></script>`},
+		{name: "Turnstile script", body: `<script src="` + defaultTurnstileOrigin + `/turnstile/v0/api.js"></script>`},
+		{name: "Turnstile script explicit HTTPS port", body: `<script src="` + defaultTurnstileOrigin + `:443/turnstile/v0/api.js"></script>`},
+		{name: "Turnstile script mixed case", body: `<script src="` + strings.ToUpper(defaultTurnstileOrigin) + `/turnstile/v0/api.js"></script>`},
+		{name: "JSON data block", body: `<script type="application/json">{"safe":true}</script>`},
+		{name: "inline script", body: `<script>window.bad = true</script>`, want: "inline script"},
+		{name: "inline handler", body: `<button onclick="bad()">go</button>`, want: "inline event handler"},
+		{name: "third-party script", body: `<script src="https://analytics.example/array.js"></script>`, want: "not permitted"},
+		{name: "protocol-relative script", body: `<script src="` + strings.TrimPrefix(defaultTurnstileOrigin, "https:") + `/x.js"></script>`, want: "not permitted"},
+		{name: "base element", body: `<base href="/">`, want: "base element"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(tc.body), 0o600); err != nil {
+				t.Fatalf("write index: %v", err)
+			}
+			err := validateStaticUI(dir, defaultTurnstileOrigin)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("validateStaticUI: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validateStaticUI error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateStaticUIUsesRuntimeScriptOrigins(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "index.html"), []byte(
+		`<script src="`+defaultTurnstileOrigin+`/turnstile/v0/api.js"></script>`,
+	), 0o600); err != nil {
+		t.Fatalf("write index: %v", err)
+	}
+	if err := validateStaticUI(dir, ""); err == nil || !strings.Contains(err.Error(), "not permitted") {
+		t.Fatalf("validateStaticUI without Turnstile origin error = %v, want not permitted", err)
+	}
+	if err := validateStaticUI(dir, defaultTurnstileOrigin); err != nil {
+		t.Fatalf("validateStaticUI with Turnstile origin: %v", err)
 	}
 }
 
