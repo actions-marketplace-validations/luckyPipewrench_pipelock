@@ -78,6 +78,26 @@ Secrets are loaded from files or environment variables and are never printed by
 the broker. Do not pass model keys, provider tokens, Turnstile secrets, or invite
 codes through public logs or shell history in real deployments.
 
+### Optional counts-only analytics
+
+`--analytics-project-key` enables `POST /api/live/analytics`, a same-origin
+relay for the playground's closed event schema. The browser cannot provide an
+identifier or arbitrary properties; the broker disables GeoIP and person
+profiles before forwarding accepted events. The relay has a bounded per-IP
+rate plus a process-wide 100,000-event daily ceiling, and the broker's
+pause/kill switch stops it with the paid session paths. The project key is a
+public ingestion key, not an account or personal API key.
+
+Accepted events receive HTTP 202 because delivery is asynchronous and
+best-effort. A bounded worker pool forwards them to
+`https://us.i.posthog.com`; Fly deployments reject other ingestion hosts.
+Upstream failures are rate-limited in the broker log and are not retried.
+
+Do not load an analytics SDK in the playground or add an analytics host to its
+CSP. Keep the browser transport same-origin and send JSON with
+`Content-Type: application/json`; the browser supplies
+`Sec-Fetch-Site: same-origin`. Cross-site and form-style requests are rejected.
+
 ## Human verification
 
 When `--turnstile-secret-file` or `--turnstile-secret-env` is set, session

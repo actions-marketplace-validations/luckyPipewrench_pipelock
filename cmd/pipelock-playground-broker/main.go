@@ -8,6 +8,8 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
@@ -129,6 +131,9 @@ type serveFlags struct {
 	embedOrigins              []string
 	externalScriptOrigins     []string
 	externalConnectOrigins    []string
+	analyticsProjectKey       string
+	analyticsEndpoint         string
+	analyticsClient           *http.Client // tests only; production uses the bounded default client
 	publicHosts               []string
 	cfAccessTeamDomain        string
 	cfAccessAUD               string
@@ -228,6 +233,8 @@ func newServeCmd() *cobra.Command {
 	fl.StringArrayVar(&f.embedOrigins, "embed-origin", nil, "origin permitted to embed the broker in an iframe, as CSP frame-ancestors (repeatable); framing is forbidden when unset")
 	fl.StringArrayVar(&f.externalScriptOrigins, "external-script-origin", nil, "trusted HTTPS origin permitted by CSP script-src (repeatable); scripts from this origin can access live session data and tokens")
 	fl.StringArrayVar(&f.externalConnectOrigins, "external-connect-origin", nil, "HTTPS origin permitted as a browser network destination by CSP connect-src (repeatable)")
+	fl.StringVar(&f.analyticsProjectKey, "analytics-project-key", "", "public analytics project key; enables the strict same-origin counts-only event relay")
+	fl.StringVar(&f.analyticsEndpoint, "analytics-endpoint", "https://us.i.posthog.com/i/v0/e/", "analytics capture endpoint")
 	fl.StringArrayVar(&f.publicHosts, "public-host", nil, "allowed public Host header for the broker (repeatable); defaults to the --allow-origin host when set")
 	fl.StringVar(&f.cfAccessTeamDomain, "cf-access-team-domain", "", "Cloudflare Access team domain, e.g. https://team.cloudflareaccess.com; enables origin-side Access JWT validation when set with --cf-access-aud")
 	fl.StringVar(&f.cfAccessAUD, "cf-access-aud", "", "Cloudflare Access application AUD tag expected in Cf-Access-Jwt-Assertion")
@@ -479,9 +486,26 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	// both. The API mux is mounted at the /api/live/ prefix; everything else is
 	// static files. Mirrors the per-VM server's static-dir handling.
 	handler := srv.Handler()
+	var analyticsRelay *broker.AnalyticsRelay
+	if strings.TrimSpace(f.analyticsProjectKey) != "" {
+		analyticsSigningKey := deriveAnalyticsSigningKey(secret)
+		analyticsRelay, err = broker.NewAnalyticsRelay(ctx, broker.AnalyticsConfig{
+			ProjectKey: strings.TrimSpace(f.analyticsProjectKey), Endpoint: f.analyticsEndpoint,
+			Client: f.analyticsClient, TrustForwardedFor: f.trustForwardedFor,
+			Enabled: func() bool { return !srv.Killed() }, Log: out, SigningKey: analyticsSigningKey,
+		})
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("configure analytics relay: %w", err)
+		}
+		mux := http.NewServeMux()
+		mux.Handle(broker.RouteAnalytics, analyticsRelay.Handler())
+		mux.Handle(livechat.RouteAPIPrefix, handler)
+		handler = mux
+		_, _ = fmt.Fprintln(out, "privacy-safe playground analytics relay enabled")
+	}
 	if strings.TrimSpace(f.staticDir) != "" {
 		mux := http.NewServeMux()
-		mux.Handle(livechat.RouteAPIPrefix, srv.Handler())
+		mux.Handle(livechat.RouteAPIPrefix, handler)
 		mux.Handle("/", noCacheStatic(http.FileServer(http.Dir(f.staticDir))))
 		handler = mux
 		_, _ = fmt.Fprintf(out, "serving static UI from %s at /\n", f.staticDir)
@@ -551,6 +575,9 @@ func defaultMachineProvider(_ context.Context, f *serveFlags, flyToken string) (
 func validateFlags(f *serveFlags) error {
 	if f == nil {
 		return errors.New("nil serve flags")
+	}
+	if err := validateAnalyticsFlags(f); err != nil {
+		return err
 	}
 	if strings.TrimSpace(f.image) == "" {
 		return errors.New("--image is required")
@@ -646,6 +673,26 @@ func validateFlags(f *serveFlags) error {
 		return err
 	}
 	return nil
+}
+
+func validateAnalyticsFlags(f *serveFlags) error {
+	if strings.TrimSpace(f.analyticsProjectKey) == "" {
+		return nil
+	}
+	endpoint, err := url.Parse(f.analyticsEndpoint)
+	if err != nil {
+		return fmt.Errorf("--analytics-endpoint: %w", err)
+	}
+	if f.provider == "fly" && (endpoint.Scheme != "https" || endpoint.Hostname() != "us.i.posthog.com" || endpoint.Port() != "") {
+		return errors.New("--analytics-endpoint must use https://us.i.posthog.com for Fly deployments")
+	}
+	return nil
+}
+
+func deriveAnalyticsSigningKey(secret []byte) []byte {
+	mac := hmac.New(sha256.New, secret)
+	_, _ = io.WriteString(mac, "pipelock-playground-analytics-signing-key\x00")
+	return mac.Sum(nil)
 }
 
 func effectiveTurnstileOrigin(f *serveFlags) string {
