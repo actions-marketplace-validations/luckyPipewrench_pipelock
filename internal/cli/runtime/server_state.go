@@ -41,6 +41,12 @@ func (s *Server) currentToolPolicyCfg() *policy.Config {
 	return s.toolPolicyCfg
 }
 
+func (s *Server) currentMCPDoWRuntime() *mcpDoWRuntime {
+	s.stateMu.RLock()
+	defer s.stateMu.RUnlock()
+	return s.mcpDoW
+}
+
 func (s *Server) currentMCPChainMatcher() *chains.Matcher {
 	s.stateMu.RLock()
 	defer s.stateMu.RUnlock()
@@ -78,6 +84,13 @@ func (s *Server) refreshRuntimeState(
 	s.receiptEmitter = s.liveReceiptEmitter()
 	s.envelopeEmitter = s.liveEnvelopeEmitter()
 	s.toolPolicyCfg = buildToolPolicyCfg(newCfg)
+	if s.hasMCPListen {
+		if s.mcpDoW == nil {
+			s.mcpDoW = newMCPDoWRuntime(newCfg, "_default")
+		} else {
+			s.mcpDoW.UpdateConfig(newCfg)
+		}
+	}
 	if bundleResult != nil {
 		s.mcpToolExtraPoison = rules.ConvertToolPoison(bundleResult.ToolPoison)
 	} else {

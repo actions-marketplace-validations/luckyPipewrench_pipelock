@@ -178,6 +178,10 @@ type MCPProxyOpts struct {
 
 	// Denial-of-wallet tracking (nil-safe).
 	DoWCheck DoWCheckFunc
+	// DoWEnabledFn returns the live denial-of-wallet enabled state for
+	// long-lived listener surfaces. Nil preserves legacy static behavior:
+	// a configured DoWCheck means the gate is enabled.
+	DoWEnabledFn func() bool
 	// DoWSubjectKey is set per request by multi-client transports before
 	// invoking the shared input pipeline. Empty is valid only when
 	// DoWRequireTrustedSession is false.
@@ -587,4 +591,14 @@ func (o MCPProxyOpts) envelopeEmitter() *envelope.Emitter {
 		return o.EnvelopeEmitterFn()
 	}
 	return o.EnvelopeEmitter
+}
+
+// dowEnabled reports the live denial-of-wallet enabled state. It is consulted by
+// both the HTTP listener and the stdio input pipeline, so it lives with the
+// option it reads rather than in either transport's file.
+func (o MCPProxyOpts) dowEnabled() bool {
+	if o.DoWEnabledFn != nil {
+		return o.DoWEnabledFn()
+	}
+	return o.DoWCheck != nil || o.DoWRequireTrustedSession
 }
