@@ -4,6 +4,7 @@
 package livechat
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/playground"
 )
 
@@ -300,7 +302,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var body createReq
-	if err := decodeJSON(r, &body); err != nil {
+	if err := decodeJSON(r, &body, "code"); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad request")
 		return
 	}
@@ -510,7 +512,7 @@ func (s *Server) handleMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body messageReq
-	if err := decodeJSON(r, &body); err != nil {
+	if err := decodeJSON(r, &body, "token", "message"); err != nil {
 		writeErr(w, http.StatusBadRequest, "bad request")
 		return
 	}
@@ -814,8 +816,18 @@ func gateErrStatus(err error) int {
 	}
 }
 
-func decodeJSON(r *http.Request, v any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, maxRequestBody))
+func decodeJSON(r *http.Request, v any, allowedKeys ...string) error {
+	body, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBody))
+	if err != nil {
+		return fmt.Errorf("livechat: read request body: %w", err)
+	}
+	if err := jsonscan.RejectDuplicateKeys(body); err != nil {
+		return fmt.Errorf("livechat: reject duplicate request keys: %w", err)
+	}
+	if err := jsonscan.RejectCaseFoldedAliases(body, allowedKeys...); err != nil {
+		return fmt.Errorf("livechat: reject case-folded request keys: %w", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
 		return err

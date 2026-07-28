@@ -90,6 +90,51 @@ func TestHardeningLivechatRoutesRejectUnsupportedAndMalformedRequests(t *testing
 	}
 }
 
+func TestHardeningDecodeJSONRejectsDuplicateMembers(t *testing.T) {
+	t.Parallel()
+
+	req := httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		RouteMessage,
+		strings.NewReader(`{"token":"attacker-first","token":"valid-last","message":"hello"}`),
+	)
+	var decoded messageReq
+	if err := decodeJSON(req, &decoded, "token", "message"); err == nil {
+		t.Fatal("decodeJSON accepted duplicate members")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		RouteMessage,
+		strings.NewReader(`{"token":"attacker-first","Token":"valid-last","message":"hello"}`),
+	)
+	if err := decodeJSON(req, &decoded, "token", "message"); err == nil {
+		t.Fatal("decodeJSON accepted a case-folded field alias")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		RouteMessage,
+		strings.NewReader(`{"token":"valid-first","message":"hello"}{"token":"attacker-second","message":"hidden"}`),
+	)
+	if err := decodeJSON(req, &decoded, "token", "message"); err == nil {
+		t.Fatal("decodeJSON accepted multiple objects")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		RouteMessage,
+		strings.NewReader(`null`),
+	)
+	if err := decodeJSON(req, &decoded, "token", "message"); err == nil {
+		t.Fatal("decodeJSON accepted null instead of an object")
+	}
+}
+
 func TestHardeningLivechatStreamRequiresFlushingSupport(t *testing.T) {
 	t.Parallel()
 

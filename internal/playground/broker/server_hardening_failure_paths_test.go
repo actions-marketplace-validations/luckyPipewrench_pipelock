@@ -150,7 +150,67 @@ func TestHardeningBrokerHelpersFailClosedAndCleanState(t *testing.T) {
 		bytes.NewBufferString(`{"code":"a"}{"code":"b"}`),
 	)
 	var decoded sessionRequest
-	if err := decodeBrokerJSON(req, &decoded); err == nil {
+	if err := decodeBrokerJSON(req, &decoded, "code", "turnstile_token"); err == nil {
 		t.Fatal("decodeBrokerJSON accepted multiple objects")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteSession,
+		bytes.NewBufferString(`null`),
+	)
+	if err := decodeBrokerJSON(req, &decoded, "code", "turnstile_token"); err == nil {
+		t.Fatal("decodeBrokerJSON accepted null instead of an object")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteSession,
+		bytes.NewBufferString(`{"code":"attacker-first","code":"valid-code"}`),
+	)
+	if err := decodeBrokerJSON(req, &decoded, "code", "turnstile_token"); err == nil {
+		t.Fatal("decodeBrokerJSON accepted duplicate members")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteSession,
+		bytes.NewBufferString(`{"code":"attacker-first","Code":"valid-code"}`),
+	)
+	if err := decodeBrokerJSON(req, &decoded, "code", "turnstile_token"); err == nil {
+		t.Fatal("decodeBrokerJSON accepted a case-folded field alias")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteMessage,
+		bytes.NewBufferString(`{"token":"attacker-first","token":"valid-last","message":"hello"}`),
+	)
+	if _, _, err := readMessageToken(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("readMessageToken accepted duplicate members")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteMessage,
+		bytes.NewBufferString(`{"token":"attacker-first","Token":"valid-last","message":"hello"}`),
+	)
+	if _, _, err := readMessageToken(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("readMessageToken accepted a case-folded field alias")
+	}
+
+	req = httptest.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		livechat.RouteMessage,
+		bytes.NewBufferString(`{"token":"valid-first","message":"hello"}{"token":"attacker-second","message":"hidden"}`),
+	)
+	if _, _, err := readMessageToken(httptest.NewRecorder(), req); err == nil {
+		t.Fatal("readMessageToken accepted multiple objects")
 	}
 }
