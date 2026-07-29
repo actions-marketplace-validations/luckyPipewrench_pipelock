@@ -1,3 +1,9 @@
+//go:build !windows
+
+// The permission refusals asserted here depend on POSIX mode bits.
+// secperm.TooPermissive and OwnedGroupWritableAllowed are deliberate no-ops on
+// Windows, so these assertions cannot hold there.
+
 // Copyright 2026 Josh Waldrep
 // SPDX-License-Identifier: Apache-2.0
 
@@ -135,6 +141,22 @@ func TestLoadFileValidContainmentCapsuleStillBinds(t *testing.T) {
 		got.ContainmentNonce != capsule.Signature ||
 		got.ContainedUID != "966" {
 		t.Fatalf("binding = %+v, want fields from valid capsule", got)
+	}
+}
+
+func TestLoadFileRejectsGroupWritableProof(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write proof: %v", err)
+	}
+	groupWritableMode := os.FileMode(0o660)
+	if err := os.Chmod(path, groupWritableMode); err != nil {
+		t.Fatalf("Chmod() error = %v", err)
+	}
+
+	if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "permissions") {
+		t.Fatalf("LoadFile(group-writable proof) error = %v, want permission rejection", err)
 	}
 }
 

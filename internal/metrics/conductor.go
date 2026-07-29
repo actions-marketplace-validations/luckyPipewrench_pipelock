@@ -9,9 +9,16 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/auditbatcher"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+var conductorPolicyHashStatuses = []conductor.PolicyHashStatus{
+	conductor.PolicyHashCurrent,
+	conductor.PolicyHashKnownLegacy,
+	conductor.PolicyHashUnknownUnverified,
+}
 
 func (m *Metrics) registerConductorMetrics(reg *prometheus.Registry) {
 	m.conductorAuditQueuePending = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -60,6 +67,13 @@ func (m *Metrics) registerConductorMetrics(reg *prometheus.Registry) {
 		Name:      "conductor_emergency_quarantine_total",
 		Help:      "Total Conductor emergency-control records dropped at a leader read path because they failed signature verification against the trusted control keys.",
 	}, []string{"control", "reason"})
+	m.conductorPolicyHashStatuses = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: "pipelock",
+		Name:      "conductor_policy_bundle_policy_hash_status_count",
+		Help: "Conductor policy bundles by policy hash status, counted when the store " +
+			"was loaded at startup. It is a snapshot and does not move as bundles are " +
+			"published; alert on unknown_unverified, which can only change across a restart.",
+	}, []string{"status"})
 	reg.MustRegister(
 		m.conductorAuditQueuePending,
 		m.conductorAuditQueueInflight,
@@ -70,6 +84,7 @@ func (m *Metrics) registerConductorMetrics(reg *prometheus.Registry) {
 		m.conductorServerAuditIngest,
 		m.conductorServerAuditQueries,
 		m.conductorEmergencyQuarantine,
+		m.conductorPolicyHashStatuses,
 	)
 }
 
@@ -121,4 +136,17 @@ func (m *Metrics) RecordConductorEmergencyQuarantine(control, reason string) {
 		return
 	}
 	m.conductorEmergencyQuarantine.WithLabelValues(control, reason).Inc()
+}
+
+// RecordConductorPolicyHashStatusCounts sets the bounded status gauge for
+// policy bundles loaded from the Conductor store. It deliberately iterates the
+// three known statuses instead of ranging over counts so a corrupt or future
+// status string cannot create unbounded label cardinality.
+func (m *Metrics) RecordConductorPolicyHashStatusCounts(counts map[conductor.PolicyHashStatus]int) {
+	if m == nil {
+		return
+	}
+	for _, status := range conductorPolicyHashStatuses {
+		m.conductorPolicyHashStatuses.WithLabelValues(string(status)).Set(float64(counts[status]))
+	}
 }
