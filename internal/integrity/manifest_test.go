@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -208,6 +209,36 @@ func TestLoad_InvalidJSON(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestLoad_PermissionPolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on Windows")
+	}
+	body := []byte(`{"version":1,"files":{}}`)
+	for _, tt := range []struct {
+		name    string
+		mode    os.FileMode
+		wantErr bool
+	}{
+		{name: "world readable is allowed", mode: 0o644},
+		{name: "group writable is rejected", mode: 0o620, wantErr: true},
+		{name: "world writable is rejected", mode: 0o602, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.json")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Load mode %04o error = %v, wantErr=%v", tt.mode, err, tt.wantErr)
+			}
+		})
 	}
 }
 
