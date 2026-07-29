@@ -59,6 +59,106 @@ func TestHTTPListener_ClientCannotOverrideOperatorPinnedHeaders(t *testing.T) {
 	}
 }
 
+// Mcp-Method and Mcp-Name describe the individual call, so no single pinned
+// value can be right for a session. Pinning one is startup-valid on its face
+// but refuses every request whose method differs from the pin, because the
+// pinned value replaces the client's before the agreement check runs. The
+// listener must refuse to start rather than serve that configuration.
+func TestValidateListenerUpstreamHeaders_RejectsPinnedRoutingHeaders(t *testing.T) {
+	for _, name := range []string{listenerMCPMethod, listenerMCPName} {
+		t.Run(name, func(t *testing.T) {
+			headers := http.Header{}
+			headers.Set(name, "tools/list")
+			if err := validateListenerUpstreamHeaders(headers); err == nil {
+				t.Errorf("pinning %s was accepted; it would refuse every other method at runtime", name)
+			}
+		})
+	}
+}
+
+// protocol revision 2026-07-28 requires Mcp-Method and Mcp-Name on Streamable
+// HTTP POST. Stripping them makes a conforming upstream answer HeaderMismatch
+// (-32020), which pushes a fallback-capable client off the stateless transport
+// and back onto the deprecated session handshake: the proxy would silently
+// downgrade the protocol it is mediating.
+func TestHTTPListener_ForwardsRequiredMCPRequestHeaders(t *testing.T) {
+	// The handler runs on the server goroutine, so hand the captured values back
+	// over a channel rather than reading plain variables across goroutines.
+	type captured struct{ method, name string }
+	seen := make(chan captured, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case seen <- captured{r.Header.Get(listenerMCPMethod), r.Header.Get(listenerMCPName)}:
+		default:
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`))
+	}))
+	defer upstream.Close()
+
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
+		Scanner: testScannerForHTTP(t),
+	})
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/", strings.NewReader(jsonToolsList))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(listenerMCPMethod, "tools/list")
+	req.Header.Set(listenerMCPName, "echo")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("request status = %d, want 200", resp.StatusCode)
+	}
+
+	got := <-seen
+	if got.method != "tools/list" {
+		t.Errorf("upstream got %s = %q, want %q (stripped header downgrades the protocol)", listenerMCPMethod, got.method, "tools/list")
+	}
+	if got.name != "echo" {
+		t.Errorf("upstream got %s = %q, want %q", listenerMCPName, got.name, "echo")
+	}
+}
+
+// a browser MCP client on protocol revision 2026-07-28 names Mcp-Method and
+// Mcp-Name in its preflight. listenerCORSPreflightAllowed refuses the whole
+// preflight if any requested header is outside the allowlist, so omitting them
+// blocks browser clients outright rather than degrading.
+func TestHTTPListener_CORSPreflightAllowsRequiredMCPRequestHeaders(t *testing.T) {
+	const origin = "https://client.vendor.example"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}`))
+	}))
+	defer upstream.Close()
+
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
+		Scanner:                testScannerForHTTP(t),
+		ListenerAllowedOrigins: []string{origin},
+	})
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodOptions, baseURL+"/", nil)
+	req.Header.Set("Origin", origin)
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set("Access-Control-Request-Headers", "content-type,mcp-protocol-version,mcp-method,mcp-name")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("preflight: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("preflight status = %d, want 204 (browser MCP clients are refused outright)", resp.StatusCode)
+	}
+	allow := strings.ToLower(resp.Header.Get("Access-Control-Allow-Headers"))
+	for _, name := range []string{"mcp-method", "mcp-name"} {
+		if !strings.Contains(allow, name) {
+			t.Errorf("Access-Control-Allow-Headers = %q, missing %q", allow, name)
+		}
+	}
+}
+
 // the listener token must never reach upstream, even when the client
 // presents it in BOTH auth headers.
 func TestHTTPListener_ListenerTokenNeverForwardedUpstream(t *testing.T) {

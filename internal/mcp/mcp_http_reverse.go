@@ -37,10 +37,34 @@ import (
 const listenerProxyAuthorization = "Proxy-Authorization"
 
 const (
-	listenerAuthorization      = "Authorization"
-	listenerLastEventID        = "Last-Event-ID"
-	listenerProtocolVersion    = "Mcp-Protocol-Version"
-	listenerCORSAllowedHeaders = "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, A2A-Extensions, A2A-Version, Last-Event-ID"
+	listenerAuthorization   = "Authorization"
+	listenerLastEventID     = "Last-Event-ID"
+	listenerProtocolVersion = "Mcp-Protocol-Version"
+	// Required on Streamable HTTP POST from protocol revision 2026-07-28
+	// (SEP-2243). An upstream that enforces them answers a stripped request
+	// with HeaderMismatch (-32020), which drives a fallback-capable client
+	// back onto the deprecated session transport.
+	listenerMCPMethod = "Mcp-Method"
+	listenerMCPName   = "Mcp-Name"
+	// HeaderMismatch, allocated by protocol revision 2026-07-28 for a routing
+	// header that disagrees with the request body's method.
+	mcpHeaderMismatchCode = -32020
+	// upstreamResponseHeaderTimeout bounds how long an upstream may take to send
+	// response headers. It intentionally does not bound the body: see
+	// newReverseUpstreamTransport.
+	upstreamResponseHeaderTimeout = 30 * time.Second
+	// upstreamIdleReadTimeout bounds the GAP between upstream body reads. A
+	// healthy stream resets it on every event; a stalled upstream trips it. It
+	// deliberately does not bound total body lifetime: see
+	// newReverseUpstreamTransport.
+	upstreamIdleReadTimeout = 120 * time.Second
+	// Mcp-Method and Mcp-Name are required from revision 2026-07-28; the
+	// preflight is refused outright when a requested header is absent here, so
+	// omitting them blocks browser MCP clients rather than degrading them.
+	// Mcp-Session-Id and Last-Event-ID belong to revisions the 2026-07-28
+	// deprecation window still covers, so they stay: dropping them would break
+	// older browser clients, and a mixed-revision fleet is the normal state.
+	listenerCORSAllowedHeaders = "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Mcp-Method, Mcp-Name, A2A-Extensions, A2A-Version, Last-Event-ID"
 	maxAuditSessionKeyLen      = 128
 )
 
@@ -73,10 +97,39 @@ func newReverseUpstreamTransport(dialContext func(ctx context.Context, network, 
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.DisableCompression = true
 	t.Proxy = nil
+	// Bound the wait for response HEADERS rather than the whole exchange. From
+	// protocol revision 2026-07-28 a subscriptions/listen response is a single
+	// long-lived POST body, so a total timeout would sever a healthy stream on a
+	// fixed schedule. Once headers arrive the body streams unbounded, which is
+	// what a notification stream requires.
+	t.ResponseHeaderTimeout = upstreamResponseHeaderTimeout
 	if dialContext != nil {
 		t.DialContext = dialContext
 	}
 	return t
+}
+
+// newReverseUpstreamClient builds the shared client used for upstream MCP
+// requests. Redirect-following is disabled to prevent SSRF via a crafted
+// Location header from the upstream.
+//
+// Envelope-refresh implication: because redirects never follow, the mediation
+// envelope signing refresh path that lives at internal/proxy/proxy.go:348
+// (CheckRedirect) is moot for the MCP HTTP transport - there is no second hop
+// to rebuild an envelope over. If a future change enables redirect following
+// here (for example, to support upstream servers that relocate endpoints) the
+// refresh helper must be wired into the new CheckRedirect closure so signed
+// envelopes do not flow with stale @target-uri / ph / hop values. The same
+// applies to internal/mcp/transport/httpclient.go:45.
+//
+// No total Client.Timeout: see newReverseUpstreamTransport.
+func newReverseUpstreamClient(dialContext func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
+	return &http.Client{
+		Transport: newReverseUpstreamTransport(dialContext),
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 }
 
 // RunHTTPListenerProxy starts an HTTP server that reverse-proxies MCP requests
@@ -92,10 +145,12 @@ func newReverseUpstreamTransport(dialContext func(ctx context.Context, network, 
 // Mcp-Session-Id header (or RemoteAddr fallback) as the session key, enabling
 // adaptive enforcement signal tracking per logical MCP session.
 //
-// DoW enforcement is stricter: when DoWRequireTrustedSession is true, a tool or
-// A2A call must present an Mcp-Session-Id that this listener observed in an
-// upstream response. A raw inbound header by itself is not trusted as a budget
-// key.
+// DoW enforcement is stricter: when DoWEnforceSubjectTrust is true, a tool or
+// A2A call is refused unless its subject is identified at or above
+// DoWMinSubjectTrust. Grades run network < agent < principal; see
+// dowSubjectTrustFor. An agent identity Pipelock did not bind or configure
+// stays at network grade, so a request-supplied name cannot buy a stronger
+// grade or a fresh budget bucket.
 //
 // Endpoints:
 //   - POST / : scan and forward JSON-RPC requests to upstream
@@ -225,7 +280,7 @@ func RunHTTPListenerProxy(
 		DoWSubjectAgent:           opts.DoWSubjectAgent,
 		DoWSubjectAgentAuth:       opts.DoWSubjectAgentAuth,
 		DoWAuthenticatedPrincipal: opts.DoWAuthenticatedPrincipal,
-		DoWRequireTrustedSession:  opts.DoWRequireTrustedSession,
+		DoWEnforceSubjectTrust:    opts.DoWEnforceSubjectTrust,
 		DoWSessionKnown:           opts.DoWSessionKnown,
 		DoWRegisterSession:        opts.DoWRegisterSession,
 		DoWForgetSession:          opts.DoWForgetSession,
@@ -250,27 +305,7 @@ func RunHTTPListenerProxy(
 		DialContext:               opts.DialContext,
 	}
 
-	// Shared HTTP client for upstream requests. Redirect-following is disabled
-	// to prevent SSRF via crafted Location headers from the upstream.
-	// 30s timeout prevents hanging on unresponsive upstreams.
-	//
-	// Envelope-refresh implication: because redirects never follow,
-	// the mediation envelope signing refresh path that lives at
-	// internal/proxy/proxy.go:348 (CheckRedirect) is moot for the
-	// MCP HTTP transport - there is no second hop to rebuild an
-	// envelope over. If a future change enables redirect following
-	// here (for example, to support upstream servers that relocate
-	// endpoints) the refresh helper must be wired into the new
-	// CheckRedirect closure so signed envelopes do not flow with
-	// stale @target-uri / ph / hop values. The same applies to
-	// internal/mcp/transport/httpclient.go:45.
-	upstreamClient := &http.Client{
-		Timeout:   30 * time.Second,
-		Transport: newReverseUpstreamTransport(opts.DialContext),
-		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
+	upstreamClient := newReverseUpstreamClient(opts.DialContext)
 	upstreamStreamTransport := newReverseUpstreamTransport(opts.DialContext)
 	upstreamStreamTransport.ResponseHeaderTimeout = 30 * time.Second
 	upstreamStreamClient := &http.Client{
@@ -293,6 +328,13 @@ func RunHTTPListenerProxy(
 	})
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// MCP responses are never storable by an intermediary. Protocol revision
+		// 2026-07-28 lets a server mark list and read results cacheScope "public",
+		// and a retained tools/list is the tool-poisoning surface: a poisoned or
+		// since-revoked tool definition served from a cache outlives the
+		// revocation. Set before any branch so error and preflight paths inherit
+		// it; the SSE path overrides Content-Type but not this.
+		w.Header().Set("Cache-Control", "no-store")
 		if !listenerOriginAllowed(r.Header.Values("Origin"), opts.ListenerAllowedOrigins) {
 			http.Error(w, "origin not allowed", http.StatusForbidden)
 			return
@@ -373,6 +415,13 @@ func RunHTTPListenerProxy(
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write(upstreamErrorResponse(nil, fmt.Errorf("invalid Mcp-Protocol-Version header")))
+			return
+		}
+		if !validMCPRoutingHeader(r.Header.Values(listenerMCPMethod)) ||
+			!validMCPRoutingHeader(r.Header.Values(listenerMCPName)) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write(upstreamErrorResponse(nil, fmt.Errorf("invalid MCP routing header")))
 			return
 		}
 		if !validA2AVersion(r.Header.Values("A2A-Version")) ||
@@ -678,6 +727,10 @@ func RunHTTPListenerProxy(
 				_, _ = w.Write(upstreamErrorResponse(nil, fmt.Errorf("upstream HTTP request failed")))
 				return
 			}
+			// The client carries no total timeout so subscriptions/listen can stream;
+			// bound the gap between body reads instead, so an upstream that sends
+			// headers and then stalls cannot pin this goroutine and both connections.
+			upResp.Body = newIdleTimeoutReader(upResp.Body, upstreamIdleReadTimeout)
 			defer func() { _ = upResp.Body.Close() }()
 
 			if upResp.StatusCode >= 400 {
@@ -735,7 +788,6 @@ func RunHTTPListenerProxy(
 				w.Header().Set("Mcp-Session-Id", sid)
 			}
 			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
 			streamWriter := &sseMessageWriter{w: w}
 			if flusher, ok := w.(http.Flusher); ok {
 				streamWriter.flusher = flusher
@@ -745,7 +797,7 @@ func RunHTTPListenerProxy(
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: scan error: %v\n", scanErr)
 			}
 			if scanErr != nil && !streamWriter.Wrote() {
-				w.Header().Del("Cache-Control")
+				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadGateway)
 				_, _ = w.Write(upstreamErrorResponse(nil, fmt.Errorf("upstream SSE response failed validation")))
@@ -807,6 +859,10 @@ func RunHTTPListenerProxy(
 				_, _ = w.Write(upstreamErrorResponse(nil, fmt.Errorf("upstream HTTP request failed")))
 				return
 			}
+			// The client carries no total timeout so subscriptions/listen can stream;
+			// bound the gap between body reads instead, so an upstream that sends
+			// headers and then stalls cannot pin this goroutine and both connections.
+			upResp.Body = newIdleTimeoutReader(upResp.Body, upstreamIdleReadTimeout)
 			defer func() { _ = upResp.Body.Close() }()
 			if upResp.StatusCode >= 500 {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream HTTP %d\n", upResp.StatusCode)
@@ -876,6 +932,28 @@ func RunHTTPListenerProxy(
 		// and upstream-error response below reads frame.ID instead of
 		// re-parsing the body bytes.
 		frame := ParseMCPFrame(body)
+
+		// Routing headers must agree with the body Pipelock scanned. Forwarding
+		// a disagreement would let the upstream act on a method or tool name
+		// that no scanner or policy in this request ever saw. Protocol revision
+		// 2026-07-28 allocates HeaderMismatch (-32020) for this condition;
+		// refusing locally also keeps the failure legible instead of surfacing
+		// as a generic upstream error.
+		if !routingHeaderMatchesFrame(r.Header, frame) {
+			_, _ = fmt.Fprintf(safeLogW, "pipelock: MCP routing header disagrees with request body\n")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			mismatch, _ := json.Marshal(rpcError{
+				JSONRPC: jsonrpc.Version,
+				ID:      frame.ID,
+				Error: rpcErrorDetail{
+					Code:    mcpHeaderMismatchCode,
+					Message: "pipelock: MCP routing header does not match the request body",
+				},
+			})
+			_, _ = w.Write(mismatch)
+			return
+		}
 
 		// Validate JSON-RPC 2.0 structure for single requests: version
 		// must be "2.0", method must be present and a string. Batch
@@ -1089,6 +1167,10 @@ func RunHTTPListenerProxy(
 			_, _ = w.Write(upstreamErrorResponse(frame.ID, fmt.Errorf("upstream HTTP request failed")))
 			return
 		}
+		// The client carries no total timeout so subscriptions/listen can stream;
+		// bound the gap between body reads instead, so an upstream that sends
+		// headers and then stalls cannot pin this goroutine and both connections.
+		upResp.Body = newIdleTimeoutReader(upResp.Body, upstreamIdleReadTimeout)
 		defer func() { _ = upResp.Body.Close() }()
 
 		// 202 Accepted: notification acknowledged, no body.
@@ -1191,7 +1273,6 @@ func RunHTTPListenerProxy(
 		// the buffer holds a single message and is forwarded verbatim below.
 		if upstreamIsSSE {
 			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
 			streamWriter := &sseMessageWriter{w: w}
 			if flusher, ok := w.(http.Flusher); ok {
 				streamWriter.flusher = flusher
@@ -1208,7 +1289,7 @@ func RunHTTPListenerProxy(
 			// content-type set above with the standard application/json
 			// upstream-error envelope.
 			if scanErr != nil && !streamWriter.Wrote() {
-				w.Header().Del("Cache-Control")
+				w.Header().Set("Cache-Control", "no-store")
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusBadGateway)
 				_, _ = w.Write(upstreamErrorResponse(frame.ID, fmt.Errorf("upstream SSE response failed validation")))
@@ -1354,6 +1435,8 @@ func forwardListenerUpstreamHeaders(upReq, r *http.Request, includeLastEventID b
 		upReq.Header.Set("Mcp-Session-Id", sid)
 	}
 	forwardIfOperatorUnset(upReq, r, listenerProtocolVersion)
+	forwardIfOperatorUnset(upReq, r, listenerMCPMethod)
+	forwardIfOperatorUnset(upReq, r, listenerMCPName)
 	forwardIfOperatorUnset(upReq, r, "A2A-Extensions")
 	forwardIfOperatorUnset(upReq, r, "A2A-Version")
 	if includeLastEventID {
@@ -1393,6 +1476,9 @@ func acceptAllowsSSE(values []string) bool {
 }
 
 func applyOperatorPinnedServiceHeaders(request, operator http.Header) {
+	// Mcp-Method and Mcp-Name are deliberately absent: they describe the
+	// individual call, are rejected as operator pins, and must reach the
+	// agreement check as the client sent them.
 	for _, name := range []string{listenerProtocolVersion, "A2A-Extensions", "A2A-Version"} {
 		values := operator.Values(name)
 		if len(values) == 0 {
@@ -1505,22 +1591,29 @@ func validMCPSessionID(values []string) bool {
 	return true
 }
 
+// trustedDoWSubjectKey returns the denial-of-wallet subject key when the request
+// identifies its subject at or above the operator's declared minimum grade, and
+// an empty key otherwise. The shared gate treats an empty key as a refusal.
+//
+// This replaces an earlier check that required a server-minted Mcp-Session-Id
+// previously observed in an upstream response. Protocol revision 2026-07-28
+// removes sessions, so that check could never again be satisfied by a
+// conforming client and refused every 2026-07-28 tool call where a budget was
+// configured. It was also a guard that decided trust by reading an artifact
+// Pipelock itself had produced, which is not an authenticated identity proof.
 func trustedDoWSubjectKey(r *http.Request, opts MCPProxyOpts) string {
-	if !opts.dowEnabled() || !opts.DoWRequireTrustedSession {
-		// Both production callers of RunHTTPListenerProxy set the trusted-session
-		// requirement, so this branch is not reached today. Returning an empty
-		// key here would collapse every client on a multi-client listener into
-		// the manager's shared "_default" bucket, letting one caller spend
-		// everyone else's budget. Derive the per-client key instead, so a future
-		// caller that turns the strict gate off degrades to per-client
-		// accounting rather than to no accounting at all.
-		return opts.dowSubjectKeyForRequest(r)
+	key, trust := opts.dowSubjectTrustFor(r)
+	if !opts.dowEnabled() {
+		return key
 	}
-	sessionID := r.Header.Get("Mcp-Session-Id")
-	if sessionID == "" || opts.DoWSessionKnown == nil || !opts.DoWSessionKnown(sessionID) {
+	// Only blank the subject when the gate will actually refuse on it. The gate
+	// fail-closes on an empty key only under DoWEnforceSubjectTrust; returning
+	// empty with enforcement off would instead bill the request to the manager's
+	// shared bucket, which is the very outcome an empty key exists to prevent.
+	if opts.DoWEnforceSubjectTrust && !trust.Meets(opts.minSubjectTrust()) {
 		return ""
 	}
-	return opts.dowSubjectKeyForRequest(r)
+	return key
 }
 
 func logUpstreamRequestError(logW io.Writer, ctx context.Context) {
@@ -1557,6 +1650,61 @@ func validMCPSessionDeleteStatus(status int) bool {
 	default:
 		return false
 	}
+}
+
+// validMCPRoutingHeader accepts an absent Mcp-Method / Mcp-Name header, since
+// revisions before 2026-07-28 never send one and a mixed-revision fleet is the
+// normal state for the deprecation window. A present value must be a single
+// visible-ASCII token: these route the request at the upstream, so a duplicate
+// or control-character value is an ambiguity the upstream may resolve
+// differently than Pipelock did.
+func validMCPRoutingHeader(values []string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	return validVisibleSingletonHeader(values, 256)
+}
+
+// routingHeaderMatchesFrame reports whether the client's routing headers agree
+// with the JSON-RPC body Pipelock scanned. Disagreement means Pipelock applies
+// policy to one call while the upstream routes another, so it is refused rather
+// than forwarded.
+//
+// An ABSENT header agrees by definition: revisions before 2026-07-28 never send
+// one. A PRESENT header must find a body value to agree with. A missing
+// comparable value is NOT agreement — it is the worst case, because Pipelock
+// has nothing to scan or apply policy to while the upstream still routes on the
+// header. Treating it as agreement was a fail-open.
+func routingHeaderMatchesFrame(headers http.Header, frame MCPFrame) bool {
+	method := headers.Get(listenerMCPMethod)
+	name := headers.Get(listenerMCPName)
+	if method == "" && name == "" {
+		return true
+	}
+	// A single routing header cannot describe several calls, and an unparseable
+	// body offers nothing to compare. Both are refused rather than exempted, so
+	// the invariant does not quietly reopen if batch handling changes.
+	if frame.ParseErr != nil || frame.IsBatch {
+		return false
+	}
+	if method != "" && method != frame.Method {
+		return false
+	}
+	// Only tools/call carries a name Pipelock can compare, and it is the method
+	// whose name drives tool policy and per-tool accounting, so it is enforced
+	// strictly: a tools/call naming a tool the body does not is refused, INCLUDING
+	// the case where the body omits the name entirely. A missing body value is
+	// the worst case, not a tolerance, because the upstream still routes on the
+	// header while Pipelock sees no tool at all.
+	//
+	// Residual: other methods may legitimately carry Mcp-Name for an entity with
+	// no comparable body field, so those are left to the upstream rather than
+	// refused. Refusing them would break spec-legal requests to buy a check
+	// Pipelock cannot actually perform.
+	if name != "" && frame.IsToolsCall() && name != frame.ToolCallName {
+		return false
+	}
+	return true
 }
 
 func validMCPProtocolVersion(values []string) bool {
@@ -1656,13 +1804,24 @@ func a2aHeaderBlockReason(result A2AScanResult) blockreason.Reason {
 }
 
 func validateListenerUpstreamHeaders(headers http.Header) error {
-	for _, name := range []string{listenerAuthorization, listenerProtocolVersion, "A2A-Extensions", "A2A-Version"} {
+	for _, name := range []string{
+		listenerAuthorization, listenerProtocolVersion,
+		"A2A-Extensions", "A2A-Version",
+	} {
 		if len(headers.Values(name)) > 1 {
 			return fmt.Errorf("operator upstream header %s must appear at most once", name)
 		}
 	}
 	if !validMCPProtocolVersion(headers.Values(listenerProtocolVersion)) {
 		return fmt.Errorf("operator upstream %s must be a valid YYYY-MM-DD protocol version", listenerProtocolVersion)
+	}
+	// Routing headers are rejected as operator pins entirely (see
+	// reservedTransportHeaders), so there is no pinned value to shape-check
+	// here. Guard the invariant rather than trusting the caller.
+	for _, name := range []string{listenerMCPMethod, listenerMCPName} {
+		if len(headers.Values(name)) > 0 {
+			return fmt.Errorf("operator upstream %s cannot be pinned: it describes an individual call, so a fixed value would refuse every other method", name)
+		}
 	}
 	if values := headers.Values(listenerAuthorization); len(values) > 0 && !validVisibleSingletonHeader(values, 8192) {
 		return fmt.Errorf("operator upstream %s must be a non-empty visible ASCII value of at most 8192 bytes", listenerAuthorization)
