@@ -12,10 +12,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/contract"
+	"github.com/luckyPipewrench/pipelock/internal/evidencename"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
@@ -210,20 +209,57 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 	if err != nil {
 		return nil, fmt.Errorf("read evidence directory: %w", err)
 	}
-	prefix := "evidence-" + sessionID + "-"
-	files := make([]string, 0)
+	// Session membership is parsed equality, not an "evidence-<session>-"
+	// prefix. For session "s", the name "evidence-s-evil-999.jsonl" satisfies
+	// the prefix but belongs to session "s-evil", so prefix matching folded
+	// another session's receipts into this one's chain order.
+	wantSession := filepath.Base(sessionID)
+	// Parse once per file rather than on every comparator call. A session's
+	// shard count is unbounded over time now that resume no longer caps the
+	// directory, and the two sibling scanners in this change already
+	// precompute the same way.
+	type shard struct {
+		path     string
+		base     string
+		seqStart uint64
+	}
+	shards := make([]shard, 0)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if strings.HasPrefix(name, prefix) && strings.HasSuffix(name, ".jsonl") {
-			files = append(files, filepath.Join(clean, name))
+		parsedSession, seqStart, ok := parseEvidenceName(name)
+		if !ok || parsedSession != wantSession {
+			continue
 		}
+		shards = append(shards, shard{
+			path:     filepath.Join(clean, name),
+			base:     name,
+			seqStart: seqStart,
+		})
 	}
-	sort.Slice(files, func(i, j int) bool {
-		return evidenceSeqStart(files[i]) < evidenceSeqStart(files[j])
+	// Total order. sort.Slice is not stable, and a non-numeric trailing segment
+	// parses to sequence 0, so several distinct names can tie. Without a
+	// tie-break the resulting chain order would depend on directory order.
+	sort.Slice(shards, func(i, j int) bool {
+		if shards[i].seqStart != shards[j].seqStart {
+			return shards[i].seqStart < shards[j].seqStart
+		}
+		return shards[i].base < shards[j].base
 	})
+	files := make([]string, 0, len(shards))
+	for _, s := range shards {
+		files = append(files, s.path)
+	}
+
+	// Refuse an ambiguous shard set rather than concatenating receipts in an
+	// order that depended on which of two indistinguishable names sorted
+	// first. A verifier presenting that as a chain is the same hazard as a
+	// truncated read presented as complete.
+	if err := evidencename.CheckNoDuplicateSeqStart(files); err != nil {
+		return nil, fmt.Errorf("evidence session %s in %s: %w", wantSession, clean, err)
+	}
 
 	var out []EvidenceReceipt
 	for _, file := range files {
@@ -278,16 +314,10 @@ func extractEvidenceReceiptsFromBytes(data []byte, label string) ([]EvidenceRece
 	return out, nil
 }
 
-func evidenceSeqStart(path string) int {
-	name := filepath.Base(path)
-	name = strings.TrimSuffix(name, ".jsonl")
-	idx := strings.LastIndex(name, "-")
-	if idx < 0 {
-		return 0
-	}
-	seq, err := strconv.Atoi(name[idx+1:])
-	if err != nil {
-		return 0
-	}
-	return seq
+// parseEvidenceName splits an evidence shard filename into its session ID and
+// starting sequence, via the shared evidencename package. This verifier and the
+// recorder must agree on session membership, and a single definition is what
+// guarantees that rather than two copies plus a drift test.
+func parseEvidenceName(path string) (sessionID string, seqStart uint64, ok bool) {
+	return evidencename.Parse(path)
 }
