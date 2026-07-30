@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -43,28 +44,85 @@ func auditQueueKeyInitCmd() *cobra.Command {
 		Short: "Create a new audit-queue keyring",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if _, err := os.Lstat(opts.keyring); err == nil {
-				return fmt.Errorf("audit queue keyring already exists: %s", opts.keyring)
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("inspect audit queue keyring: %w", err)
+			if strings.TrimSpace(opts.queueDir) != "" {
+				if keyringWithinQueueDir(opts.queueDir, opts.keyring) {
+					return fmt.Errorf("keyring %q must be outside the audit queue directory %q; a keyring on the queue volume defeats at-rest encryption", opts.keyring, opts.queueDir)
+				}
+				return auditbatcher.WithQueueMaintenanceLock(opts.queueDir, func() error {
+					return createAuditQueueKeyring(cmd, opts.keyring)
+				})
 			}
-			keyring, err := auditbatcher.NewKeyring()
-			if err != nil {
-				return err
-			}
-			if err := auditbatcher.EnsureKeyringParent(opts.keyring); err != nil {
-				return err
-			}
-			if err := keyring.Save(opts.keyring); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "created audit queue keyring %s (active %s)\n", opts.keyring, keyring.ActiveKeyID())
-			return nil
+			return createAuditQueueKeyring(cmd, opts.keyring)
 		},
 	}
 	cmd.Flags().StringVar(&opts.keyring, "keyring", "", "path to the keyring file (required; keep outside the audit queue volume)")
 	_ = cmd.MarkFlagRequired("keyring")
+	cmd.Flags().StringVar(&opts.queueDir, "queue-dir", "", "initialized durable audit queue directory to lock while preparing this keyring")
 	return cmd
+}
+
+func createAuditQueueKeyring(cmd *cobra.Command, path string) error {
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("audit queue keyring already exists: %s; use rotate or recover instead of clobbering it", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect audit queue keyring: %w", err)
+	}
+	keyring, err := auditbatcher.NewKeyring()
+	if err != nil {
+		return err
+	}
+	if err := auditbatcher.EnsureKeyringParent(path); err != nil {
+		return err
+	}
+	if err := keyring.Save(path); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "created audit queue keyring %s (active %s)\n", path, keyring.ActiveKeyID())
+	return nil
+}
+
+// keyringWithinQueueDir reports whether keyring resolves to the queue directory
+// itself or a descendant of it. A keyring stored on the queue volume defeats the
+// at-rest encryption boundary, so init refuses it up front rather than deferring
+// to config validation at proxy start.
+func keyringWithinQueueDir(queueDir, keyring string) bool {
+	rel, err := filepath.Rel(canonicalContainmentPath(queueDir), canonicalContainmentPath(keyring))
+	if err != nil {
+		return false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
+}
+
+// canonicalContainmentPath returns an absolute, symlink-resolved path so a
+// relative path or a symlinked parent cannot defeat the queue/keyring
+// separation check. The keyring file itself may not exist yet, so it resolves
+// symlinks on the deepest existing ancestor and re-appends the remaining
+// components physically.
+func canonicalContainmentPath(p string) string {
+	abs, err := filepath.Abs(p)
+	if err != nil {
+		return filepath.Clean(p)
+	}
+	abs = filepath.Clean(abs)
+	rest := ""
+	cur := abs
+	for {
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			if rest == "" {
+				return resolved
+			}
+			return filepath.Join(resolved, rest)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs
+		}
+		rest = filepath.Join(filepath.Base(cur), rest)
+		cur = parent
+	}
 }
 
 func auditQueueKeyInspectCmd() *cobra.Command {

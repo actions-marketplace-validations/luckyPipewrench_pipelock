@@ -21,6 +21,7 @@ package auditbatcher
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -46,7 +47,12 @@ const (
 	recordExt              = ".json"
 )
 
-const lockFileName = ".lock"
+const (
+	lockFileName       = ".lock"
+	queueStateFileName = "queue-state.json"
+)
+
+const maxQueueStateBytes = 1024
 
 var (
 	ErrQueueEmpty    = errors.New("auditbatcher: queue empty")
@@ -56,11 +62,14 @@ var (
 	ErrQueueClosed   = errors.New("auditbatcher: queue closed")
 )
 
+var errQueueEncryptionPreviouslySeen = errors.New("auditbatcher: durable audit queue previously ran encrypted; refusing plaintext open without a keyring")
+
 type Config struct {
 	Dir             string
 	MaxPending      int
 	MaxPayloadBytes uint64
 	Keyring         *Keyring
+	AllowPlaintext  bool
 }
 
 type Batch struct {
@@ -114,6 +123,10 @@ type diskRecord struct {
 	DroppedReason string                       `json:"dropped_reason,omitempty"`
 }
 
+type queueState struct {
+	EncryptionSeen bool `json:"encryption_seen"`
+}
+
 func Open(cfg Config) (*Queue, error) {
 	if strings.TrimSpace(cfg.Dir) == "" {
 		return nil, errors.New("auditbatcher: queue dir required")
@@ -125,7 +138,7 @@ func Open(cfg Config) (*Queue, error) {
 	if cfg.MaxPayloadBytes == 0 {
 		cfg.MaxPayloadBytes = conductor.MaxAuditPayloadBytes
 	}
-	if cfg.Keyring == nil {
+	if cfg.Keyring == nil && !cfg.AllowPlaintext {
 		return nil, errors.New("auditbatcher: queue encryption keyring required")
 	}
 	dir, pendingDir, inflightDir, deadDir, err := ensurePrivateQueueDirs(cleanDir)
@@ -161,10 +174,17 @@ func Open(cfg Config) (*Queue, error) {
 	// so they're invisible to claim but visible to df). Opening fresh is the
 	// only safe time to remove them - no other writer could legitimately
 	// have a .tmp-* in flight before Open returns.
-	for _, dir := range []string{q.pendingDir, q.inflightDir, q.deadDir} {
+	for _, dir := range []string{q.dir, q.pendingDir, q.inflightDir, q.deadDir} {
 		if err := sweepStaleTempsLocked(dir); err != nil {
 			return nil, err
 		}
+	}
+	if q.keyring == nil {
+		if err := q.verifyPlaintextOpenAllowedLocked(); err != nil {
+			return nil, err
+		}
+	} else if err := q.markEncryptionSeenLocked(); err != nil {
+		return nil, err
 	}
 	if err := q.migrateRecordsLocked(); err != nil {
 		return nil, err
@@ -229,7 +249,7 @@ func (q *Queue) Enqueue(batch Batch) (string, error) {
 		Envelope:   batch.Envelope,
 		Payload:    append([]byte(nil), batch.Payload...),
 	}
-	data, err := encryptDiskRecord(record, q.keyring)
+	data, err := marshalQueueRecord(record, q.keyring)
 	if err != nil {
 		return "", fmt.Errorf("auditbatcher: marshal record: %w", err)
 	}
@@ -449,6 +469,9 @@ func (q *Queue) recoverInflightLocked() error {
 // a partially migrated queue. Each replacement is individually atomic and
 // durable; a crash simply resumes from the remaining records on next Open.
 func (q *Queue) migrateRecordsLocked() error {
+	if q.keyring == nil {
+		return q.verifyPlaintextRecordsLocked()
+	}
 	active := q.keyring.ActiveKeyID()
 	for _, dir := range []string{q.pendingDir, q.inflightDir, q.deadDir} {
 		files, err := listRecordFiles(dir)
@@ -491,6 +514,100 @@ func (q *Queue) migrateRecordsLocked() error {
 		}
 	}
 	return nil
+}
+
+func (q *Queue) verifyPlaintextRecordsLocked() error {
+	for _, dir := range []string{q.pendingDir, q.inflightDir, q.deadDir} {
+		files, err := listRecordFiles(dir)
+		if err != nil {
+			return err
+		}
+		for _, id := range files {
+			path := filepath.Join(dir, id)
+			_, _, _, err := readRecordWithKeyring(path, q.maxPayloadBytes, nil)
+			if err == nil {
+				continue
+			}
+			// Fail closed on a v2 encrypted record found in plaintext mode (a
+			// keyring was configured and then removed): errQueueKeyUnavailable is
+			// not ErrCorruptRecord, so it takes this branch and blocks startup
+			// rather than silently dropping still-encrypted evidence.
+			if errors.Is(err, errQueueKeyUnavailable) || !errors.Is(err, ErrCorruptRecord) {
+				return fmt.Errorf("auditbatcher: plaintext queue record %s: %w", id, err)
+			}
+			// A corrupt record already quarantined in dead/ must not turn a later
+			// restart into a permanent availability failure. Mirror encrypted-mode
+			// migration: skip dead-letter corruption, quarantine a corrupt live
+			// record so the remaining queue can still open.
+			if dir == q.deadDir {
+				continue
+			}
+			deadPath, pathErr := uniqueDeadPath(q.deadDir, id)
+			if pathErr != nil {
+				return fmt.Errorf("auditbatcher: quarantine queue record %s: %w", id, errors.Join(err, pathErr))
+			}
+			if moveErr := moveToDead(path, deadPath); moveErr != nil {
+				return fmt.Errorf("auditbatcher: quarantine queue record %s: %w", id, errors.Join(err, moveErr))
+			}
+		}
+	}
+	return nil
+}
+
+func (q *Queue) verifyPlaintextOpenAllowedLocked() error {
+	seen, err := q.queueEncryptionSeenLocked()
+	if err != nil {
+		return err
+	}
+	if seen {
+		return errQueueEncryptionPreviouslySeen
+	}
+	return nil
+}
+
+func (q *Queue) markEncryptionSeenLocked() error {
+	seen, err := q.queueEncryptionSeenLocked()
+	if err != nil {
+		return err
+	}
+	if seen {
+		return nil
+	}
+	// Defense-in-depth against accidental downgrade-after-encryption, such as a
+	// config or Secret regression after the queue drains empty. This is not a
+	// cryptographic guarantee: a writer on the queue volume can delete the marker.
+	// Encrypted v2 records remain the strong signal when any records exist.
+	data, err := json.Marshal(queueState{EncryptionSeen: true})
+	if err != nil {
+		return fmt.Errorf("auditbatcher: marshal queue state: %w", err)
+	}
+	if err := durableWrite(q.queueStatePath(), append(data, '\n')); err != nil {
+		return fmt.Errorf("auditbatcher: write queue state: %w", err)
+	}
+	return nil
+}
+
+func (q *Queue) queueEncryptionSeenLocked() (bool, error) {
+	data, err := securefile.Read(q.queueStatePath(), securefile.Options{
+		MaxBytes:      maxQueueStateBytes,
+		RejectSymlink: true,
+		OwnedState:    true,
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("auditbatcher: read queue state: %w", err)
+	}
+	var state queueState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return false, fmt.Errorf("auditbatcher: decode queue state: %w", err)
+	}
+	return state.EncryptionSeen, nil
+}
+
+func (q *Queue) queueStatePath() string {
+	return filepath.Join(q.dir, queueStateFileName)
 }
 
 // uniqueRecoveryPath finds a free filename in pendingDir for a recovered
@@ -642,9 +759,11 @@ func readRecordWithKeyring(path string, maxPayloadBytes uint64, keyring *Keyring
 	// becomes ErrCorruptRecord and Claim moves the record to dead/, so strictness
 	// costs delivery of that audit data rather than merely delaying it.
 	//
-	// Queue records are encrypted before durableWrite under a keyring required to
-	// live outside this queue directory. Group access to the widened volume can
-	// therefore expose ciphertext and metadata, but not the audit payload.
+	// When a keyring is configured, queue records are encrypted before
+	// durableWrite under a keyring required to live outside this queue directory.
+	// Group access to the widened volume can therefore expose ciphertext and
+	// metadata, but not the audit payload. Plaintext compatibility mode is
+	// explicit and keeps the pre-encryption v1 record format.
 	data, err := securefile.Read(path, securefile.Options{
 		MaxBytes:      limit,
 		RejectSymlink: true,
@@ -725,7 +844,7 @@ func (q *Queue) updateInflightRecordLocked(id string, mutate func(*diskRecord)) 
 		return fmt.Errorf("auditbatcher: annotate inflight %s: %w", id, err)
 	}
 	mutate(&record)
-	data, err := encryptDiskRecord(record, q.keyring)
+	data, err := marshalQueueRecord(record, q.keyring)
 	if err != nil {
 		return fmt.Errorf("auditbatcher: marshal annotated record %s: %w", id, err)
 	}
@@ -733,6 +852,13 @@ func (q *Queue) updateInflightRecordLocked(id string, mutate func(*diskRecord)) 
 		return fmt.Errorf("auditbatcher: write annotated record %s: %w", id, err)
 	}
 	return nil
+}
+
+func marshalQueueRecord(record diskRecord, keyring *Keyring) ([]byte, error) {
+	if keyring == nil {
+		return json.Marshal(record)
+	}
+	return encryptDiskRecord(record, keyring)
 }
 
 func normalizeAccountingReason(reason string) string {

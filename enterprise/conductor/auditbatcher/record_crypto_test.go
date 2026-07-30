@@ -58,6 +58,233 @@ func TestQueueEncryptsRecordsAtRest(t *testing.T) {
 	}
 }
 
+func TestEncryptedOpenWritesEncryptionSeenMarker(t *testing.T) {
+	keyring, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := Open(Config{Dir: t.TempDir(), Keyring: keyring})
+	if err != nil {
+		t.Fatalf("Open(encrypted) error = %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	data, err := os.ReadFile(filepath.Clean(q.queueStatePath()))
+	if err != nil {
+		t.Fatalf("ReadFile(queue state) error = %v", err)
+	}
+	var state queueState
+	if err := json.Unmarshal(data, &state); err != nil {
+		t.Fatalf("Unmarshal(queue state) error = %v", err)
+	}
+	if !state.EncryptionSeen {
+		t.Fatalf("queue state encryption_seen = false, want true: %s", data)
+	}
+	info, err := os.Stat(q.queueStatePath())
+	if err != nil {
+		t.Fatalf("Stat(queue state) error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != fileMode {
+		t.Fatalf("queue state mode = %#o, want %#o", got, fileMode)
+	}
+}
+
+func TestQueuePlaintextModeWritesLegacyRecords(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	q, err := Open(Config{Dir: dir, AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("Open(plaintext) error = %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	payload := []byte(`{"events":[{"message":"plaintext-sentinel"}]}`)
+	envelope := validUnsignedEnvelope(t, "batch-plaintext-at-rest", payload)
+	signed, err := SignEnvelope(envelope, "audit-key-1", priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := q.Enqueue(Batch{Envelope: signed, Payload: payload})
+	if err != nil {
+		t.Fatalf("Enqueue(plaintext) error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Clean(filepath.Join(q.pendingDir, id)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"version":2`)) || bytes.Contains(data, []byte(`"ciphertext"`)) {
+		t.Fatalf("plaintext-mode durable record used encrypted envelope: %s", data)
+	}
+	record, _, legacy, err := readRecordWithKeyring(filepath.Join(q.pendingDir, id), q.maxPayloadBytes, nil)
+	if err != nil {
+		t.Fatalf("readRecordWithKeyring(plaintext) error = %v", err)
+	}
+	if !legacy || !bytes.Equal(record.Payload, payload) {
+		t.Fatalf("plaintext record legacy=%t payload=%q, want legacy v1 payload %q", legacy, record.Payload, payload)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("Close(plaintext) error = %v", err)
+	}
+
+	reopened, err := Open(Config{Dir: dir, AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("Open(plaintext reopen) error = %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	reopenedData, err := os.ReadFile(filepath.Clean(filepath.Join(reopened.pendingDir, id)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(reopenedData, data) {
+		t.Fatal("plaintext reopen migrated or rewrote a legacy v1 record")
+	}
+	lease, err := reopened.Claim()
+	if err != nil {
+		t.Fatalf("Claim(plaintext) error = %v", err)
+	}
+	if !bytes.Equal(lease.Batch.Payload, payload) {
+		t.Fatalf("Claim(plaintext) payload = %q, want %q", lease.Batch.Payload, payload)
+	}
+}
+
+func TestPlaintextModeOpensNeverEncryptedQueueWithoutMarker(t *testing.T) {
+	dir := t.TempDir()
+	q, err := Open(Config{Dir: dir, AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("Open(never encrypted plaintext) error = %v", err)
+	}
+	defer func() { _ = q.Close() }()
+
+	if _, err := os.Stat(filepath.Join(q.dir, queueStateFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Stat(queue state) error = %v, want missing marker", err)
+	}
+}
+
+func TestPlaintextModeFailsClosedAfterEncryptedQueueDrainsEmpty(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	encrypted, err := Open(Config{Dir: dir, Keyring: keyring})
+	if err != nil {
+		t.Fatalf("Open(encrypted) error = %v", err)
+	}
+	if _, err := encrypted.Enqueue(signedTestBatch(t, "batch-encrypted-drained", priv)); err != nil {
+		t.Fatalf("Enqueue(encrypted) error = %v", err)
+	}
+	lease, err := encrypted.Claim()
+	if err != nil {
+		t.Fatalf("Claim(encrypted) error = %v", err)
+	}
+	if err := encrypted.Ack(lease.ID); err != nil {
+		t.Fatalf("Ack(encrypted) error = %v", err)
+	}
+	assertStats(t, encrypted, Stats{})
+	if err := encrypted.Close(); err != nil {
+		t.Fatalf("Close(encrypted) error = %v", err)
+	}
+
+	_, err = Open(Config{Dir: dir, AllowPlaintext: true})
+	if !errors.Is(err, errQueueEncryptionPreviouslySeen) {
+		t.Fatalf("Open(plaintext after drained encrypted queue) error = %v, want errQueueEncryptionPreviouslySeen", err)
+	}
+	for _, sub := range []string{"pending", "inflight", "dead"} {
+		files, listErr := listRecordFiles(filepath.Join(dir, sub))
+		if listErr != nil {
+			t.Fatalf("listRecordFiles(%s) error = %v", sub, listErr)
+		}
+		if len(files) != 0 {
+			t.Fatalf("%s records = %d, want drained empty queue", sub, len(files))
+		}
+	}
+}
+
+func TestPlaintextModeFailsClosedOnEncryptedRecord(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyring, err := NewKeyring()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	encrypted, err := Open(Config{Dir: dir, Keyring: keyring})
+	if err != nil {
+		t.Fatalf("Open(encrypted) error = %v", err)
+	}
+	if _, err := encrypted.Enqueue(signedTestBatch(t, "batch-encrypted-before-removal", priv)); err != nil {
+		t.Fatalf("Enqueue(encrypted) error = %v", err)
+	}
+	if err := encrypted.Close(); err != nil {
+		t.Fatalf("Close(encrypted) error = %v", err)
+	}
+	// Simulate an upgraded queue that contains pre-marker encrypted records. The
+	// record-level v2 guard must remain fail-closed even when the new marker is
+	// absent.
+	if err := os.Remove(filepath.Join(dir, queueStateFileName)); err != nil {
+		t.Fatalf("Remove(queue state) error = %v", err)
+	}
+
+	_, err = Open(Config{Dir: dir, AllowPlaintext: true})
+	if !errors.Is(err, errQueueKeyUnavailable) {
+		t.Fatalf("Open(plaintext with encrypted record) error = %v, want errQueueKeyUnavailable", err)
+	}
+	pending, listErr := listRecordFiles(filepath.Join(dir, "pending"))
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	dead, listErr := listRecordFiles(filepath.Join(dir, "dead"))
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(pending) != 1 || len(dead) != 0 {
+		t.Fatalf("after fail-closed plaintext open pending=%d dead=%d, want pending record retained and no quarantine/drop", len(pending), len(dead))
+	}
+}
+
+func TestPlaintextModeToleratesCorruptDeadLetterAndQuarantinesCorruptLive(t *testing.T) {
+	dir := t.TempDir()
+	q, err := Open(Config{Dir: dir, AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("Open(plaintext) error = %v", err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatalf("Close error = %v", err)
+	}
+	// A corrupt record already quarantined in dead/ must not block startup.
+	deadFile := filepath.Join(dir, "dead", "00000000000000000001-corrupt"+recordExt)
+	if err := os.WriteFile(deadFile, []byte("{ not a valid record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A corrupt live record must be quarantined to dead/, not block startup.
+	liveFile := filepath.Join(dir, "pending", "00000000000000000002-corrupt"+recordExt)
+	if err := os.WriteFile(liveFile, []byte("{ also not a valid record"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(Config{Dir: dir, AllowPlaintext: true})
+	if err != nil {
+		t.Fatalf("Open(plaintext with corrupt dead + live records) error = %v, want success", err)
+	}
+	defer func() { _ = reopened.Close() }()
+	pending, _ := listRecordFiles(filepath.Join(dir, "pending"))
+	dead, _ := listRecordFiles(filepath.Join(dir, "dead"))
+	if len(pending) != 0 {
+		t.Fatalf("corrupt live record not quarantined: pending=%d, want 0", len(pending))
+	}
+	if len(dead) != 2 {
+		t.Fatalf("dead-letter records after open = %d, want 2 (pre-existing corrupt + quarantined live)", len(dead))
+	}
+}
+
 func TestEncryptedRecordMaxPayloadSurvivesRestartAndClaim(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {

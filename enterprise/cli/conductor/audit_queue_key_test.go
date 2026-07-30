@@ -115,6 +115,89 @@ func TestAuditQueueKeyCommandsRespectQueueLock(t *testing.T) {
 	if !errors.Is(err, auditbatcher.ErrQueueLocked) {
 		t.Fatalf("migrate while queue live error = %v, want ErrQueueLocked", err)
 	}
+
+	initPath := filepath.Join(root, "secrets", "second-keyring.json")
+	cmd = auditQueueKeyCmd()
+	cmd.SetArgs([]string{"init", "--keyring", initPath, "--queue-dir", queueDir})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	err = cmd.Execute()
+	if !errors.Is(err, auditbatcher.ErrQueueLocked) {
+		t.Fatalf("init while queue live error = %v, want ErrQueueLocked", err)
+	}
+}
+
+func TestAuditQueueKeyInitRefusesKeyringInsideQueueDir(t *testing.T) {
+	root := t.TempDir()
+	queueDir := filepath.Join(root, "queue")
+	if err := os.MkdirAll(queueDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(queueDir) error = %v", err)
+	}
+	insideKeyring := filepath.Join(queueDir, "keyring.json")
+	cmd := auditQueueKeyCmd()
+	cmd.SetArgs([]string{"init", "--keyring", insideKeyring, "--queue-dir", queueDir})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "must be outside") {
+		t.Fatalf("init keyring inside queue error = %v, want \"must be outside\"", err)
+	}
+	if _, statErr := os.Lstat(insideKeyring); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused init must not create the keyring file; stat err = %v", statErr)
+	}
+}
+
+func TestAuditQueueKeyInitRefusesSymlinkedKeyringIntoQueueDir(t *testing.T) {
+	root := t.TempDir()
+	queueDir := filepath.Join(root, "queue")
+	if err := os.MkdirAll(queueDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll(queueDir) error = %v", err)
+	}
+	// A symlink whose target is the queue directory: lexically the keyring path
+	// is outside queueDir, but it physically resolves inside it.
+	linkDir := filepath.Join(root, "link-to-queue")
+	if err := os.Symlink(queueDir, linkDir); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	smuggled := filepath.Join(linkDir, "keyring.json")
+	cmd := auditQueueKeyCmd()
+	cmd.SetArgs([]string{"init", "--keyring", smuggled, "--queue-dir", queueDir})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "must be outside") {
+		t.Fatalf("init symlinked keyring into queue error = %v, want \"must be outside\"", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(queueDir, "keyring.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused init must not create the keyring through the symlink; stat err = %v", statErr)
+	}
+}
+
+func TestAuditQueueKeyInitRefusesRelativeKeyringInsideQueueDir(t *testing.T) {
+	root := t.TempDir()
+	// A relative --queue-dir and a relative keyring path that resolves inside it.
+	// The old lexical filepath.Rel between a relative and an absolute path errored
+	// and returned "outside"; canonicalizing both to absolute physical paths
+	// catches it.
+	t.Chdir(root)
+	if err := os.MkdirAll("queue", 0o750); err != nil {
+		t.Fatalf("MkdirAll(queue) error = %v", err)
+	}
+	// Relative --queue-dir with an ABSOLUTE keyring inside it: the exact bypass a
+	// lexical filepath.Rel misses (Rel of a relative parent against an absolute
+	// candidate errors, so the old check reported "outside").
+	absKeyring := filepath.Join(root, "queue", "keyring.json")
+	cmd := auditQueueKeyCmd()
+	cmd.SetArgs([]string{"init", "--keyring", absKeyring, "--queue-dir", "queue"})
+	cmd.SetOut(&bytes.Buffer{})
+	cmd.SetErr(&bytes.Buffer{})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "must be outside") {
+		t.Fatalf("init relative keyring inside queue error = %v, want \"must be outside\"", err)
+	}
+	if _, statErr := os.Lstat(filepath.Join(root, "queue", "keyring.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("refused init must not create the relative keyring inside the queue; stat err = %v", statErr)
+	}
 }
 
 func TestAuditQueueKeyInspectReportsUnreadableRecords(t *testing.T) {
@@ -153,8 +236,12 @@ func TestAuditQueueKeyInitRefusesOverwrite(t *testing.T) {
 	cmd.SetArgs([]string{"init", "--keyring", path})
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
-	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "already exists") {
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("second init error = %v, want overwrite refusal", err)
+	}
+	if !strings.Contains(err.Error(), "rotate or recover") {
+		t.Fatalf("second init error = %v, want lifecycle guidance", err)
 	}
 }
 

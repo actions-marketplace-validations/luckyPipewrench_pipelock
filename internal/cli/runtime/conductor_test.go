@@ -6,6 +6,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -19,6 +20,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -386,17 +388,45 @@ func TestBuildConductorAuditTransportRejectsMissingQueueKeyring(t *testing.T) {
 	}
 }
 
-func TestBuildConductorAuditTransportRejectsEmptyQueueKeyring(t *testing.T) {
+func TestBuildConductorAuditTransportOpensPlaintextWhenQueueKeyringEmpty(t *testing.T) {
+	dir := t.TempDir()
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 	cfg := &config.Config{
 		Conductor: config.Conductor{
 			Enabled:                  true,
-			DurableAuditQueueDir:     filepath.Join(t.TempDir(), "audit-queue"),
+			ConductorURL:             "https://conductor.example",
+			ServerCAFile:             filepath.Join(dir, "missing-ca.pem"),
+			DurableAuditQueueDir:     filepath.Join(dir, "audit-queue"),
 			DurableAuditQueueKeyring: "",
 		},
 	}
-	if _, _, err := buildConductorAuditTransport(cfg, nil); err == nil || !strings.Contains(err.Error(), "queue keyring is required") {
-		t.Fatalf("buildConductorAuditTransport() error = %v, want empty keyring refusal", err)
+	if _, _, err := buildConductorAuditTransport(cfg, nil); err == nil || strings.Contains(err.Error(), "queue keyring is required") {
+		t.Fatalf("buildConductorAuditTransport() error = %v, want later constructor failure after plaintext queue open", err)
 	}
+	gotLogs := logs.String()
+	if !strings.Contains(gotLogs, "level=WARN") ||
+		!strings.Contains(gotLogs, "conductor durable audit queue running unencrypted at rest") ||
+		!strings.Contains(gotLogs, "component=conductor_audit_queue") {
+		t.Fatalf("plaintext queue warning log = %q, want WARN unencrypted advisory", gotLogs)
+	}
+	// The plaintext-mode Open must actually have run: it lays down the private
+	// queue subdirectories. If the keyring check had blocked, these would not exist.
+	for _, sub := range []string{"pending", "inflight", "dead"} {
+		if _, statErr := os.Stat(filepath.Join(cfg.Conductor.DurableAuditQueueDir, sub)); statErr != nil {
+			t.Fatalf("plaintext queue subdir %q not created (Open did not run in plaintext mode): %v", sub, statErr)
+		}
+	}
+	reopened, err := auditbatcher.Open(auditbatcher.Config{
+		Dir:            cfg.Conductor.DurableAuditQueueDir,
+		AllowPlaintext: true,
+	})
+	if err != nil {
+		t.Fatalf("Open(queue after plaintext build) error = %v", err)
+	}
+	defer func() { _ = reopened.Close() }()
 }
 
 // TestBuildConductorBundlePollerDisabled confirms the poller is a no-op (nil,
