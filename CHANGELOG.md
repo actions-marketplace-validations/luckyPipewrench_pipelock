@@ -7,20 +7,319 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [3.3.0] - 2026-07-30
 
-- **Audit Packet verification now requires external trust.** The Go, Rust, and
-  TypeScript verifiers reject empty receipt chains and no longer accept a
-  packet's embedded signer key as its own trust anchor. Supply `--key` or an
-  out-of-band `--expect-sha256` pin; explicitly weaker structural modes remain
-  available where documented.
+### Breaking Changes / Upgrade Notes
 
-### ⚠️ Breaking Changes / Upgrade Notes
+- **Denial-of-wallet budgets are keyed by subject, not by MCP session id.** Budgets
+  now key on a derived subject in which only bound and configured-default agent
+  authentication contributes an agent component; self-declared and matched
+  identities collapse to a client-only bucket, so renaming yourself no longer buys
+  a fresh allowance. `max_tool_calls_per_session` now limits per subject; the field
+  name is kept only for configuration compatibility.
+- **`max_wall_clock_minutes` is now window-scoped active time**, not
+  session-lifetime wall clock. Deployments that relied on the old meaning should
+  set an explicit window.
+- **The denial-of-wallet window defaults to 30 minutes when `window_minutes` is
+  unset.** A long-lived session therefore receives a fresh allowance every 30
+  minutes. Deployments that expected a session-lifetime budget must set a larger
+  window explicitly.
+- **ACTION REQUIRED — three denial-of-wallet budget fields were removed and a
+  configuration that still sets any of them will not load.** Pipelock refuses to
+  start rather than silently ignoring them. Remove these keys from every
+  `budget:` block before upgrading:
+  - `max_retries_per_endpoint`
+  - `fan_out_limit`
+  - `fan_out_window_seconds`
 
+  All three were accepted by previous releases but never enforced by the runtime,
+  so removing them changes no enforcement behaviour. The startup error names the
+  offending field and the file, for example
+  `max_retries_per_endpoint was removed because it was not enforced; remove it
+  from the config`. Verify before upgrading with `pipelock check --config
+  /path/to/pipelock.yaml` using the new binary.
+
+  Until the config is corrected, every subcommand that resolves the discovered
+  config fails the same way. Measured on a real pre-upgrade config, that is
+  `rules verify`, `rules status`, `license status`, `signing pubkey`,
+  `session list`, `adaptive status`, and `baseline list`. Commands that do not
+  resolve a config, including `version`, `doctor`, `discover`, and `explain`,
+  are unaffected. Correcting the config restores all of them.
+- **`max_concurrent_tool_calls` is now reserved and validation rejects any
+  nonzero value.** It parses, but a configuration that sets it will fail
+  validation rather than implying a concurrency limit that is not enforced. Set
+  it to zero or remove it.
+- **Rule bundles that cannot prove compatibility no longer load implicitly.** A
+  build that cannot resolve its own version no longer auto-satisfies a bundle's
+  `min_pipelock`. The runtime refuses such a bundle and `pipelock rules install`
+  warns and proceeds; `rules.allow_unversioned_bundle_load` overrides. The runtime
+  refusal is availability-class, so strict startup starts *without* that bundle's
+  rules rather than aborting, and reports the shortfall through the
+  `rule_bundle_degraded` audit event, `/stats`, and a Prometheus gauge.
+- **The canonical policy hash changed.** Both the new bundle-version
+  configuration field and the new default response pattern move it, so receipt
+  policy hashes shift on upgrade for every deployment, even one that never sets
+  the new field. This is expected for a policy-surface addition.
+- **Control-actor names are reserved in agent configuration.** An existing agent
+  configured under a reserved name will now be rejected at load.
+- **Rekor log-key acceptance is narrowed**, and operators may now drop the vendor
+  rules key. A deployment pinning a key outside the accepted set must update it.
+- **Source builds report a truthful version derived from version control** instead
+  of a placeholder. Tooling that parsed the previous value should be rechecked.
+- **`pipelock mcp scan` and `pipelock mcp explain` verdicts are scoped to
+  injection**, so response findings no longer widen those two commands' verdicts.
 - **Trusted Audit Packet verification requires `--key` or
   `--expect-sha256`.** Existing automation that invokes `audit-packet` without
   an external trust anchor now fails closed. Add the trusted signer public key
   or a separately obtained SHA-256 digest of `packet.json`.
+- **Forward-proxy CONNECT tunnels can require TLS with SNI.** Shipped profiles
+  enable `forward_proxy.sni_require_tls` when SNI verification is on, so raw
+  CONNECT bytes and TLS handshakes without SNI are blocked unless an operator
+  chooses the documented compatibility opt-out.
+- **Conductor durable audit-queue encryption is opt-in via a keyring.**
+  Encryption is enabled only when `conductor.durable_audit_queue_keyring` is set;
+  an existing follower with no keyring keeps a plaintext queue (a startup and
+  `pipelock check` advisory names it) so upgrades do not break. When a keyring is
+  configured, existing plaintext records migrate on startup and a missing or
+  invalid keyring, or a still-encrypted record without its key, fails closed.
+
+### Added
+
+- **Opaque high-entropy egress detection** across request bodies, WebSocket
+  frames, and agent-to-agent traffic, catching encoded exfiltration that carries
+  no recognizable credential shape.
+- **Detection for safety-reclassification injection directives**, the shape that
+  tells a model to treat its earlier safety instructions as advisory before
+  handing it the real task. Added as a default response pattern, so it ships in
+  every preset and in the quickstart config rather than only where an operator
+  opts in.
+- **Enterprise counterparty-attestation verifier**, with caller-driven
+  replay-store compaction. The verifier ships as reserved foundation.
+- **Receipt-chain auto-anchoring.** When an anchor point is configured, checkpoints
+  are anchored automatically, and the anchor bundle v1 format is now a published
+  spec with a schema.
+- **Receipt rotation-endorsement verification.** Operators can pin the retiring
+  key and supply an old-key-signed endorsement that binds its successor to the
+  exact prior sequence, tail hash, timestamp, and recorder session. Missing,
+  replayed, malformed, cross-session, duplicate, and boundary-mismatched
+  endorsements fail closed. Endorsement generation/emission and an atomic
+  rotation ceremony are not yet shipped.
+- **OCSF syslog output format**, OCSF over HTTP, and audit-sink delivery health
+  metrics.
+- **Delivery-failure accounting for webhook and OTLP sinks**, with an atomic sink
+  health snapshot and a shared output-format allowlist.
+- **Remediation hints on audit events.** Block and warn events now name the
+  specific configuration knob that governs them, including on WebSocket, body-DLP,
+  and denial-of-wallet events, and on audit-mode anomaly events.
+- **MCP data-class label taxonomy** and its configuration foundation.
+- **Streamable HTTP GET and DELETE parity** on the MCP reverse-proxy listener, and
+  recognition of the HTTP QUERY method.
+- **Operator-tunable adaptive-enforcement recovery** with opt-in false-positive
+  relief.
+- **Body-DLP tuning knobs** and a distinct `ssrf_dns_rebind` block reason.
+- **A startup warning when content scanners do not cover HTTPS** because TLS
+  interception is off, so silent blind spots surface at load.
+- **Read-only conductor decision replay** in the dashboard, which also now records
+  the authenticated principal on its audit lines.
+- **Human-gated codeless playground sessions.** A broker protected by Turnstile
+  or a complete Cloudflare Access configuration can omit public invite codes
+  without weakening the human gate, per-IP limits, or global limits.
+- **Privacy-safe playground analytics relay.** The optional same-origin relay
+  accepts only a closed counts-only event schema, disables person profiles and
+  GeoIP, and bounds forwarding with per-IP rate limits and a process-wide daily
+  budget.
+- **Explicit external CSP origin allowlists for the playground broker.** Trusted
+  runtime script and browser-connection origins are validated as exact HTTPS
+  origins and widened only in their corresponding CSP directives; defaults
+  remain closed.
+- **Startup and receipt observability for liveness and coverage.** The configured
+  heartbeat cadence is recorded in the `session_open` record, so a witness can
+  judge observed heartbeat spacing against the intended interval rather than
+  guessing it. Startup also reports the resolved listener port and the armed
+  watch-path count, so a deployment that bound somewhere unintended or armed
+  fewer paths than expected is visible at boot instead of at incident time.
+- **Forward-proxy TLS/SNI enforcement for opaque CONNECT tunnels.**
+  `forward_proxy.sni_require_tls` blocks non-TLS and missing-SNI tunnels when
+  SNI verification is configured, with validation and reload coverage for the
+  explicit compatibility opt-out.
+- **Encrypted Conductor durable audit queues.** Enterprise followers can use a
+  Secret-backed audit-queue keyring, Helm mounts it read-only outside the queue
+  directory, and `pipelock conductor audit-queue-key` now supports key
+  initialization, inspection, rotation, migration, revocation, and recovery.
+
+### Fixed
+
+- **Audit Packet verification now requires external trust.** The Go, Rust, and
+  TypeScript verifiers reject empty receipt chains and no longer accept a
+  packet's embedded signer key as its own trust anchor. Explicitly weaker
+  structural modes remain available where documented.
+- **Matched credentials are no longer written to the audit stream by the
+  immutable core detectors.** Redaction of content-bearing URL, target, and
+  resource fields was keyed on a scanner-name allowlist that covered the
+  configurable `dlp` scanner but not the core floors, warn-mode DLP, or the
+  dedicated response-scan and WebSocket-scan events. A block raised by the
+  strictest, non-exemptable detector therefore echoed the credential that
+  triggered it into the audit log and onward to every configured sink. The
+  default is now inverted: any scanner is treated as content-bearing and
+  redacted unless it explicitly opts into raw destination fields, so a detector
+  added in future cannot leak by omission. Address-class scanners such as the
+  SSRF floor keep their full destination, because the address is the diagnostic
+  object rather than secret-shaped content, and every redacted event still
+  carries its request id, scanner, reason, and remediation hint.
+- **`pipelock contain install` validates the effective config with the binary it
+  is installing, before it touches the running service.** The install path
+  previously copied the config, installed the binary, wrote the unit, and started
+  the service without ever parsing that config. On a contained host the nftables
+  ruleset loads from a separate unit, so a config the new binary could not read
+  meant the proxy failed to start while egress stayed blocked, taking contained
+  agents offline. It now refuses before any stop, unit write, restart, or
+  ruleset load, and it also refuses when no config exists at all. The binary is
+  digest-checked across the preflight and the copy, so the binary that was
+  validated is the binary that becomes the service. Upgrade note: the service
+  sandbox now requires `metrics_listen` on a dedicated loopback port, so run
+  `pipelock contain install --config <your-config>` when upgrading a contained
+  host. The `--config` path migrates a config with `metrics_listen` unset by
+  assigning a dedicated loopback port; a plain `pipelock contain install` refuses
+  rather than rewriting the already-installed managed config in place.
+  **The supplied `--config` is the intended replacement for the managed
+  `/etc/pipelock/pipelock.yaml` when their contents differ.** Pass the current
+  production config, not another local profile; install warns before replacement
+  and preserves the prior managed file as `.bak`.
+- **Cloud metadata endpoints are hard-floored against every exemption and at dial
+  time**, closing the path where an exemption could reach instance metadata.
+- **Legacy `inet_aton` IPv4 literals no longer bypass SSRF checks**, and IP-literal
+  canonicalization is shared with the SIEM forwarder, which now activates
+  fail-closed.
+- **Hostile event fields are bounded.** A single oversized field previously
+  produced a multi-megabyte record on the OCSF, CEF, and OTLP paths while
+  reporting healthy delivery; all three are now bounded through one shared cap.
+- **Rule bundles fail closed** on integrity degradation, on unclassified load
+  errors, and on tampering in strict MCP proxy mode.
+- **Certificate generation fails closed on a nil certificate authority** during
+  leaf generation, and returns an error instead of panicking on invalid
+  certificate-cache input.
+- **Containment self-test integrity is fail-closed**, enforcement is attributed
+  positively rather than inferred, and scripts are validated before they are
+  applied.
+- **Flight-recorder retention now takes effect**, and chain forks are detected.
+- **Evidence read paths are bounded and report truncation** instead of silently
+  returning a partial view, and inapplicable receipt detail fields are omitted.
+- **Rekor material is rejected on non-Rekor proofs.**
+- **Content-bearing URLs are redacted on anomaly events.**
+- **MCP Streamable HTTP fails closed on ambiguous responses** and no longer leaks
+  upstream bytes.
+- **Denial-of-wallet enforcement follows a hot reload.** Enabling, disabling, or
+  retuning the MCP denial-of-wallet gates required a restart to take effect, so a
+  reload left the previous limits enforcing. Budgets now update in place without
+  resetting each subject's accumulated consumption, meaning a retune no longer
+  hands every active subject a fresh allowance.
+- **File-sentry block findings survive backpressure and shutdown.** Saturated
+  delivery channels no longer hide agent-attributed blocking findings, and close
+  waits for in-flight debounce scans before reporting shutdown complete.
+- **Provider-opaque GitHub token matches warn only inside validated opaque
+  provider fields.** Generic content still blocks on enforceable tokens,
+  malformed or multiple-root JSON fails closed, and critical matches keep
+  priority over opaque-field downgrades.
+- **Full evidence directories no longer stop receipt emission.** Recorder resume
+  no longer applies the read-path directory cap to the one tail record it needs,
+  while query, verification, and dashboard reads keep bounded scans. Evidence
+  shard matching now uses parsed session equality so similar session prefixes
+  cannot cross-contaminate receipt chains or health tails.
+- **Conductor leaders survive policy-hash-moving upgrades.** Stored bundles with
+  legacy or unknown policy-hash derivations load after signature verification,
+  offline inspect and repair use the same tolerance, and a bounded metric reports
+  current, known-legacy, and unknown-unverified policy hash status counts.
+- **Conductor local state works on Kubernetes group-owned volumes.** State files
+  written and owned by Pipelock may use group read/write when the group belongs
+  to the process, while operator-supplied credentials and private keys keep the
+  stricter permission policy.
+- **Containment reinstall handles changed managed inputs as an operator
+  lifecycle.** Reinstall restarts changed managed inputs, rolls back failures,
+  and waits for proxy readiness before reporting success.
+- **Conductor remote-kill status reports the newest effective state.** Resume
+  and supersede overlaps no longer make follower audiences appear active or
+  recovered incorrectly.
+- **MCP protocol revision 2026-07-28 is mediated without a silent downgrade.**
+  That revision makes `Mcp-Method` and `Mcp-Name` required on Streamable HTTP
+  POST, and the reverse proxy stripped both in transit. An upstream that enforces
+  them rejected the stripped request, and a fallback-capable client then completed
+  the exchange over the deprecated session-based handshake while still reporting
+  success, so the proxy downgraded the protocol it was mediating and the downgrade
+  was invisible from the client side. Both headers now forward through the
+  operator-unset path, so a value pinned with `--header` still wins. Browser
+  preflight also allowlists them, and `Mcp-Session-Id` and `Last-Event-ID` stay
+  allowlisted because a mixed-revision fleet is the normal state throughout the
+  revision's deprecation window.
+- **MCP routing headers that disagree with the scanned body are refused.**
+  `Mcp-Method` and `Mcp-Name` route a request at the upstream while Pipelock scans
+  and applies policy to the JSON-RPC body, so forwarding a header that disagrees
+  with that body would let the upstream act on a method or tool name no scanner
+  ever saw. That is a display-versus-reality divergence on the mediating path.
+- **Server-sent-event content types are matched exactly** rather than by prefix.
+- **Agent attribution is bound to resolved identity.**
+- **Dashboard routes enforce mapped OIDC role permissions.**
+- **Release tooling fails closed** on incomplete attestation and non-semver tags.
+- **Public-facing playground and license-service surfaces are hardened**, alongside
+  provider health reporting, containment capture and UID handling, deployment
+  contract validation, and request boundary validation.
+- **Playground brokers warn when a served static UI cannot be embedded.** The
+  closed-by-default `frame-ancestors 'none'` policy is unchanged, but an omitted
+  embed origin is now visible at startup instead of surfacing only as a blank
+  iframe.
+- **WASM verifier compilation is restored.**
+
+### Changed
+
+- **A verified inline image no longer trips content scanning on its own
+  opacity.** Legitimate `data:image/png;base64` payloads were indistinguishable
+  from an encoded blob. Response scanning and text DLP now excise a verified
+  image before evaluating the surrounding content. The two surfaces differ in
+  what happens to the image itself: text DLP keeps the decoded bytes in scope,
+  so a secret carried inside a verified image is still detected there, while
+  response scanning discards them, so a verified image's own bytes are not
+  examined on that path. The carve-out is deliberately narrow: only a strict PNG
+  or JPEG in an exact data-URL envelope, whose bytes are fully accounted for and
+  which decodes successfully, is excised. A payload that merely looks like an
+  image, or that carries data before, after, or around the image, is scanned
+  normally, and the verification itself is allocation-bounded.
+  **URL query parameters are deliberately not covered.** A high-entropy image
+  payload in a query parameter still blocks on entropy, so a deployment that
+  passes inline media through URLs must exempt it explicitly rather than rely on
+  the carve-out.
+- **The containment guide states the enforced nftables minimum.** It documented
+  0.6 while the install path requires 0.8, which is the version that supports
+  the check mode used by install and rollback validation.
+- **Anchor-state selection is O(1)** on the recurring health read.
+- **False-positive tuning guidance points single-pattern response findings at the
+  narrowest effective knob**, rather than a broader one the blocking path does not
+  consult.
+- **Kubernetes deployment guidance tells operators to verify per-pod NetworkPolicy
+  enforcement rather than assume it.** NetworkPolicies are additive with no deny
+  rule, so a narrow policy cannot override a broader one that already permits the
+  traffic. Separately, on one k3s cluster a namespace-wide policy that selected
+  every pod and declared both directions in a single object was observed defeating
+  a more specific per-pod ingress policy outright. The affected surface is named,
+  the observation is reported with its exact provenance rather than as a general
+  guarantee, and the verification recipe requires a positive control before the
+  negative test.
+- Documentation adds an evidence terminology quick reference, a rewritten README
+  with a capability table and a verify-it-yourself walkthrough, and executable
+  examples for hot reload, learn-and-lock, receipt verification, request-policy
+  GraphQL, MCP media policy, reverse-proxy server-sent-event streaming, OpenCode
+  integration, and SIEM events.
+
+### Security
+
+- **Dependency advisories resolved.** `golang.org/x/net` updated to v0.56.0, and
+  the TypeScript verifier's `fast-uri` updated to 3.1.4 for GHSA-4c8g-83qw-93j6.
+- **Local integrity and sidecar state use explicit permission policies.**
+  Integrity manifests, MCP integrity state, and SVID sidecar state reject group-
+  or world-writable files instead of inheriting a looser generic read policy.
+- **Keyring-enabled durable audit queue records are encrypted at rest with AES-256-GCM.**
+  Startup migrates plaintext records only after the keyring is available, retired
+  keys remain available for migration, corrupt records are quarantined, and
+  encrypted recovery enforces the maximum record size across restart and
+  delivery.
 
 ## [3.2.0] - 2026-07-17
 
