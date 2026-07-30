@@ -216,9 +216,31 @@ func EncodePrivateKey(key ed25519.PrivateKey) string {
 //
 // Detection is by content: a leading '{' (after whitespace trim) selects JSON.
 func DecodePrivateKey(encoded string) (ed25519.PrivateKey, error) {
+	return decodePrivateKeyForPurpose(encoded, "")
+}
+
+// DecodePrivateKeyForPurpose decodes a private key and, for purpose-bound JSON
+// key files, requires the declared purpose to match. Legacy two-line recorder
+// keys have no purpose field and remain accepted for migration compatibility,
+// so purpose enforcement through this compatibility API is advisory.
+func DecodePrivateKeyForPurpose(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return decodePrivateKeyForPurpose(encoded, expectedPurpose)
+}
+
+// DecodePrivateKeyForPurposeStrict decodes only a purpose-bound JSON key file
+// and requires its declared purpose to match. It rejects legacy two-line keys,
+// whose lack of purpose metadata cannot provide a hard binding guarantee.
+func DecodePrivateKeyForPurposeStrict(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	if trimmed := strings.TrimSpace(encoded); len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, errors.New("purpose-bound JSON private key required; legacy key format has no purpose metadata")
+	}
+	return decodePrivateKeyForPurpose(encoded, expectedPurpose)
+}
+
+func decodePrivateKeyForPurpose(encoded string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
 	trimmed := strings.TrimSpace(encoded)
 	if len(trimmed) > 0 && trimmed[0] == '{' {
-		return decodePrivateKeyJSON([]byte(trimmed))
+		return decodePrivateKeyJSON([]byte(trimmed), expectedPurpose)
 	}
 
 	lines := strings.SplitN(trimmed, "\n", 2)
@@ -243,10 +265,11 @@ func DecodePrivateKey(encoded string) (ed25519.PrivateKey, error) {
 // decodePrivateKeyJSON extracts an ed25519 private key from the JSON keyfile
 // format produced by "pipelock signing key generate". The private key is
 // stored as a 128-char hex string.
-func decodePrivateKeyJSON(data []byte) (ed25519.PrivateKey, error) {
+func decodePrivateKeyJSON(data []byte, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
 	// Minimal struct matching the keyfile schema fields we need.
 	var kf struct {
 		SchemaVersion int    `json:"schema_version"`
+		Purpose       string `json:"purpose"`
 		Private       string `json:"private"`
 		Public        string `json:"public"`
 	}
@@ -262,6 +285,9 @@ func decodePrivateKeyJSON(data []byte) (ed25519.PrivateKey, error) {
 	}
 	if kf.SchemaVersion != 1 {
 		return nil, fmt.Errorf("unsupported JSON key file schema_version %d (expected 1)", kf.SchemaVersion)
+	}
+	if expectedPurpose != "" && KeyPurpose(kf.Purpose) != expectedPurpose {
+		return nil, fmt.Errorf("JSON key file purpose mismatch: file=%q expected=%q", kf.Purpose, expectedPurpose)
 	}
 	if kf.Private == "" {
 		return nil, fmt.Errorf("JSON key file missing private field")
@@ -371,6 +397,34 @@ func LoadPublicKey(pathOrValue string) (ed25519.PublicKey, error) {
 // rejects non-regular files, group-writable files, and all world access.
 // Group-read (0o040) is allowed because k8s fsGroup sets it automatically.
 func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
+	return loadPrivateKeyFileForPurpose(path, "")
+}
+
+// LoadPrivateKeyFileForPurpose securely loads a private key and enforces the
+// declared purpose on JSON key files. Legacy two-line keys remain accepted
+// because that format predates purpose binding.
+func LoadPrivateKeyFileForPurpose(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return loadPrivateKeyFileForPurpose(path, expectedPurpose)
+}
+
+// LoadPrivateKeyFileForPurposeStrict securely loads a purpose-bound JSON key
+// and rejects legacy keys that cannot prove their intended purpose.
+func LoadPrivateKeyFileForPurposeStrict(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return readAndDecodePrivateKeyFile(path, func(encoded string) (ed25519.PrivateKey, error) {
+		return DecodePrivateKeyForPurposeStrict(encoded, expectedPurpose)
+	})
+}
+
+func loadPrivateKeyFileForPurpose(path string, expectedPurpose KeyPurpose) (ed25519.PrivateKey, error) {
+	return readAndDecodePrivateKeyFile(path, func(encoded string) (ed25519.PrivateKey, error) {
+		return DecodePrivateKeyForPurpose(encoded, expectedPurpose)
+	})
+}
+
+func readAndDecodePrivateKeyFile(
+	path string,
+	decode func(string) (ed25519.PrivateKey, error),
+) (ed25519.PrivateKey, error) {
 	data, err := securefile.Read(path, securefile.Options{
 		MaxBytes:        privateKeyFileMaxBytes,
 		DisallowedPerms: 0o037,
@@ -378,5 +432,5 @@ func LoadPrivateKeyFile(path string) (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading private key: %w", err)
 	}
-	return DecodePrivateKey(string(data))
+	return decode(string(data))
 }

@@ -98,12 +98,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Receipt-chain auto-anchoring.** When an anchor point is configured, checkpoints
   are anchored automatically, and the anchor bundle v1 format is now a published
   spec with a schema.
-- **Receipt rotation-endorsement verification.** Operators can pin the retiring
-  key and supply an old-key-signed endorsement that binds its successor to the
-  exact prior sequence, tail hash, timestamp, and recorder session. Missing,
-  replayed, malformed, cross-session, duplicate, and boundary-mismatched
-  endorsements fail closed. Endorsement generation/emission and an atomic
-  rotation ceremony are not yet shipped.
+- **Receipt rotation-endorsement preparation and verification.** Operators can
+  run `pipelock signing receipt-rotation endorse` against a cleanly closed chain
+  to bind a successor to the exact prior sequence, tail hash, timestamp, and
+  recorder session, then verify from the original pinned root. Missing,
+  replayed, malformed, cross-session, duplicate, boundary-mismatched, or
+  concurrently advanced ceremonies fail closed. Deployment-specific stop, key
+  replacement, restart, and rollback steps remain operator-run. Successors must
+  use purpose-bound `receipt-signing` JSON keys; legacy retiring keys remain
+  accepted for migration from existing recorder deployments. Cross-process
+  ceremony locking currently requires Unix `flock` and fails closed on Windows;
+  the artifact output filesystem must support hard links.
 - **OCSF syslog output format**, OCSF over HTTP, and audit-sink delivery health
   metrics.
 - **Delivery-failure accounting for webhook and OTLP sinks**, with an atomic sink

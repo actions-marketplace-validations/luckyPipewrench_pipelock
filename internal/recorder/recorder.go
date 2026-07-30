@@ -149,6 +149,9 @@ type Recorder struct {
 	prevHash       string
 	writer         *bufio.Writer
 	file           *os.File
+	ceremonyLock   *os.File
+	ceremonyDir    os.FileInfo
+	evidenceDir    os.FileInfo
 	fileEntryCount int
 	fileSeqStart   uint64
 	fileGeneration uint64
@@ -254,6 +257,20 @@ func New(cfg Config, redactFn RedactFunc, privKey ed25519.PrivateKey) (*Recorder
 		var pub [x25519KeySize]byte
 		copy(pub[:], keyBytes)
 		r.escrowPub = &pub
+	}
+
+	ceremonyLock, ceremonyDir, err := acquireEvidenceWriterCeremonyLock(cfg.Dir)
+	if err != nil {
+		return nil, err
+	}
+	r.ceremonyLock = ceremonyLock
+	r.ceremonyDir = ceremonyDir
+	r.evidenceDir = ceremonyDir
+	if r.evidenceDir == nil {
+		r.evidenceDir, err = os.Stat(filepath.Clean(cfg.Dir))
+		if err != nil {
+			return nil, fmt.Errorf("stat evidence directory: %w", err)
+		}
 	}
 
 	return r, nil
@@ -616,7 +633,7 @@ func (r *Recorder) waitDurability(batch *durableBatch, generation, seq uint64) e
 }
 
 // Close flushes and closes the recorder, writing a final checkpoint.
-func (r *Recorder) Close() error {
+func (r *Recorder) Close() (retErr error) {
 	if r.nop {
 		return nil
 	}
@@ -628,6 +645,9 @@ func (r *Recorder) Close() error {
 		return nil
 	}
 	r.closed = true
+	defer func() {
+		retErr = errors.Join(retErr, r.releaseEvidenceWriterCeremonyLock())
+	}()
 
 	if r.sinceCheckpoint > 0 {
 		r.waitDurableForCurrentFileLocked()
@@ -1030,7 +1050,7 @@ func (r *Recorder) ensureFile(sessionID string, seqStart uint64) error {
 	// silent" repro). Statting the configured dir on every call catches
 	// the disappearance while r.file is still the stale fd.
 	dir := filepath.Clean(r.cfg.Dir)
-	_, statErr := os.Stat(dir)
+	dirInfo, statErr := os.Stat(dir)
 	if statErr != nil && !os.IsNotExist(statErr) {
 		// Fail-closed: a non-NotExist stat error (permission denied,
 		// transient I/O failure, mount unmapped) means we cannot trust
@@ -1044,20 +1064,34 @@ func (r *Recorder) ensureFile(sessionID string, seqStart uint64) error {
 		if mkErr := os.MkdirAll(dir, dirPermissions); mkErr != nil {
 			return fmt.Errorf("evidence directory %s disappeared and could not be recreated: %w", r.cfg.Dir, mkErr)
 		}
+		dirInfo, statErr = os.Stat(dir)
+		if statErr != nil {
+			return fmt.Errorf("stat recreated evidence directory %s: %w", r.cfg.Dir, statErr)
+		}
 		_, _ = fmt.Fprintf(os.Stderr,
 			"pipelock: recorder: evidence directory %s disappeared mid-run and was recreated; prior receipts are lost\n",
 			r.cfg.Dir)
-		// Drop the stale fd so the next OpenFile lands in the freshly
-		// recreated directory. Ignore close errors - the fd was
-		// already pointing at an unlinked inode.
-		if r.file != nil {
-			r.waitDurableForCurrentFileLocked()
-			_ = r.file.Close()
-			r.file = nil
-			r.writer = nil
-			r.fileEntryCount = 0
-		}
 	}
+
+	dirReplaced := r.evidenceDir != nil && !os.SameFile(dirInfo, r.evidenceDir)
+	if dirReplaced && r.file != nil {
+		// An atomic directory swap never exposes a missing path. Close the
+		// stale file before refreshing the directory lock so the next write
+		// cannot continue through an fd in the old directory inode.
+		if err := r.closeFile(); err != nil {
+			return fmt.Errorf("closing evidence file after directory replacement: %w", err)
+		}
+		r.fileEntryCount = 0
+	}
+
+	// This comparison is deliberately before the open-file short circuit.
+	// It detects directory replacement while r.file still names an unlinked
+	// inode, but reuses the stat above and cached identity metadata rather
+	// than adding filesystem calls to every receipt.
+	if err := r.ensureEvidenceWriterCeremonyLock(dirInfo); err != nil {
+		return fmt.Errorf("refreshing recorder receipt ceremony lock: %w", err)
+	}
+	r.evidenceDir = dirInfo
 
 	if r.file != nil {
 		return nil
@@ -1131,10 +1165,8 @@ func (r *Recorder) ensureEntryCapacityLocked(sessionID string, seq uint64, lineB
 	if lineBytes > MaxEvidenceReadFileBytes {
 		return fmt.Errorf("%w: serialized evidence entry exceeds %d bytes", ErrEvidenceReadLimitExceeded, MaxEvidenceReadFileBytes)
 	}
-	if r.file == nil {
-		if err := r.ensureFile(sessionID, seq); err != nil {
-			return fmt.Errorf("opening evidence file: %w", err)
-		}
+	if err := r.ensureFile(sessionID, seq); err != nil {
+		return fmt.Errorf("opening evidence file: %w", err)
 	}
 	info, err := r.file.Stat()
 	if err != nil {
