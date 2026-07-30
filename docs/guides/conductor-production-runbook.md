@@ -326,6 +326,8 @@ remote-kill, but it does **not** appear in `conductor fleet status` and the audi
 sink cannot verify its evidence — the Conductor has no audit key registered for
 it. Enrollment is what turns both on.
 
+For a direct follower deployment, mount each path exactly as configured:
+
 ```yaml
 # pipelock-enterprise-skip-id: conductor-production-follower
 conductor:
@@ -342,6 +344,7 @@ conductor:
   client_key_path: /etc/pipelock/follower.key
   bundle_cache_dir: /var/lib/pipelock/bundles
   durable_audit_queue_dir: /var/lib/pipelock/audit-queue
+  durable_audit_queue_keyring: /etc/pipelock/secrets/audit-queue-keyring.json
   # audit_signing_key_id and recorder_key_id default to instance_id when omitted; override only if the audit sink expects a different key id
   # audit_signing_key_id: edge-01-audit
   # recorder_key_id: edge-01-recorder
@@ -357,8 +360,68 @@ flight_recorder:
 
 A follower **must produce signed evidence** to participate: config validation
 rejects `conductor.enabled: true` unless the flight recorder is enabled with
-signing checkpoints and a `signing_key_path`. On Kubernetes, use
+signing checkpoints and a `signing_key_path`. The YAML above is a manual-mount
+example; do not copy its paths into Helm-generated configuration. On Kubernetes,
+use
 [`values-enterprise-follower.yaml`](../../charts/pipelock/examples/values-enterprise-follower.yaml):
+
+Create a writable operator-owned source keyring before the first start, then
+import it into a Kubernetes Secret mounted separately from the queue PVC. The
+chart renders `durable_audit_queue_keyring` from
+`auditQueueKeyringSecretRef.mountPath` and `.key` (the example resolves to
+`/etc/pipelock/conductor/audit-queue-key/audit-queue-keyring.json`). The mounted
+copy is runtime-only and read-only. Keep the operator source directory at
+`0700`: it contains the raw symmetric key and has no group consumer.
+
+```bash
+install -d -m 700 "$PWD/operator-secrets"
+pipelock conductor audit-queue-key init \
+  --keyring "$PWD/operator-secrets/audit-queue-keyring.json"
+kubectl -n pipelock create secret generic follower-audit-queue-keyring \
+  --from-file=audit-queue-keyring.json="$PWD/operator-secrets/audit-queue-keyring.json"
+```
+
+Day-2 lifecycle commands require the follower to be stopped and must run in an
+operator maintenance environment that mounts the real queue PVC at
+`/var/lib/pipelock/conductor/audit-queue` while keeping the operator source keyring on a
+different writable volume. Inspection may use the read-only runtime mount;
+rotate, revoke, and recover must never target that Secret mount:
+
+```bash
+kubectl -n pipelock scale deployment pipelock-follower --replicas=0
+export KEYRING="$PWD/operator-secrets/audit-queue-keyring.json"
+export QUEUE_DIR=/var/lib/pipelock/conductor/audit-queue
+pipelock conductor audit-queue-key inspect --keyring "$KEYRING" --queue-dir "$QUEUE_DIR"
+pipelock conductor audit-queue-key rotate --keyring "$KEYRING" --queue-dir "$QUEUE_DIR"
+pipelock conductor audit-queue-key migrate --keyring "$KEYRING" --queue-dir "$QUEUE_DIR"
+pipelock conductor audit-queue-key revoke sha256:0123456789abcdef --keyring "$KEYRING" --queue-dir "$QUEUE_DIR"
+pipelock conductor audit-queue-key recover --backup "$KEYRING.bak" --keyring "$KEYRING" --queue-dir "$QUEUE_DIR"
+kubectl -n pipelock create secret generic follower-audit-queue-keyring \
+  --from-file=audit-queue-keyring.json="$KEYRING" \
+  --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n pipelock scale deployment pipelock-follower --replicas=1
+```
+
+Rotation saves the pre-rotation keyring as `KEYRING.bak.previous`, then writes
+the rotated keyring—with both old and new decryptors—to the live file and
+`KEYRING.bak` before re-encrypting records. An interruption therefore retains
+both decryptors; rerun `migrate` to converge. Revocation refuses the active key
+and any key still referenced by a pending, inflight, or dead-letter record.
+Recovery first proves `KEYRING.bak` decrypts every queued record, preserves the
+current live keyring as `KEYRING.pre-recover`, then restores the backup
+verbatim. That intentionally reinstates any keys revoked after the backup; use
+the pre-recovery snapshot to reverse an accidental recovery.
+Use the inactive key ID printed by `inspect` in place of the example
+`sha256:0123456789abcdef` value.
+
+Kubernetes Secret mounts are read-only, so retain the operator-owned source
+copy. Never rotate against an empty temporary queue: maintenance commands now
+require the initialized real queue layout and inspect every durable state before
+mutation. Update the Secret only after the command succeeds, then scale the
+Deployment back up. Startup verifies and migrates every PVC record before
+delivery resumes. After `inspect` reports zero records for the old ID, revoke it
+in the source file and repeat the scale-down/update/scale-up flow. Never delete
+the old key from the Secret before PVC migration has completed.
 
 ```bash
 helm install pipelock-follower ./charts/pipelock \

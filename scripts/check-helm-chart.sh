@@ -48,6 +48,26 @@ expect_template_error "/image/digest" \
 expect_template_error "conductorFollower.conductorURL is required" \
   --set conductorFollower.enabled=true
 
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.name is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.name=
+
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.key is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.key=
+
+expect_template_error "conductorFollower.auditQueueKeyringSecretRef.mountPath is required" \
+  -f "$chart/examples/values-enterprise-follower.yaml" \
+  --set conductorFollower.auditQueueKeyringSecretRef.mountPath=
+
+for overlapping_keyring_mount in \
+  /var/lib/pipelock/conductor/audit-queue \
+  /var/lib/pipelock/conductor/audit-queue/keys; do
+  expect_template_error "conductorFollower.auditQueueKeyringSecretRef.mountPath must be outside" \
+    -f "$chart/examples/values-enterprise-follower.yaml" \
+    --set "conductorFollower.auditQueueKeyringSecretRef.mountPath=${overlapping_keyring_mount}"
+done
+
 expect_template_error "enterprise modes require explicit networkPolicy.ingress and networkPolicy.egress rules" \
   --set mode=conductor \
   --set networkPolicy.enabled=true \
@@ -97,6 +117,12 @@ grep -q -- "- run" "$render_dir/default.yaml"
 grep -q -- "conductor:" "$render_dir/values-enterprise-follower.yaml"
 grep -q -- "pipelock-follower-bundles" "$render_dir/values-enterprise-follower.yaml"
 grep -q -- "pipelock-follower-audit-queue" "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'secretName: "follower-audit-queue-keyring"' "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'key: "audit-queue-keyring.json"' "$render_dir/values-enterprise-follower.yaml"
+grep -q -- 'mountPath: "/etc/pipelock/conductor/audit-queue-key"' "$render_dir/values-enterprise-follower.yaml"
+keyring_mount_block=$(grep -A2 -- 'name: conductor-audit-queue-keyring' "$render_dir/values-enterprise-follower.yaml" || true)
+[[ "$keyring_mount_block" == *"readOnly: true"* ]]
+grep -q -- 'durable_audit_queue_keyring: /etc/pipelock/conductor/audit-queue-key/audit-queue-keyring.json' "$render_dir/values-enterprise-follower.yaml"
 
 grep -q -- "- conductor" "$render_dir/values-enterprise-conductor.yaml"
 grep -q -- "- serve" "$render_dir/values-enterprise-conductor.yaml"
