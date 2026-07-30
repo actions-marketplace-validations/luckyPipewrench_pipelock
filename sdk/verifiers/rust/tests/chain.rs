@@ -9,6 +9,9 @@ use pipelock_verifier_rs::chain::{
     compute_session_open_genesis, receipt_hash, verify_chain, verify_chain_with_options,
 };
 use pipelock_verifier_rs::recorder::extract_receipts;
+use pipelock_verifier_rs::rotation::{
+    load_rotation_endorsement_file, verify_chain_with_endorsements, verify_rotation_endorsement,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -216,6 +219,209 @@ fn g1_rotated_close_count_valid_fixture_verifies() {
     assert!(result.valid, "{:?}", result.error);
     assert_eq!(result.receipt_count, 6);
     assert_eq!(result.final_seq, 2);
+}
+
+#[test]
+fn g1_rotated_chain_verifies_from_one_root_plus_endorsement() {
+    let root = common::repo_root();
+    let receipts =
+        extract_receipts(&root.join("sdk/conformance/testdata/g1-rotated-close-count-valid.jsonl"))
+            .unwrap();
+    let endorsement = load_rotation_endorsement_file(
+        &root.join("sdk/conformance/testdata/g1-rotation-endorsement.json"),
+    )
+    .unwrap();
+    let result = verify_chain_with_endorsements(
+        &receipts,
+        "conformance-session",
+        &[endorsement],
+        &conformance_key(),
+    );
+    assert!(result.valid, "{:?}", result.error);
+}
+
+#[test]
+fn g1_twice_rotated_chain_verifies_from_one_root_plus_both_endorsements() {
+    let root = common::repo_root();
+    let receipts =
+        extract_receipts(&root.join("sdk/conformance/testdata/g1-rotated-twice-valid.jsonl"))
+            .unwrap();
+    let endorsements = [
+        load_rotation_endorsement_file(
+            &root.join("sdk/conformance/testdata/g1-rotation-endorsement.json"),
+        )
+        .unwrap(),
+        load_rotation_endorsement_file(
+            &root.join("sdk/conformance/testdata/g1-rotation-endorsement-2.json"),
+        )
+        .unwrap(),
+    ];
+    let result = verify_chain_with_endorsements(
+        &receipts,
+        "conformance-session",
+        &endorsements,
+        &conformance_key(),
+    );
+    assert!(result.valid, "{:?}", result.error);
+    assert_eq!(result.receipt_count, 9);
+}
+
+#[test]
+fn rotation_endorsement_trust_fails_closed_when_absent_altered_or_duplicated() {
+    let root = common::repo_root();
+    let receipts =
+        extract_receipts(&root.join("sdk/conformance/testdata/g1-rotated-close-count-valid.jsonl"))
+            .unwrap();
+    let endorsement = load_rotation_endorsement_file(
+        &root.join("sdk/conformance/testdata/g1-rotation-endorsement.json"),
+    )
+    .unwrap();
+
+    let missing =
+        verify_chain_with_endorsements(&receipts, "conformance-session", &[], &conformance_key());
+    assert!(!missing.valid);
+    assert!(missing
+        .error
+        .unwrap_or_default()
+        .contains("does not match receipt boundary"));
+
+    let pre_pinned_successor = verify_chain_with_endorsements(
+        &receipts,
+        "conformance-session",
+        &[],
+        &conformance_trusted_keys(),
+    );
+    assert!(!pre_pinned_successor.valid);
+    assert!(pre_pinned_successor
+        .error
+        .unwrap_or_default()
+        .contains("does not match receipt boundary"));
+
+    let mut unmarked_switch =
+        extract_receipts(&root.join("sdk/conformance/testdata/g1-valid-chain.jsonl")).unwrap();
+    sign_action_receipt_with_conformance_key_fields(
+        &mut unmarked_switch[1],
+        "rotated_seed_hex",
+        "rotated_public_key_hex",
+    );
+    let forged = verify_chain_with_endorsements(
+        &unmarked_switch,
+        "conformance-session",
+        &[],
+        &conformance_key(),
+    );
+    assert!(!forged.valid);
+    assert!(forged
+        .error
+        .unwrap_or_default()
+        .contains("without a key_transition boundary"));
+
+    let mut altered = endorsement.clone();
+    altered.prior_tail_hash = "0".repeat(64);
+    assert!(verify_rotation_endorsement(&altered)
+        .unwrap_err()
+        .to_string()
+        .contains("signature verification failed"));
+    let mut impossible_date = endorsement.clone();
+    impossible_date.rotated_at = "2026-02-30T12:00:00Z".to_string();
+    assert!(verify_rotation_endorsement(&impossible_date)
+        .unwrap_err()
+        .to_string()
+        .contains("canonical UTC RFC3339Nano"));
+
+    let duplicate = verify_chain_with_endorsements(
+        &receipts,
+        "conformance-session",
+        &[endorsement.clone(), endorsement.clone()],
+        &conformance_key(),
+    );
+    assert!(!duplicate.valid);
+    assert!(duplicate
+        .error
+        .unwrap_or_default()
+        .contains("multiple rotation endorsements"));
+
+    let second = load_rotation_endorsement_file(
+        &root.join("sdk/conformance/testdata/g1-rotation-endorsement-2.json"),
+    )
+    .unwrap();
+    let replayed = verify_chain_with_endorsements(
+        &receipts,
+        "conformance-session",
+        &[endorsement.clone(), second],
+        &conformance_key(),
+    );
+    assert!(!replayed.valid);
+    assert!(replayed
+        .error
+        .unwrap_or_default()
+        .contains("unused rotation endorsement"));
+
+    let cross_session = verify_chain_with_endorsements(
+        &receipts,
+        "other-session",
+        &[endorsement],
+        &conformance_key(),
+    );
+    assert!(!cross_session.valid);
+    assert!(cross_session
+        .error
+        .unwrap_or_default()
+        .contains("signed recorder session"));
+}
+
+#[test]
+fn rotation_endorsement_file_rejects_duplicate_unknown_and_trailing_fields() {
+    let root = common::repo_root();
+    let source =
+        fs::read_to_string(root.join("sdk/conformance/testdata/g1-rotation-endorsement.json"))
+            .unwrap();
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let base = std::env::temp_dir().join(format!(
+        "pipelock-rotation-json-{}-{suffix}",
+        std::process::id()
+    ));
+    let cases = [
+        (
+            "duplicate",
+            source.replace("\"version\": 1,", "\"version\": 1, \"version\": 1,"),
+            "duplicate field",
+        ),
+        (
+            "unknown",
+            source.replace("\n}", ",\n  \"trusted\": true\n}"),
+            "unknown field",
+        ),
+        ("trailing", format!("{}\n{{}}", source.trim()), "trailing"),
+    ];
+    for (name, body, want) in cases {
+        let path = base.with_extension(format!("{name}.json"));
+        fs::write(&path, body).unwrap();
+        let error = load_rotation_endorsement_file(&path)
+            .expect_err("malformed endorsement should fail")
+            .to_string();
+        let _ = fs::remove_file(path);
+        assert!(error.contains(want), "{name}: {error}");
+    }
+
+    let oversized = base.with_extension("oversized.json");
+    fs::write(&oversized, vec![0; 64 * 1024 + 1]).unwrap();
+    let error = load_rotation_endorsement_file(&oversized)
+        .expect_err("oversized endorsement should fail")
+        .to_string();
+    let _ = fs::remove_file(oversized);
+    assert!(error.contains("exceeds 65536 bytes"), "{error}");
+
+    let directory = base.with_extension("directory");
+    fs::create_dir(&directory).unwrap();
+    let error = load_rotation_endorsement_file(&directory)
+        .expect_err("endorsement directory should fail")
+        .to_string();
+    let _ = fs::remove_dir(directory);
+    assert!(error.contains("must be a regular file"), "{error}");
 }
 
 #[test]
@@ -569,11 +775,19 @@ fn sign_evidence_receipt(receipt: &mut Value) {
 }
 
 fn sign_action_receipt_with_conformance_key(receipt: &mut Value) {
+    sign_action_receipt_with_conformance_key_fields(receipt, "seed_hex", "public_key_hex");
+}
+
+fn sign_action_receipt_with_conformance_key_fields(
+    receipt: &mut Value,
+    seed_field: &str,
+    public_key_field: &str,
+) {
     let root = common::repo_root();
     let data =
         fs::read_to_string(root.join("sdk/conformance/testdata/test-key.json")).expect("read key");
     let value: Value = serde_json::from_str(&data).expect("parse key");
-    let seed: [u8; 32] = hex::decode(value["seed_hex"].as_str().expect("seed_hex"))
+    let seed: [u8; 32] = hex::decode(value[seed_field].as_str().expect("seed field"))
         .expect("decode seed")
         .try_into()
         .expect("seed length");
@@ -581,5 +795,5 @@ fn sign_action_receipt_with_conformance_key(receipt: &mut Value) {
     let digest = Sha256::digest(canonicalize_action_record(&receipt["action_record"]));
     let signature = key.sign(&digest);
     receipt["signature"] = json!(format!("ed25519:{}", hex::encode(signature.to_bytes())));
-    receipt["signer_key"] = value["public_key_hex"].clone();
+    receipt["signer_key"] = value[public_key_field].clone();
 }

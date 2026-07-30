@@ -3,6 +3,7 @@
 
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -12,7 +13,13 @@ import { canonicalizeBytes } from "../src/aarp/canonical.js";
 import { canonicalizeActionRecord } from "../src/canonical.js";
 import { extractReceipts } from "../src/recorder.js";
 import { computeSessionOpenGenesis, receiptHash, verifyChain } from "../src/chain.js";
+import {
+  loadRotationEndorsementFile,
+  verifyChainWithEndorsements,
+  verifyRotationEndorsement,
+} from "../src/rotation.js";
 import type { JSONObject, Receipt } from "../src/types.js";
+import { InvalidError } from "../src/util.js";
 
 const validChain = "../../conformance/testdata/valid-chain.jsonl";
 const brokenChain = "../../conformance/testdata/broken-chain.jsonl";
@@ -26,8 +33,11 @@ const g1AmbiguousSessionControl = "../../conformance/testdata/g1-ambiguous-sessi
 const g1AmbiguousOpenClose = "../../conformance/testdata/g1-ambiguous-open-close.jsonl";
 const g1AmbiguousHeartbeatClose = "../../conformance/testdata/g1-ambiguous-heartbeat-close.jsonl";
 const g1RotatedCloseCountValid = "../../conformance/testdata/g1-rotated-close-count-valid.jsonl";
+const g1RotatedTwice = "../../conformance/testdata/g1-rotated-twice-valid.jsonl";
 const g1RotatedCloseCountInvalid =
   "../../conformance/testdata/g1-rotated-close-count-invalid.jsonl";
+const g1RotationEndorsement = "../../conformance/testdata/g1-rotation-endorsement.json";
+const g1RotationEndorsementSecond = "../../conformance/testdata/g1-rotation-endorsement-2.json";
 const g1PlainAfterClose = "../../conformance/testdata/g1-plain-after-close.jsonl";
 const g1EmptyRunNonceAfterClose = "../../conformance/testdata/g1-empty-run-nonce-after-close.jsonl";
 const g1HeartbeatAfterClose = "../../conformance/testdata/g1-heartbeat-after-close.jsonl";
@@ -178,6 +188,192 @@ test("g1 rotated close receipt_count valid fixture verifies", async () => {
   assert.equal(result.valid, true, result.error);
   assert.equal(result.receipt_count, 6);
   assert.equal(result.final_seq, 2);
+});
+
+test("g1 rotated chain verifies from one root plus the signed endorsement", async () => {
+  const rootKey = (JSON.parse(readFileSync(testKey, "utf8")) as { public_key_hex: string })
+    .public_key_hex;
+  const endorsement = await loadRotationEndorsementFile(g1RotationEndorsement);
+  const result = await verifyChainWithEndorsements(
+    extractReceipts(g1RotatedCloseCountValid),
+    rootKey,
+    {
+      sessionID: "conformance-session",
+      endorsements: [endorsement],
+    },
+  );
+  assert.equal(result.valid, true, result.error);
+});
+
+test("g1 twice-rotated chain verifies from one root plus both endorsements", async () => {
+  const rootKey = (JSON.parse(readFileSync(testKey, "utf8")) as { public_key_hex: string })
+    .public_key_hex;
+  const endorsements = await Promise.all([
+    loadRotationEndorsementFile(g1RotationEndorsement),
+    loadRotationEndorsementFile(g1RotationEndorsementSecond),
+  ]);
+  const result = await verifyChainWithEndorsements(extractReceipts(g1RotatedTwice), rootKey, {
+    sessionID: "conformance-session",
+    endorsements,
+  });
+  assert.equal(result.valid, true, result.error);
+  assert.equal(result.receipt_count, 9);
+});
+
+test("rotation endorsement trust fails closed when absent, altered, or duplicated", async () => {
+  const rootKey = (JSON.parse(readFileSync(testKey, "utf8")) as { public_key_hex: string })
+    .public_key_hex;
+  const receipts = extractReceipts(g1RotatedCloseCountValid);
+  const endorsement = await loadRotationEndorsementFile(g1RotationEndorsement);
+
+  const missing = await verifyChainWithEndorsements(receipts, rootKey, {
+    sessionID: "conformance-session",
+    endorsements: [],
+  });
+  assert.equal(missing.valid, false);
+  assert.match(missing.error ?? "", /does not match receipt boundary/u);
+
+  const unpinned = await verifyChainWithEndorsements(receipts, "", {
+    sessionID: "conformance-session",
+    endorsements: [endorsement],
+  });
+  assert.equal(unpinned.valid, false);
+  assert.match(unpinned.error ?? "", /requires at least one trusted root key/u);
+
+  const successorKey = receipts.find(
+    (receipt) => receipt.action_record?.key_transition !== undefined,
+  )?.signer_key;
+  assert.ok(successorKey);
+  const prePinnedSuccessor = await verifyChainWithEndorsements(
+    receipts,
+    `${rootKey},${successorKey}`,
+    {
+      sessionID: "conformance-session",
+      endorsements: [],
+    },
+  );
+  assert.equal(prePinnedSuccessor.valid, false);
+  assert.match(prePinnedSuccessor.error ?? "", /does not match receipt boundary/u);
+
+  const keyInfo = JSON.parse(readFileSync(testKey, "utf8")) as {
+    rotated_public_key_hex: string;
+    rotated_seed_hex: string;
+  };
+  const unmarkedSwitch = extractReceipts(g1ValidChain);
+  await signActionReceiptWithKey(
+    unmarkedSwitch[1]!,
+    keyInfo.rotated_seed_hex,
+    keyInfo.rotated_public_key_hex,
+  );
+  const forged = await verifyChainWithEndorsements(unmarkedSwitch, rootKey, {
+    sessionID: "conformance-session",
+    endorsements: [],
+  });
+  assert.equal(forged.valid, false);
+  assert.match(forged.error ?? "", /without a key_transition boundary/u);
+
+  const altered = { ...endorsement, prior_tail_hash: "0".repeat(64) };
+  await assert.rejects(verifyRotationEndorsement(altered), /signature verification failed/u);
+  await assert.rejects(
+    verifyRotationEndorsement({ ...endorsement, rotated_at: "2026-02-30T12:00:00Z" }),
+    /canonical UTC RFC3339Nano/u,
+  );
+
+  const duplicate = await verifyChainWithEndorsements(receipts, rootKey, {
+    sessionID: "conformance-session",
+    endorsements: [endorsement, endorsement],
+  });
+  assert.equal(duplicate.valid, false);
+  assert.match(duplicate.error ?? "", /multiple rotation endorsements/u);
+
+  const second = await loadRotationEndorsementFile(g1RotationEndorsementSecond);
+  const replayed = await verifyChainWithEndorsements(receipts, rootKey, {
+    sessionID: "conformance-session",
+    endorsements: [endorsement, second],
+  });
+  assert.equal(replayed.valid, false);
+  assert.match(replayed.error ?? "", /unused rotation endorsement/u);
+
+  const crossSession = await verifyChainWithEndorsements(receipts, rootKey, {
+    sessionID: "other-session",
+    endorsements: [endorsement],
+  });
+  assert.equal(crossSession.valid, false);
+  assert.match(crossSession.error ?? "", /signed recorder session/u);
+});
+
+test("rotation endorsement file rejects duplicate, unknown, and trailing fields", async () => {
+  const source = readFileSync(g1RotationEndorsement, "utf8").trim();
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-rotation-json-"));
+  try {
+    const duplicate = join(dir, "duplicate.json");
+    writeFileSync(duplicate, source.replace('"version": 1,', '"version": 1, "version": 1,'));
+    await assert.rejects(loadRotationEndorsementFile(duplicate), InvalidError);
+    await assert.rejects(loadRotationEndorsementFile(duplicate), /duplicate object key/u);
+
+    const unknown = join(dir, "unknown.json");
+    writeFileSync(unknown, source.replace(/\n\}$/u, ',\n  "trusted": true\n}'));
+    await assert.rejects(loadRotationEndorsementFile(unknown), /unknown field trusted/u);
+
+    const trailing = join(dir, "trailing.json");
+    writeFileSync(trailing, `${source}\n{}`);
+    await assert.rejects(loadRotationEndorsementFile(trailing), /trailing tokens/u);
+
+    const oversized = join(dir, "oversized.json");
+    writeFileSync(oversized, Buffer.alloc(64 * 1024 + 1));
+    await assert.rejects(loadRotationEndorsementFile(oversized), /exceeds 65536 bytes/u);
+
+    const malformedUtf8 = join(dir, "malformed-utf8.json");
+    writeFileSync(malformedUtf8, Buffer.from([0xff]));
+    await assert.rejects(loadRotationEndorsementFile(malformedUtf8), /not valid UTF-8/u);
+
+    if (process.platform !== "win32") {
+      const fifo = join(dir, "fifo.json");
+      const created = spawnSync("mkfifo", [fifo], { encoding: "utf8", timeout: 2_000 });
+      assert.equal(created.status, 0, created.stderr);
+      const child = spawnSync(
+        process.execPath,
+        [
+          "--input-type=module",
+          "--eval",
+          [
+            'import { loadRotationEndorsementFile } from "./dist/src/rotation.js";',
+            "try {",
+            "  await loadRotationEndorsementFile(process.argv[1]);",
+            "  process.exit(1);",
+            "} catch (error) {",
+            "  process.exit(/must be a regular file/u.test(error.message) ? 0 : 1);",
+            "}",
+          ].join("\n"),
+          fifo,
+        ],
+        { encoding: "utf8", timeout: 2_000 },
+      );
+      assert.notEqual((child.error as NodeJS.ErrnoException | undefined)?.code, "ETIMEDOUT");
+      assert.equal(child.status, 0, child.stderr);
+    }
+
+    await assert.rejects(loadRotationEndorsementFile(dir), /must be a regular file/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("rotation endorsements cannot be combined with allow-unpinned", () => {
+  const result = spawnSync(
+    process.execPath,
+    [
+      "dist/src/cli.js",
+      "chain",
+      g1RotatedCloseCountValid,
+      "--rotation-endorsement",
+      g1RotationEndorsement,
+      "--allow-unpinned",
+    ],
+    { encoding: "utf8", timeout: 10_000 },
+  );
+  assert.equal(result.status, 64);
+  assert.match(result.stderr, /cannot be combined with --allow-unpinned/u);
 });
 
 test("g1 rotated close receipt_count invalid fixture is rejected", async () => {
@@ -453,12 +649,20 @@ async function signActionReceiptWithTestKey(receipt: Receipt): Promise<void> {
     public_key_hex: string;
     seed_hex: string;
   };
+  await signActionReceiptWithKey(receipt, keyInfo.seed_hex, keyInfo.public_key_hex);
+}
+
+async function signActionReceiptWithKey(
+  receipt: Receipt,
+  seedHex: string,
+  publicKeyHex: string,
+): Promise<void> {
   const digest = createHash("sha256")
     .update(canonicalizeActionRecord(receipt.action_record!))
     .digest();
-  const sig = await ed25519.signAsync(digest, Buffer.from(keyInfo.seed_hex, "hex"));
+  const sig = await ed25519.signAsync(digest, Buffer.from(seedHex, "hex"));
   receipt.signature = `ed25519:${Buffer.from(sig).toString("hex")}`;
-  receipt.signer_key = keyInfo.public_key_hex;
+  receipt.signer_key = publicKeyHex;
 }
 
 function trustedKeys(): string {
