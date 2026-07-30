@@ -17,7 +17,9 @@ import (
 const (
 	// MaxEvidenceReadFileBytes matches the bounded dashboard evidence
 	// verification ceiling: one evidence source may contribute at most 8 MiB
-	// to in-memory verifier/resume reads.
+	// to in-memory verifier and online UI reads. Recorder resume uses a
+	// separately bounded single-entry tail read so legacy shards larger than
+	// this whole-file ceiling remain upgradeable.
 	MaxEvidenceReadFileBytes int64 = 8 << 20
 
 	// MaxEvidenceReadDirectoryEntries matches the bounded dashboard evidence
@@ -55,7 +57,7 @@ var ErrEvidenceReadLimitExceeded = errors.New("evidence read limit exceeded")
 
 // openRegularEvidenceFile opens an unchanged regular evidence file after the
 // platform access policy has accepted the operation.
-func openRegularEvidenceFile(path, label string, accessErr error) (*os.File, os.FileInfo, error) {
+func openRegularEvidenceFile(path string, accessErr error) (*os.File, os.FileInfo, error) {
 	if accessErr != nil {
 		return nil, nil, accessErr
 	}
@@ -65,7 +67,7 @@ func openRegularEvidenceFile(path, label string, accessErr error) (*os.File, os.
 		return nil, nil, err
 	}
 	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
-		return nil, nil, fmt.Errorf("%s is symlinked or non-regular", label)
+		return nil, nil, errors.New("evidence file is symlinked or non-regular")
 	}
 	file, err := os.OpenFile(cleanPath, os.O_RDONLY|evidenceReadNoFollowFlag|evidenceReadNonblockFlag, 0)
 	if err != nil {
@@ -78,7 +80,7 @@ func openRegularEvidenceFile(path, label string, accessErr error) (*os.File, os.
 	}
 	if !info.Mode().IsRegular() || !os.SameFile(before, info) {
 		_ = file.Close()
-		return nil, nil, fmt.Errorf("%s changed or is non-regular", label)
+		return nil, nil, errors.New("evidence file changed or is non-regular")
 	}
 	return file, info, nil
 }
@@ -93,7 +95,7 @@ func readBoundedEvidence(path string, maxBytes int64, sink io.Writer) error {
 	if maxBytes <= 0 {
 		maxBytes = MaxEvidenceReadFileBytes
 	}
-	file, info, err := openRegularEvidenceFile(path, "evidence file", validateEvidenceFileAccess())
+	file, info, err := openRegularEvidenceFile(path, validateEvidenceFileAccess())
 	if err != nil {
 		return err
 	}

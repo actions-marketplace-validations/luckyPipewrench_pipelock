@@ -5,7 +5,6 @@ package recorder
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -860,7 +859,10 @@ func (r *Recorder) resumeSessionLocked(sessionID string) error {
 		if len(entries) == 0 {
 			continue
 		}
-		last := entries[len(entries)-1]
+		// Directional tail reads return newest-first. Resume explicitly from the
+		// first entry so a future increase to the bounded window cannot select an
+		// older sequence and fork the chain.
+		last := entries[0]
 
 		// NOTE: We do NOT recompute and verify the tail hash here because
 		// ComputeHash is not round-trip stable for entries whose Detail was
@@ -1007,17 +1009,12 @@ func (r *Recorder) sessionResumeCandidates(sessionID string) ([]resumeCandidate,
 }
 
 func readEntriesForResume(path string) ([]Entry, error) {
-	limits := defaultEntryReadLimits()
-	data, err := ReadEvidenceFileBounded(path, limits.MaxBytes)
+	entries, truncated, err := ReadTailEntriesBounded(path, 1, int64(maxEntryWireLineBytes))
 	if err != nil {
 		return nil, err
 	}
-	entries, truncated, bytesRead, err := readEntriesFromReader(bytes.NewReader(data), limits)
-	if err != nil {
-		return nil, err
-	}
-	if truncated {
-		return nil, readLimitExceededError(path, limits, bytesRead)
+	if len(entries) == 0 && truncated {
+		return nil, fmt.Errorf("%w: no complete evidence tail entry within %d bytes", ErrEvidenceReadLimitExceeded, maxEntryWireLineBytes)
 	}
 	return entries, nil
 }
@@ -1298,7 +1295,7 @@ func (r *Recorder) ExpireOldFiles() (int, error) {
 // directories are created 0o750 and owned by the service, so no other
 // unprivileged principal can rename entries within them.
 func removeExpiredEvidenceFile(path string, cutoff time.Time) (bool, error) {
-	file, info, err := openRegularEvidenceFile(path, "evidence file", validateEvidenceFileAccess())
+	file, info, err := openRegularEvidenceFile(path, validateEvidenceFileAccess())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return false, nil

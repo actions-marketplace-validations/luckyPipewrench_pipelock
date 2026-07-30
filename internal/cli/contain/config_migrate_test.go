@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"gopkg.in/yaml.v3"
 )
 
 func TestMigratePipelockConfigForContain_RewritesHomePaths(t *testing.T) {
@@ -142,7 +143,7 @@ learn_lock:
 	}
 }
 
-func TestMigratePipelockConfigForContain_EmptyMappingIsNoOp(t *testing.T) {
+func TestMigratePipelockConfigForContain_EmptyMappingSeparatesObservability(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	home := t.TempDir()
 	origLookup := env.lookupUser
@@ -159,8 +160,138 @@ func TestMigratePipelockConfigForContain_EmptyMappingIsNoOp(t *testing.T) {
 	if len(artifacts) != 0 {
 		t.Fatalf("expected no artifacts, got %+v", artifacts)
 	}
-	if strings.TrimSpace(string(out)) != "{}" {
-		t.Fatalf("output: %q", out)
+	var cfg map[string]any
+	if err := yaml.Unmarshal(out, &cfg); err != nil {
+		t.Fatalf("decode migrated config: %v", err)
+	}
+	if got := cfg["metrics_listen"]; got != containMetricsListen {
+		t.Fatalf("metrics_listen = %v, want %q", got, containMetricsListen)
+	}
+}
+
+func TestMigratePipelockConfigForContain_PreservesExplicitMetricsListener(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	home := t.TempDir()
+	origLookup := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == containInstallOperatorUser {
+			return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+		}
+		return origLookup(name)
+	}
+	out, _, err := migratePipelockConfigForContain(env, filepath.Join(home, "pipelock.yaml"), []byte("metrics_listen: 127.0.0.1:9191\n"))
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if !strings.Contains(string(out), "127.0.0.1:9191") {
+		t.Fatalf("explicit metrics listener changed: %s", out)
+	}
+}
+
+func TestMigratePipelockConfigForContain_RejectsAgentReachableMetricsListener(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	home := t.TempDir()
+	origLookup := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == containInstallOperatorUser {
+			return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+		}
+		return origLookup(name)
+	}
+	for _, listen := range []string{"127.0.0.1", "0.0.0.0:9191", "[::]:9191", "localhost:9191", "127.0.0.1:8888", "127.0.0.1:-1", "127.0.0.1:0", "127.0.0.1:65536"} {
+		t.Run(listen, func(t *testing.T) {
+			_, _, err := migratePipelockConfigForContain(env, filepath.Join(home, "pipelock.yaml"), []byte("metrics_listen: \""+listen+"\"\n"))
+			if err == nil || !strings.Contains(err.Error(), "unsafe for containment") {
+				t.Fatalf("migrate error = %v, want containment refusal", err)
+			}
+		})
+	}
+}
+
+func TestMigratePipelockConfigForContain_NarrowsFileSentryHomeVisibility(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	home := "/home/operator"
+	origLookup := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == containInstallOperatorUser {
+			return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+		}
+		return origLookup(name)
+	}
+	sourceDir := filepath.Join(home, "config")
+	out, _, err := migratePipelockConfigForContain(env, filepath.Join(sourceDir, "pipelock.yaml"), []byte("file_sentry:\n  enabled: true\n  watch_paths:\n    - ../project\n    - path: /tmp/outside-home\n      required: true\n"))
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	wantHome := filepath.Join(home, "project")
+	if !strings.Contains(string(out), wantHome) {
+		t.Fatalf("relative watch path was not made absolute: %s", out)
+	}
+	paths, err := containServiceReadOnlyPaths(out, env.proxyPort)
+	if err != nil {
+		t.Fatalf("containServiceReadOnlyPaths: %v", err)
+	}
+	wantTmp := "/tmp/outside-home"
+	if len(paths) != 2 || paths[0] != wantHome || paths[1] != wantTmp {
+		t.Fatalf("service read-only paths = %#v, want [%q %q]", paths, wantHome, wantTmp)
+	}
+}
+
+func TestContainServiceReadOnlyPaths_ValidationAndFiltering(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "invalid yaml", body: ":\n", want: "parse pipelock config"},
+		{name: "non mapping", body: "- item\n", want: "YAML mapping"},
+		{name: "missing metrics", body: "mode: balanced\n", want: "dedicated loopback port"},
+		{name: "unsafe metrics", body: "metrics_listen: 0.0.0.0:9091\n", want: "unsafe for containment"},
+		{name: "relative path", body: "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: true\n  watch_paths: [relative]\n", want: "must be absolute"},
+		{name: "unsafe bind path", body: "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: true\n  watch_paths: [\"/tmp/bad:path\"]\n", want: "cannot be represented safely"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := containServiceReadOnlyPaths([]byte(tc.body), 8888); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("containServiceReadOnlyPaths error = %v, want %q", err, tc.want)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "disabled", body: "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: false\n"},
+		{name: "non sequence", body: "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: true\n  watch_paths: invalid\n"},
+		{name: "unhidden and blank", body: "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: true\n  watch_paths: [\"\", /srv/project]\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, err := containServiceReadOnlyPaths([]byte(tc.body), 8888)
+			if err != nil || len(paths) != 0 {
+				t.Fatalf("containServiceReadOnlyPaths paths=%v error=%v, want empty nil", paths, err)
+			}
+		})
+	}
+}
+
+func TestMigrateFileSentryWatchPaths_EdgeCases(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	source := filepath.Join(t.TempDir(), "pipelock.yaml")
+	for _, tc := range []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{name: "non sequence", body: "file_sentry:\n  watch_paths: invalid\n"},
+		{name: "blank items", body: "file_sentry:\n  watch_paths: [\"\", {}]\n"},
+		{name: "unsafe path", body: "file_sentry:\n  watch_paths: [\"/tmp/bad:path\"]\n", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := migratePipelockConfigForContain(env, source, []byte(tc.body))
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("migrate error = %v, wantErr=%v", err, tc.wantErr)
+			}
+		})
 	}
 }
 

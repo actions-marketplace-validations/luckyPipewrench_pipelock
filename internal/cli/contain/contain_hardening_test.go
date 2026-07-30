@@ -5,6 +5,7 @@ package contain
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -320,6 +321,63 @@ func TestStepWritePipelockConfigUndoRestoresMigratedArtifacts(t *testing.T) {
 	}
 	if _, err := os.Stat(migrated); !os.IsNotExist(err) {
 		t.Fatalf("migrated license should be removed, stat err=%v", err)
+	}
+}
+
+func TestStepStagePipelockConfigExplicitCandidatePreservesHomeSentryPaths(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	home := "/home/operator"
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == containInstallOperatorUser {
+			return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+		}
+		return &user.User{Uid: "988", Gid: "988", Username: name, HomeDir: "/tmp"}, nil
+	}
+	src := filepath.Join(t.TempDir(), "pipelock.yaml")
+	mustWriteFile(t, src, "file_sentry:\n  enabled: true\n  watch_paths:\n    - /home/operator/project\n")
+	step := stepStagePipelockConfig(installOpts{configSource: src})
+	if _, err := step.apply(t.Context(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if len(env.serviceReadOnlyPaths) != 1 || env.serviceReadOnlyPaths[0] != "/home/operator/project" {
+		t.Fatalf("service read-only paths = %#v, want explicit candidate path", env.serviceReadOnlyPaths)
+	}
+	unit := renderSystemUnit(env)
+	if !strings.Contains(unit, `BindReadOnlyPaths=-"/home/operator/project"`) {
+		t.Fatalf("system unit does not preserve explicit candidate path:\n%s", unit)
+	}
+}
+
+func TestStepStagePipelockConfigManagedRerunRejectsExposedMetrics(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	mustWriteFile(t, managedPipelockConfigPath(env), "mode: balanced\nmetrics_listen: \"\"\n")
+
+	if _, err := stepStagePipelockConfig(installOpts{}).apply(t.Context(), env); err == nil || !strings.Contains(err.Error(), "metrics_listen must use a dedicated loopback port") {
+		t.Fatalf("managed rerun error = %v, want exposed-metrics refusal", err)
+	}
+}
+
+func TestStepStagePipelockConfigManagedRerunReportsReadFailure(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	env.readFile = func(string) ([]byte, error) { return nil, errors.New("read failed") }
+	if _, err := stepStagePipelockConfig(installOpts{}).apply(t.Context(), env); err == nil || !strings.Contains(err.Error(), "read managed config") {
+		t.Fatalf("managed rerun read error = %v, want contextual refusal", err)
+	}
+}
+
+func TestStepStagePipelockConfigManagedRerunPreservesPrivateTmpSentryPaths(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	mustWriteFile(t, managedPipelockConfigPath(env), "metrics_listen: 127.0.0.1:9091\nfile_sentry:\n  enabled: true\n  watch_paths:\n    - /tmp/project\n")
+
+	applied, err := stepStagePipelockConfig(installOpts{}).apply(t.Context(), env)
+	if err != nil || applied {
+		t.Fatalf("managed rerun apply = %v, %v; want false, nil", applied, err)
+	}
+	if len(env.serviceReadOnlyPaths) != 1 || env.serviceReadOnlyPaths[0] != "/tmp/project" {
+		t.Fatalf("service read-only paths = %#v, want [/tmp/project]", env.serviceReadOnlyPaths)
+	}
+	if unit := renderSystemUnit(env); !strings.Contains(unit, `BindReadOnlyPaths=-"/tmp/project"`) {
+		t.Fatalf("system unit does not preserve /tmp watch path:\n%s", unit)
 	}
 }
 

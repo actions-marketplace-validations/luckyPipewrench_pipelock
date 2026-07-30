@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
@@ -148,6 +149,171 @@ func TestResume_SameKeyValidTail_ResumesUnchanged(t *testing.T) {
 			t.Errorf("receipt %d unexpectedly carries a key transition marker", i)
 		}
 	}
+}
+
+func TestResume_SelectsOldestHeadAndNewestTail(t *testing.T) {
+	dir := t.TempDir()
+	_, priv := generateTestKey(t)
+	rec1 := newTestRecorder(t, dir, priv)
+	e1 := NewEmitter(EmitterConfig{Recorder: rec1, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
+	timestamps := []time.Time{
+		time.Date(2026, time.July, 29, 12, 0, 0, 0, time.UTC),
+		time.Date(2026, time.July, 29, 12, 0, 1, 0, time.UTC),
+		time.Date(2026, time.July, 29, 12, 0, 2, 0, time.UTC),
+	}
+	nextTimestamp := 0
+	e1.now = func() time.Time {
+		got := timestamps[nextTimestamp]
+		nextTimestamp++
+		return got
+	}
+	emitOne(t, e1)
+	emitOne(t, e1)
+	emitOne(t, e1)
+	if err := rec1.Close(); err != nil {
+		t.Fatalf("close rec1: %v", err)
+	}
+	receipts := allReceiptsRaw(t, dir)
+	if len(receipts) != 3 {
+		t.Fatalf("receipt count = %d, want 3", len(receipts))
+	}
+	for i, want := range timestamps {
+		if !receipts[i].ActionRecord.Timestamp.Equal(want) {
+			t.Fatalf("receipt %d timestamp = %s, want %s", i, receipts[i].ActionRecord.Timestamp, want)
+		}
+	}
+
+	rec2 := newTestRecorder(t, dir, priv)
+	defer func() { _ = rec2.Close() }()
+	e2 := NewEmitter(EmitterConfig{Recorder: rec2, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
+	if err := e2.InitError(); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if e2.chainSeq != receipts[2].ActionRecord.ChainSeq+1 {
+		t.Fatalf("chainSeq = %d, want newest tail + 1 (%d)", e2.chainSeq, receipts[2].ActionRecord.ChainSeq+1)
+	}
+	if !e2.chainStart.Equal(receipts[0].ActionRecord.Timestamp) {
+		t.Fatalf("chainStart = %s, want oldest head %s", e2.chainStart, receipts[0].ActionRecord.Timestamp)
+	}
+}
+
+// Legacy recorder shards may be larger than the current 8 MiB rotation cap.
+// Receipt resume needs the first receipt for chainStart and the last receipt
+// for live chain state; neither lookup requires loading the entire shard.
+func TestResume_LegacyOversizedShardUsesBoundedHeadAndTail(t *testing.T) {
+	dir := t.TempDir()
+	_, priv := generateTestKey(t)
+
+	rec1 := newTestRecorder(t, dir, priv)
+	e1 := NewEmitter(EmitterConfig{Recorder: rec1, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
+	emitOne(t, e1)
+	if err := rec1.Close(); err != nil {
+		t.Fatalf("close rec1: %v", err)
+	}
+
+	path := filepath.Join(dir, "evidence-proxy-0.jsonl")
+	entries, err := recorder.ReadEntries(path)
+	if err != nil {
+		t.Fatalf("ReadEntries initial shard: %v", err)
+	}
+	var receiptEntry recorder.Entry
+	for _, entry := range entries {
+		if entry.Type == recorderEntryType {
+			receiptEntry = entry
+			break
+		}
+	}
+	if receiptEntry.Type == "" {
+		t.Fatal("initial shard has no action receipt")
+	}
+
+	file, err := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatalf("OpenFile append: %v", err)
+	}
+	encoder := json.NewEncoder(file)
+	padding := strings.Repeat("x", 512<<10)
+	seq := receiptEntry.Sequence + 1
+	for {
+		entry := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  seq,
+			Timestamp: receiptEntry.Timestamp,
+			SessionID: "proxy",
+			Type:      "request",
+			Transport: testTransport,
+			Summary:   padding,
+			Detail:    map[string]string{"safe": "value"},
+			PrevHash:  "legacy-prev",
+			Hash:      "legacy-hash",
+		}
+		if err := encoder.Encode(entry); err != nil {
+			_ = file.Close()
+			t.Fatalf("Encode padding: %v", err)
+		}
+		seq++
+		info, statErr := file.Stat()
+		if statErr != nil {
+			_ = file.Close()
+			t.Fatalf("Stat: %v", statErr)
+		}
+		if info.Size() > recorder.MaxEvidenceReadFileBytes+(1<<20) {
+			break
+		}
+	}
+	receiptEntry.Sequence = seq
+	receiptEntry.PrevHash = "legacy-prev"
+	receiptEntry.Hash = "legacy-tail-hash"
+	if err := encoder.Encode(receiptEntry); err != nil {
+		_ = file.Close()
+		t.Fatalf("Encode receipt tail: %v", err)
+	}
+	receiptInfo, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatalf("Stat receipt position: %v", err)
+	}
+	for {
+		entry := recorder.Entry{
+			Version:   recorder.EntryVersion,
+			Sequence:  seq + 1,
+			Timestamp: receiptEntry.Timestamp,
+			SessionID: "proxy",
+			Type:      "request",
+			Transport: testTransport,
+			Summary:   padding,
+			Detail:    map[string]string{"safe": "value"},
+			PrevHash:  "legacy-prev",
+			Hash:      "legacy-hash",
+		}
+		if err := encoder.Encode(entry); err != nil {
+			_ = file.Close()
+			t.Fatalf("Encode trailing non-receipt: %v", err)
+		}
+		seq++
+		info, statErr := file.Stat()
+		if statErr != nil {
+			_ = file.Close()
+			t.Fatalf("Stat trailing entries: %v", statErr)
+		}
+		if info.Size()-receiptInfo.Size() > recorder.MaxEvidenceReadFileBytes+(1<<20) {
+			break
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close legacy shard: %v", err)
+	}
+
+	rec2 := newTestRecorder(t, dir, priv)
+	defer func() { _ = rec2.Close() }()
+	e2 := NewEmitter(EmitterConfig{Recorder: rec2, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
+	if err := e2.InitError(); err != nil {
+		t.Fatalf("InitError after legacy oversized shard: %v", err)
+	}
+	if e2.chainSeq != 1 {
+		t.Fatalf("chainSeq = %d, want 1 from resumed signed receipt", e2.chainSeq)
+	}
+	emitOne(t, e2)
 }
 
 // TestResume_RotatedKeySelfValidTail_OpensNewSegment is case 2: a tail signed
