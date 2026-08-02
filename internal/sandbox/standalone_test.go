@@ -116,6 +116,35 @@ func TestLaunchStandalone_RejectsInvalidWorkspace(t *testing.T) {
 	}
 }
 
+func TestLaunchStandalone_RequireProxyHandlerRejectsBeforeChildStart(t *testing.T) {
+	workspace := t.TempDir()
+	marker := filepath.Join(workspace, "child-started")
+
+	err := LaunchStandalone(StandaloneLaunchConfig{
+		Command:             []string{"sh", "-c", "touch " + marker},
+		Workspace:           workspace,
+		RequireProxyHandler: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "proxy handler is required") {
+		t.Fatalf("LaunchStandalone error = %v, want required proxy handler error", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("child started despite required proxy handler denial: stat error = %v", statErr)
+	}
+}
+
+func TestLaunchStandalone_RequireNetNSRejectsBestEffort(t *testing.T) {
+	err := LaunchStandalone(StandaloneLaunchConfig{
+		Command:      []string{"true"},
+		Workspace:    t.TempDir(),
+		BestEffort:   true,
+		RequireNetNS: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "network namespace is required") {
+		t.Fatalf("LaunchStandalone error = %v, want required network namespace error", err)
+	}
+}
+
 func TestLaunchStandalone_NonLinuxReturnsError(t *testing.T) {
 	if runtime.GOOS == osLinux {
 		t.Skip("testing non-linux behavior")
@@ -176,6 +205,79 @@ func TestLaunchStandalone_BridgeProxyListens(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("LaunchStandalone: %v", err)
+	}
+}
+
+func TestLaunchStandalone_ControlDirectoryIsPrivate(t *testing.T) {
+	dir, err := newStandaloneControlDir()
+	if err != nil {
+		t.Fatalf("newStandaloneControlDir: %v", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+
+	// Lstat so a symlink would be reported as a symlink, not followed.
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatalf("lstat control directory: %v", err)
+	}
+	if !info.Mode().IsDir() {
+		t.Fatalf("control dir is not a real directory: %v", info.Mode())
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("control directory mode = %#o, want 0700", got)
+	}
+	// The name must be unpredictable, not the per-PID path an attacker could
+	// anticipate and pre-create or symlink in the sticky /tmp.
+	if predictable := fmt.Sprintf("/tmp/pipelock-sandbox-%d", os.Getpid()); dir == predictable {
+		t.Fatalf("control directory uses the predictable per-PID path: %s", dir)
+	}
+	// Two allocations must differ: a predictable implementation would return the
+	// same path both times.
+	dir2, err := newStandaloneControlDir()
+	if err != nil {
+		t.Fatalf("newStandaloneControlDir (second): %v", err)
+	}
+	defer func() { _ = os.RemoveAll(dir2) }()
+	if dir2 == dir {
+		t.Fatalf("two control directories share a predictable path: %s", dir)
+	}
+}
+
+func TestPreflightWithRequirements_IndependentlyReportsNetworkAndHandler(t *testing.T) {
+	requirements := PreflightRequirements{
+		RequireNetNS:        true,
+		RequireProxyHandler: true,
+	}
+	result := PreflightWithRequirements(t.TempDir(), []string{"true"}, nil, requirements)
+	if result.Mode != "required" {
+		t.Fatalf("mode = %q, want required", result.Mode)
+	}
+	if result.Requirements == nil || *result.Requirements != requirements {
+		t.Fatalf("requirements = %#v, want %#v", result.Requirements, requirements)
+	}
+
+	required := make(map[LayerName]bool, len(result.Layers))
+	for _, layer := range result.Layers {
+		required[layer.Name] = layer.Required
+	}
+	if !required[LayerNetNS] {
+		t.Fatal("network namespace was not reported as required")
+	}
+	if required[LayerLandlock] || required[LayerSeccomp] {
+		t.Fatalf("optional layers reported as required: %#v", required)
+	}
+	if !Detect().UserNamespaces && result.Status != StatusError {
+		t.Fatalf("required unavailable network namespace status = %q, want error", result.Status)
+	}
+}
+
+func TestPreflight_BackwardCompatibleStrictWrapper(t *testing.T) {
+	result := Preflight(t.TempDir(), []string{"true"}, nil, false)
+	if result.Requirements != nil {
+		t.Fatalf("legacy Preflight exposed requirements = %#v", result.Requirements)
+	}
+	if result.Mode != "best-effort" {
+		t.Fatalf("legacy Preflight mode = %q, want best-effort", result.Mode)
 	}
 }
 

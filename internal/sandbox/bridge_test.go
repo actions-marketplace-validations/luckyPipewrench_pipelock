@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -64,7 +65,7 @@ func TestBridgeProxy_ForwardsToUnixSocket(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan struct{})
 	go func() {
-		bp.Serve(ctx)
+		_ = bp.Serve(ctx)
 		close(serveDone)
 	}()
 	defer func() {
@@ -101,6 +102,55 @@ func TestNewBridgeProxy_ListenError(t *testing.T) {
 	_, err := NewBridgeProxy("/nonexistent/socket", "invalid-not-an-address")
 	if err == nil {
 		t.Error("expected error for invalid listen address")
+	}
+}
+
+func TestBridgeProxy_ServeReturnsParentSocketFailure(t *testing.T) {
+	bp, err := NewBridgeProxy("/tmp/pipelock-parent-socket-does-not-exist", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewBridgeProxy: %v", err)
+	}
+	defer bp.Close()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- bp.Serve(context.Background()) }()
+
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", bp.Addr())
+	if err != nil {
+		t.Fatalf("dial bridge: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	select {
+	case err := <-serveErr:
+		if err == nil || !strings.Contains(err.Error(), "connect to parent proxy") {
+			t.Fatalf("Serve error = %v, want parent socket failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not report parent socket failure")
+	}
+}
+
+func TestBridgeProxy_ServeReturnsUnexpectedListenerFailure(t *testing.T) {
+	bp, err := NewBridgeProxy("/tmp/pipelock-parent-socket-does-not-exist", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewBridgeProxy: %v", err)
+	}
+	defer bp.Close()
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- bp.Serve(context.Background()) }()
+	if err := bp.listener.Close(); err != nil {
+		t.Fatalf("close listener: %v", err)
+	}
+
+	select {
+	case err := <-serveErr:
+		if err == nil || !strings.Contains(err.Error(), "bridge listener accept") {
+			t.Fatalf("Serve error = %v, want listener failure", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not report listener failure")
 	}
 }
 
@@ -160,7 +210,7 @@ func TestBridgeProxy_CloseClosesIdleActiveConnections(t *testing.T) {
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
-		bp.Serve(ctx)
+		_ = bp.Serve(ctx)
 	}()
 	defer func() {
 		cancel()
@@ -215,7 +265,7 @@ func TestBridgeProxy_CloseStopsContextWatcher(t *testing.T) {
 	serveDone := make(chan struct{})
 	go func() {
 		defer close(serveDone)
-		bp.Serve(ctx)
+		_ = bp.Serve(ctx)
 	}()
 
 	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", bp.Addr())
@@ -371,7 +421,7 @@ func TestBridgeProxy_HandleConnFailsGracefully(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	serveDone := make(chan struct{})
 	go func() {
-		bp.Serve(ctx)
+		_ = bp.Serve(ctx)
 		close(serveDone)
 	}()
 	defer func() {
@@ -403,5 +453,85 @@ func TestProxySocketPath(t *testing.T) {
 	}
 	if !strings.HasPrefix(path, "/tmp/sandbox-123") {
 		t.Errorf("expected /tmp/sandbox-123 prefix, got %s", path)
+	}
+}
+
+func TestBridgeProxy_FailWakesServeWithRecordedError(t *testing.T) {
+	bp, err := NewBridgeProxy("/tmp/pipelock-parent-socket-not-used", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewBridgeProxy: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- bp.Serve(context.Background()) }()
+
+	// A connection handler records a fatal parent-socket failure; Serve must
+	// wake and return exactly that error instance rather than a nil shutdown.
+	wantErr := errors.New("parent socket lost")
+	bp.fail(wantErr)
+
+	select {
+	case err := <-serveErr:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Serve error = %v, want the recorded failure %v", err, wantErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after fail()")
+	}
+	bp.Close()
+}
+
+func TestBridgeProxy_FailAfterCloseIsDropped(t *testing.T) {
+	bp, err := NewBridgeProxy("/tmp/pipelock-parent-socket-not-used", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("NewBridgeProxy: %v", err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- bp.Serve(context.Background()) }()
+
+	// Close wins the once/closed ordering: a failure recorded after Close must
+	// be dropped, and Serve must still return the clean nil shutdown result.
+	bp.Close()
+	bp.fail(errors.New("late failure after close"))
+
+	// Assert the drop directly rather than only through Serve's result: Close
+	// does not wait for Serve to return, so the Serve read alone could pass even
+	// if fail() had recorded the late error.
+	if got := bp.getFailure(); got != nil {
+		t.Fatalf("fail() recorded a failure after Close: %v", got)
+	}
+
+	select {
+	case err := <-serveErr:
+		if err != nil {
+			t.Fatalf("Serve error = %v, want nil after Close drops a late failure", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve did not return after Close")
+	}
+}
+
+func TestBridgeProxy_CloseAndFailAreRaceSafe(t *testing.T) {
+	// fail() runs from a connection handler while Close() runs from the caller.
+	// Neither may panic, double-close, or deadlock, and Serve must always
+	// return. Run under -race to catch a data race on the shared state.
+	for range 50 {
+		bp, err := NewBridgeProxy("/tmp/pipelock-parent-socket-not-used", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("NewBridgeProxy: %v", err)
+		}
+		serveDone := make(chan struct{})
+		go func() { _ = bp.Serve(context.Background()); close(serveDone) }()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); bp.fail(errors.New("parent socket lost")) }()
+		go func() { defer wg.Done(); bp.Close() }()
+		wg.Wait()
+
+		select {
+		case <-serveDone:
+		case <-time.After(2 * time.Second):
+			t.Fatal("Serve did not return under concurrent Close and fail")
+		}
 	}
 }

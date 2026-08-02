@@ -7,6 +7,7 @@ package sandbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,6 +44,11 @@ type StandaloneLaunchConfig struct {
 	// instead of kernel-enforced isolation. Mutually exclusive with Strict.
 	BestEffort bool
 
+	// RequireNetNS rejects launches that cannot create a user and network
+	// namespace. It is independent of Strict, which additionally requires the
+	// optional filesystem and syscall containment layers.
+	RequireNetNS bool
+
 	// ExtraEnv contains additional KEY=VALUE pairs to pass to the child.
 	ExtraEnv []string
 
@@ -51,6 +57,11 @@ type StandaloneLaunchConfig struct {
 	// it as an HTTP forward proxy (CONNECT tunneling, DLP scanning, etc.).
 	// If nil, connections are closed without forwarding.
 	ProxyHandler func(conn net.Conn)
+
+	// RequireProxyHandler rejects a nil ProxyHandler before the child starts.
+	// This makes the debug-only direct-forward path unreachable for callers
+	// that require scanning.
+	RequireProxyHandler bool
 }
 
 // standaloneProxyConnectionConfig controls how one accepted bridge connection
@@ -81,6 +92,12 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	if runtime.GOOS != osLinux {
 		return fmt.Errorf("%w: sandbox requires Linux", ErrUnavailable)
 	}
+	if cfg.RequireProxyHandler && cfg.ProxyHandler == nil {
+		return errors.New("sandbox: proxy handler is required")
+	}
+	if cfg.RequireNetNS && cfg.BestEffort {
+		return errors.New("sandbox: network namespace is required; best_effort is not permitted")
+	}
 
 	if err := ValidateWorkspace(cfg.Workspace); err != nil {
 		return fmt.Errorf("workspace validation: %w", err)
@@ -110,7 +127,7 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	// on unprivileged processes - if user namespaces work, network namespaces
 	// will too (created inside the user namespace with CAP_SYS_ADMIN).
 	hasNamespaces := probeUserNamespace()
-	if !hasNamespaces && !cfg.BestEffort {
+	if !hasNamespaces && (cfg.RequireNetNS || !cfg.BestEffort) {
 		return fmt.Errorf("%w: user namespaces unavailable (blocked by seccomp or sysctl? use --best-effort for degraded mode)", ErrUnavailable)
 	}
 
@@ -119,10 +136,10 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		ctx = context.Background()
 	}
 
-	// Create sandbox temp directory for the Unix socket.
-	sandboxDir := fmt.Sprintf("/tmp/pipelock-sandbox-%d", os.Getpid())
-	if err := os.MkdirAll(sandboxDir, 0o750); err != nil {
-		return fmt.Errorf("creating sandbox dir: %w", err)
+	// Create a private per-invocation 0o700 control directory for the Unix socket.
+	sandboxDir, err := newStandaloneControlDir()
+	if err != nil {
+		return err
 	}
 	defer func() { _ = os.RemoveAll(sandboxDir) }()
 
@@ -242,6 +259,51 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	}
 
 	return waitErr
+}
+
+// newStandaloneControlDir creates the per-invocation control directory that
+// carries the Unix proxy socket. It uses os.MkdirTemp so the name is
+// unpredictable and the directory is created atomically at 0o700: a predictable
+// /tmp/pipelock-sandbox-<pid> path could be pre-created, symlinked, or squatted
+// in the sticky /tmp before this invocation, letting a same-permission attacker
+// interpose on the control socket. The caller passes the resolved socket path
+// to the child, so the directory name does not need to be predictable.
+//
+// As defense in depth against a TOCTOU swap, it re-validates with Lstat (not
+// Stat, so a symlink is detected rather than followed): the result must be a
+// real directory owned by this process. Any deviation fails closed.
+func newStandaloneControlDir() (retDir string, retErr error) {
+	sandboxDir, err := os.MkdirTemp("", "pipelock-sandbox-")
+	if err != nil {
+		return "", fmt.Errorf("creating sandbox dir: %w", err)
+	}
+	// On any validation failure below, remove the directory we just created:
+	// the caller's cleanup defer is only installed once this returns a path, so
+	// without this a rejected directory would leak. os.Remove (not RemoveAll) so
+	// a swapped or unexpectedly non-empty path is never recursively deleted.
+	defer func() {
+		if retErr != nil {
+			_ = os.Remove(sandboxDir)
+		}
+	}()
+	info, err := os.Lstat(sandboxDir)
+	if err != nil {
+		return "", fmt.Errorf("stat sandbox dir: %w", err)
+	}
+	if !info.Mode().IsDir() {
+		return "", fmt.Errorf("sandbox control dir %s is not a directory", sandboxDir)
+	}
+	if perm := info.Mode().Perm(); perm != 0o700 {
+		return "", fmt.Errorf("sandbox control dir %s has mode %04o, want 0700", sandboxDir, perm)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("sandbox control dir %s ownership is unavailable", sandboxDir)
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return "", fmt.Errorf("sandbox control dir %s is owned by uid %d, not this process (uid %d)", sandboxDir, stat.Uid, os.Geteuid())
+	}
+	return sandboxDir, nil
 }
 
 type standaloneProxyServer struct {
