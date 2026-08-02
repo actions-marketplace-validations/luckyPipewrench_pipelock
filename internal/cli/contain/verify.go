@@ -144,6 +144,7 @@ type probeEnv struct {
 	wrapperInvPath     string
 	toolsListPath      string
 	workspacePaths     []string
+	pipelockTarget     string
 	// postureProofPath is the resolved path the current `contain run` writes its
 	// signed posture capsule to. It is exported into the contained launch env as
 	// PIPELOCK_POSTURE_PROOF so an in-child emitter binds the exact capsule this
@@ -187,6 +188,7 @@ func defaultProbeEnv() *probeEnv {
 		pinPath:            defaultIntegrityPin,
 		wrapperInvPath:     defaultWrapperInvPath,
 		toolsListPath:      defaultToolsListPath,
+		pipelockTarget:     defaultPipelockTarget,
 		runCmd:             realRunCommand,
 		dropCounter:        readContainmentDropCounter,
 		dialCtx:            realDial,
@@ -520,11 +522,18 @@ func probeCCLaunchAllowList(ctx context.Context, env *probeEnv) (string, string)
 }
 
 // probeBinaryIntegrity reads the integrity pin written at install time and
-// compares it against the SHA-256 of the currently-running binary.
+// compares it against the SHA-256 of the binary at the deployed install path.
 // Skipped when the pin file is missing (install never happened) or
 // unreadable to this user (run as root to verify). Failure means either
-// the binary was swapped after install OR a different pipelock binary is
-// being used to run verify than the one that was installed.
+// the deployed binary was swapped after install or cannot be verified.
+//
+// Two limits, stated because a probe should not imply more than it checks.
+// Nothing here reads the unit's effective ExecStart, so this establishes that
+// the binary at the install path is unchanged, not that the running service
+// has that binary mapped; proving the latter needs the live process image.
+// And the pin is written by our own installer, so this is trust-on-first-use
+// drift detection. It does not survive anyone able to rewrite both the binary
+// and the pin, which root can do.
 func probeBinaryIntegrity(_ context.Context, env *probeEnv) (string, string) {
 	data, err := env.readFile(env.pinPath)
 	if err != nil {
@@ -537,24 +546,43 @@ func probeBinaryIntegrity(_ context.Context, env *probeEnv) (string, string) {
 	if pinned == "" {
 		return statusFail, fmt.Sprintf("%s is empty (corrupted pin)", env.pinPath)
 	}
-	if _, err := hex.DecodeString(pinned); err != nil || len(pinned) != sha256HexLen {
+	// Install writes a lowercase hex digest and hashFile returns lowercase, so an
+	// uppercase pin can never match. Rejecting it as malformed here tells the
+	// operator the pin itself is wrong; letting it through reports a hash
+	// mismatch, which reads as a swapped binary and sends them hunting a
+	// compromise that did not happen.
+	if _, err := hex.DecodeString(pinned); err != nil || len(pinned) != sha256HexLen ||
+		pinned != strings.ToLower(pinned) {
 		return statusFail, fmt.Sprintf("%s contains malformed SHA-256 pin (length %d)", env.pinPath, len(pinned))
 	}
 
-	self, err := env.selfPath()
+	target := filepath.Clean(env.pipelockTarget)
+	got, err := env.hashFile(target)
 	if err != nil {
-		return statusFail, fmt.Sprintf("resolve self path: %v", err)
-	}
-	got, err := env.hashFile(self)
-	if err != nil {
-		return statusFail, fmt.Sprintf("hash %s: %v", self, err)
+		return statusFail, fmt.Sprintf("hash deployed binary %s: %v", target, err)
 	}
 	if got != pinned {
 		// Truncate for readability; full hashes are 64 chars.
-		return statusFail, fmt.Sprintf("binary hash mismatch: pin=%s got=%s (binary swapped after install or different binary running verify)",
+		return statusFail, fmt.Sprintf("binary hash mismatch: pin=%s got=%s (deployed binary swapped after install)",
 			shortHash(pinned), shortHash(got))
 	}
-	return statusPass, fmt.Sprintf("binary hash %s matches pin", shortHash(pinned))
+
+	detail := fmt.Sprintf("binary hash %s matches pin", shortHash(pinned))
+	if self, err := env.selfPath(); err == nil && filepath.Clean(self) != target {
+		self = filepath.Clean(self)
+		targetInfo, targetErr := env.stat(target)
+		selfInfo, selfErr := env.stat(self)
+		switch {
+		case targetErr != nil || selfErr != nil:
+			// Identity is unknown, not different. Saying the binaries differ here
+			// would assert something unverified, which is the failure this probe
+			// exists to stop making.
+			detail += fmt.Sprintf(" (note: could not compare invoking binary %s with deployed binary %s)", self, target)
+		case !os.SameFile(targetInfo, selfInfo):
+			detail += fmt.Sprintf(" (note: invoking binary %s differs from deployed binary %s)", self, target)
+		}
+	}
+	return statusPass, detail
 }
 
 const sha256HexLen = 64
