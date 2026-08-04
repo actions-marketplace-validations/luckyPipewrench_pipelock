@@ -4340,19 +4340,36 @@ func (c *Config) validateGuard() error {
 		}
 		manifestNames[m.Name] = true
 
+		pathFields := make(map[string]string, len(m.ReadOnly)+len(m.ReadOnlyDirectories)+len(m.ReadWrite)+len(m.ReadWriteDirectories))
 		for j, p := range m.ReadOnly {
-			if !filepath.IsAbs(p) {
-				return fmt.Errorf("%s.read_only[%d]: path must be absolute (got %q)", label, j, p)
+			if err := validateGuardManifestPath(label, "read_only", j, p, guardPathFile, pathFields); err != nil {
+				return err
 			}
-			if err := validateGuardROPath(label, j, p); err != nil {
+			if err := validateGuardROPath(label, "read_only", j, p); err != nil {
+				return err
+			}
+		}
+		for j, p := range m.ReadOnlyDirectories {
+			if err := validateGuardManifestPath(label, "read_only_directories", j, p, guardPathDirectory, pathFields); err != nil {
+				return err
+			}
+			if err := validateGuardROPath(label, "read_only_directories", j, p); err != nil {
 				return err
 			}
 		}
 		for j, p := range m.ReadWrite {
-			if !filepath.IsAbs(p) {
-				return fmt.Errorf("%s.read_write[%d]: path must be absolute (got %q)", label, j, p)
+			if err := validateGuardManifestPath(label, "read_write", j, p, guardPathFile, pathFields); err != nil {
+				return err
 			}
-			if err := validateGuardRWPath(label, j, p); err != nil {
+			if err := validateGuardRWPath(label, "read_write", j, p); err != nil {
+				return err
+			}
+		}
+		for j, p := range m.ReadWriteDirectories {
+			if err := validateGuardManifestPath(label, "read_write_directories", j, p, guardPathDirectory, pathFields); err != nil {
+				return err
+			}
+			if err := validateGuardRWPath(label, "read_write_directories", j, p); err != nil {
 				return err
 			}
 		}
@@ -4394,6 +4411,41 @@ func (c *Config) validateGuard() error {
 	return errGuardNotEnforced
 }
 
+type guardPathType string
+
+const (
+	guardPathFile      guardPathType = "file"
+	guardPathDirectory guardPathType = "directory"
+)
+
+// validateGuardManifestPath validates the declared kind of one manifest path.
+// The declaration is intentionally lexical: it must produce the same verdict
+// whether or not the target exists on the host reading the configuration.
+func validateGuardManifestPath(label, fieldName string, idx int, rawPath string, pathType guardPathType, pathFields map[string]string) error {
+	field := fmt.Sprintf("%s.%s[%d]", label, fieldName, idx)
+	if !filepath.IsAbs(rawPath) {
+		return fmt.Errorf("%s: path must be absolute (got %q)", field, rawPath)
+	}
+	if pathType == guardPathFile && strings.HasSuffix(rawPath, string(filepath.Separator)) {
+		return fmt.Errorf("%s: file path %q must not end in a path separator; declare directories in %s_directories", field, rawPath, strings.TrimSuffix(fieldName, "_directories"))
+	}
+
+	// The conflict key is case folded, matching the credential floor's
+	// comparison policy. filepath.Clean does not normalize case, so on a
+	// case-insensitive volume two spellings of one object would each be
+	// recorded as a distinct declaration and the conflict would go unnoticed.
+	// The failure direction is the bad one: the same object declared read-only
+	// in one list and read-write in another resolves, once the evaluator
+	// consumes both, to the WIDER grant, silently turning an intended
+	// read-only grant into a writable one.
+	conflictKey := strings.ToLower(filepath.Clean(rawPath))
+	if earlierField, ok := pathFields[conflictKey]; ok {
+		return fmt.Errorf("%s: path %q conflicts with an earlier declaration in %s; a path may appear in only one grant list", field, rawPath, earlierField)
+	}
+	pathFields[conflictKey] = field
+	return nil
+}
+
 // errGuardNotEnforced is returned for any non-empty guard declaration while the
 // runtime evaluator does not exist.
 var errGuardNotEnforced = errors.New(
@@ -4404,8 +4456,8 @@ var errGuardNotEnforced = errors.New(
 
 // validateGuardRWPath checks that a read-write path does not grant write
 // access to dangerous or trust-bearing locations.
-func validateGuardRWPath(label string, idx int, rawPath string) error {
-	field := fmt.Sprintf("%s.read_write[%d]", label, idx)
+func validateGuardRWPath(label, fieldName string, idx int, rawPath string) error {
+	field := fmt.Sprintf("%s.%s[%d]", label, fieldName, idx)
 
 	resolved := resolveGuardPath(rawPath)
 
@@ -4415,8 +4467,8 @@ func validateGuardRWPath(label string, idx int, rawPath string) error {
 	// and a home-derived list would protect /root/.ssh while leaving every
 	// real operator's ~/.ssh unguarded. Writing into any .ssh, .gnupg or
 	// .gpg directory is unsafe regardless of which user owns it.
-	if comp := guardForbiddenComponent(resolved); comp != "" {
-		return fmt.Errorf("%s: read-write on trust-bearing path %q is not allowed (contains %q)", field, rawPath, comp)
+	if comp, reason := guardForbiddenComponent(resolved); comp != "" {
+		return fmt.Errorf("%s: read-write on trust-bearing path %q is not allowed (contains %q, which is %s)", field, rawPath, comp, reason)
 	}
 	if suffix := guardForbiddenSuffix(resolved); suffix != "" {
 		return fmt.Errorf("%s: read-write on %s %q is not allowed", field, suffix, rawPath)
@@ -4431,12 +4483,25 @@ func validateGuardRWPath(label string, idx int, rawPath string) error {
 	// account this process happens to run as. Dead code that reads as live
 	// protection is worse than no code, because the next reader trusts it.
 
-	// Static dangerous roots
+	// Static dangerous roots. These run BEFORE the credential-material check so
+	// that a path both rules cover (/etc/shadow is a privilege path AND a
+	// credential store) keeps its established, more specific message.
 	for _, dr := range guardDangerousRWRoots {
 		clean := filepath.Clean(dr.prefix)
 		if resolved == clean || strings.HasPrefix(resolved, clean+string(filepath.Separator)) {
 			return fmt.Errorf("%s: read-write on %s %q is not allowed", field, dr.reason, rawPath)
 		}
+	}
+
+	// Credential material is refused for WRITE as well as read, and not merely
+	// because writing usually implies reading. Write alone is its own attack:
+	// rewriting ~/.npmrc or ~/.pypirc redirects a build to an attacker's
+	// registry, and rewriting ~/.kube/config or ~/.aws/credentials repoints the
+	// workload's cluster and cloud identity. Both floors share this set; the
+	// write floor adds the write-sensitive locations above that a read grant
+	// may legitimately keep.
+	if reason := guardDeclaredPathSecretMaterialReason(rawPath, resolved); reason != "" {
+		return fmt.Errorf("%s: read-write on %q is not allowed (%s); writing a credential file redirects the workload's identity", field, rawPath, reason)
 	}
 
 	return nil

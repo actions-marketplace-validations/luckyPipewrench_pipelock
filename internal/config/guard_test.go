@@ -7,8 +7,11 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestValidateGuard_EmptyIsValid(t *testing.T) {
@@ -30,7 +33,18 @@ func TestValidateGuard_ValidFull(t *testing.T) {
 			{Name: "worker", Manifests: []string{"app-state"}},
 		},
 		Manifests: []GuardManifest{
-			{Name: "app-state", ReadOnly: []string{"/opt/app/config"}, ReadWrite: []string{"/var/lib/app/data"}},
+			// Exercises both shapes deliberately, because this is the example a
+			// reader copies. The plain lists are FILE grants, so a path that is
+			// really a directory belongs in a *_directories list; declaring
+			// /opt/app/config as a plain read_only would validate cleanly and
+			// then fail to reach anything inside it once enforcement lands.
+			{
+				Name:                 "app-state",
+				ReadOnly:             []string{"/opt/app/config/settings.yaml"},
+				ReadOnlyDirectories:  []string{"/opt/app/config"},
+				ReadWrite:            []string{"/var/lib/app/data/state.db"},
+				ReadWriteDirectories: []string{"/var/lib/app/data"},
+			},
 		},
 	}
 	// A structurally valid declaration passes every path and naming rule and is
@@ -44,6 +58,166 @@ func TestValidateGuard_ValidFull(t *testing.T) {
 	}
 	if !errors.Is(err, errGuardNotEnforced) {
 		t.Fatalf("valid guard config should fail only on the not-enforced gate, got: %v", err)
+	}
+}
+
+func TestValidateGuard_PathTypes(t *testing.T) {
+	t.Parallel()
+
+	missingFile := filepath.Join(t.TempDir(), "state-file")
+	missingDirectory := filepath.Join(t.TempDir(), "state-directory") + string(filepath.Separator)
+	for _, path := range []string{missingFile, strings.TrimSuffix(missingDirectory, string(filepath.Separator))} {
+		if _, err := os.Lstat(path); !os.IsNotExist(err) {
+			t.Fatalf("test precondition: %q must not exist, got: %v", path, err)
+		}
+	}
+
+	tests := []struct {
+		name      string
+		manifest  GuardManifest
+		wantErr   string
+		wantGate  bool
+		noPathErr bool
+	}{
+		{
+			name: "legacy_plain_paths_default_to_files",
+			manifest: GuardManifest{
+				Name:      "state",
+				ReadOnly:  []string{missingFile},
+				ReadWrite: []string{filepath.Join(t.TempDir(), "writable-state")},
+			},
+			wantGate:  true,
+			noPathErr: true,
+		},
+		{
+			name: "declared_directories_allow_trailing_separator",
+			manifest: GuardManifest{
+				Name:                 "state",
+				ReadOnlyDirectories:  []string{missingDirectory},
+				ReadWriteDirectories: []string{filepath.Join(t.TempDir(), "writable-state") + string(filepath.Separator)},
+			},
+			wantGate:  true,
+			noPathErr: true,
+		},
+		{
+			name: "file_with_trailing_separator_is_inconsistent",
+			manifest: GuardManifest{
+				Name:     "bad",
+				ReadOnly: []string{"/var/lib/app/config/"},
+			},
+			wantErr: "file path",
+		},
+		{
+			name: "directory_path_must_be_absolute",
+			manifest: GuardManifest{
+				Name:                "bad",
+				ReadOnlyDirectories: []string{"relative/directory"},
+			},
+			wantErr: "absolute",
+		},
+		{
+			name: "same_path_cannot_be_file_and_directory",
+			manifest: GuardManifest{
+				Name:                "bad",
+				ReadOnly:            []string{"/var/lib/app/config"},
+				ReadOnlyDirectories: []string{"/var/lib/app/config/"},
+			},
+			wantErr: "conflicts",
+		},
+		{
+			name: "same_path_cannot_be_read_only_and_read_write",
+			manifest: GuardManifest{
+				Name:      "bad",
+				ReadOnly:  []string{"/var/lib/app/config/settings.yaml"},
+				ReadWrite: []string{"/var/lib/app/config/settings.yaml"},
+			},
+			wantErr: "only one grant list",
+		},
+		{
+			name: "read_only_directory_still_hits_credential_floor",
+			manifest: GuardManifest{
+				Name:                "bad",
+				ReadOnlyDirectories: []string{"/home/someoperator/.kube/"},
+			},
+			// Anchored on the protected component rather than on a word in the
+			// prose. Which floor rule fires for a given path is an
+			// implementation detail that can change without weakening
+			// anything, and the assertion above already proves the refusal did
+			// not come from the not-enforced gate.
+			wantErr: ".kube",
+		},
+		{
+			name: "read_write_directory_still_hits_credential_floor",
+			manifest: GuardManifest{
+				Name:                 "bad",
+				ReadWriteDirectories: []string{"/home/someoperator/.kube/"},
+			},
+			wantErr: ".kube",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Defaults()
+			cfg.Guard = Guard{Manifests: []GuardManifest{tt.manifest}}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("guard config must be rejected while the evaluator is absent")
+			}
+			if tt.wantGate && !errors.Is(err, errGuardNotEnforced) {
+				t.Fatalf("declared path type must pass path validation and reach the gate, got: %v", err)
+			}
+			if tt.noPathErr && !errors.Is(err, errGuardNotEnforced) {
+				t.Fatalf("path type validation must not depend on an absent path, got: %v", err)
+			}
+			if tt.wantErr != "" {
+				if errors.Is(err, errGuardNotEnforced) {
+					t.Fatalf("invalid declaration was refused only by the gate, not its path-type rule: %v", err)
+				}
+				if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.wantErr)) {
+					t.Errorf("error %q does not contain %q", err.Error(), tt.wantErr)
+				}
+			}
+		})
+	}
+}
+
+func TestGuardManifest_PathTypeYAMLSurface(t *testing.T) {
+	t.Parallel()
+
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(`
+guard:
+  manifests:
+    - name: app-state
+      read_only:
+        - /etc/resolv.conf
+      read_only_directories:
+        - /var/lib/app/cache/
+      read_write:
+        - /var/lib/app/state.db
+      read_write_directories:
+        - /var/lib/app/data/
+`), &cfg); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+
+	if len(cfg.Guard.Manifests) != 1 {
+		t.Fatalf("manifests = %d, want 1", len(cfg.Guard.Manifests))
+	}
+	manifest := cfg.Guard.Manifests[0]
+	if got, want := manifest.ReadOnly, []string{"/etc/resolv.conf"}; !slices.Equal(got, want) {
+		t.Errorf("read_only = %q, want %q", got, want)
+	}
+	if got, want := manifest.ReadOnlyDirectories, []string{"/var/lib/app/cache/"}; !slices.Equal(got, want) {
+		t.Errorf("read_only_directories = %q, want %q", got, want)
+	}
+	if got, want := manifest.ReadWrite, []string{"/var/lib/app/state.db"}; !slices.Equal(got, want) {
+		t.Errorf("read_write = %q, want %q", got, want)
+	}
+	if got, want := manifest.ReadWriteDirectories, []string{"/var/lib/app/data/"}; !slices.Equal(got, want) {
+		t.Errorf("read_write_directories = %q, want %q", got, want)
 	}
 }
 
@@ -646,3 +820,396 @@ func TestCanonicalPolicyHash_GuardExcludedWhileInert(t *testing.T) {
 // guardIsHomeRoot recognises it without depending on the running user's
 // real $HOME. This keeps the tests hermetic on CI runners.
 const guardTestHome = "/home/testoperator"
+
+// TestValidateGuard_SecretMaterialRefusedBothDirections is the fail-closed half
+// of the credential floor.
+//
+// Every path here is refused for READ as well as write. Read-only is not a
+// safe posture for credential material under an agent threat model: a token
+// does not need to be modified to be lost, and the copy leaves through any
+// destination the workload is otherwise permitted to reach.
+func TestValidateGuard_SecretMaterialRefusedBothDirections(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		// The credential file itself.
+		"/home/someoperator/.aws/credentials",
+		// .aws is refused whole, not just its credentials file: config carries
+		// SSO settings and credential_process directives, and the sso/cli
+		// caches hold live session tokens.
+		"/home/someoperator/.aws/config",
+		"/home/someoperator/.aws/sso/cache/abc123.json",
+		"/home/someoperator/.azure/msal_token_cache.json",
+		"/home/someoperator/.cargo/credentials.toml",
+		"/home/someoperator/.terraform.d/credentials.tfrc.json",
+		"/home/someoperator/.pulumi/credentials.json",
+		"/home/someoperator/.config/containers/auth.json",
+		"/home/someoperator/.claude/.credentials.json",
+		"/home/someoperator/.cursor/mcp.json",
+		"/home/someoperator/.gemini/oauth_creds.json",
+		// Renamed copies. A credential file is routinely duplicated rather
+		// than moved, and each copy carries the full credential under a name
+		// no static list can predict. This case is drawn from a real
+		// kubeconfig backup found holding client-certificate-data and
+		// client-key-data beside a config the floor already refused.
+		"/home/someoperator/.kube/config.pre-fedora-removal-20260703T1539",
+		"/home/someoperator/.npmrc.bak",
+		"/home/someoperator/.netrc.old",
+		"/home/someoperator/.pypirc~",
+		"/home/someoperator/.claude.json.orig",
+		"/home/someoperator/.config/gh/hosts.yml.bak",
+		// Regenerable caches inside a credential directory. Refused with the
+		// directory rather than carved out, because the carve-out is what
+		// would let a renamed credential beside them through.
+		"/home/someoperator/.kube/cache",
+		"/home/someoperator/.docker/buildx",
+		"/home/someoperator/.kube/config",
+		"/home/someoperator/.docker/config.json",
+		"/home/someoperator/.npmrc",
+		"/home/someoperator/.pypirc",
+		"/home/someoperator/.netrc",
+		"/home/someoperator/.git-credentials",
+		"/home/someoperator/.config/gh/hosts.yml",
+		"/home/someoperator/.config/gcloud/credentials.db",
+		"/home/someoperator/.claude.json",
+		"/home/someoperator/.codex/auth.json",
+		"/Users/someoperator/.aws/credentials",
+		"/root/.kube/config",
+		// A directory that CONTAINS credential material. Under Landlock a
+		// directory grant reaches the whole subtree, so permitting the parent
+		// permits the secret; without this arm every entry above is decorative.
+		"/home/someoperator/.aws",
+		"/home/someoperator/.docker",
+		"/home/someoperator/.kube",
+		"/home/someoperator/.config/gh",
+		"/home/someoperator/.config/gcloud",
+		"/home/someoperator/.config",
+		"/home/someoperator/.codex",
+		// Roots sitting above every user home at once.
+		"/home",
+		"/Users",
+		// Per-user runtime state. An SSH agent socket lives here, and reaching
+		// it is full use of every loaded key without any key file being read,
+		// so guarding ~/.ssh alone guards the copy and not the capability.
+		// These were already refused for write as "socket path"; the read
+		// direction is the one that matters for an agent socket.
+		"/run/user",
+		"/run/user/1000",
+		"/run/user/1000/keyring/ssh",
+		"/run/secrets/api-token",
+		"/run", // ancestor of /run/user
+	} {
+		for _, mode := range []string{"read_only", "read_write"} {
+			t.Run(mode+"_"+path, func(t *testing.T) {
+				t.Parallel()
+				m := GuardManifest{Name: "bad"}
+				if mode == "read_only" {
+					m.ReadOnly = []string{path}
+				} else {
+					m.ReadWrite = []string{path}
+				}
+				cfg := Defaults()
+				cfg.Guard = Guard{Manifests: []GuardManifest{m}}
+
+				err := cfg.Validate()
+				if err == nil {
+					t.Fatalf("%s on credential path %q must be rejected", mode, path)
+				}
+				// The rejection must come from a PATH rule. A bare err != nil
+				// check passes with every rule in this file deleted, because
+				// errGuardNotEnforced refuses any non-empty guard declaration.
+				if errors.Is(err, errGuardNotEnforced) {
+					t.Errorf("%s on %q was refused only by the not-enforced gate, so no path rule rejected it: %v", mode, path, err)
+				}
+			})
+		}
+	}
+}
+
+// TestValidateGuard_NonSecretNeighboursStillAllowed is the availability half of
+// the credential floor.
+//
+// The ancestor rule refuses ~/.aws and ~/.config as whole directories, which is
+// only tolerable because the specific non-secret paths beside the credential
+// remain grantable. If these regressed, an operator could not express a working
+// manifest for cargo, npm, docker or gh, and would switch guard off -- which on
+// a security product costs nearly as much as permitting too much.
+func TestValidateGuard_NonSecretNeighboursStillAllowed(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"/home/someoperator/.config/myapp",                 // unrelated app config
+		"/home/someoperator/.config/gcloud/configurations", // named configs, not the credential db
+		"/home/someoperator/.cache/some-tool",
+		"/home/someoperator/.cargo/registry",
+		"/home/someoperator/.npm/_cacache", // the npm CACHE; the token lives in ~/.npmrc
+		"/home/someoperator/projects/app",
+		// A name that merely STARTS with a credential filename is not a
+		// variant of it. The variant rule requires a separator after the
+		// name, so these must stay grantable.
+		"/home/someoperator/.npmrcfoo",
+		"/home/someoperator/.netrcher",
+	} {
+		for _, mode := range []string{"read_only", "read_write"} {
+			t.Run(mode+"_"+path, func(t *testing.T) {
+				t.Parallel()
+				m := GuardManifest{Name: "ok"}
+				if mode == "read_only" {
+					m.ReadOnly = []string{path}
+				} else {
+					m.ReadWrite = []string{path}
+				}
+				cfg := Defaults()
+				cfg.Guard = Guard{Manifests: []GuardManifest{m}}
+
+				err := cfg.Validate()
+				if err == nil {
+					t.Fatalf("guard is refused while unenforced; %q should still reach the gate", path)
+				}
+				if !errors.Is(err, errGuardNotEnforced) {
+					t.Errorf("non-secret path %q must pass the %s path rules, got: %v", path, mode, err)
+				}
+			})
+		}
+	}
+}
+
+// TestValidateGuard_WholeHomeReadRefused pins the specific bypass that made the
+// pre-existing .ssh refusal reachable-around: the write validator called
+// guardIsHomeRoot and the read validator did not, so `read_only: [/home/x]`
+// was accepted and carried ~/.ssh with it.
+//
+// This test asserts the MESSAGE, not merely that the path was refused, and the
+// distinction is the whole point. The credential-material ancestor rule also
+// refuses every path here (a home directory is an ancestor of ~/.aws/credentials),
+// so an outcome-only assertion passes with the home-root arm deleted -- it was
+// written that way first and proven vacuous by neutralizing the arm and watching
+// it still pass. The home-root arm survives because it runs first and says
+// "the entire home directory" instead of naming one incidental credential
+// beneath it, which is the difference between an operator fixing the manifest
+// and an operator adding an exception for AWS.
+func TestValidateGuard_WholeHomeReadRefused(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{"/home/someoperator", "/Users/someoperator", "/root", "/"} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			cfg := Defaults()
+			cfg.Guard = Guard{
+				Manifests: []GuardManifest{{Name: "bad", ReadOnlyDirectories: []string{path}}},
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("read access to whole home %q must be rejected", path)
+			}
+			if errors.Is(err, errGuardNotEnforced) {
+				t.Fatalf("read on %q was refused only by the not-enforced gate: %v", path, err)
+			}
+			if !strings.Contains(err.Error(), "entire home directory") {
+				t.Errorf("read on %q must be refused as a whole-home grant, not incidentally by a credential rule, got: %v", path, err)
+			}
+		})
+	}
+}
+
+// TestValidateGuard_RunSubtreesStillReadable is the availability half of the
+// agent-socket rule.
+//
+// Read is asserted alone on purpose. The whole of /run has been refused for
+// WRITE since the manifest rules landed, as a "socket path", so a both-modes
+// assertion here would fail on a pre-existing rule that has nothing to do with
+// credentials. Reading resolver config or an application's own runtime state
+// is ordinary, so the credential rule must reach only the credential-bearing
+// subtrees under /run rather than the whole directory.
+func TestValidateGuard_RunSubtreesStillReadable(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"/run/systemd/resolve/stub-resolv.conf",
+		"/run/myapp/state",
+	} {
+		t.Run(path, func(t *testing.T) {
+			t.Parallel()
+			cfg := Defaults()
+			cfg.Guard = Guard{
+				Manifests: []GuardManifest{{Name: "ok", ReadOnly: []string{path}}},
+			}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("guard is refused while unenforced; %q should still reach the gate", path)
+			}
+			if !errors.Is(err, errGuardNotEnforced) {
+				t.Errorf("non-credential runtime path %q must remain readable, got: %v", path, err)
+			}
+		})
+	}
+}
+
+// TestValidateGuard_CredentialFloorIndependentOfHomeLayout closes the
+// enumerated-home class.
+//
+// A deployment sets HOME to whatever it likes. Recognizing only /home, /Users,
+// /root, /var/home and /app leaves the floor completely inert for a container
+// using /workspace or /srv/agent, which is a straightforward bypass: declare
+// /workspace/.aws and the credential is granted. Credential DIRECTORIES are
+// therefore matched as path components wherever they appear, which is the idiom
+// this file already used for .ssh, rather than by extending the layout list.
+func TestValidateGuard_CredentialFloorIndependentOfHomeLayout(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"/workspace/.aws/credentials",
+		"/srv/agent/.kube/config",
+		"/opt/anything/.docker/config.json",
+		"/var/home/someoperator/.aws",
+		"/app/.azure",
+	} {
+		for _, mode := range []string{"read_only", "read_write"} {
+			t.Run(mode+"_"+path, func(t *testing.T) {
+				t.Parallel()
+				m := GuardManifest{Name: "bad"}
+				if mode == "read_only" {
+					m.ReadOnly = []string{path}
+				} else {
+					m.ReadWrite = []string{path}
+				}
+				cfg := Defaults()
+				cfg.Guard = Guard{Manifests: []GuardManifest{m}}
+
+				err := cfg.Validate()
+				if err == nil {
+					t.Fatalf("%s on %q must be rejected regardless of home layout", mode, path)
+				}
+				if errors.Is(err, errGuardNotEnforced) {
+					t.Errorf("%s on %q was refused only by the not-enforced gate, so no path rule rejected it: %v", mode, path, err)
+				}
+			})
+		}
+	}
+}
+
+// TestValidateGuard_CredentialFloorIsCaseInsensitive covers case-insensitive
+// volumes, where a differently-spelled path reaches the very same file.
+//
+// The comparison is folded rather than the input path, which matters: lowering
+// the whole path first stops /Users from being recognized as a home root at
+// all, silently disabling every home-relative rule instead of strengthening it.
+func TestValidateGuard_CredentialFloorIsCaseInsensitive(t *testing.T) {
+	t.Parallel()
+
+	for _, path := range []string{
+		"/Users/someoperator/.AWS/credentials",
+		"/Users/someoperator/Library/application support/Claude/claude_desktop_config.json",
+		"/home/someoperator/.NPMRC",
+		"/home/someoperator/.Npmrc.bak",
+		"/home/someoperator/.Kube/config",
+		// The HOME ROOT itself, spelled differently. Detection has to fold as
+		// well as the comparison downstream of it: an unrecognized root
+		// returns no home at all, which switches every home-relative rule OFF
+		// rather than merely loosening one.
+		"/users/someoperator/.npmrc",
+		"/Home/someoperator/.npmrc",
+		"/users/someoperator",
+		"/HOME",
+	} {
+		// Both grant modes. The two validators consult the credential floor
+		// through separate call sites, so a fix applied to one does not cover
+		// the other; asserting only the read side is what let the write side
+		// drift out of parity once already.
+		for _, mode := range []string{"read_only", "read_write"} {
+			t.Run(mode+"_"+path, func(t *testing.T) {
+				t.Parallel()
+				m := GuardManifest{Name: "bad"}
+				if mode == "read_only" {
+					m.ReadOnly = []string{path}
+				} else {
+					m.ReadWrite = []string{path}
+				}
+				cfg := Defaults()
+				cfg.Guard = Guard{Manifests: []GuardManifest{m}}
+
+				err := cfg.Validate()
+				if err == nil {
+					t.Fatalf("%s on %q must be rejected on a case-insensitive volume", mode, path)
+				}
+				if errors.Is(err, errGuardNotEnforced) {
+					t.Errorf("%s on %q was refused only by the not-enforced gate: %v", mode, path, err)
+				}
+			})
+		}
+	}
+}
+
+// TestValidateGuard_DeclaredPathRefusedWhenItResolvesElsewhere covers the
+// declared-spelling half of the credential check.
+//
+// SCOPE, stated plainly: this proves the HELPER, not the call sites. Both
+// validators must route through it, and the write validator did not, which is
+// the regression this replaced. A test that drove the two validators instead
+// was written first and proven VACUOUS: reproducing the divergence needs a
+// symlink planted at a credential shape inside a real home directory, and for
+// any path a hermetic test can name, resolution equals the declared spelling,
+// so the buggy resolved-only form passes too. Call-site parity is therefore
+// verified by inspection, not by this test. If a future change makes symlink
+// resolution injectable, replace this with a real divergence test.
+func TestValidateGuard_DeclaredPathRefusedWhenItResolvesElsewhere(t *testing.T) {
+	t.Parallel()
+
+	if guardDeclaredPathSecretMaterialReason("/home/someoperator/.npmrc", "/tmp/innocuous") == "" {
+		t.Error("a declared credential path must be refused even when it resolves somewhere innocuous")
+	}
+	if guardDeclaredPathSecretMaterialReason("/tmp/innocuous", "/home/someoperator/.npmrc") == "" {
+		t.Error("an innocuous-looking alias must be refused when it resolves into credential material")
+	}
+}
+
+// TestValidateGuard_CaseEquivalentGrantsConflict covers the conflict key.
+//
+// filepath.Clean does not normalize case, so on a case-insensitive volume two
+// spellings name one object. The dangerous pairing is read-only in one list and
+// read-write in another: once the evaluator consumes both, the object resolves
+// to the WIDER grant, so an intended read-only grant becomes writable without
+// anything in the manifest looking wrong.
+func TestValidateGuard_CaseEquivalentGrantsConflict(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		manifest GuardManifest
+	}{
+		{
+			name: "read_only_and_read_write_case_variants",
+			manifest: GuardManifest{
+				Name:      "bad",
+				ReadOnly:  []string{"/Users/someoperator/state"},
+				ReadWrite: []string{"/users/someoperator/STATE"},
+			},
+		},
+		{
+			name: "file_and_directory_case_variants",
+			manifest: GuardManifest{
+				Name:                "bad",
+				ReadOnly:            []string{"/var/lib/app/Config"},
+				ReadOnlyDirectories: []string{"/var/lib/app/config/"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := Defaults()
+			cfg.Guard = Guard{Manifests: []GuardManifest{tt.manifest}}
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatal("case-equivalent declarations of one object must be rejected")
+			}
+			if errors.Is(err, errGuardNotEnforced) {
+				t.Fatalf("case-equivalent declarations were refused only by the not-enforced gate, so no path rule caught the conflict: %v", err)
+			}
+			if !strings.Contains(err.Error(), "conflicts") {
+				t.Errorf("expected a conflict refusal, got: %v", err)
+			}
+		})
+	}
+}
