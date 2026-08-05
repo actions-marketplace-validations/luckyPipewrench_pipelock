@@ -63,23 +63,83 @@ func TestNewEngineWithKey(t *testing.T) {
 	}
 }
 
-func TestDecisiveVerdict_Fallback(t *testing.T) {
+func TestDecisiveVerdict_RequiresMediatedDecision(t *testing.T) {
 	t.Parallel()
 
 	cs := &CapturedScenario{
-		Scenario: Scenario{ExpectedVerdict: verdictBlock},
+		Scenario: Scenario{Transport: TransportForward, ExpectedVerdict: verdictBlock, ExpectedLayer: "body_dlp"},
 		Receipts: []receipt.Receipt{
-			{ActionRecord: receipt.ActionRecord{Verdict: verdictWarn}},
+			{ActionRecord: receipt.ActionRecord{Verdict: verdictAllow, SessionControl: &receipt.SessionControl{Kind: receipt.SessionControlOpen}}},
 		},
 	}
-	// No receipt matches the expected verdict, so the last receipt's verdict wins.
-	if got := decisiveVerdict(cs); got != verdictWarn {
-		t.Errorf("fallback verdict=%q want warn", got)
+	if got := decisiveVerdict(cs); got != "unknown" {
+		t.Errorf("control-only verdict=%q want unknown", got)
+	}
+	if err := validateExpectedDecision(cs); err == nil {
+		t.Fatal("control-only chain passed the expected-decision gate")
+	}
+
+	cs.Receipts = append(cs.Receipts, receipt.Receipt{ActionRecord: receipt.ActionRecord{
+		Verdict:   verdictBlock,
+		Layer:     "response_scan",
+		Transport: TransportForward,
+	}})
+	if err := validateExpectedDecision(cs); err == nil || !strings.Contains(err.Error(), "layer") {
+		t.Fatalf("wrong-layer decision error = %v", err)
+	}
+	cs.Receipts[1].ActionRecord.Layer = "body_dlp"
+	if err := validateExpectedDecision(cs); err != nil {
+		t.Fatalf("expected mediated decision rejected: %v", err)
+	}
+	cs.Receipts[1].ActionRecord.Transport = TransportWebSocket
+	if err := validateExpectedDecision(cs); err == nil || !strings.Contains(err.Error(), "transport") {
+		t.Fatalf("wrong-transport decision error = %v", err)
+	}
+	cs.Receipts[1].ActionRecord.Transport = TransportForward
+	cs.Scenario.ExpectedLayer = ""
+	cs.Receipts[1].ActionRecord.Layer = "any_recorded_layer"
+	if err := validateExpectedDecision(cs); err != nil {
+		t.Fatalf("empty expected layer rejected a recorded layer: %v", err)
 	}
 
 	empty := &CapturedScenario{Scenario: Scenario{ExpectedVerdict: verdictBlock}}
 	if got := decisiveVerdict(empty); got != "unknown" {
 		t.Errorf("empty verdict=%q want unknown", got)
+	}
+}
+
+func TestValidateExpectedDecision_ExactSequence(t *testing.T) {
+	t.Parallel()
+	scenario := Scenario{
+		Transport:       TransportForward,
+		ExpectedVerdict: verdictBlock,
+		ExpectedLayer:   "body_dlp",
+		ExpectedSequence: []ExpectedDecision{
+			{Verdict: verdictAllow},
+			{Verdict: verdictAllow},
+			{Verdict: verdictBlock, Layer: "body_dlp"},
+		},
+	}
+	receipts := []receipt.Receipt{
+		{ActionRecord: receipt.ActionRecord{Verdict: verdictAllow, Transport: TransportForward}},
+		{ActionRecord: receipt.ActionRecord{Verdict: verdictAllow, Transport: TransportForward}},
+		{ActionRecord: receipt.ActionRecord{Verdict: verdictBlock, Layer: "body_dlp", Transport: TransportForward}},
+	}
+	if err := validateExpectedDecision(&CapturedScenario{Scenario: scenario, Receipts: receipts}); err != nil {
+		t.Fatalf("exact sequence rejected: %v", err)
+	}
+	if err := validateExpectedDecision(&CapturedScenario{Scenario: scenario, Receipts: receipts[1:]}); err == nil || !strings.Contains(err.Error(), "mediated decisions") {
+		t.Fatalf("missing sequence decision error = %v", err)
+	}
+	reordered := append([]receipt.Receipt(nil), receipts...)
+	reordered[1], reordered[2] = reordered[2], reordered[1]
+	if err := validateExpectedDecision(&CapturedScenario{Scenario: scenario, Receipts: reordered}); err == nil || !strings.Contains(err.Error(), "verdict") {
+		t.Fatalf("reordered sequence error = %v", err)
+	}
+	wrongTransport := append([]receipt.Receipt(nil), receipts...)
+	wrongTransport[0].ActionRecord.Transport = TransportWebSocket
+	if err := validateExpectedDecision(&CapturedScenario{Scenario: scenario, Receipts: wrongTransport}); err == nil || !strings.Contains(err.Error(), "transport") {
+		t.Fatalf("sequence transport error = %v", err)
 	}
 }
 
