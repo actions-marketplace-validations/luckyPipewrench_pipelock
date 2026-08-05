@@ -1,99 +1,72 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package cli
 
 import (
-	"errors"
-	"fmt"
+	"bytes"
+	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
-func TestExitError_Error(t *testing.T) {
-	inner := fmt.Errorf("config load error: file not found")
-	ee := &ExitError{Err: inner, Code: 2}
+func TestRegisterCommand(t *testing.T) {
+	// Save and restore global state.
+	saved := extraCommands
+	extraCommands = nil
+	t.Cleanup(func() { extraCommands = saved })
 
-	if ee.Error() != inner.Error() {
-		t.Errorf("Error() = %q, want %q", ee.Error(), inner.Error())
+	// Register a test command.
+	RegisterCommand(&cobra.Command{Use: "test-cmd", Short: "test"})
+
+	if len(extraCommands) != 1 {
+		t.Fatalf("expected 1 registered command, got %d", len(extraCommands))
+	}
+	if extraCommands[0].Use != "test-cmd" {
+		t.Errorf("command.Use = %q, want %q", extraCommands[0].Use, "test-cmd")
 	}
 
-	// Direct struct construction with nil Err should not panic.
-	nilErr := &ExitError{Code: 2}
-	got := nilErr.Error()
-	if got != "exit code 2" {
-		t.Errorf("Error() with nil Err = %q, want %q", got, "exit code 2")
+	// Verify rootCmd picks up extra commands.
+	cmd := rootCmd()
+	found := false
+	for _, sub := range cmd.Commands() {
+		if sub.Use == "test-cmd" {
+			found = true
+			break
+		}
 	}
-}
-
-func TestExitError_Unwrap(t *testing.T) {
-	inner := fmt.Errorf("wrapped: %w", errors.New("root cause"))
-	ee := &ExitError{Err: inner, Code: 2}
-
-	if !errors.Is(ee.Unwrap(), inner) {
-		t.Error("Unwrap() should return the inner error")
-	}
-
-	// errors.Is should see through the ExitError wrapper.
-	root := errors.New("sentinel")
-	ee2 := &ExitError{Err: fmt.Errorf("wrap: %w", root), Code: 3}
-	if !errors.Is(ee2, root) {
-		t.Error("errors.Is should find sentinel through ExitError")
+	if !found {
+		t.Error("registered command not found in rootCmd subcommands")
 	}
 }
 
-func TestExitCodeError(t *testing.T) {
-	inner := errors.New("bad config")
-	wrapped := ExitCodeError(2, inner)
+func TestEnvelopeHelpRegistered(t *testing.T) {
+	cmd := rootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"envelope", "--help"})
 
-	var ee *ExitError
-	if !errors.As(wrapped, &ee) {
-		t.Fatal("ExitCodeError should produce an *ExitError")
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("envelope help: %v", err)
 	}
-	if ee.Code != 2 {
-		t.Errorf("Code = %d, want 2", ee.Code)
-	}
-	if !errors.Is(ee.Err, inner) {
-		t.Error("Err should be the original error")
+	if got := out.String(); !strings.Contains(got, "trust") {
+		t.Fatalf("help output = %q, want trust subcommand", got)
 	}
 }
 
-func TestExitCodeError_NilErr(t *testing.T) {
-	if got := ExitCodeError(2, nil); got != nil {
-		t.Errorf("ExitCodeError(2, nil) = %v, want nil", got)
-	}
-}
+func TestPresetsCommandRegistered(t *testing.T) {
+	cmd := rootCmd()
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&bytes.Buffer{})
+	cmd.SetArgs([]string{"presets"})
 
-func TestExitCodeOf(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want int
-	}{
-		{
-			name: "ExitError with code 2",
-			err:  ExitCodeError(2, errors.New("config error")),
-			want: 2,
-		},
-		{
-			name: "ExitError with code 42",
-			err:  ExitCodeError(42, errors.New("custom")),
-			want: 42,
-		},
-		{
-			name: "plain error defaults to 1",
-			err:  errors.New("generic failure"),
-			want: 1,
-		},
-		{
-			name: "wrapped ExitError",
-			err:  fmt.Errorf("outer: %w", ExitCodeError(2, errors.New("inner"))),
-			want: 2,
-		},
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("presets command: %v", err)
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := ExitCodeOf(tt.err)
-			if got != tt.want {
-				t.Errorf("ExitCodeOf() = %d, want %d", got, tt.want)
-			}
-		})
+	if got := out.String(); !strings.Contains(got, "hostile-model") {
+		t.Fatalf("presets output = %q, want hostile-model preset", got)
 	}
 }

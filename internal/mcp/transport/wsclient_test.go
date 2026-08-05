@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package transport
 
 import (
@@ -16,6 +19,12 @@ import (
 	gobwasutil "github.com/gobwas/ws/wsutil"
 )
 
+const (
+	testJSONID1 = `{"id":1}`
+)
+
+const testJSONRPCMsg = `{"jsonrpc":"2.0","id":1}`
+
 // wsTestServer creates an httptest server that upgrades to WebSocket and runs handler.
 func wsTestServer(t *testing.T, handler func(conn net.Conn)) *httptest.Server {
 	t.Helper()
@@ -33,7 +42,7 @@ func TestWSClient_SingleTextFrame(t *testing.T) {
 	clientDone := make(chan struct{})
 	srv := wsTestServer(t, func(conn net.Conn) {
 		defer func() { _ = conn.Close() }()
-		_ = gobwasutil.WriteServerMessage(conn, ws.OpText, []byte(`{"jsonrpc":"2.0","id":1}`))
+		_ = gobwasutil.WriteServerMessage(conn, ws.OpText, []byte(testJSONRPCMsg))
 		<-clientDone
 	})
 	defer srv.Close()
@@ -50,7 +59,7 @@ func TestWSClient_SingleTextFrame(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(msg) != `{"jsonrpc":"2.0","id":1}` { //nolint:goconst // test value
+	if string(msg) != testJSONRPCMsg {
 		t.Errorf("unexpected message: %s", msg)
 	}
 }
@@ -126,7 +135,7 @@ func TestWSClient_FragmentedMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	expected := `{"jsonrpc":"2.0","id":1}`
+	expected := testJSONRPCMsg
 	if string(msg) != expected {
 		t.Errorf("got %q, want %q", string(msg), expected)
 	}
@@ -279,6 +288,21 @@ func TestWSClient_DialFailure(t *testing.T) {
 	_, err := NewWSClient(ctx, "ws://127.0.0.1:1") // port 1 should be unreachable
 	if err == nil {
 		t.Fatal("expected dial error")
+	}
+}
+
+func TestNewWSClientWithDialer_UsesCustomDialer(t *testing.T) {
+	errDialBlocked := errors.New("sentinel dial blocked")
+	var calls int
+	_, err := NewWSClientWithDialer(context.Background(), "ws://api.vendor.example/mcp", func(_ context.Context, _, _ string) (net.Conn, error) {
+		calls++
+		return nil, errDialBlocked
+	})
+	if !errors.Is(err, errDialBlocked) {
+		t.Fatalf("NewWSClientWithDialer error = %v, want sentinel dial error", err)
+	}
+	if calls == 0 {
+		t.Fatal("custom dialer was not called")
 	}
 }
 
@@ -597,7 +621,7 @@ func TestWSClient_OversizedControlFrame(t *testing.T) {
 	// The exact error depends on how the WS library parses the malformed
 	// control frame. It may report "control frame too large" (our check)
 	// or a fragment/parse error from the underlying reader. Either way,
-	// the client must reject it — that's what we're testing.
+	// the client must reject it - that's what we're testing.
 }
 
 func TestWSClient_UnsolicitedPongIgnored(t *testing.T) {
@@ -606,7 +630,7 @@ func TestWSClient_UnsolicitedPongIgnored(t *testing.T) {
 		defer func() { _ = conn.Close() }()
 		// Send unsolicited pong, then a text message.
 		_ = gobwasutil.WriteServerMessage(conn, ws.OpPong, []byte("pong"))
-		_ = gobwasutil.WriteServerMessage(conn, ws.OpText, []byte(`{"id":1}`))
+		_ = gobwasutil.WriteServerMessage(conn, ws.OpText, []byte(testJSONID1))
 		<-clientDone
 	})
 	defer srv.Close()
@@ -623,7 +647,7 @@ func TestWSClient_UnsolicitedPongIgnored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(msg) != `{"id":1}` { //nolint:goconst // test value
+	if string(msg) != testJSONID1 {
 		t.Errorf("expected text message, got: %s", msg)
 	}
 }

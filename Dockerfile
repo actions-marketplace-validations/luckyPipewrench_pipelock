@@ -1,23 +1,30 @@
+# Copyright 2026 Pipelock contributors
+# SPDX-License-Identifier: Apache-2.0
+
 # Multi-stage build for minimal image size
-FROM golang:1.24-alpine@sha256:8bee1901f1e530bfb4a7850aa7a479d17ae3a18beb6e09064ed54cfd245b7191 AS builder
+FROM golang:1.26.5-alpine@sha256:99e12cfb19b753915f9b9fdc5a99f1869a24a69d3a0955832d5702e7fa68f1be AS builder
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-ARG VERSION=0.1.0-dev
+ARG VERSION=0.0.0-dev.unknown
 ARG BUILD_DATE=unknown
 ARG GIT_COMMIT=unknown
+ARG LICENSE_PUBLIC_KEY=""
+ARG RULES_KEYRING_HEX=""
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -tags enterprise \
     -ldflags "-s -w \
-      -X github.com/luckyPipewrench/pipelock/internal/cli.Version=${VERSION} \
-      -X github.com/luckyPipewrench/pipelock/internal/cli.BuildDate=${BUILD_DATE} \
-      -X github.com/luckyPipewrench/pipelock/internal/cli.GitCommit=${GIT_COMMIT} \
-      -X github.com/luckyPipewrench/pipelock/internal/cli.GoVersion=$(go version | awk '{print $3}') \
-      -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION}" \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.Version=${VERSION} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.BuildDate=${BUILD_DATE} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.GitCommit=${GIT_COMMIT} \
+      -X github.com/luckyPipewrench/pipelock/internal/cliutil.GoVersion=$(go version | awk '{print $3}') \
+      -X github.com/luckyPipewrench/pipelock/internal/proxy.Version=${VERSION} \
+      -X github.com/luckyPipewrench/pipelock/internal/license.PublicKeyHex=${LICENSE_PUBLIC_KEY} \
+      -X github.com/luckyPipewrench/pipelock/internal/rules.KeyringHex=${RULES_KEYRING_HEX}" \
     -o /pipelock ./cmd/pipelock
 
 # Scratch-based final image (~15MB)

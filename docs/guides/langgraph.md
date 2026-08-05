@@ -197,7 +197,7 @@ Use `dockerfile_lines` in `langgraph.json` to install Pipelock into the image:
     "env": ".env",
     "dockerfile_lines": [
         "RUN apt-get update && apt-get install -y curl",
-        "RUN PIPELOCK_VERSION=0.3.2 && curl -fsSL https://github.com/luckyPipewrench/pipelock/releases/download/v${PIPELOCK_VERSION}/pipelock_${PIPELOCK_VERSION}_linux_amd64.tar.gz | tar xz -C /usr/local/bin/",
+        "RUN curl -fsSL https://github.com/luckyPipewrench/pipelock/releases/latest/download/pipelock_linux_amd64.tar.gz | tar xz -C /usr/local/bin/",
         "COPY pipelock-config.yaml /etc/pipelock/config.yaml"
     ]
 }
@@ -319,17 +319,39 @@ You can also generate a base template with:
 pipelock generate docker-compose --agent generic
 ```
 
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy (`HTTPS_PROXY`), CONNECT tunnels
+are opaque by default: pipelock only sees the hostname, not the request body or
+response content. Enabling TLS interception closes this gap by performing a MITM
+on HTTPS connections, giving you full DLP on request bodies and response
+injection detection through CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Trust the CA in your Python environment:
+
+```bash
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+# Or for requests/httpx specifically:
+export REQUESTS_CA_BUNDLE=~/.pipelock/ca.pem
+```
+
+MCP proxy mode (stdio wrapping) does not require TLS interception. It scans
+traffic in both directions without certificates.
+
 ## Choosing a Config
 
 | Preset | Action | Best For |
 |--------|--------|----------|
-| `generic-agent.yaml` | warn | New agent integrations (recommended starting point) |
-| `balanced.yaml` | warn | General purpose, fetch proxy tuning |
-| `claude-code.yaml` | block | Claude Code, unattended agents |
-| `strict.yaml` | block | High-security, production |
+| `generic-agent` | warn | New agent integrations (recommended starting point) |
+| `balanced` | warn | General purpose, fetch proxy tuning |
+| `claude-code` | block | Claude Code, unattended agents |
+| `strict` | block | High-security, production |
 
-Start with `generic-agent.yaml` to log detections without blocking. Review the
-logs, then switch to `strict.yaml` for production.
+Start with `generic-agent` to log detections without blocking. Review the
+logs, then switch to `strict` for production.
 
 ## Troubleshooting
 

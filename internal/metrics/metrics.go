@@ -1,33 +1,42 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 // Package metrics provides Prometheus instrumentation and a JSON stats endpoint
 // for the Pipelock fetch proxy.
+//
+// The package is split into per-feature files. metrics.go owns the Metrics
+// struct definition and the New constructor; per-feature files
+// (proxy.go, websocket.go, dlp.go, session.go, tls.go, airlock.go,
+// cross_request.go, scan_api.go, kill_switch.go, shield.go, capture.go)
+// own the corresponding metric handles and Record/Set methods. The JSON
+// stats and Prometheus HTTP handlers live in stats_handler.go.
 package metrics
 
 import (
-	"encoding/json"
-	"net/http"
-	"sort"
 	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/client_golang/prometheus/collectors"
 )
-
-const maxTopEntries = 100
 
 // Metrics collects Prometheus counters and histograms for the fetch proxy.
 type Metrics struct {
 	registry *prometheus.Registry
 
-	requestsTotal  *prometheus.CounterVec
-	scannerHits    *prometheus.CounterVec
-	requestLatency prometheus.Histogram
+	// Proxy / tunnel / SNI / reverse proxy (proxy.go).
+	requestsTotal           *prometheus.CounterVec
+	scannerHits             *prometheus.CounterVec
+	requestLatency          prometheus.Histogram
+	tunnelsTotal            *prometheus.CounterVec
+	tunnelDuration          prometheus.Histogram
+	tunnelBytes             prometheus.Counter
+	activeTunnels           prometheus.Gauge
+	sniTotal                *prometheus.CounterVec
+	reverseProxyRequests    *prometheus.CounterVec
+	reverseProxyScanBlocked *prometheus.CounterVec
 
-	tunnelsTotal   *prometheus.CounterVec
-	tunnelDuration prometheus.Histogram
-	tunnelBytes    prometheus.Counter
-	activeTunnels  prometheus.Gauge
-
+	// WebSocket (websocket.go).
 	wsConnectionsTotal *prometheus.CounterVec
 	wsDuration         prometheus.Histogram
 	wsBytes            *prometheus.CounterVec
@@ -36,354 +45,240 @@ type Metrics struct {
 	wsScanHits         *prometheus.CounterVec
 	wsRedirectHints    prometheus.Counter
 
+	// DLP / address protection / file sentry (dlp.go).
+	bodyDLPHits        *prometheus.CounterVec
+	bodyEntropyHits    *prometheus.CounterVec
+	bodyInjectionHits  *prometheus.CounterVec
+	bodyRedactions     *prometheus.CounterVec
+	headerDLPHits      *prometheus.CounterVec
+	dlpWarnMatches     *prometheus.CounterVec
+	AddressFindings    *prometheus.CounterVec
+	FileSentryFindings *prometheus.CounterVec
+
+	// Sessions / adaptive enforcement / chain detection (session.go).
+	sessionAnomalies         *prometheus.CounterVec
+	sessionEscalations       *prometheus.CounterVec
+	sessionsActive           prometheus.Gauge
+	sessionsEvicted          prometheus.Counter
+	adaptiveUpgrades         *prometheus.CounterVec
+	adaptiveSessionsCurrent  *prometheus.GaugeVec
+	sessionAutoDeescalations *prometheus.CounterVec
+	chainDetections          *prometheus.CounterVec
+
+	// TLS interception (tls.go).
+	tlsInterceptTotal    *prometheus.CounterVec
+	tlsCertCacheSize     prometheus.Gauge
+	tlsHandshakeDuration *prometheus.HistogramVec
+	tlsRequestBlocked    *prometheus.CounterVec
+	tlsResponseBlocked   *prometheus.CounterVec
+
+	// Airlock graduated quarantine (airlock.go).
+	airlockSessions       *prometheus.GaugeVec
+	airlockTransitions    *prometheus.CounterVec
+	airlockDenials        *prometheus.CounterVec
+	airlockDrainCompleted prometheus.Counter
+	airlockDrainTimeout   prometheus.Counter
+
+	// Request policy operation safety rails (requestpolicy.go).
+	requestPolicyDecisions *prometheus.CounterVec
+
+	// Cross-request exfiltration detection (cross_request.go).
+	CrossRequestEntropyExceeded prometheus.Counter
+	CrossRequestDLPMatch        prometheus.Counter
+	CrossRequestFragmentBytes   prometheus.Gauge
+
+	// Scan API (scan_api.go).
+	ScanAPIRequests *prometheus.CounterVec
+	ScanAPIDuration *prometheus.HistogramVec
+	ScanAPIFindings *prometheus.CounterVec
+	ScanAPIErrors   *prometheus.CounterVec
+	ScanAPIInflight prometheus.Gauge
+
+	// Kill switch (kill_switch.go).
 	killSwitchDenials *prometheus.CounterVec
 
-	chainDetections *prometheus.CounterVec
+	// Browser shield + response scan exemption (shield.go).
+	shieldRewrites                          *prometheus.CounterVec
+	shieldBytesStripped                     *prometheus.CounterVec
+	shieldShimsInjected                     *prometheus.CounterVec
+	shieldSkipped                           *prometheus.CounterVec
+	shieldOversizeScanHead                  *prometheus.CounterVec
+	shieldLatency                           *prometheus.HistogramVec
+	responseScanExemptTotal                 *prometheus.CounterVec
+	responseScanExemptOverCapUnscannedTotal *prometheus.CounterVec
 
-	sessionAnomalies   *prometheus.CounterVec
-	sessionEscalations *prometheus.CounterVec
-	sessionsActive     prometheus.Gauge
-	sessionsEvicted    prometheus.Counter
+	// Capture (capture.go).
+	CaptureDropped              prometheus.Counter
+	captureSessionIDSanitized   *prometheus.CounterVec
+	captureActionClassSanitized *prometheus.CounterVec
 
-	wsConnectionCount int64
+	// Conductor audit transport (conductor.go).
+	conductorAuditQueuePending   prometheus.Gauge
+	conductorAuditQueueInflight  prometheus.Gauge
+	conductorAuditQueueDead      prometheus.Gauge
+	conductorAuditDeliveries     *prometheus.CounterVec
+	conductorServerRequests      *prometheus.CounterVec
+	conductorServerDuration      *prometheus.HistogramVec
+	conductorServerAuditIngest   *prometheus.CounterVec
+	conductorServerAuditQueries  *prometheus.CounterVec
+	conductorEmergencyQuarantine *prometheus.CounterVec
+	conductorPolicyHashStatuses  *prometheus.GaugeVec
 
-	mu                sync.Mutex
-	startTime         time.Time
-	topBlockedDomains map[string]int64
-	topScannerHits    map[string]int64
-	allowedCount      int64
-	blockedCount      int64
-	tunnelCount       int64
+	// Learn-and-lock observation pipeline (learn.go).
+	learnObservationEvents        *prometheus.CounterVec
+	learnRegulatedDataBlocked     *prometheus.CounterVec
+	learnUnclassifiedActions      prometheus.Counter
+	learnUnclassifiedRate         prometheus.Gauge
+	learnInferenceClassifications *prometheus.CounterVec
+	learnInferenceFloorFailures   *prometheus.CounterVec
+	learnCaptureRecords           prometheus.Counter
+	learnCaptureDropped           prometheus.Counter
 
-	// Session profiling stats (for JSON /stats endpoint)
+	// Mediation envelope verification (envelope.go).
+	envelopeVerifyTotal *prometheus.CounterVec
+
+	// Signed action-receipt emission (receipt.go).
+	receiptEmitFailures      *prometheus.CounterVec
+	requiredReceiptBlockings *prometheus.CounterVec
+	receiptEmitFailureCounts map[string]int64
+	requiredReceiptBlocks    map[string]int64
+
+	// Evidence health (evidence.go).
+	evidenceSequenceGaps        *prometheus.CounterVec
+	evidenceHeartbeatInterval   prometheus.Gauge
+	evidenceLastAnchorTimestamp prometheus.Gauge
+	evidenceAnchoredFinalSeq    prometheus.Gauge
+	evidenceFsyncErrors         *prometheus.CounterVec
+	evidenceAELRequirements     *prometheus.GaugeVec
+	evidenceSelfAuditOK         prometheus.Gauge
+	evidenceSelfAuditFailures   *prometheus.CounterVec
+	evidenceAnchorStateSkipped  prometheus.Counter
+	evidenceAutoAnchorAttempts  prometheus.Counter
+	evidenceAutoAnchorSuccesses prometheus.Counter
+	evidenceAutoAnchorFailures  prometheus.Counter
+	evidenceSequenceGapCounts   map[string]int64
+	evidenceFsyncErrorCounts    map[string]int64
+	evidenceSelfAuditFailCounts map[string]int64
+	evidenceAutoAnchorStats     EvidenceAutoAnchorStats
+	evidenceRequirementValues   map[string]bool
+	evidenceHealthFunc          func() (EvidenceHealthStats, bool)
+	evidenceCollector           *evidenceCollector
+
+	// Rule bundle loading state (rule_bundles.go).
+	ruleBundlesDegraded prometheus.Gauge
+
+	// Enterprise durable SIEM forwarder (siem_forwarder.go).
+	siemForwarderQueued      prometheus.Gauge
+	siemForwarderDelivered   prometheus.Counter
+	siemForwarderFailed      prometheus.Counter
+	siemForwarderDropped     prometheus.Counter
+	siemForwarderLastSuccess prometheus.Gauge
+	siemForwarderSpoolBytes  prometheus.Gauge
+
+	// Built-in audit sink delivery health (audit_sinks.go).
+	auditSinkCollector *auditSinkCollector
+
+	// Stats endpoint state (stats_handler.go).
+	mu                     sync.Mutex
+	startTime              time.Time
+	topBlockedDomains      map[string]int64
+	topScannerHits         map[string]int64
+	topAnomalyTypes        map[string]int64
+	allowedCount           int64
+	blockedCount           int64
+	tunnelCount            int64
+	wsConnectionCount      int64
 	sessionActiveCount     int64
 	sessionAnomalyCount    int64
 	sessionEscalationCount int64
-	topAnomalyTypes        map[string]int64
+	agentStats             map[string]*agentCounters
+	degradedRuleBundles    []string
+
+	// Cross-request exfiltration stats callback (for JSON /stats endpoint).
+	// Called on each /stats request to get live CEE state.
+	CEEStatsFunc func() CEEStats
 }
 
-// New creates a Metrics instance with its own Prometheus registry.
+// agentCounters tracks per-agent request counts for the /stats endpoint.
+// Cardinality is bounded because callers pass the resolved profile name
+// (not the raw header value), which falls back to "_default" for unknown agents.
+type agentCounters struct {
+	Allowed int64
+	Blocked int64
+	Tunnels int64
+}
+
+// New creates a Metrics instance with its own Prometheus registry. Each
+// per-feature register helper allocates that feature's metric handles,
+// registers them with reg, and stores them on m. Splitting the
+// constructor like this keeps each bundle's wiring colocated with the
+// methods that use it without changing the underlying registry pattern
+// (one registry per Metrics, one MustRegister call site per feature).
 func New() *Metrics {
 	reg := prometheus.NewRegistry()
 
-	requestsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "requests_total",
-		Help:      "Total number of fetch proxy requests by result.",
-	}, []string{"result"})
-
-	scannerHits := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "scanner_hits_total",
-		Help:      "Total blocks by scanner type.",
-	}, []string{"scanner"})
-
-	requestLatency := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "pipelock",
-		Name:      "request_duration_seconds",
-		Help:      "Fetch request latency in seconds.",
-		Buckets:   []float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10},
-	})
-
-	tunnelsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "tunnels_total",
-		Help:      "Total CONNECT tunnels by result.",
-	}, []string{"result"})
-
-	tunnelDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "pipelock",
-		Name:      "tunnel_duration_seconds",
-		Help:      "CONNECT tunnel duration in seconds.",
-		Buckets:   []float64{1, 5, 10, 30, 60, 120, 300},
-	})
-
-	tunnelBytes := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "tunnel_bytes_total",
-		Help:      "Total bytes transferred through CONNECT tunnels.",
-	})
-
-	activeTunnels := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "pipelock",
-		Name:      "active_tunnels",
-		Help:      "Current number of active CONNECT tunnels.",
-	})
-
-	wsConnectionsTotal := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "ws_connections_total",
-		Help:      "Total WebSocket proxy connections by result.",
-	}, []string{"result"})
-
-	wsDuration := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Namespace: "pipelock",
-		Name:      "ws_duration_seconds",
-		Help:      "WebSocket connection duration in seconds.",
-		Buckets:   []float64{1, 5, 10, 30, 60, 120, 300, 600, 1800, 3600},
-	})
-
-	wsBytes := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "ws_bytes_total",
-		Help:      "Total bytes transferred through WebSocket proxy.",
-	}, []string{"direction"})
-
-	activeWS := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "pipelock",
-		Name:      "ws_active_connections",
-		Help:      "Current number of active WebSocket proxy connections.",
-	})
-
-	wsFrames := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "ws_frames_total",
-		Help:      "Total WebSocket frames by type.",
-	}, []string{"type"})
-
-	wsScanHits := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "ws_scan_hits_total",
-		Help:      "Total WebSocket scan detections by scanner.",
-	}, []string{"scanner"})
-
-	wsRedirectHints := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "forward_ws_redirect_hint_total",
-		Help:      "CONNECT requests to known WebSocket API hosts.",
-	})
-
-	killSwitchDenials := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "kill_switch_denials_total",
-		Help:      "Total requests denied by the kill switch.",
-	}, []string{"transport", "endpoint"})
-
-	chainDetections := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "chain_detections_total",
-		Help:      "Total tool call chain pattern detections.",
-	}, []string{"pattern", "severity", "action"})
-
-	sessionAnomalies := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "session_anomalies_total",
-		Help:      "Total session behavioral anomalies by type.",
-	}, []string{"type"})
-
-	sessionEscalations := prometheus.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "session_escalations_total",
-		Help:      "Total session enforcement escalations by transition.",
-	}, []string{"from", "to"})
-
-	sessionsActive := prometheus.NewGauge(prometheus.GaugeOpts{
-		Namespace: "pipelock",
-		Name:      "sessions_active",
-		Help:      "Current number of active tracked sessions.",
-	})
-
-	sessionsEvicted := prometheus.NewCounter(prometheus.CounterOpts{
-		Namespace: "pipelock",
-		Name:      "sessions_evicted_total",
-		Help:      "Total sessions evicted by TTL or capacity.",
-	})
-
-	reg.MustRegister(requestsTotal, scannerHits, requestLatency,
-		tunnelsTotal, tunnelDuration, tunnelBytes, activeTunnels,
-		wsConnectionsTotal, wsDuration, wsBytes, activeWS, wsFrames, wsScanHits, wsRedirectHints,
-		killSwitchDenials, chainDetections,
-		sessionAnomalies, sessionEscalations, sessionsActive, sessionsEvicted)
-
-	return &Metrics{
-		registry:           reg,
-		requestsTotal:      requestsTotal,
-		scannerHits:        scannerHits,
-		requestLatency:     requestLatency,
-		tunnelsTotal:       tunnelsTotal,
-		tunnelDuration:     tunnelDuration,
-		tunnelBytes:        tunnelBytes,
-		activeTunnels:      activeTunnels,
-		wsConnectionsTotal: wsConnectionsTotal,
-		wsDuration:         wsDuration,
-		wsBytes:            wsBytes,
-		activeWS:           activeWS,
-		wsFrames:           wsFrames,
-		wsScanHits:         wsScanHits,
-		wsRedirectHints:    wsRedirectHints,
-		killSwitchDenials:  killSwitchDenials,
-		chainDetections:    chainDetections,
-		sessionAnomalies:   sessionAnomalies,
-		sessionEscalations: sessionEscalations,
-		sessionsActive:     sessionsActive,
-		sessionsEvicted:    sessionsEvicted,
-		startTime:          time.Now(),
-		topBlockedDomains:  make(map[string]int64),
-		topScannerHits:     make(map[string]int64),
-		topAnomalyTypes:    make(map[string]int64),
+	m := &Metrics{
+		registry:                    reg,
+		startTime:                   time.Now(),
+		topBlockedDomains:           make(map[string]int64),
+		topScannerHits:              make(map[string]int64),
+		topAnomalyTypes:             make(map[string]int64),
+		agentStats:                  make(map[string]*agentCounters),
+		receiptEmitFailureCounts:    make(map[string]int64),
+		requiredReceiptBlocks:       make(map[string]int64),
+		evidenceSequenceGapCounts:   make(map[string]int64),
+		evidenceFsyncErrorCounts:    make(map[string]int64),
+		evidenceSelfAuditFailCounts: make(map[string]int64),
+		evidenceRequirementValues:   make(map[string]bool),
 	}
+
+	m.registerProxyMetrics(reg)
+	m.registerWSMetrics(reg)
+	m.registerDLPMetrics(reg)
+	m.registerSessionMetrics(reg)
+	m.registerTLSMetrics(reg)
+	m.registerAirlockMetrics(reg)
+	m.registerRequestPolicyMetrics(reg)
+	m.registerCrossRequestMetrics(reg)
+	m.registerScanAPIMetrics(reg)
+	m.registerKillSwitchMetrics(reg)
+	m.registerShieldMetrics(reg)
+	m.registerCaptureMetrics(reg)
+	m.registerConductorMetrics(reg)
+	m.registerLearnMetrics(reg)
+	m.registerEnvelopeMetrics(reg)
+	m.registerReceiptMetrics(reg)
+	m.registerEvidenceMetrics(reg)
+	m.registerRuleBundleMetrics(reg)
+	m.registerSIEMForwarderMetrics(reg)
+	m.auditSinkCollector = newAuditSinkCollector()
+	reg.MustRegister(m.auditSinkCollector)
+
+	// Built-in Go runtime + process collectors. These expose
+	// go_memstats_heap_alloc_bytes, go_goroutines, process_resident_memory_bytes,
+	// and friends. Useful for operators capacity-planning pipelock and for the
+	// agent-egress benchmark to record runtime memory alongside RSS without
+	// adding a separate /debug/vars endpoint.
+	reg.MustRegister(collectors.NewGoCollector())
+	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+
+	return m
 }
 
-// RecordAllowed records a successful (allowed) request.
-func (m *Metrics) RecordAllowed(duration time.Duration) {
-	m.requestsTotal.WithLabelValues("allowed").Inc()
-	m.requestLatency.Observe(duration.Seconds())
-
-	m.mu.Lock()
-	m.allowedCount++
-	m.mu.Unlock()
+// Registry returns the underlying Prometheus registry for test assertions.
+func (m *Metrics) Registry() *prometheus.Registry {
+	return m.registry
 }
 
-// RecordBlocked records a blocked request with domain and scanner info.
-func (m *Metrics) RecordBlocked(domain, scannerName string, duration time.Duration) {
-	m.requestsTotal.WithLabelValues("blocked").Inc()
-	m.scannerHits.WithLabelValues(scannerName).Inc()
-	m.requestLatency.Observe(duration.Seconds())
-
-	m.mu.Lock()
-	m.blockedCount++
-	if len(m.topBlockedDomains) < maxTopEntries {
-		m.topBlockedDomains[domain]++
-	} else if _, exists := m.topBlockedDomains[domain]; exists {
-		m.topBlockedDomains[domain]++
+// agentCounter returns the per-agent counters, creating them on first access.
+// Must be called with m.mu held.
+func (m *Metrics) agentCounter(agent string) *agentCounters {
+	ac := m.agentStats[agent]
+	if ac == nil {
+		ac = &agentCounters{}
+		m.agentStats[agent] = ac
 	}
-	if len(m.topScannerHits) < maxTopEntries {
-		m.topScannerHits[scannerName]++
-	} else if _, exists := m.topScannerHits[scannerName]; exists {
-		m.topScannerHits[scannerName]++
-	}
-	m.mu.Unlock()
-}
-
-// RecordTunnel records a completed CONNECT tunnel.
-func (m *Metrics) RecordTunnel(duration time.Duration, totalBytes int64) {
-	m.tunnelsTotal.WithLabelValues("completed").Inc()
-	m.tunnelDuration.Observe(duration.Seconds())
-	m.tunnelBytes.Add(float64(totalBytes))
-
-	m.mu.Lock()
-	m.tunnelCount++
-	m.mu.Unlock()
-}
-
-// RecordTunnelBlocked records a blocked CONNECT tunnel attempt.
-func (m *Metrics) RecordTunnelBlocked() {
-	m.tunnelsTotal.WithLabelValues("blocked").Inc()
-}
-
-// IncrActiveTunnels increments the active tunnel gauge.
-func (m *Metrics) IncrActiveTunnels() {
-	m.activeTunnels.Inc()
-}
-
-// DecrActiveTunnels decrements the active tunnel gauge.
-func (m *Metrics) DecrActiveTunnels() {
-	m.activeTunnels.Dec()
-}
-
-// RecordWSCompleted records a WebSocket connection that ended normally.
-func (m *Metrics) RecordWSCompleted() {
-	m.wsConnectionsTotal.WithLabelValues("completed").Inc()
-
-	m.mu.Lock()
-	m.wsConnectionCount++
-	m.mu.Unlock()
-}
-
-// RecordWSBlocked records a WebSocket connection terminated by policy/DLP/injection.
-func (m *Metrics) RecordWSBlocked() {
-	m.wsConnectionsTotal.WithLabelValues("blocked").Inc()
-}
-
-// RecordWSStats records duration and byte counters for any WebSocket connection
-// regardless of outcome (completed or blocked).
-func (m *Metrics) RecordWSStats(duration time.Duration, clientToServer, serverToClient int64) {
-	m.wsDuration.Observe(duration.Seconds())
-	m.wsBytes.WithLabelValues("client_to_server").Add(float64(clientToServer))
-	m.wsBytes.WithLabelValues("server_to_client").Add(float64(serverToClient))
-}
-
-// IncrActiveWS increments the active WebSocket connection gauge.
-func (m *Metrics) IncrActiveWS() {
-	m.activeWS.Inc()
-}
-
-// DecrActiveWS decrements the active WebSocket connection gauge.
-func (m *Metrics) DecrActiveWS() {
-	m.activeWS.Dec()
-}
-
-// RecordWSFrame records a WebSocket frame by type.
-func (m *Metrics) RecordWSFrame(frameType string) {
-	m.wsFrames.WithLabelValues(frameType).Inc()
-}
-
-// RecordWSScanHit records a WebSocket scan detection.
-func (m *Metrics) RecordWSScanHit(scannerName string) {
-	m.wsScanHits.WithLabelValues(scannerName).Inc()
-}
-
-// RecordWSRedirectHint records a CONNECT request to a known WebSocket API host.
-func (m *Metrics) RecordWSRedirectHint() {
-	m.wsRedirectHints.Inc()
-}
-
-// RecordKillSwitchDenial increments the kill switch denial counter.
-func (m *Metrics) RecordKillSwitchDenial(transport, endpoint string) {
-	m.killSwitchDenials.WithLabelValues(transport, endpoint).Inc()
-}
-
-// RecordChainDetection increments the chain detection counter.
-func (m *Metrics) RecordChainDetection(pattern, severity, action string) {
-	m.chainDetections.WithLabelValues(pattern, severity, action).Inc()
-}
-
-// RecordSessionAnomaly increments the session anomaly counter by type.
-func (m *Metrics) RecordSessionAnomaly(anomalyType string) {
-	m.sessionAnomalies.WithLabelValues(anomalyType).Inc()
-
-	m.mu.Lock()
-	m.sessionAnomalyCount++
-	if len(m.topAnomalyTypes) < maxTopEntries {
-		m.topAnomalyTypes[anomalyType]++
-	} else if _, exists := m.topAnomalyTypes[anomalyType]; exists {
-		m.topAnomalyTypes[anomalyType]++
-	}
-	m.mu.Unlock()
-}
-
-// RecordSessionEscalation increments the session escalation counter by transition.
-func (m *Metrics) RecordSessionEscalation(from, to string) {
-	m.sessionEscalations.WithLabelValues(from, to).Inc()
-
-	m.mu.Lock()
-	m.sessionEscalationCount++
-	m.mu.Unlock()
-}
-
-// SetSessionsActive sets the current number of active tracked sessions.
-func (m *Metrics) SetSessionsActive(n float64) {
-	m.sessionsActive.Set(n)
-
-	m.mu.Lock()
-	m.sessionActiveCount = int64(n)
-	m.mu.Unlock()
-}
-
-// RecordSessionEvicted increments the evicted sessions counter.
-func (m *Metrics) RecordSessionEvicted() {
-	m.sessionsEvicted.Inc()
-}
-
-// RegisterKillSwitchState registers a custom collector that reports the
-// current kill switch state as pipelock_kill_switch_active{source=...}
-// gauges. The sourceFunc is called once per Prometheus scrape and should
-// return the active/inactive state of each source (e.g. Controller.Sources).
-func (m *Metrics) RegisterKillSwitchState(sourceFunc func() map[string]bool) {
-	if sourceFunc == nil {
-		return
-	}
-	m.registry.MustRegister(&killSwitchCollector{sourceFunc: sourceFunc})
+	return ac
 }
 
 // RegisterInfo registers a pipelock_info gauge with the given version label.
@@ -398,109 +293,4 @@ func (m *Metrics) RegisterInfo(version string) {
 	})
 	info.Set(1)
 	m.registry.MustRegister(info)
-}
-
-// killSwitchCollector implements prometheus.Collector to report kill switch
-// source states on each scrape. This avoids stale gauge values: the state
-// is read fresh from the Controller on every Prometheus scrape request.
-type killSwitchCollector struct {
-	sourceFunc func() map[string]bool
-}
-
-var killSwitchActiveDesc = prometheus.NewDesc(
-	"pipelock_kill_switch_active",
-	"Whether a kill switch source is currently active (1) or inactive (0).",
-	[]string{"source"}, nil,
-)
-
-func (c *killSwitchCollector) Describe(ch chan<- *prometheus.Desc) {
-	ch <- killSwitchActiveDesc
-}
-
-func (c *killSwitchCollector) Collect(ch chan<- prometheus.Metric) {
-	for source, active := range c.sourceFunc() {
-		val := 0.0
-		if active {
-			val = 1.0
-		}
-		ch <- prometheus.MustNewConstMetric(killSwitchActiveDesc, prometheus.GaugeValue, val, source)
-	}
-}
-
-// PrometheusHandler returns an HTTP handler that serves /metrics in Prometheus text format.
-func (m *Metrics) PrometheusHandler() http.Handler {
-	return promhttp.HandlerFor(m.registry, promhttp.HandlerOpts{})
-}
-
-// StatsHandler returns an HTTP handler that serves a JSON stats summary.
-func (m *Metrics) StatsHandler() http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		m.mu.Lock()
-		total := m.allowedCount + m.blockedCount
-		stats := statsResponse{
-			UptimeSeconds: time.Since(m.startTime).Seconds(),
-			Requests: requestStats{
-				Total:   total,
-				Allowed: m.allowedCount,
-				Blocked: m.blockedCount,
-			},
-			Tunnels:           m.tunnelCount,
-			WebSockets:        m.wsConnectionCount,
-			TopBlockedDomains: topN(m.topBlockedDomains),
-			TopScanners:       topN(m.topScannerHits),
-			Sessions: sessionStats{
-				Active:       m.sessionActiveCount,
-				Anomalies:    m.sessionAnomalyCount,
-				Escalations:  m.sessionEscalationCount,
-				TopAnomalies: topN(m.topAnomalyTypes),
-			},
-		}
-		if total > 0 {
-			stats.Requests.BlockRate = float64(m.blockedCount) / float64(total)
-		}
-		m.mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(stats)
-	}
-}
-
-type statsResponse struct {
-	UptimeSeconds     float64       `json:"uptime_seconds"`
-	Requests          requestStats  `json:"requests"`
-	Tunnels           int64         `json:"tunnels"`
-	WebSockets        int64         `json:"websockets"`
-	TopBlockedDomains []rankedEntry `json:"top_blocked_domains"`
-	TopScanners       []rankedEntry `json:"top_scanners"`
-	Sessions          sessionStats  `json:"sessions"`
-}
-
-type sessionStats struct {
-	Active       int64         `json:"active"`
-	Anomalies    int64         `json:"anomalies"`
-	Escalations  int64         `json:"escalations"`
-	TopAnomalies []rankedEntry `json:"top_anomalies"`
-}
-
-type requestStats struct {
-	Total     int64   `json:"total"`
-	Allowed   int64   `json:"allowed"`
-	Blocked   int64   `json:"blocked"`
-	BlockRate float64 `json:"block_rate"`
-}
-
-type rankedEntry struct {
-	Name  string `json:"name"`
-	Count int64  `json:"count"`
-}
-
-func topN(m map[string]int64) []rankedEntry {
-	entries := make([]rankedEntry, 0, len(m))
-	for name, count := range m {
-		entries = append(entries, rankedEntry{Name: name, Count: count})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Count > entries[j].Count
-	})
-	return entries
 }

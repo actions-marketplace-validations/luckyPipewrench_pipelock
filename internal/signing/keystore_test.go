@@ -1,9 +1,13 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package signing
 
 import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -259,6 +263,9 @@ func TestKeystoreListTrusted(t *testing.T) {
 }
 
 func TestKeystoreDirectoryPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows uses NTFS ACLs not Unix mode bits; the dirPermission assertion is meaningless here")
+	}
 	base := t.TempDir()
 	ks := NewKeystore(base)
 
@@ -266,13 +273,15 @@ func TestKeystoreDirectoryPermissions(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Agent directory should be 0700.
+	// MkdirAll requests 0750, but a stricter process umask may safely remove
+	// group bits. Require owner access and reject group-write/world access.
 	info, err := os.Stat(ks.agentDir("test"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != dirPermission {
-		t.Errorf("agent dir permissions = %04o, want %04o", info.Mode().Perm(), dirPermission)
+	perm := info.Mode().Perm()
+	if perm&0o700 != 0o700 || perm&0o027 != 0 {
+		t.Errorf("agent dir permissions = %04o, want owner rwx with no group-write/world access", perm)
 	}
 }
 
@@ -336,7 +345,7 @@ func TestKeystoreResolvePublicKey_CorruptedKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	pubPath := ks.PublicKeyPath("corrupt")
-	if err := os.WriteFile(pubPath, []byte("garbage"), 0o600); err != nil { //nolint:gosec // test path
+	if err := os.WriteFile(filepath.Clean(pubPath), []byte("garbage"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -439,6 +448,9 @@ func TestKeystoreResolvePublicKey_NotFound(t *testing.T) {
 }
 
 func TestKeystoreListAgents_ReadError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o000 does not block directory reads on Windows (NTFS ACLs, not Unix mode bits)")
+	}
 	base := t.TempDir()
 	ks := NewKeystore(base)
 
@@ -485,6 +497,9 @@ func TestKeystoreListAgents_NonDirEntries(t *testing.T) {
 }
 
 func TestKeystoreGenerateAgent_ReadOnlyBaseDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o500 does not block directory writes on Windows (NTFS ACLs, not Unix mode bits)")
+	}
 	base := t.TempDir()
 	ks := NewKeystore(base)
 
@@ -501,6 +516,9 @@ func TestKeystoreGenerateAgent_ReadOnlyBaseDir(t *testing.T) {
 }
 
 func TestKeystoreListTrusted_ReadError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o000 does not block directory reads on Windows (NTFS ACLs, not Unix mode bits)")
+	}
 	base := t.TempDir()
 	ks := NewKeystore(base)
 
@@ -554,6 +572,9 @@ func TestKeystoreListTrusted_NonPubEntries(t *testing.T) {
 }
 
 func TestKeystoreGenerateAgent_MkdirError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod 0o500 does not block directory writes on Windows (NTFS ACLs, not Unix mode bits)")
+	}
 	// Make the base dir unwritable so MkdirAll fails inside generateAgent.
 	base := t.TempDir()
 	if err := os.Chmod(base, 0o500); err != nil { //nolint:gosec // intentionally restrictive for test
@@ -566,8 +587,8 @@ func TestKeystoreGenerateAgent_MkdirError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unwritable base directory")
 	}
-	if !strings.Contains(err.Error(), "creating agent directory") {
-		t.Errorf("expected 'creating agent directory' error, got: %v", err)
+	if !strings.Contains(err.Error(), "creating agents directory") {
+		t.Errorf("expected 'creating agents directory' error, got: %v", err)
 	}
 }
 
@@ -581,7 +602,7 @@ func TestKeystoreForceGenerateAgent_Success(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Force regenerate — should succeed and produce different key.
+	// Force regenerate - should succeed and produce different key.
 	pub2, err := ks.ForceGenerateAgent("myagent")
 	if err != nil {
 		t.Fatal(err)
@@ -621,6 +642,9 @@ func TestKeystoreTrustKey_MissingFile(t *testing.T) {
 }
 
 func TestKeystoreTrustKey_ReadOnlyBase(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod does not block directory writes on Windows (NTFS ACLs, not Unix mode bits)")
+	}
 	// TrustKey should fail when the keystore base dir is read-only
 	// (MkdirAll for trusted/ subdir fails).
 	base := t.TempDir()
@@ -645,5 +669,102 @@ func TestKeystoreTrustKey_ReadOnlyBase(t *testing.T) {
 	err = ks.TrustKey("test-agent", keyPath)
 	if err == nil {
 		t.Fatal("expected error for read-only base directory")
+	}
+}
+
+func TestKeystoreGenerateAgent_SymlinkContainment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege which non-admin shells lack")
+	}
+	base := t.TempDir()
+	outside := t.TempDir()
+	ks := NewKeystore(base)
+
+	// Create the agents/ directory so we can plant a symlink inside it.
+	agentsDir := filepath.Join(base, "agents")
+	if err := os.MkdirAll(agentsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	// Symlink agents/evil -> outside directory.
+	if err := os.Symlink(outside, filepath.Join(agentsDir, "evil")); err != nil {
+		t.Fatal(err)
+	}
+
+	// GenerateAgent should refuse because resolved path is outside keystore.
+	_, err := ks.ForceGenerateAgent("evil")
+	if err == nil {
+		t.Fatal("expected containment error for symlinked agent directory")
+	}
+	if !strings.Contains(err.Error(), "containment") {
+		t.Fatalf("expected containment error, got: %v", err)
+	}
+
+	// Verify no key was written to the outside directory.
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("key was written outside keystore: %v", entries)
+	}
+}
+
+func TestKeystoreLoadPrivateKey_SymlinkContainment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege which non-admin shells lack")
+	}
+	base := t.TempDir()
+	outside := t.TempDir()
+	ks := NewKeystore(base)
+
+	// Create agents/ and symlink agents/evil -> outside.
+	agentsDir := filepath.Join(base, "agents")
+	if err := os.MkdirAll(agentsDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(agentsDir, "evil")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ks.LoadPrivateKey("evil")
+	if err == nil {
+		t.Fatal("expected containment error for symlinked agent directory")
+	}
+	if !strings.Contains(err.Error(), "containment") {
+		t.Fatalf("expected containment error, got: %v", err)
+	}
+}
+
+func TestKeystoreGenerateAgent_SymlinkedParentContainment(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Symlink on Windows requires SeCreateSymbolicLinkPrivilege which non-admin shells lack")
+	}
+	base := t.TempDir()
+	outside := t.TempDir()
+	ks := NewKeystore(base)
+
+	// Symlink the entire agents/ directory to an external location.
+	// This tests that containment catches a symlinked parent, not
+	// just a symlinked leaf agent directory.
+	if err := os.Symlink(outside, filepath.Join(base, "agents")); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := ks.ForceGenerateAgent("victim")
+	if err == nil {
+		t.Fatal("expected containment error for symlinked agents/ parent")
+	}
+	if !strings.Contains(err.Error(), "containment") {
+		t.Fatalf("expected containment error, got: %v", err)
+	}
+
+	// Verify no directory was created outside the keystore.
+	entries, err := os.ReadDir(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("directory created outside keystore via symlinked parent: %v", entries)
 	}
 }

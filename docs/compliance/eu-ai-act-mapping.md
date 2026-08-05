@@ -6,7 +6,19 @@ How Pipelock's runtime security controls map to the [EU AI Act (Regulation 2024/
 
 **Disclaimer:** This document maps Pipelock's security features to EU AI Act requirements for informational purposes. It does not constitute legal advice or guarantee regulatory compliance. Organizations should consult qualified legal counsel for compliance obligations specific to their AI systems.
 
-**Last updated:** v0.3.2 (March 2026)
+**Last reviewed:** July 2026 against v3.3.0. This mapping describes current
+behavior; see [CHANGELOG.md](../../CHANGELOG.md) for release history.
+
+Recent control additions reviewed:
+
+- Art. 12: block-reason receipts, scan API tool-call findings, and file_sentry skip visibility improve operator records for mediated decisions and uninspected local files.
+- Art. 13: `request_policy_deny` block reasons and explicit scan-cap failure behavior make denial causes more transparent to operators and agent clients.
+- Art. 14: `verify-install` WebSocket coverage and file_sentry block mode give deployers more concrete checks and controls over protected agent runtime behavior.
+- Art. 15: `request_policy` operation rails, per-frame WebSocket enforcement, header-DLP parity, and submit-profile SSRF-safe dialing strengthen runtime robustness against unsafe egress.
+- Art. 15(4)/(5): redaction passthrough hardening, media canonical-end truncation, and response scan-cap fail-closed behavior reduce avoidable corruption while keeping cybersecurity controls fail-closed.
+
+Fleet control-plane documentation ships in v2.7: see the
+[Conductor guide](../guides/conductor.md).
 
 ---
 
@@ -17,7 +29,7 @@ Coverage levels: **Full** = Pipelock feature directly implements the requirement
 | Article | Topic | Coverage |
 |---------|-------|----------|
 | Art. 9 | Risk Management System | Partial (runtime controls only) |
-| Art. 12 | Record-Keeping | Full (logging requirements) |
+| Art. 12 | Record-Keeping | Partial (mediated events; core delivery is best-effort) |
 | Art. 13 | Transparency | Moderate |
 | Art. 14 | Human Oversight | Moderate (terminal-only HITL) |
 | Art. 15 | Accuracy, Robustness, Cybersecurity | Moderate |
@@ -33,12 +45,12 @@ Article 9 requires a continuous, iterative risk management process throughout th
 
 | Requirement | Pipelock Feature | Coverage |
 |-------------|-----------------|----------|
-| Identify and analyze known risks (Art. 9(2)(a)) | 9-layer scanner pipeline classifies network-level risks: scheme validation, SSRF, domain blocklist, rate limiting, DLP (inc. env leak), path entropy, subdomain entropy, URL length, data budget | Partial |
+| Identify and analyze known risks (Art. 9(2)(a)) | Ordered scanner pipeline classifies mediated network risks through URL validation, destination policy, DLP, entropy analysis, SSRF/rebinding protection, rate limiting, and data budgets | Partial |
 | Evaluate risks under foreseeable misuse (Art. 9(2)(b)) | Adversarial testing of bypass attempts (encoded secrets, DNS exfiltration, zero-width injection, split-key attacks) | Partial |
 | Post-market monitoring data (Art. 9(2)(c)) | Prometheus metrics (`/metrics`), JSON stats (`/stats`), structured audit logs | Partial |
-| Eliminate risks through design (Art. 9(5)(a)) | Capability separation eliminates network-based credential exfiltration: agent holds secrets with no network; proxy has network with no secrets | Partial |
+| Eliminate risks through design (Art. 9(5)(a)) | Capability separation reduces network-based credential exfiltration risk: agent holds secrets with no network; proxy has network with no agent secrets. Deployment enforces the boundary | Partial |
 | Mitigation and control measures (Art. 9(5)(b)) | Multi-layer scanning, domain blocklist, rate limiting, DLP patterns, HITL approval | Full |
-| Residual risk information to deployers (Art. 9(5)(c)) | Audit logs document every scan decision; `/stats` endpoint surfaces top threats | Partial |
+| Residual risk information to deployers (Art. 9(5)(c)) | Audit events document mediated scanner and policy decisions; `/stats` surfaces observed threats. Completeness still depends on deployment routing and sink delivery | Partial |
 | Prior defined metrics and thresholds (Art. 9(8)) | Configurable thresholds per scanner layer; Prometheus counters for block rates by category | Full |
 | Continuous lifecycle process (Art. 9(2)) | Hot-reload config (fsnotify + SIGHUP) for live policy updates without restart | Partial |
 
@@ -52,12 +64,15 @@ Article 12 requires automatic event logging in high-risk AI systems for risk ide
 
 | Requirement | Pipelock Feature | Coverage |
 |-------------|-----------------|----------|
-| Automatic recording of events (Art. 12(1)) | Structured JSON audit logging (zerolog) for every request: URL, domain, agent name, scan result, scanner reason, timestamp, duration | Full |
+| Automatic recording of events (Art. 12(1)) | Structured JSON logging records mediated scanner and policy events with transport-appropriate fields. External emission is best-effort unless the Enterprise durable SIEM path is used | Partial |
 | Identify risk situations (Art. 12(2)(a)) | Categorized threat events: SSRF, DLP match, prompt injection, env leak, entropy anomaly, rate limit, redirect chain | Full |
 | Support post-market monitoring (Art. 12(2)(b)) | Prometheus metrics with counters, histograms, and alerting integration; Grafana dashboard (`configs/grafana-dashboard.json`) | Full |
-| Enable deployer monitoring (Art. 12(2)(c)) | Per-agent identification via `X-Pipelock-Agent` header; agent name in every log entry | Full |
+| Enable deployer monitoring (Art. 12(2)(c)) | Per-agent profiles provide named identity, independent config, and per-agent budgets; mediated events carry resolved agent identity when available | Partial |
 
-**Gap:** None for the logging requirements Pipelock addresses. Full Art. 12 includes biometric system requirements (Art. 12(3)) that don't apply.
+**Gap:** Pipelock cannot prove that traffic bypassing the mediated boundary was
+recorded, and core external emission is best-effort. Full Article 12 also
+includes system-level retention and biometric requirements that are outside
+this component's scope.
 
 ---
 
@@ -71,7 +86,7 @@ Article 13 requires sufficient operational transparency for deployers to underst
 | Limitations documented | Each OWASP mapping doc includes explicit coverage gaps and "out of scope" sections | Full |
 | Logging mechanism description | Audit log format, event types, and fields documented in CLAUDE.md and guides | Full |
 | Human oversight measures described (Art. 14 ref) | HITL documentation in guides and config presets | Partial |
-| Computational/hardware requirements | Single static binary (~12MB), documented in README | Full |
+| Computational/hardware requirements | Single-binary deployment and reproducible performance benchmarks are documented; artifact size varies by platform, build tags, and release flags | Partial |
 
 **Gap:** Full Art. 13 compliance requires system-level documentation that depends on the deployer's AI system, not just the security layer.
 
@@ -85,7 +100,7 @@ Article 14 requires AI systems to be designed for effective human oversight, inc
 |-------------|-----------------|----------|
 | Understand system operation (Art. 14(4)(a)) | Audit logs, Prometheus metrics, `/stats` endpoint, Grafana dashboard | Full |
 | Detect anomalies and dysfunctions (Art. 14(4)(a)) | Real-time threat detection via pattern matching and entropy threshold analysis | Partial |
-| Override or reverse output (Art. 14(4)(d)) | HITL `action: ask` lets the operator approve, deny, or strip on each flagged request | Full |
+| Override or reverse output (Art. 14(4)(d)) | HITL `action: ask` lets the operator approve, deny, or strip on each flagged request, but only for flagged traffic rather than all system outputs | Partial |
 | Intervene or interrupt via "stop button" (Art. 14(4)(e)) | Fail-closed design: HITL timeout defaults to block; context cancellation stops operation | Full |
 | Awareness of automation bias (Art. 14(4)(b)) | Configurable modes (audit/balanced/strict) force explicit enforcement decisions | Partial |
 | Commensurate with risk level (Art. 14(3)) | Three preset modes map to different risk tolerances; per-scanner thresholds configurable | Full |
@@ -104,9 +119,9 @@ Note: Art. 15(5) uses "adversarial examples" and "model evasion," not "prompt in
 | Requirement | Pipelock Feature | Coverage |
 |-------------|-----------------|----------|
 | **Adversarial examples / model evasion** (Art. 15(5)) | Content scanning on responses and MCP tool results; zero-width char stripping; NFKC normalization; case-insensitive matching; null byte stripping. Covers text-based injection patterns, not model-level evasion. | Partial |
-| **Confidentiality attacks** (Art. 15(5)) | DLP scanning (22 built-in credential patterns, extensible via config), env leak detection (raw + base64 + hex), Shannon entropy analysis, DNS subdomain exfiltration detection, split-key concatenation scanning | Full |
+| **Confidentiality attacks** (Art. 15(5)) | DLP scanning (65 built-in credential patterns, extensible via config), env leak detection (raw + base64 + hex), Shannon entropy analysis, DNS subdomain exfiltration detection, split-key concatenation scanning | Full |
 | **Data poisoning** (Art. 15(5)) | File integrity monitoring (SHA256 manifests), Ed25519 signing and verification, response scanning on fetched content | Partial |
-| **Resilient against unauthorized alteration** (Art. 15(5)) | Capability separation prevents agent from being manipulated into exfiltrating data; SSRF blocks access to internal infrastructure | Full |
+| **Resilient against unauthorized alteration** (Art. 15(5)) | Pipelock blocks mediated exfiltration attempts and SSRF probes by inspecting traffic at the network and tool boundary. Coverage is bounded to traffic that traverses the Pipelock proxy (forward, intercept, reverse, fetch, MCP, WebSocket, A2A surfaces); capability separation reduces risk further when deployment topology or sandboxing forces agent traffic through Pipelock, but the topology that routes traffic through the proxy is deployment-enforced, not binary-enforced. Out-of-band channels not routed through Pipelock fall outside this control. | Partial |
 | **Technical redundancy / fail-safe** (Art. 15(4)) | Fail-closed architecture: scan error, HITL timeout, parse failure, DNS error, context cancellation all default to block | Full |
 | **Resilient to errors and faults** (Art. 15(4)) | DNS rebinding protection (resolve-validate-dial); IPv4-mapped IPv6 normalization; CRLF normalization in diff parsing | Full |
 | **Accuracy metrics declared** (Art. 15(1-3)) | Prometheus counters per scanner layer; false positive tuning via audit mode | Partial |
@@ -143,7 +158,7 @@ These require other tools or organizational processes:
 | EU database registration | Art. 71 | Administrative requirement |
 | Incident reporting timelines | Art. 73 | Audit logs provide incident data; reporting process is organizational |
 | Bias and fairness evaluation | Art. 10(2) | Pipelock applies rules uniformly but doesn't evaluate model fairness |
-| Code execution sandboxing | Art. 15(4) | Pipelock controls egress, not process isolation. See [srt](https://github.com/anthropic-experimental/sandbox-runtime) or [agentsh](https://github.com/canyonroad/agentsh). |
+| Full process isolation for the agent runtime | Art. 15(4) | Pipelock ships best-effort sandbox primitives (Landlock, seccomp, network namespace isolation on Linux) but full process isolation for the agent itself depends on OS/container support and deployment policy. For a stricter agent-runtime sandbox see [srt](https://github.com/anthropic-experimental/sandbox-runtime) or [agentsh](https://github.com/canyonroad/agentsh). |
 
 ---
 
@@ -157,7 +172,7 @@ How Pipelock maps to NIST AI Risk Management Framework functions, with EU AI Act
 |-----------------|-------------|-----------------|-----------|
 | GOVERN 1.2 | Trustworthy AI characteristics integrated into organizational policies | Capability separation architecture; fail-closed design philosophy | Art. 9 |
 | GOVERN 1.4 | Ongoing monitoring plans documented | Prometheus metrics, audit logging, Grafana dashboard | Art. 12 |
-| GOVERN 2.1 | Roles and responsibilities for AI risk management | Per-agent identification (`X-Pipelock-Agent`); HITL assigns human approval responsibility | Art. 14 |
+| GOVERN 2.1 | Roles and responsibilities for AI risk management | Per-agent profiles with listener binding (spoof-proof) or header-based identification; HITL assigns human approval responsibility | Art. 14 |
 | GOVERN 4.2 | Organizational teams document AI risks and impacts | Structured audit logs, config files, OWASP mapping docs | Art. 11, 13 |
 | GOVERN 6.1 | Third-party AI risks addressed in policy | MCP bidirectional scanning treats all MCP servers as untrusted; domain blocklists control external access | Art. 9, 15 |
 | GOVERN 6.2 | Contingency processes for third-party risk | Fail-closed: scanning failure blocks traffic; HITL timeout blocks; MCP parse errors block | Art. 15 |
@@ -176,7 +191,7 @@ How Pipelock maps to NIST AI Risk Management Framework functions, with EU AI Act
 | NIST Subcategory | Description | Pipelock Feature | EU AI Act |
 |-----------------|-------------|-----------------|-----------|
 | MEASURE 1.1 | Metrics selected and documented | Prometheus: `pipelock_requests_total`, `pipelock_scanner_hits_total`, `pipelock_request_duration_seconds` | Art. 12 |
-| MEASURE 2.5 | System demonstrated valid and reliable | CI: 3 required checks (test, lint, build), CodeQL analysis, full test suite with race detector (see [README](../../README.md#testing)) | Art. 15 |
+| MEASURE 2.5 | System demonstrated valid and reliable | CI: 6 required checks (test, lint, build, govulncheck, CodeQL, pipelock self-scan), CodeQL analysis, full test suite with race detector (see [README](../../README.md#testing)) | Art. 15 |
 | MEASURE 2.6 | Evaluated for misuse and abuse | Scanning layers target misuse: DLP catches exfiltration, SSRF catches internal probing, injection detection catches hijacking | Art. 9, 15 |
 | MEASURE 2.7 | Security and resilience evaluated | Security audit completed (26 of 32 items fixed); DNS rebinding protection; fail-closed architecture | Art. 15 |
 | MEASURE 3.1 | Risks tracked on ongoing basis | Prometheus real-time tracking; zerolog persistent timeline; both queryable and alertable | Art. 12 |
@@ -201,11 +216,11 @@ Mapping from individual Pipelock controls to both frameworks.
 
 | Control | Description | EU AI Act | NIST AI RMF |
 |---------|-------------|-----------|-------------|
-| Capability separation | Agent has secrets, no network; proxy has network, no secrets | Art. 15(5) | GOVERN 1.2, MAP 1.1 |
+| Capability separation | Agent has secrets, no network; proxy has network, no agent secrets. Deployment enforces boundary | Art. 15(5) | GOVERN 1.2, MAP 1.1 |
 | SSRF protection | Private IP blocking, DNS rebinding prevention, metadata endpoint blocking | Art. 15(4-5) | MAP 2.1, MEASURE 2.7 |
 | Domain blocklist | Configurable deny/allow lists with wildcard support | Art. 9(5) | GOVERN 1.2, MANAGE 1.1 |
 | Rate limiting | Per-domain sliding window, base domain normalization | Art. 15(4) | MANAGE 1.1 |
-| DLP scanning | 22 built-in credential patterns, custom regex, severity classification | Art. 15(5) | GOVERN 1.2, MEASURE 2.6 |
+| DLP scanning | 65 built-in credential patterns, custom regex, severity classification | Art. 15(5) | GOVERN 1.2, MEASURE 2.6 |
 | Env leak detection | Raw + base64 + hex, Shannon entropy > 3.0 | Art. 15(5) | MEASURE 2.6 |
 | Entropy analysis | Shannon entropy on URL path segments and query parameters | Art. 15(5) | MAP 2.1 |
 | Content scanning | Response scanning with zero-width stripping, NFKC, case-insensitive | Art. 15(5) | MAP 2.1, MEASURE 2.6 |

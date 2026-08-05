@@ -2,6 +2,10 @@
 
 How Pipelock addresses the [OWASP Top 10 for Agentic Applications (2026)](https://genai.owasp.org/resource/owasp-top-10-for-agentic-applications-for-2026/).
 
+See also: [OWASP AIVSS coverage mapping](https://pipelab.org/learn/owasp-aivss-coverage/) for Pipelock's coverage against the AIVSS v0.8 scoring framework (all 10 Agentic AI Core Security Risks).
+
+> **Note:** Coverage levels reflect architectural capabilities against known attack patterns, not guarantees of threat prevention. "Strong" means the feature addresses the threat effectively for known techniques. "Partial" means it contributes but is not sufficient alone. No security tool prevents all instances of any threat class. This mapping is for informational purposes and does not constitute compliance certification.
+
 | Threat | Coverage | Status |
 |--------|----------|--------|
 | ASI01 Agent Goal Hijack | Strong | Shipped |
@@ -33,8 +37,8 @@ How Pipelock addresses the [OWASP Top 10 for Agentic Applications (2026)](https:
 response_scanning:
   enabled: true
   action: block  # block, strip, warn, or ask
-  # 5 patterns ship by default (prompt injection, system override,
-  # role override, new instructions, jailbreak). Example:
+  # 29 patterns ship by default (prompt injection, system override,
+  # role override, jailbreak, credential solicitation, etc). Example:
   patterns:
     - name: "Prompt Injection"
       regex: '(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions|prompts|rules|context)'
@@ -58,7 +62,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 - **MCP tool scanning:** `tools/list` responses are scanned for poisoned descriptions containing hidden instructions. SHA256 baseline per session detects rug-pull definition changes.
 - **Input validation:** URLs are validated, parsed, and scanned before any HTTP request is made. Malformed URLs are rejected.
 
-**Gap:** Pipelock controls the HTTP fetch tool and scans MCP traffic bidirectionally (requests, responses, and tool definitions). It does not restrict shell/filesystem operations. For shell/filesystem controls, see [agentsh](https://github.com/canyonroad/agentsh) or [srt](https://github.com/anthropic-experimental/sandbox-runtime).
+**Gap:** Pipelock controls the HTTP fetch tool, scans MCP traffic bidirectionally (requests, responses, and tool definitions), and with sandbox mode restricts filesystem and network access at the OS level (Landlock + network namespaces + seccomp). Shell command content is inspected via tool policy rules with obfuscation detection. Pipelock does not monitor in-process agent memory or context window manipulation.
 
 ---
 
@@ -68,7 +72,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 
 **Pipelock coverage:**
 
-- **Capability separation:** the agent process (which holds secrets) runs in a network-restricted environment. The fetch proxy (which has network access) holds no secrets. Neither process has both.
+- **Capability separation:** the agent process (which holds secrets) runs in a network-restricted environment. The fetch proxy (which has network access) holds no agent secrets. Deployment (Docker, Kubernetes NetworkPolicy) enforces the boundary. Neither process has both capabilities.
 - **Domain allowlisting:** the agent can only reach explicitly allowed API endpoints (e.g., `*.anthropic.com`, `github.com`).
 - **SSRF protection:** blocks requests to internal/private IP ranges (RFC 1918, link-local, loopback) with DNS rebinding prevention. Custom DialContext resolves DNS and validates all returned IPs before connecting.
 - **Docker Compose isolation:** `pipelock generate docker-compose` creates a network topology where the agent container has no direct internet access.
@@ -86,7 +90,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 - **MCP tool scanning:** `tools/list` responses are scanned for poisoned tool descriptions (hidden instructions, file exfiltration directives, cross-tool manipulation). SHA256 baseline detects rug-pull changes to tool definitions mid-session.
 - **Ed25519 signing:** files and manifests can be signed for tamper-evident verification. Unsigned or re-signed files are flagged.
 
-**Gap:** No dependency scanning (use [Trivy](https://github.com/aquasecurity/trivy) or Dependabot for that). No MCP server identity verification yet.
+**Gap:** No dependency scanning (use [Trivy](https://github.com/aquasecurity/trivy) or [Renovate](https://github.com/renovatebot/renovate) for that). No MCP server identity verification yet.
 
 ---
 
@@ -100,7 +104,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 - **Content extraction:** HTML is converted to clean text via go-readability, removing scripts, styles, and other executable content from fetched pages.
 - **DLP pattern matching:** detects API key formats in URLs and request bodies, which can indicate code execution results leaking secrets.
 
-**Gap:** Pipelock does not sandbox code execution itself. For OS-level sandboxing, see [srt](https://github.com/anthropic-experimental/sandbox-runtime) or [agentsh](https://github.com/canyonroad/agentsh).
+**Gap:** With sandbox mode, pipelock restricts filesystem, network, and syscall access for the agent process (Landlock + network namespaces + seccomp). However, code running inside the allowed filesystem paths with allowed syscalls is not semantically analyzed — pipelock does not interpret what code does, only where it can reach.
 
 ---
 
@@ -113,8 +117,9 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 - **Response scanning:** fetched web content (the most common knowledge source for coding agents) is scanned for injection before entering the agent's context.
 - **Content extraction:** go-readability strips non-content elements, reducing the attack surface of fetched pages.
 - **Workspace integrity monitoring:** detects unauthorized modifications to memory files, config files, and other workspace data the agent reads.
+- **Session taint propagation:** when a contaminated session emits an A2A request body or MCP tool call through a proxied boundary, Pipelock records a `cross_agent` taint source. Hostile-level propagation feeds adaptive enforcement so sustained spread can escalate.
 
-**Gap:** No semantic analysis of retrieved content. Pipelock detects pattern-based injection but not subtly misleading information.
+**Gap:** No semantic analysis of retrieved content. Pipelock detects pattern-based injection but not subtly misleading information. Cross-agent contamination tracking is scoped to a single proxied session; correlating distinct sessions to one logical agent remains outside binary enforcement.
 
 ---
 
@@ -124,11 +129,13 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 
 **Pipelock coverage:**
 
-- **Multi-agent identification:** each agent identifies itself via `X-Pipelock-Agent` header. All audit log entries include the agent name, enabling per-agent monitoring.
+- **Multi-agent identification:** each agent gets a named profile with independent mode, allowlist, DLP, rate limits, and budget. Identity resolution via listener binding (spoof-proof), `X-Pipelock-Agent` header, or `?agent=` query param. All audit log entries include the agent name, enabling per-agent monitoring.
 - **File integrity monitoring:** `pipelock integrity init/check/update` detects unauthorized workspace modifications. An agent that tampers with shared handoff files is detected.
 - **Ed25519 signing:** agents can sign and verify files/manifests. Tampered content is cryptographically detectable.
+- **MCP confused deputy protection:** response ID validation ensures a malicious MCP server cannot inject unsolicited JSON-RPC responses to hijack agent execution flow. Outbound request IDs are tracked and inbound responses are validated against them (one-shot consumption prevents replay).
+- **MCP and A2A scanning:** bidirectional MCP scanning covers proxied tool traffic, and A2A scanning inspects request and response bodies, service-parameter headers, Agent Cards, and SSE streams for injection, DLP, and SSRF findings. One scope exception is worth stating plainly: a **configured MCP upstream** is an operator-chosen destination, and MCP servers legitimately run on loopback or private addresses, so dialing one enforces the cloud instance-metadata floor rather than the full private-address SSRF policy applied to agent-chosen destinations. An agent cannot redirect that dial: the upstream comes from config, not from request input.
 
-**Gap:** No runtime inter-agent communication policy yet. See roadmap issue [#44](https://github.com/luckyPipewrench/pipelock/issues/44).
+**Gap:** Direct agent-to-agent traffic that never transits Pipelock is outside binary enforcement. End-to-end message authentication between agents remains deployment-enforced.
 
 ---
 
@@ -141,7 +148,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 - **Per-domain rate limiting:** sliding window rate limiter prevents bulk requests from one agent overwhelming external services.
 - **Response size limits:** `max_response_mb` caps the size of fetched content, preventing memory exhaustion.
 - **Request timeouts:** configurable per-request timeout prevents hanging connections that block agent pipelines.
-- **Structured logging:** every request is logged with zerolog, enabling rapid diagnosis of failure chains across agents.
+- **Structured logging:** mediated scanner and policy events are logged with zerolog, supporting diagnosis of observed failure chains across agents.
 
 **Gap:** No circuit-breaker pattern or agent-level health checks yet.
 
@@ -154,7 +161,9 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 **Pipelock coverage:**
 
 - **HITL terminal approval:** `action: ask` prompts the human operator with a terminal y/N/s dialog when suspicious content is detected. The human can approve, deny, or strip before the request proceeds.
-- **Audit logging:** every request and scanner detection is logged, giving humans a verifiable record to review.
+- **Audit and receipt evidence:** mediated scanner and policy events are logged.
+  Signed receipts add tamper evidence for recorded enforcement actions, but do
+  not prove that bypassed traffic or every allowed stream frame was captured.
 - **Prometheus metrics:** `/metrics` and `/stats` endpoints surface block rates, scanner hits, and top domains for human oversight dashboards.
 
 **Gap:** No user-facing UI for non-terminal environments. HITL is terminal-only.
@@ -168,7 +177,7 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 **Pipelock coverage:**
 
 - **Principle of least privilege:** the agent only reaches allowed API domains. Everything else is blocked.
-- **Capability separation:** the agent process has no direct network access. Only the proxy (which has no secrets) can reach the internet.
+- **Capability separation:** in an enforced deployment, the agent process has no direct network access. Only the proxy (which holds no agent secrets) can reach the internet. Deployment enforces the network boundary.
 - **Configurable enforcement modes:** strict (block on detection, tight thresholds), balanced (warn on detection, default thresholds), audit (detect and log without blocking).
 - **Domain blocklist:** known exfiltration targets (pastebin, transfer.sh) are explicitly blocked.
 - **Rate limiting:** per-domain sliding window prevents bulk data transfer even to allowed domains.
@@ -180,6 +189,6 @@ Use `pipelock generate config --preset balanced` for the complete default patter
 
 ## Summary
 
-Pipelock provides strong coverage for 3/10 OWASP Agentic threats (ASI01, ASI03, ASI10), moderate coverage for 3/10 (ASI05, ASI06, ASI08), and partial coverage for 4/10 (ASI02, ASI04, ASI07, ASI09). The primary gaps are in inter-agent communication policy (ASI07, [roadmap](https://github.com/luckyPipewrench/pipelock/issues/44)) and semantic content analysis (ASI06).
+Pipelock provides strong coverage for 3/10 OWASP Agentic threats (ASI01, ASI03, ASI10), moderate coverage for 3/10 (ASI05, ASI06, ASI08), and partial coverage for 4/10 (ASI02, ASI04, ASI07, ASI09). The primary gaps are semantic content analysis (ASI06), direct off-proxy inter-agent traffic, and cross-session identity correlation (ASI07).
 
-No single tool covers all 10 threats. Pipelock focuses on the **network egress + content inspection + workspace integrity** layers. For OS-level sandboxing, see [Anthropic srt](https://github.com/anthropic-experimental/sandbox-runtime). For shell-level policy, see [agentsh](https://github.com/canyonroad/agentsh). See [comparison.md](comparison.md) for a full feature matrix.
+No single tool covers all 10 threats. Pipelock covers **network egress + content inspection + process containment + workspace integrity**. For complementary shell-level policy, see [agentsh](https://github.com/canyonroad/agentsh). See [comparison.md](comparison.md) for a full feature matrix.

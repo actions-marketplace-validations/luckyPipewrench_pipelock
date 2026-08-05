@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 // Package projectscan implements project directory scanning for the
 // pipelock audit command. It detects agent types, programming languages,
 // package ecosystems, MCP servers, and secrets to generate a suggested
@@ -144,8 +147,15 @@ func Scan(dir string) (*Report, error) {
 		})
 	}
 
+	// Check for hostile tooling (ablation/uncensor packages)
+	hostileFindings := detectHostileTooling(dir)
+	r.Findings = append(r.Findings, hostileFindings...)
+
 	// Compile DLP patterns once for both scans
-	patterns := compileDLPPatterns()
+	patterns, err := compileDLPPatterns()
+	if err != nil {
+		return nil, fmt.Errorf("compile DLP patterns: %w", err)
+	}
 
 	// Scan for secrets in environment
 	envFindings := scanEnvSecrets(patterns)
@@ -174,6 +184,64 @@ func Scan(dir string) (*Report, error) {
 	return r, nil
 }
 
+// envVarAlwaysSafe holds env var names whose values are structurally
+// guaranteed not to be secrets. These are standard CI runner, shell,
+// and locale variables. Any match against a DLP pattern on these is a
+// false positive. Keeping the list narrow - only names that are
+// defined by well-known infrastructure and whose values never contain
+// credentials.
+var envVarAlwaysSafe = map[string]bool{
+	// POSIX / shell basics.
+	"HOME": true, "PATH": true, "PWD": true, "OLDPWD": true,
+	"SHELL": true, "SHLVL": true, "TERM": true, "USER": true,
+	"LOGNAME": true, "LANG": true, "LC_ALL": true, "TMPDIR": true,
+	// GitHub Actions runner variables (paths + workflow metadata).
+	"GITHUB_ACTION": true, "GITHUB_ACTION_PATH": true,
+	"GITHUB_ACTION_REF": true, "GITHUB_ACTION_REPOSITORY": true,
+	"GITHUB_ACTIONS": true, "GITHUB_ACTOR": true,
+	"GITHUB_API_URL": true, "GITHUB_BASE_REF": true,
+	"GITHUB_ENV": true, "GITHUB_EVENT_NAME": true,
+	"GITHUB_EVENT_PATH": true, "GITHUB_GRAPHQL_URL": true,
+	"GITHUB_HEAD_REF": true, "GITHUB_JOB": true,
+	"GITHUB_OUTPUT": true, "GITHUB_PATH": true,
+	"GITHUB_REF": true, "GITHUB_REF_NAME": true,
+	"GITHUB_REF_PROTECTED": true, "GITHUB_REF_TYPE": true,
+	"GITHUB_REPOSITORY": true, "GITHUB_REPOSITORY_OWNER": true,
+	"GITHUB_RETENTION_DAYS": true, "GITHUB_RUN_ATTEMPT": true,
+	"GITHUB_RUN_ID": true, "GITHUB_RUN_NUMBER": true,
+	"GITHUB_SERVER_URL": true, "GITHUB_SHA": true,
+	"GITHUB_STATE": true, "GITHUB_STEP_SUMMARY": true,
+	"GITHUB_TRIGGERING_ACTOR": true, "GITHUB_WORKFLOW": true,
+	"GITHUB_WORKFLOW_REF": true, "GITHUB_WORKFLOW_SHA": true,
+	"GITHUB_WORKSPACE": true,
+	"RUNNER_ARCH":      true, "RUNNER_DEBUG": true,
+	"RUNNER_ENVIRONMENT": true, "RUNNER_NAME": true,
+	"RUNNER_OS": true, "RUNNER_TEMP": true,
+	"RUNNER_TOOL_CACHE": true, "RUNNER_WORKSPACE": true,
+	// CI_* is GitLab's prefix - mirror coverage for parity.
+	"CI": true, "CI_COMMIT_REF_NAME": true, "CI_PIPELINE_ID": true,
+	"CI_PROJECT_DIR": true, "CI_RUNNER_ID": true,
+}
+
+// envValueIsNeverSecret returns true when the env var value is
+// structurally impossible to be a credential (e.g., an absolute file
+// path). File paths can match digit-heavy regexes (Credit Card Number,
+// etc.) but are never themselves the secret - at most they point at
+// one.
+func envValueIsNeverSecret(value string) bool {
+	// Unix absolute path: starts with "/" and contains a "/" separator
+	// past the first byte. Conservative: requires at least one internal
+	// slash to avoid matching single-char env vars like "/".
+	if strings.HasPrefix(value, "/") && strings.Contains(value[1:], "/") {
+		return true
+	}
+	// Windows absolute path: drive letter + ":\" or ":/".
+	if len(value) >= 3 && value[1] == ':' && (value[2] == '\\' || value[2] == '/') {
+		return true
+	}
+	return false
+}
+
 // scanEnvSecrets checks environment variables against DLP patterns.
 func scanEnvSecrets(patterns []compiledDLP) []Finding {
 	var findings []Finding
@@ -188,8 +256,19 @@ func scanEnvSecrets(patterns []compiledDLP) []Finding {
 		name := parts[0]
 		value := parts[1]
 
+		// Skip variables we know are not credentials. This eliminates
+		// false positives against CI runner metadata and file paths,
+		// which have been observed to match high-entropy digit patterns
+		// (Credit Card Number) purely by coincidence.
+		if envVarAlwaysSafe[name] {
+			continue
+		}
+		if envValueIsNeverSecret(value) {
+			continue
+		}
+
 		for _, p := range patterns {
-			if p.re.MatchString(value) {
+			if p.matches(value) {
 				findings = append(findings, Finding{
 					Severity: severityCritical,
 					Category: "secret",
@@ -205,21 +284,53 @@ func scanEnvSecrets(patterns []compiledDLP) []Finding {
 }
 
 type compiledDLP struct {
-	name string
-	re   *regexp.Regexp
+	name     string
+	re       *regexp.Regexp
+	validate func(string) bool
 }
 
-func compileDLPPatterns() []compiledDLP {
+func compileDLPPatterns() ([]compiledDLP, error) {
 	defaults := config.Defaults()
-	patterns := make([]compiledDLP, 0, len(defaults.DLP.Patterns))
-	for _, p := range defaults.DLP.Patterns {
-		re, err := regexp.Compile(p.Regex)
-		if err != nil {
-			continue
+	return compileDLPPatternsFrom(defaults.DLP.Patterns)
+}
+
+func compileDLPPatternsFrom(patternDefs []config.DLPPattern) ([]compiledDLP, error) {
+	patterns := make([]compiledDLP, 0, len(patternDefs))
+	for _, p := range patternDefs {
+		pattern := p.Regex
+		if !strings.HasPrefix(pattern, "(?i)") {
+			pattern = "(?i)" + pattern
 		}
-		patterns = append(patterns, compiledDLP{name: p.Name, re: re})
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("compile DLP pattern %q: %w", p.Name, err)
+		}
+		cp := compiledDLP{name: p.Name, re: re}
+		if p.Validator != "" {
+			fn, ok := scanner.DLPValidators[p.Validator]
+			if !ok {
+				return nil, fmt.Errorf("unknown DLP validator %q for pattern %q", p.Validator, p.Name)
+			}
+			cp.validate = fn
+		}
+		patterns = append(patterns, cp)
 	}
-	return patterns
+	return patterns, nil
+}
+
+func (p compiledDLP) matches(text string) bool {
+	if p.re == nil {
+		return false
+	}
+	if p.validate == nil {
+		return p.re.MatchString(text)
+	}
+	for _, match := range p.re.FindAllString(text, -1) {
+		if p.validate(match) {
+			return true
+		}
+	}
+	return false
 }
 
 // scanFiles walks the directory and scans config/env files for secrets.
@@ -272,7 +383,7 @@ func scanFiles(dir string, patterns []compiledDLP) []Finding {
 }
 
 func scanFileForSecrets(path, relPath string, patterns []compiledDLP) []Finding {
-	f, err := os.Open(path) //nolint:gosec // G304: path from caller-controlled dir walk
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil
 	}
@@ -285,7 +396,7 @@ func scanFileForSecrets(path, relPath string, patterns []compiledDLP) []Finding 
 		lineNum++
 		line := s.Text()
 		for _, p := range patterns {
-			if p.re.MatchString(line) {
+			if p.matches(line) {
 				findings = append(findings, Finding{
 					Severity: severityCritical,
 					Category: "secret",
@@ -303,7 +414,7 @@ func scanFileForSecrets(path, relPath string, patterns []compiledDLP) []Finding 
 }
 
 func scanFileForEntropy(path, relPath string) []Finding {
-	f, err := os.Open(path) //nolint:gosec // G304: path from caller-controlled dir walk
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return nil
 	}

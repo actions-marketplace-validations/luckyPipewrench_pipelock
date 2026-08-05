@@ -76,7 +76,7 @@ egress:
 
 Rules are evaluated top-to-bottom. First match wins. If no rule matches, `default` applies.
 
-Domain matching is case-insensitive. `*.example.com` matches `api.example.com` but not `example.com` itself. Use both `example.com` and `*.example.com` to cover both.
+Domain matching is case-insensitive. `*.example.com` matches `api.example.com` and the apex `example.com` itself.
 
 ## DLP Rules
 
@@ -84,18 +84,18 @@ Define patterns for detecting secrets and sensitive data in URLs, request bodies
 
 ```yaml
 dlp:
-  scan_environment: true       # Check env vars for leaked values
-  min_env_length: 16           # Min env var value length to flag
+  scan_env: true               # Check env vars for leaked values
+  min_env_secret_length: 16    # Min env var value length to flag
   patterns:
+    # A per-pattern action may only DOWNGRADE to warn; block comes from the
+    # global dlp action, which these patterns inherit by omitting action.
     - name: "Anthropic API Key"
-      regex: 'sk-ant-[a-zA-Z0-9\-_]{10,}'
+      regex: 'sk-ant-[a-zA-Z0-9\-_]{20,}\b'
       severity: critical
-      action: block
 
     - name: "AWS Access Key"
       regex: '(AKIA|ASIA)[A-Z0-9]{16,}'
       severity: critical
-      action: block
 
     - name: "Credential in URL"
       regex: '(password|token|secret|api_?key)=[^\s&]{8,}'
@@ -110,7 +110,7 @@ dlp:
 | `name` | string | yes | Pattern identifier (used in audit events) |
 | `regex` | string | yes | Case-insensitive regex |
 | `severity` | string | yes | `critical`, `high`, `medium`, `low` |
-| `action` | string | no | `block` or `warn` (overrides global DLP action) |
+| `action` | string | no | `warn` only. A per-pattern action may downgrade the global DLP action but never raise it, so `block` and `strip` are rejected. Omit to inherit the global action. |
 
 Regexes are always applied case-insensitive. Implementations should support at minimum: PCRE-compatible syntax, character classes, alternation, and quantifiers.
 
@@ -207,7 +207,16 @@ mcp:
 | `name` | string | yes | Rule identifier |
 | `tool_pattern` | string | yes | Regex matching tool name |
 | `arg_pattern` | string | no | Regex matching argument values |
-| `action` | string | no | `block` or `warn` |
+| `arg_key` | string | no | Regex scoping `arg_pattern` or structural validators to top-level argument keys. Required when any structural validator is set. |
+| `arg_type` | string | no | Required JSON type guard (`string`, `number`, `integer`, `boolean`, `array`, `object`). Type mismatch is dangerous and matches fail-closed. Standalone `arg_type` matches when the value is not that type. With numeric bounds, it must be `number` or `integer`; with length bounds, it must be `string` or `array`. |
+| `arg_number_gt` | number | no | Dangerous numeric condition: match when the parsed JSON number is strictly greater than this threshold. |
+| `arg_number_lt` | number | no | Dangerous numeric condition: match when the parsed JSON number is strictly less than this threshold. |
+| `arg_len_gt` | integer | no | Dangerous length condition: match when a string rune count or array element count is strictly greater than this non-negative threshold. |
+| `arg_len_lt` | integer | no | Dangerous length condition: match when a string rune count or array element count is strictly less than this non-negative threshold. |
+| `arg_value_in` | string array | no | Dangerous value set: match when the canonical value at `arg_key` is in this set. |
+| `action` | string | no | `block`, `warn`, `redirect`, or `defer` |
+
+Structural validators describe dangerous conditions in the default-allow denylist model. Within one rule, `tool_pattern`, optional `arg_pattern`, and every configured structural validator AND together. Numeric checks compare parsed JSON numbers losslessly. Bound, type, and length validators fail closed when the value is absent or unevaluable; `arg_value_in` alone does not match an absent key.
 
 ## Audit Event Format
 

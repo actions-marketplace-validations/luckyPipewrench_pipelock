@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 // Package hitl provides human-in-the-loop terminal approval for pipelock.
 // When the response scanning action is "ask", detected threats are presented
 // to the terminal operator who decides whether to allow, block, or strip.
@@ -96,8 +99,18 @@ func New(timeoutSeconds int, opts ...Option) *Approver {
 		opt(a)
 	}
 
-	a.wg.Add(1)
-	go a.worker()
+	// Only a terminal can answer prompts. When stdin is not a terminal,
+	// Ask() short-circuits to DecisionBlock (fail-closed) and never enqueues a
+	// request, so the worker/readLines goroutine would consume input for
+	// nothing. Worse, that reader is created eagerly on construction: in MCP
+	// stdio proxy mode stdin carries the JSON-RPC protocol, so a background
+	// bufio reader here steals the client's framing bytes and silently breaks
+	// the transport. Skip the reader entirely when non-terminal: no behavior
+	// change for Ask (still fail-closed), just no stdin theft.
+	if a.isTerminal {
+		a.wg.Add(1)
+		go a.worker()
+	}
 
 	return a
 }

@@ -1,10 +1,19 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package chains
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+)
+
+const (
+	maxTrackedSessions = 4096
+	maxSessionKeyBytes = 256
 )
 
 // Verdict describes the result of checking a tool call against chain patterns.
@@ -22,10 +31,12 @@ type MetricsRecorder interface {
 
 // Matcher tracks tool call history per session and matches against patterns.
 type Matcher struct {
-	cfg      *config.ToolChainDetection
-	patterns []pattern
-	sessions sync.Map // sessionKey -> *sessionHistory
-	metrics  MetricsRecorder
+	cfg          *config.ToolChainDetection
+	patterns     []pattern
+	sessions     sync.Map // sessionKey -> *sessionHistory
+	metrics      MetricsRecorder
+	sessionCount atomic.Int64
+	pruneMu      sync.Mutex
 }
 
 // pattern is an internal compiled representation of a chain pattern.
@@ -38,9 +49,10 @@ type pattern struct {
 
 // toolCallRecord stores a classified tool call in the session history.
 type toolCallRecord struct {
-	category  string
-	name      string
-	timestamp time.Time
+	category    string
+	name        string
+	sensitivity string
+	timestamp   time.Time
 }
 
 // sessionHistory holds the tool call history for a single session.
@@ -49,7 +61,7 @@ type sessionHistory struct {
 	records []toolCallRecord
 }
 
-// builtInPatterns defines the 8 default attack chain patterns.
+// builtInPatterns defines the default attack chain patterns (category axis).
 var builtInPatterns = []pattern{
 	{name: "read-then-exec", sequence: []string{"read", "exec"}, severity: "high", action: "warn"},
 	{name: "read-write-send", sequence: []string{"read", "write", "network"}, severity: "critical", action: "warn"},
@@ -59,6 +71,23 @@ var builtInPatterns = []pattern{
 	{name: "write-chmod-execute", sequence: []string{"write", "exec", "exec"}, severity: "critical", action: "warn"},
 	{name: "read-sensitive-write", sequence: []string{"read", "write"}, severity: "medium", action: "warn"},
 	{name: "shell-burst", sequence: []string{"exec", "exec", "exec", "exec"}, severity: "high", action: "warn"},
+	{name: "write-persist", sequence: []string{"write", "persist"}, severity: "critical", action: "warn"},
+	{name: "persist-callback", sequence: []string{"persist", "network"}, severity: "critical", action: "warn"},
+}
+
+// lethalTrifectaPattern is the sensitivity-axis pattern: untrusted-source
+// then sensitive-source then external-sink within the chain window.
+// Three independent research sources cite this shape (Invariantlabs GitHub
+// MCP, parasitic toolchain arXiv 2509.06572, Toxic Flow Analysis).
+//
+// Run separately from category-axis patterns because the data is orthogonal.
+// Operators can override the action via PatternOverrides[lethalTrifectaName].
+const lethalTrifectaName = "lethal-trifecta"
+
+var lethalTrifectaSequence = []string{
+	SensitivityUntrustedSource,
+	SensitivitySensitiveSource,
+	SensitivityExternalSink,
 }
 
 // severityRank maps severity strings to numeric rank for comparison.
@@ -132,19 +161,49 @@ func (m *Matcher) WithMetrics(mr MetricsRecorder) *Matcher {
 // all patterns against the updated history. Returns the highest-severity match.
 //
 // If the tool classifies as "unknown", it is not recorded and no match is returned.
-func (m *Matcher) Record(sessionKey, toolName string) Verdict {
+//
+// The optional argHint parameter provides the raw tool arguments (e.g., the
+// JSON-RPC message body) for argument-aware reclassification. When a tool
+// name classifies as "exec" but the arguments contain persistence commands
+// (crontab, systemctl enable, etc.), the category is upgraded to "persist".
+func (m *Matcher) Record(sessionKey, toolName string, argHint ...string) Verdict {
 	if !m.cfg.Enabled || len(m.patterns) == 0 {
 		return Verdict{}
 	}
 
-	// Classify tool.
+	// Classify tool by name, then refine by arguments if provided.
 	category := classifyTool(toolName, m.cfg)
-	if category == "unknown" {
+	argHintStr := ""
+	if len(argHint) > 0 {
+		argHintStr = argHint[0]
+		category = reclassifyByArgs(category, argHintStr)
+	}
+	sensitivity := ClassifySensitivity(toolName, argHintStr, m.cfg)
+	// Skip recording only if BOTH axes are uninformative. A tool that's
+	// "unknown" by category but carries a real sensitivity label
+	// (e.g., an unrecognized tool name with "external_sink" keywords)
+	// still belongs in the trifecta history.
+	if category == "unknown" && sensitivity == SensitivityNeutral {
 		return Verdict{}
+	}
+	if len(sessionKey) == 0 || len(sessionKey) > maxSessionKeyBytes {
+		return m.recordResourceLimit("session-key-invalid")
 	}
 
 	// Get or create session history.
-	val, _ := m.sessions.LoadOrStore(sessionKey, &sessionHistory{})
+	val, loaded := m.sessions.LoadOrStore(sessionKey, &sessionHistory{})
+	if !loaded {
+		count := m.sessionCount.Add(1)
+		if count%256 == 0 || count > maxTrackedSessions {
+			m.pruneExpiredSessions(time.Now())
+		}
+		if m.sessionCount.Load() > maxTrackedSessions {
+			if _, deleted := m.sessions.LoadAndDelete(sessionKey); deleted {
+				m.sessionCount.Add(-1)
+			}
+			return m.recordResourceLimit("session-capacity")
+		}
+	}
 	sess := val.(*sessionHistory)
 
 	sess.mu.Lock()
@@ -153,9 +212,10 @@ func (m *Matcher) Record(sessionKey, toolName string) Verdict {
 	// Add record.
 	now := time.Now()
 	sess.records = append(sess.records, toolCallRecord{
-		category:  category,
-		name:      toolName,
-		timestamp: now,
+		category:    category,
+		name:        toolName,
+		sensitivity: sensitivity,
+		timestamp:   now,
 	})
 
 	// Evict old entries: time-based first, then count-based.
@@ -172,7 +232,43 @@ func (m *Matcher) Record(sessionKey, toolName string) Verdict {
 // ClearSession removes all tool call history for the given session key.
 // Safe to call with a non-existent key (no-op).
 func (m *Matcher) ClearSession(sessionKey string) {
-	m.sessions.Delete(sessionKey)
+	if _, deleted := m.sessions.LoadAndDelete(sessionKey); deleted {
+		m.sessionCount.Add(-1)
+	}
+}
+
+func (m *Matcher) pruneExpiredSessions(now time.Time) {
+	m.pruneMu.Lock()
+	defer m.pruneMu.Unlock()
+	cutoff := now.Add(-time.Duration(m.cfg.WindowSeconds) * time.Second)
+	m.sessions.Range(func(key, value any) bool {
+		sess := value.(*sessionHistory)
+		sess.mu.Lock()
+		expired := len(sess.records) > 0 && sess.records[len(sess.records)-1].timestamp.Before(cutoff)
+		sess.mu.Unlock()
+		if expired {
+			if _, deleted := m.sessions.LoadAndDelete(key); deleted {
+				m.sessionCount.Add(-1)
+			}
+		}
+		return true
+	})
+}
+
+func resourceLimitVerdict(pattern string) Verdict {
+	return Verdict{Matched: true, PatternName: pattern, Severity: "critical", Action: "block"}
+}
+
+// recordResourceLimit emits the resource-limit block to metrics before returning
+// it. These verdicts return early, ahead of the match path that records every
+// other detection, so without this an operator whose agents are being blocked by
+// session-capacity sees a block with no counter behind it and no way to diagnose it.
+func (m *Matcher) recordResourceLimit(pattern string) Verdict {
+	v := resourceLimitVerdict(pattern)
+	if m.metrics != nil {
+		m.metrics.RecordChainDetection(v.PatternName, v.Severity, v.Action)
+	}
+	return v
 }
 
 // evict removes stale entries from the session history.
@@ -201,6 +297,10 @@ func (m *Matcher) evict(sess *sessionHistory, now time.Time) {
 // matchPatterns checks all patterns against the session history.
 // Returns the highest-severity match (critical > high > medium),
 // breaking ties by strictest action (block > warn).
+//
+// Both axes are evaluated independently: category-axis built-ins/customs,
+// plus the sensitivity-axis lethal-trifecta pattern. The highest-severity
+// match across both wins.
 func (m *Matcher) matchPatterns(sess *sessionHistory) Verdict {
 	var best Verdict
 
@@ -221,6 +321,31 @@ func (m *Matcher) matchPatterns(sess *sessionHistory) Verdict {
 		}
 	}
 
+	// Sensitivity-axis: lethal-trifecta detection.
+	if sensitivitySubsequenceMatch(sess.records, lethalTrifectaSequence, maxGap) {
+		action := m.cfg.Action
+		if action == "" {
+			action = "warn"
+		}
+		if override, ok := m.cfg.PatternOverrides[lethalTrifectaName]; ok {
+			action = override
+		}
+		p := pattern{
+			name:     lethalTrifectaName,
+			sequence: lethalTrifectaSequence,
+			severity: "critical",
+			action:   action,
+		}
+		if !best.Matched || isBetterMatch(p, best) {
+			best = Verdict{
+				Matched:     true,
+				PatternName: p.name,
+				Severity:    p.severity,
+				Action:      p.action,
+			}
+		}
+	}
+
 	return best
 }
 
@@ -236,23 +361,54 @@ func isBetterMatch(p pattern, best Verdict) bool {
 }
 
 // subsequenceMatch checks if the pattern sequence appears as a subsequence
-// in the history records, with at most maxGap non-matching entries between
-// consecutive matched steps.
+// in the history records on the CATEGORY axis, with at most maxGap
+// non-matching entries between consecutive matched steps.
 //
 // If a match attempt fails due to gap constraint, the algorithm retries
 // starting from the next occurrence of the first step.
 func subsequenceMatch(records []toolCallRecord, sequence []string, maxGap int) bool {
+	return subsequenceMatchOnAxis(records, sequence, maxGap, axisCategory)
+}
+
+// sensitivitySubsequenceMatch checks for the sequence on the SENSITIVITY axis.
+// Separate function so the axis is explicit at call sites and the trifecta
+// detector reads naturally.
+func sensitivitySubsequenceMatch(records []toolCallRecord, sequence []string, maxGap int) bool {
+	return subsequenceMatchOnAxis(records, sequence, maxGap, axisSensitivity)
+}
+
+// axis identifies which field of toolCallRecord drives the match.
+type axis int
+
+const (
+	axisCategory axis = iota
+	axisSensitivity
+)
+
+// recordField extracts the value of the axis field from a record.
+func recordField(r toolCallRecord, a axis) string {
+	switch a {
+	case axisSensitivity:
+		return r.sensitivity
+	default:
+		return r.category
+	}
+}
+
+// subsequenceMatchOnAxis is the generic subsequence walker used by both
+// the category-axis and sensitivity-axis matchers.
+func subsequenceMatchOnAxis(records []toolCallRecord, sequence []string, maxGap int, a axis) bool {
 	if len(sequence) == 0 || len(records) == 0 {
 		return false
 	}
 
 	// Try each possible starting position for the first step.
 	for startIdx := 0; startIdx < len(records); startIdx++ {
-		if records[startIdx].category != sequence[0] {
+		if recordField(records[startIdx], a) != sequence[0] {
 			continue
 		}
 
-		if matchFromPosition(records, sequence, startIdx, maxGap) {
+		if matchFromPositionOnAxis(records, sequence, startIdx, maxGap, a) {
 			return true
 		}
 	}
@@ -260,14 +416,14 @@ func subsequenceMatch(records []toolCallRecord, sequence []string, maxGap int) b
 	return false
 }
 
-// matchFromPosition attempts to match the sequence starting from a given position.
-func matchFromPosition(records []toolCallRecord, sequence []string, startIdx, maxGap int) bool {
+// matchFromPositionOnAxis attempts to match the sequence starting from a
+// given position on the specified axis.
+func matchFromPositionOnAxis(records []toolCallRecord, sequence []string, startIdx, maxGap int, a axis) bool {
 	seqIdx := 1 // Already matched step 0 at startIdx.
 	gap := 0
 
 	for i := startIdx + 1; i < len(records) && seqIdx < len(sequence); i++ {
-		if records[i].category == sequence[seqIdx] {
-			// Step matched.
+		if recordField(records[i], a) == sequence[seqIdx] {
 			seqIdx++
 			gap = 0
 		} else {

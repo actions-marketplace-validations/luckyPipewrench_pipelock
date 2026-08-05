@@ -1,9 +1,15 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package integrity
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -174,7 +180,7 @@ func TestManifest_Save_ValidJSON(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data, err := os.ReadFile(path) //nolint:gosec // G304: test reads its own temp file
+	data, err := os.ReadFile(filepath.Clean(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,6 +209,70 @@ func TestLoad_InvalidJSON(t *testing.T) {
 	_, err := Load(path)
 	if err == nil {
 		t.Error("expected error for invalid JSON")
+	}
+}
+
+func TestLoad_PermissionPolicy(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not enforced on Windows")
+	}
+	body := []byte(`{"version":1,"files":{}}`)
+	for _, tt := range []struct {
+		name    string
+		mode    os.FileMode
+		wantErr bool
+	}{
+		{name: "world readable is allowed", mode: 0o644},
+		{name: "group writable is rejected", mode: 0o620, wantErr: true},
+		{name: "world writable is rejected", mode: 0o602, wantErr: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.json")
+			if err := os.WriteFile(path, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(path, tt.mode); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Load mode %04o error = %v, wantErr=%v", tt.mode, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_RejectsDuplicateAndOversizedManifest(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		body []byte
+		want string
+	}{
+		{name: "duplicate files", body: []byte(`{"version":1,"files":{},"files":{"tool":{"sha256":"bad"}}}`), want: "duplicate object key"},
+		// A run of "x" is not JSON, so the decoder rejects it with or without the
+		// size ceiling and the case proves nothing. Pad valid JSON with
+		// insignificant whitespace so exceeding maxManifestBytes is the only
+		// reason this can fail, and match the message so a decode error cannot
+		// masquerade as a size rejection.
+		{
+			name: "oversized valid prefix",
+			body: append([]byte(`{"version":1,"files":{}}`), bytes.Repeat([]byte(" "), maxManifestBytes)...),
+			want: "exceeds",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.json")
+			if err := os.WriteFile(path, tt.body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(path)
+			if err == nil {
+				t.Fatal("Load accepted hostile integrity manifest")
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("Load error = %v, want it to contain %q", err, tt.want)
+			}
+		})
 	}
 }
 
@@ -239,7 +309,7 @@ func TestSave_TargetIsDirectory(t *testing.T) {
 func TestHashFile_Directory(t *testing.T) {
 	dir := t.TempDir()
 
-	// Passing a directory to HashFile — io.Copy from dir fd fails with EISDIR.
+	// Passing a directory to HashFile - io.Copy from dir fd fails with EISDIR.
 	_, err := HashFile(dir)
 	if err == nil {
 		t.Fatal("expected error when hashing a directory")
@@ -255,6 +325,56 @@ func TestSave_BadDirectory(t *testing.T) {
 	err := m.Save("/nonexistent/dir/manifest.json")
 	if err == nil {
 		t.Fatal("expected error for non-existent directory")
+	}
+}
+
+func TestSave_ReadOnlyDirectory(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("cannot test permission errors as root")
+	}
+	dir := t.TempDir()
+	roDir := filepath.Join(dir, "readonly")
+	if err := os.Mkdir(roDir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) }) //nolint:gosec // restore for cleanup
+
+	m := &Manifest{Version: ManifestVersion, Files: map[string]FileEntry{}}
+	err := m.Save(filepath.Join(roDir, "manifest.json"))
+	if err == nil {
+		t.Fatal("expected error when directory is read-only")
+	}
+}
+
+func TestSave_Overwrite(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "manifest.json")
+
+	m1 := &Manifest{
+		Version: ManifestVersion,
+		Files:   map[string]FileEntry{"a.txt": {SHA256: "abc", Size: 10, Mode: "0600"}},
+	}
+	if err := m1.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	m2 := &Manifest{
+		Version: ManifestVersion,
+		Files:   map[string]FileEntry{"b.txt": {SHA256: "def", Size: 20, Mode: "0600"}},
+	}
+	if err := m2.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := loaded.Files["b.txt"]; !ok {
+		t.Error("expected b.txt in manifest after overwrite")
+	}
+	if _, ok := loaded.Files["a.txt"]; ok {
+		t.Error("unexpected a.txt in manifest after overwrite")
 	}
 }
 

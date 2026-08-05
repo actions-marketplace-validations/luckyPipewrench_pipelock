@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package gitprotect
 
 import (
@@ -8,7 +11,10 @@ import (
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
+
+const testPatternAWSKey = "AWS Key"
 
 func TestParseDiff_SingleFileAdded(t *testing.T) {
 	diff := `diff --git a/main.go b/main.go
@@ -153,6 +159,7 @@ func TestParseHunkNewStart(t *testing.T) {
 		{"@@ -10,5 +20,8 @@", 20},
 		{"@@ -0,0 +1,100 @@", 1},
 		{"@@ -5 +7 @@", 7},
+		{"@@ -0,0 +9223372036854775807 @@", 1},
 		{"@@ invalid", 1}, // fallback
 		{"no plus sign", 1},
 	}
@@ -167,7 +174,7 @@ func TestParseHunkNewStart(t *testing.T) {
 
 func testPatterns() []CompiledDLPPattern {
 	return CompileDLPPatterns([]config.DLPPattern{
-		{Name: "AWS Key", Regex: `AKIA[0-9A-Z]{16}`, Severity: "critical"},
+		{Name: testPatternAWSKey, Regex: `AKIA[0-9A-Z]{16}`, Severity: "critical"},
 		{Name: "GitHub Token", Regex: `gh[ps]_[A-Za-z0-9_]{36,}`, Severity: "critical"},
 	})
 }
@@ -191,7 +198,8 @@ func makeDiffWithSecret(file, line string) string {
 func TestScanDiff_FindsSecret(t *testing.T) {
 	key := fakeKey("EXAMPLE")
 	diff := makeDiffWithSecret("config.go", `var key = "`+key+`"`)
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 1 {
 		t.Fatalf("expected 1 finding, got %d", len(findings))
 	}
@@ -202,15 +210,188 @@ func TestScanDiff_FindsSecret(t *testing.T) {
 	if f.Line != 2 {
 		t.Errorf("expected line 2, got %d", f.Line)
 	}
-	if f.Pattern != "AWS Key" {
-		t.Errorf("expected pattern 'AWS Key', got %q", f.Pattern)
+	if f.Pattern != testPatternAWSKey {
+		t.Errorf("expected pattern %q, got %q", testPatternAWSKey, f.Pattern)
 	}
 	if f.Severity != "critical" {
 		t.Errorf("expected severity 'critical', got %q", f.Severity)
 	}
-	// Verify secret is redacted — content should NOT contain the original key
+	// Verify secret is redacted - content should NOT contain the original key
 	if f.Content == `var key = "`+key+`"` {
 		t.Error("content should be redacted but contains original secret")
+	}
+}
+
+func TestScanDiff_WholeFileDeletion(t *testing.T) {
+	// A whole-file deletion emits "@@ -N,M +0,0 @@". It adds no lines, so it must
+	// scan clean rather than fail as unattributed content. Deleting a file that
+	// contained a secret is not a leak - there are no added lines to flag.
+	key := fakeKey("EXAMPLE")
+	diff := "diff --git a/secrets.txt b/secrets.txt\n" +
+		"deleted file mode 100644\n" +
+		"index abc1234..0000000\n" +
+		"--- a/secrets.txt\n" +
+		"+++ /dev/null\n" +
+		"@@ -1,3 +0,0 @@\n" +
+		"-first line\n" +
+		"-key = \"" + key + "\"\n" +
+		"-third line\n"
+	result, err := ScanDiff(diff, testPatterns())
+	if err != nil {
+		t.Fatalf("whole-file deletion should scan clean, got error: %v", err)
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("deletion has no added lines, expected 0 findings, got %d", len(result.Findings))
+	}
+}
+
+func TestParseHunkNewStartOK(t *testing.T) {
+	tests := []struct {
+		name   string
+		hunk   string
+		wantN  int
+		wantOK bool
+	}{
+		{"normal add", "@@ -1,3 +1,5 @@", 1, true},
+		{"add at later line", "@@ -0,0 +5,2 @@", 5, true},
+		{"whole-file deletion", "@@ -1,3 +0,0 @@", 0, true},
+		{"mid-file deletion", "@@ -3,2 +2,0 @@", 2, true},
+		{"malformed zero-start with content", "@@ -1,1 +0,5 @@", 1, false},
+		{"nonnumeric zero-start count", "@@ -1,1 +0,invalid @@", 1, false},
+		{"deletion count at end of header", "@@ -1,1 +0,0", 0, true},
+		{"zero-start no explicit count", "@@ -1,1 +0 @@", 1, false},
+		{"no plus token", "@@ nonsense @@", 1, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			n, ok := parseHunkNewStartOK(tt.hunk)
+			if n != tt.wantN || ok != tt.wantOK {
+				t.Fatalf("parseHunkNewStartOK(%q) = (%d, %v), want (%d, %v)", tt.hunk, n, ok, tt.wantN, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestScanDiff_MalformedZeroStartHunkNotAcceptedAsDeletion(t *testing.T) {
+	// A "+0,N" with N > 0 is not a valid deletion hunk (there is no line 0 to add
+	// at), so the fix must not accept it as one. Added content under such a hunk
+	// must never be silently accepted: it is either scanned and flagged, or the
+	// input fails closed as unattributed content.
+	secretDiff := "diff --git a/x.go b/x.go\n" +
+		"--- a/x.go\n" +
+		"+++ b/x.go\n" +
+		"@@ -1,1 +0,5 @@\n" +
+		"+" + `var key = "` + fakeKey("EXAMPLE") + `"` + "\n"
+	result, err := ScanDiff(secretDiff, testPatterns())
+	if err == nil && len(result.Findings) == 0 {
+		t.Fatal("malformed +0,N hunk carrying a secret must not be silently accepted")
+	}
+
+	// The same malformed hunk with benign content fails closed as unattributed.
+	benignDiff := "diff --git a/x.go b/x.go\n" +
+		"--- a/x.go\n" +
+		"+++ b/x.go\n" +
+		"@@ -1,1 +0,5 @@\n" +
+		"+harmless configuration value\n"
+	if _, err := ScanDiff(benignDiff, testPatterns()); !errors.Is(err, ErrUnattributedAddedLines) {
+		t.Fatalf("malformed +0,N hunk with benign content should fail closed, got: %v", err)
+	}
+}
+
+func TestCompileDLPPatterns_InvalidRegexWithKnownClassFallback(t *testing.T) {
+	patterns := CompileDLPPatterns([]config.DLPPattern{{
+		Name:     testPatternAWSKey,
+		Regex:    "(",
+		Severity: "critical",
+	}})
+
+	if len(patterns) != 1 {
+		t.Fatalf("compiled patterns = %d, want 1", len(patterns))
+	}
+	if patterns[0].Class == "" {
+		t.Fatal("expected known class fallback for AWS Key")
+	}
+	if patterns[0].Re != nil {
+		t.Fatal("invalid regex should not produce compiled regexp")
+	}
+
+	key := fakeKey("EXAMPLE")
+	diff := makeDiffWithSecret("x.go", `var key = "`+key+`"`)
+	result, err := ScanDiff(diff, patterns)
+	if err != nil {
+		t.Fatalf("ScanDiff: %v", err)
+	}
+	if len(result.Findings) != 1 {
+		t.Fatalf("expected known-class fallback finding, got %+v", result.Findings)
+	}
+	if result.Findings[0].Pattern != testPatternAWSKey {
+		t.Fatalf("expected %s finding, got %q", testPatternAWSKey, result.Findings[0].Pattern)
+	}
+	if strings.Contains(result.Findings[0].Content, key) {
+		t.Fatalf("redacted content leaked key: %q", result.Findings[0].Content)
+	}
+}
+
+func TestReplaceGitProtectMatches_SkipsInvalidAndOverlappingSpans(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	input := `prefix "` + key + `" suffix`
+	redacted := replaceGitProtectMatches(input, []redact.Match{
+		{Start: -1, End: 3},
+		{Start: 8, End: 28},
+		{Start: 10, End: 15},
+		{Start: 40, End: 35},
+	})
+
+	if strings.Count(redacted, "[REDACTED]") != 1 {
+		t.Fatalf("expected exactly one replacement, got %q", redacted)
+	}
+	if strings.Contains(redacted, key) {
+		t.Fatalf("redacted output leaked secret: %q", redacted)
+	}
+}
+
+func TestScanDiff_ClassMatchStillRequiresConfiguredRegex(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	diff := makeDiffWithSecret("x.go", `var key = "`+key+`"`)
+	patterns := CompileDLPPatterns([]config.DLPPattern{{
+		Name:     testPatternAWSKey,
+		Regex:    `ZZZ-NOT-A-MATCH`,
+		Severity: "critical",
+	}})
+
+	result, err := ScanDiff(diff, patterns)
+	if err != nil {
+		t.Fatalf("ScanDiff: %v", err)
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("expected configured regex to gate class match, got %+v", result.Findings)
+	}
+}
+
+func TestScanDiff_ClassAndRegexRedactionsAreAdditive(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	diff := makeDiffWithSecret("x.go", `payload = "`+key+` leaky_123"`)
+	patterns := CompileDLPPatterns([]config.DLPPattern{{
+		Name:     testPatternAWSKey,
+		Regex:    `AKIA[0-9A-Z]{16}|leaky_[0-9]+`,
+		Severity: "critical",
+	}})
+
+	result, err := ScanDiff(diff, patterns)
+	if err != nil {
+		t.Fatalf("ScanDiff: %v", err)
+	}
+	if len(result.Findings) != 1 {
+		t.Fatalf("expected 1 finding, got %d", len(result.Findings))
+	}
+	if strings.Contains(result.Findings[0].Content, key) {
+		t.Fatalf("redacted content leaked AWS key: %q", result.Findings[0].Content)
+	}
+	if strings.Contains(result.Findings[0].Content, "leaky_123") {
+		t.Fatalf("redacted content leaked regex-only secret: %q", result.Findings[0].Content)
+	}
+	if strings.Count(result.Findings[0].Content, "[REDACTED]") != 2 {
+		t.Fatalf("expected both secrets to be redacted, got %q", result.Findings[0].Content)
 	}
 }
 
@@ -223,25 +404,49 @@ func TestScanDiff_NoFindings(t *testing.T) {
 +import "fmt"
 
 `
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 0 {
 		t.Fatalf("expected 0 findings, got %d", len(findings))
 	}
 }
 
 func TestScanDiff_EmptyDiff(t *testing.T) {
-	findings, _ := ScanDiff("", testPatterns())
-	if findings != nil {
-		t.Fatalf("expected nil findings, got %d", len(findings))
+	_, err := ScanDiff("", testPatterns())
+	if !errors.Is(err, ErrNoDiffHeaders) {
+		t.Fatalf("expected %v, got %v", ErrNoDiffHeaders, err)
 	}
 }
 
 func TestScanDiff_EmptyPatterns(t *testing.T) {
 	key := fakeKey("EXAMPLE")
 	diff := makeDiffWithSecret("x.go", `var key = "`+key+`"`)
-	findings, _ := ScanDiff(diff, nil)
+	result, _ := ScanDiff(diff, nil)
+	findings := result.Findings
 	if findings != nil {
 		t.Fatalf("expected nil findings, got %d", len(findings))
+	}
+}
+
+func TestScanDiff_FailsClosedOnUnattributedCleanInput(t *testing.T) {
+	diff := "+not_a_secret=true\n" +
+		"diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -0,0 +1 @@\n+package x\n"
+	_, err := ScanDiff(diff, testPatterns())
+	if !errors.Is(err, ErrUnattributedAddedLines) {
+		t.Fatalf("expected %v, got %v", ErrUnattributedAddedLines, err)
+	}
+}
+
+func TestScanDiff_FailsClosedWhenInlineSuppressionMasksUnattributedSecret(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	diff := "+provider_token=" + key + " // pipelock:ignore\n" +
+		"diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n@@ -0,0 +1 @@\n+package x\n"
+	result, err := ScanDiff(diff, testPatterns())
+	if !errors.Is(err, ErrUnattributedAddedLines) {
+		t.Fatalf("expected %v, got %v", ErrUnattributedAddedLines, err)
+	}
+	if len(result.Suppressed) != 1 {
+		t.Fatalf("expected suppressed finding to be retained, got %+v", result.Suppressed)
 	}
 }
 
@@ -263,7 +468,8 @@ diff --git a/a.go b/a.go
 +var a = "%s"
 
 `, keyZ, keyA)
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 2 {
 		t.Fatalf("expected 2 findings, got %d", len(findings))
 	}
@@ -279,7 +485,8 @@ diff --git a/a.go b/a.go
 func TestScanDiff_RedactsContent(t *testing.T) {
 	key := fakeKey("EXAMPLE")
 	diff := makeDiffWithSecret("x.go", "export AWS_KEY="+key)
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 1 {
 		t.Fatalf("expected 1 finding, got %d", len(findings))
 	}
@@ -309,7 +516,7 @@ func TestFormatFindings_NoFindings(t *testing.T) {
 
 func TestFormatFindings_WithFindings(t *testing.T) {
 	findings := []Finding{
-		{File: "main.go", Line: 10, Pattern: "AWS Key", Severity: "critical", Content: "export AWS_KEY=[REDACTED]"},
+		{File: "main.go", Line: 10, Pattern: testPatternAWSKey, Severity: "critical", Content: "export AWS_KEY=[REDACTED]"},
 	}
 	result := FormatFindings(findings)
 	if result == "" {
@@ -325,7 +532,7 @@ func TestFormatFindings_WithFindings(t *testing.T) {
 
 func TestFindingsJSON_WithFindings(t *testing.T) {
 	findings := []Finding{
-		{File: "main.go", Line: 42, Pattern: "AWS Key", Severity: "critical", Content: "[REDACTED]"},
+		{File: "main.go", Line: 42, Pattern: testPatternAWSKey, Severity: "critical", Content: "[REDACTED]"},
 	}
 	data, err := FindingsJSON(findings)
 	if err != nil {
@@ -345,8 +552,8 @@ func TestFindingsJSON_WithFindings(t *testing.T) {
 	if decoded[0].Line != 42 {
 		t.Errorf("expected line 42, got %d", decoded[0].Line)
 	}
-	if decoded[0].Pattern != "AWS Key" {
-		t.Errorf("expected pattern 'AWS Key', got %q", decoded[0].Pattern)
+	if decoded[0].Pattern != testPatternAWSKey {
+		t.Errorf("expected pattern %q, got %q", testPatternAWSKey, decoded[0].Pattern)
 	}
 }
 
@@ -380,7 +587,8 @@ func TestParseDiff_NoPrefixFormat(t *testing.T) {
  package main
 +var key = "%s"
 `, key)
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 1 {
 		t.Fatalf("expected 1 finding with --no-prefix diff, got %d", len(findings))
 	}
@@ -393,7 +601,8 @@ func TestParseDiff_CRLFLineEndings(t *testing.T) {
 	// Windows-style \r\n line endings should not break parsing.
 	key := fakeKey("WINDOWS")
 	diff := "diff --git a/x.go b/x.go\r\n--- a/x.go\r\n+++ b/x.go\r\n@@ -1,2 +1,3 @@\r\n package x\r\n+var k = \"" + key + "\"\r\n\r\n"
-	findings, _ := ScanDiff(diff, testPatterns())
+	result, _ := ScanDiff(diff, testPatterns())
+	findings := result.Findings
 	if len(findings) != 1 {
 		t.Fatalf("expected 1 finding with CRLF line endings, got %d", len(findings))
 	}
@@ -403,12 +612,157 @@ func TestParseDiff_CRLFLineEndings(t *testing.T) {
 }
 
 func TestScanDiff_ErrNoDiffHeaders(t *testing.T) {
-	findings, err := ScanDiff("random text without diff headers", testPatterns())
+	result, err := ScanDiff("random text without diff headers", testPatterns())
+	findings := result.Findings
 	if !errors.Is(err, ErrNoDiffHeaders) {
 		t.Errorf("expected ErrNoDiffHeaders, got %v", err)
 	}
 	if findings != nil {
 		t.Errorf("expected nil findings, got %v", findings)
+	}
+}
+
+func TestScanDiff_FailClosedMalformedAddedContent(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	tests := []struct {
+		name string
+		diff string
+	}{
+		{
+			name: "bare added secret no headers",
+			diff: "+provider_token=" + key + "\n",
+		},
+		{
+			name: "bogus empty new-file header",
+			diff: "+++ \n+provider_token=" + key + "\n",
+		},
+		{
+			name: "dev null new-file header",
+			diff: "+++ /dev/null\n+provider_token=" + key + "\n",
+		},
+		{
+			name: "partial parse secret before valid section",
+			diff: "+provider_token=" + key + "\n" +
+				"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+safe=true\n",
+		},
+		{
+			name: "secret in later malformed section",
+			diff: "diff --git a/safe b/safe\n--- a/safe\n+++ b/safe\n@@ -0,0 +1 @@\n+safe=true\n" +
+				"diff --git a/bad b/bad\n--- a/bad\n+++ \n@@ -0,0 +1 @@\n+provider_token=" + key + "\n",
+		},
+		{
+			name: "multi file with missing header",
+			diff: "diff --git a/safe b/safe\n--- a/safe\n+++ b/safe\n@@ -0,0 +1 @@\n+safe=true\n" +
+				"diff --git a/noheader b/noheader\n@@ -0,0 +1 @@\n+provider_token=" + key + "\n",
+		},
+		{
+			name: "secret in malformed hunk line without diff marker",
+			diff: "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\nprovider_token=" + key + "\n",
+		},
+		{
+			name: "crlf orphan",
+			diff: "diff --git a/safe b/safe\r\n--- a/safe\r\n+++ b/safe\r\n@@ -0,0 +1 @@\r\n+safe=true\r\n" +
+				"+provider_token=" + key + "\r\n",
+		},
+		{
+			name: "non diff raw secret without plus",
+			diff: "provider_token=" + key + "\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ScanDiff(tc.diff, testPatterns())
+			if err != nil {
+				t.Fatalf("ScanDiff returned error instead of findings: %v", err)
+			}
+			if len(result.Findings) == 0 {
+				t.Fatal("expected secret finding")
+			}
+		})
+	}
+}
+
+func TestScanDiff_CleanMetadataOnlyDiffs(t *testing.T) {
+	tests := []struct {
+		name string
+		diff string
+	}{
+		{
+			name: "mode only",
+			diff: "diff --git a/tool.sh b/tool.sh\nold mode 100644\nnew mode 100755\n",
+		},
+		{
+			name: "rename only",
+			diff: "diff --git a/old.txt b/new.txt\nsimilarity index 100%\nrename from old.txt\nrename to new.txt\n",
+		},
+		{
+			name: "no prefix clean",
+			diff: "diff --git main.go main.go\n--- main.go\n+++ main.go\n@@ -1,2 +1,3 @@\n package main\n+import \"fmt\"\n",
+		},
+		{
+			name: "clean text with binary summary",
+			diff: "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -1 +1,2 @@\n package main\n+const ok = true\n" +
+				"diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n",
+		},
+		{
+			name: "long clean line",
+			diff: "diff --git a/min.js b/min.js\n--- a/min.js\n+++ b/min.js\n@@ -0,0 +1 @@\n+" + strings.Repeat("A", 1100*1024) + "\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ScanDiff(tc.diff, testPatterns())
+			if err != nil {
+				t.Fatalf("ScanDiff returned error for clean metadata/text diff: %v", err)
+			}
+			if len(result.Findings) != 0 {
+				t.Fatalf("expected no findings, got %+v", result.Findings)
+			}
+		})
+	}
+}
+
+func TestScanDiff_SecretsWithLongLinesAndBinarySummaries(t *testing.T) {
+	key := fakeKey("EXAMPLE")
+	tests := []struct {
+		name string
+		diff string
+	}{
+		{
+			name: "secret in long line",
+			diff: "diff --git a/min.js b/min.js\n--- a/min.js\n+++ b/min.js\n@@ -0,0 +1 @@\n+" +
+				strings.Repeat("A", 1100*1024) + "provider_token=" + key + "\n",
+		},
+		{
+			name: "secret with binary summary",
+			diff: "diff --git a/main.go b/main.go\n--- a/main.go\n+++ b/main.go\n@@ -0,0 +1 @@\n+provider_token=" + key + "\n" +
+				"diff --git a/x.png b/x.png\nBinary files a/x.png and b/x.png differ\n",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := ScanDiff(tc.diff, testPatterns())
+			if err != nil {
+				t.Fatalf("ScanDiff returned error instead of findings: %v", err)
+			}
+			if len(result.Findings) == 0 {
+				t.Fatal("expected secret finding")
+			}
+		})
+	}
+}
+
+func TestScanDiff_FailClosedUnsupportedBinaryPatch(t *testing.T) {
+	diff := "diff --git a/blob.bin b/blob.bin\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\nA\n"
+	result, err := ScanDiff(diff, testPatterns())
+	if !errors.Is(err, ErrUnsupportedBinaryPatch) {
+		t.Fatalf("expected ErrUnsupportedBinaryPatch, got %v", err)
+	}
+	if len(result.Findings) != 0 {
+		t.Fatalf("expected no findings on unsupported error, got %+v", result.Findings)
 	}
 }
 
@@ -424,5 +778,180 @@ func TestParseDiff_DevNullSkipped(t *testing.T) {
 	result := parseDiff(diff)
 	if len(result) != 0 {
 		t.Fatalf("expected 0 files from /dev/null diff, got %d", len(result))
+	}
+}
+
+// --- Validator parity tests ---
+
+// TestScanDiff_CreditCard_UUIDNotFlagged verifies that all-numeric UUIDs
+// are NOT flagged as credit card numbers. The credit card regex matches
+// UUID-shaped digit groups, but the Luhn issuer check rejects them.
+// Regression: before validator wiring, scan-diff used regex-only matching
+// and flagged UUIDs as false positives.
+func TestScanDiff_CreditCard_UUIDNotFlagged(t *testing.T) {
+	patterns := CompileDLPPatterns(config.Defaults().DLP.Patterns)
+
+	tests := []struct {
+		name string
+		uuid string
+	}{
+		{"nil UUID", `00000000-0000-0000-0000-000000000000`},
+		{"numeric UUID", "12345678" + "-1234-5678-1234-" + "567812345678"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			diff := fmt.Sprintf("diff --git a/t.rb b/t.rb\n--- a/t.rb\n+++ b/t.rb\n@@ -0,0 +1 @@\n+security_id: \"%s\"\n", tc.uuid)
+			result, err := ScanDiff(diff, patterns)
+			findings := result.Findings
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, f := range findings {
+				if f.Pattern == "Credit Card"+" Number" {
+					t.Errorf("UUID %s should NOT be flagged as credit card, but got finding: %+v", tc.uuid, f)
+				}
+			}
+		})
+	}
+}
+
+// TestScanDiff_CreditCard_RealCardFlagged verifies that actual credit card
+// numbers ARE still caught after validator wiring.
+func TestScanDiff_CreditCard_RealCardFlagged(t *testing.T) {
+	patterns := CompileDLPPatterns(config.Defaults().DLP.Patterns)
+
+	// Visa test number (passes Luhn, starts with 4, 16 digits).
+	card := "4532" + "015112830366"
+	diff := fmt.Sprintf("diff --git a/t.txt b/t.txt\n--- a/t.txt\n+++ b/t.txt\n@@ -0,0 +1 @@\n+card: \"%s\"\n", card)
+
+	result, err := ScanDiff(diff, patterns)
+	findings := result.Findings
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, f := range findings {
+		if f.Pattern == "Credit Card"+" Number" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected real Visa card to be flagged as Credit Card Number")
+	}
+}
+
+// TestScanDiff_IBAN_ValidFlagged verifies IBAN validation works in scan-diff.
+func TestScanDiff_IBAN_ValidFlagged(t *testing.T) {
+	patterns := CompileDLPPatterns(config.Defaults().DLP.Patterns)
+
+	// Valid GB IBAN (passes mod-97). Split to avoid self-scan match.
+	iban := "GB82WEST" + "12345698765432"
+	diff := fmt.Sprintf("diff --git a/t.txt b/t.txt\n--- a/t.txt\n+++ b/t.txt\n@@ -0,0 +1 @@\n+iban: %s\n", iban)
+
+	result, err := ScanDiff(diff, patterns)
+	findings := result.Findings
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, f := range findings {
+		if strings.Contains(f.Pattern, "IBAN") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected valid IBAN to be flagged")
+	}
+}
+
+func TestScanDiff_InlineSuppressSkipsLine(t *testing.T) {
+	patterns := CompileDLPPatterns([]config.DLPPattern{
+		{Name: "TestSecret", Regex: `SECRET_KEY=\S+`, Severity: "critical"},
+	})
+
+	diff := "diff --git a/env b/env\n--- a/env\n+++ b/env\n@@ -0,0 +1,3 @@\n" +
+		"+SECRET_KEY=exposed\n" +
+		"+SECRET_KEY=suppressed # pipelock:ignore\n" +
+		"+SECRET_KEY=also_suppressed // pipelock:ignore\n"
+
+	result, err := ScanDiff(diff, patterns)
+	findings := result.Findings
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding (unsuppressed), got %d", len(findings))
+	}
+	if findings[0].Line != 1 {
+		t.Errorf("expected finding on line 1, got line %d", findings[0].Line)
+	}
+	// Verify suppressed findings are tracked for --verbose reporting
+	if len(result.Suppressed) != 2 {
+		t.Errorf("expected 2 suppressed findings, got %d", len(result.Suppressed))
+	}
+}
+
+func TestScanDiff_InlineSuppressWithRuleName(t *testing.T) {
+	patterns := CompileDLPPatterns([]config.DLPPattern{
+		{Name: "TestSecret", Regex: `SECRET_KEY=\S+`, Severity: "critical"},
+		{Name: "OtherPattern", Regex: `TOKEN=\S+`, Severity: "high"},
+	})
+
+	// pipelock:ignore with a specific rule name suppresses ONLY that pattern.
+	// Other patterns on the same line should still fire.
+	diff := "diff --git a/env b/env\n--- a/env\n+++ b/env\n@@ -0,0 +1,2 @@\n" +
+		"+SECRET_KEY=test_value # pipelock:ignore TestSecret\n" +
+		"+SECRET_KEY=leaked TOKEN=also_leaked\n"
+
+	result, err := ScanDiff(diff, patterns)
+	findings := result.Findings
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Line 1: TestSecret suppressed, no TOKEN on that line = 0 findings
+	// Line 2: no suppress comment, both patterns match = 2 findings
+	if len(findings) != 2 {
+		t.Fatalf("expected 2 findings (line 2 unsuppressed), got %d", len(findings))
+	}
+	for _, f := range findings {
+		if f.Line != 2 {
+			t.Errorf("expected findings on line 2, got line %d", f.Line)
+		}
+	}
+}
+
+func TestScanDiff_InlineSuppressRuleNameOnlyAffectsNamed(t *testing.T) {
+	patterns := CompileDLPPatterns([]config.DLPPattern{
+		{Name: "SecretA", Regex: `KEYA=\S+`, Severity: "critical"},
+		{Name: "SecretB", Regex: `KEYB=\S+`, Severity: "high"},
+	})
+
+	// Suppress only SecretA, SecretB should still fire on the same line
+	diff := "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -0,0 +1,1 @@\n" +
+		"+KEYA=xxx KEYB=yyy # pipelock:ignore SecretA\n"
+
+	result, err := ScanDiff(diff, patterns)
+	findings := result.Findings
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(findings) != 1 {
+		t.Fatalf("expected 1 finding (SecretB only), got %d", len(findings))
+	}
+	if findings[0].Pattern != "SecretB" {
+		t.Errorf("expected SecretB finding, got %s", findings[0].Pattern)
+	}
+	// SecretA was suppressed
+	if len(result.Suppressed) != 1 {
+		t.Fatalf("expected 1 suppressed, got %d", len(result.Suppressed))
+	}
+	if result.Suppressed[0].Pattern != "SecretA" {
+		t.Errorf("expected SecretA suppressed, got %s", result.Suppressed[0].Pattern)
 	}
 }

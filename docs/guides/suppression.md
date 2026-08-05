@@ -68,6 +68,27 @@ The `reason` field is optional but recommended. It appears in audit logs and hel
 
 **When to use:** Directories with known false positives, third-party code, generated files, documentation directories.
 
+### Custom Provider Keys
+
+Some providers use bare high-entropy strings or undocumented key shapes. Pipelock does not ship generic entropy-as-secret DLP because it would block legitimate IDs, digests, and session values. If you know a provider key shape in your environment, add a named DLP pattern and bind that same rule to the provider's host:
+
+```yaml
+dlp:
+  patterns:
+    - name: "Internal Provider API Key"
+      regex: '\bintprov_[A-Za-z0-9_-]{32,}\b'
+      severity: critical
+      exempt_domains:
+        - "api.provider.example"
+
+suppress:
+  - rule: "Internal Provider API Key"
+    path: "https://api.provider.example/*"
+    reason: "provider-bound credential"
+```
+
+Use both knobs. `exempt_domains` keeps URL DLP from blocking a provider-bound key on the provider's own host. `suppress` silences the same rule for request bodies and headers on the provider endpoint. The key still blocks when it is sent anywhere else.
+
 ## Layer 3: `--exclude` Flag
 
 Remove entire paths from scan results. Available on `pipelock git scan-diff` and `pipelock audit`:
@@ -88,7 +109,7 @@ Path patterns use the same matching rules as config suppress entries (exact, dir
 Use the `exclude-paths` input (one pattern per line):
 
 ```yaml
-- uses: luckyPipewrench/pipelock@v0.3.2
+- uses: luckyPipewrench/pipelock@v2
   with:
     exclude-paths: |
       vendor/
@@ -98,19 +119,24 @@ Use the `exclude-paths` input (one pattern per line):
 
 ### Config-level suppression
 
-Use the `config` input to provide inline YAML config with suppress entries:
+Write a Pipelock config file, then pass its path with the `config` input:
 
 ```yaml
-- uses: luckyPipewrench/pipelock@v0.3.2
+- name: Write Pipelock config
+  run: |
+    cat > pipelock-ci.yaml <<'EOF'
+    suppress:
+      - rule: "Credential in URL"
+        path: "docs/"
+        reason: "Documentation examples"
+      - rule: "JWT Token"
+        path: "test/"
+        reason: "Test tokens"
+    EOF
+
+- uses: luckyPipewrench/pipelock@v2
   with:
-    config: |
-      suppress:
-        - rule: "Credential in URL"
-          path: "docs/"
-          reason: "Documentation examples"
-        - rule: "JWT Token"
-          path: "test/"
-          reason: "Test tokens"
+    config: pipelock-ci.yaml
 ```
 
 ### Inline comments
@@ -123,10 +149,13 @@ Inline `// pipelock:ignore` comments work automatically with no action config ne
 
 | Rule Name | What It Detects | Severity |
 |-----------|----------------|----------|
-| Anthropic API Key | `sk-ant-*` | critical |
-| OpenAI API Key | `sk-proj-*` | critical |
-| OpenAI Service Key | `sk-svcacct-*` | critical |
+| Anthropic API Key | `sk-ant-*` with 20+ token chars | critical |
+| OpenAI API Key | `sk-proj-*` with 20+ token chars | critical |
+| OpenAI Service Key | `sk-svcacct-*` with 20+ token chars | critical |
 | Fireworks API Key | `fw_*` | critical |
+| LLM Router API Key | `sk-or-v1-*` with 20+ hex chars | critical |
+| Answer Engine API Key | `pplx-*` with 20+ token chars | critical |
+| Web Research API Key | `tvly-*` with 20+ token chars | critical |
 | Google API Key | `AIza*` | high |
 | Google OAuth Client Secret | `GOCSPX-*` | critical |
 | Google OAuth Token | `ya29.*` | critical |
@@ -137,12 +166,12 @@ Inline `// pipelock:ignore` comments work automatically with no action config ne
 | AWS Access ID | `AKIA*` / `ASIA*` / `AROA*` + 6 more prefixes | critical |
 | Slack Token | `xox[bpras]-*` | critical |
 | Slack App Token | `xapp-*` | critical |
-| Discord Bot Token | Base64 three-segment token | critical |
+| Discord Bot Token | `M*.*.*` / `N*.*.*` / `mfa.*` | critical |
 | Twilio API Key | `SK` + 32 hex | high |
 | SendGrid API Key | `SG.*.*` | critical |
 | Mailgun API Key | `key-` + 32 chars | high |
 | Private Key Header | `-----BEGIN * PRIVATE KEY-----` | critical |
-| JWT Token | `eyJ*.eyJ*.*` (three base64url segments) | high |
+| JWT Token | JSON-object base64url header and payload, three segments | high |
 | Social Security Number | `###-##-####` | low |
 | Credential in URL | `password=`, `token=`, `apikey=`, etc. | high |
 

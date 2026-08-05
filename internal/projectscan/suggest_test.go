@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package projectscan
 
 import (
@@ -36,7 +39,7 @@ func TestBuildConfig_ClaudeCode(t *testing.T) {
 	if cfg.FetchProxy.Monitoring.EntropyThreshold != 5.0 {
 		t.Errorf("entropy threshold = %.1f, want 5.0", cfg.FetchProxy.Monitoring.EntropyThreshold)
 	}
-	if cfg.ResponseScanning.Action != "block" { //nolint:goconst // test value
+	if cfg.ResponseScanning.Action != "block" {
 		t.Errorf("response action = %q, want block", cfg.ResponseScanning.Action)
 	}
 	if !cfg.GitProtection.Enabled {

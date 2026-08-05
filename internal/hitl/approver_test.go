@@ -1,13 +1,42 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package hitl
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) contains(s string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Contains(b.buf.String(), s)
+}
+
+func (b *lockedBuffer) count(s string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Count(b.buf.String(), s)
+}
 
 func testApprover(t *testing.T, input string, timeoutSec int) (*Approver, *bytes.Buffer) { //nolint:unparam // timeout varies in manual tests
 	t.Helper()
@@ -26,7 +55,7 @@ func TestApprover_Allow(t *testing.T) {
 
 	d := a.Ask(&Request{
 		Agent:    "test-agent",
-		URL:      "https://evil.com/attack",
+		URL:      "https://attacker.example/attack",
 		Reason:   "prompt injection detected",
 		Patterns: []string{"Prompt Injection"},
 		Preview:  "ignore all previous instructions",
@@ -49,7 +78,7 @@ func TestApprover_Allow(t *testing.T) {
 func TestApprover_AllowYes(t *testing.T) {
 	a, _ := testApprover(t, "yes\n", 5)
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionAllow {
 		t.Fatalf("expected DecisionAllow for 'yes', got %d", d)
 	}
@@ -58,7 +87,7 @@ func TestApprover_AllowYes(t *testing.T) {
 func TestApprover_Block(t *testing.T) {
 	a, output := testApprover(t, "n\n", 5)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test threat"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test threat"})
 
 	if d != DecisionBlock {
 		t.Fatalf("expected DecisionBlock, got %d", d)
@@ -71,7 +100,7 @@ func TestApprover_Block(t *testing.T) {
 func TestApprover_Strip(t *testing.T) {
 	a, output := testApprover(t, "s\n", 5)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test threat"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test threat"})
 
 	if d != DecisionStrip {
 		t.Fatalf("expected DecisionStrip, got %d", d)
@@ -84,7 +113,7 @@ func TestApprover_Strip(t *testing.T) {
 func TestApprover_StripWord(t *testing.T) {
 	a, _ := testApprover(t, "strip\n", 5)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"})
 	if d != DecisionStrip {
 		t.Fatalf("expected DecisionStrip for 'strip', got %d", d)
 	}
@@ -93,7 +122,7 @@ func TestApprover_StripWord(t *testing.T) {
 func TestApprover_GarbageInputBlocks(t *testing.T) {
 	a, _ := testApprover(t, "maybe\n", 5)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"})
 	if d != DecisionBlock {
 		t.Fatalf("expected DecisionBlock for garbage input, got %d", d)
 	}
@@ -102,14 +131,14 @@ func TestApprover_GarbageInputBlocks(t *testing.T) {
 func TestApprover_EmptyInputBlocks(t *testing.T) {
 	a, _ := testApprover(t, "\n", 5)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"})
 	if d != DecisionBlock {
 		t.Fatalf("expected DecisionBlock for empty input, got %d", d)
 	}
 }
 
 func TestApprover_Timeout(t *testing.T) {
-	// Empty reader — ReadString will block, triggering timeout.
+	// Empty reader - ReadString will block, triggering timeout.
 	output := &bytes.Buffer{}
 	r, w := io.Pipe() //nolint:govet // shadow is fine in test
 	t.Cleanup(func() {
@@ -125,7 +154,7 @@ func TestApprover_Timeout(t *testing.T) {
 	t.Cleanup(a.Close)
 
 	start := time.Now()
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"})
 	elapsed := time.Since(start)
 
 	if d != DecisionBlock {
@@ -148,13 +177,49 @@ func TestApprover_NonTerminalBlocks(t *testing.T) {
 	)
 	t.Cleanup(a.Close)
 
-	d := a.Ask(&Request{URL: "https://evil.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"})
 	if d != DecisionBlock {
 		t.Fatalf("expected DecisionBlock for non-terminal, got %d", d)
 	}
 	// No prompt should be shown.
 	if output.Len() != 0 {
 		t.Errorf("expected no output for non-terminal, got: %s", output.String())
+	}
+}
+
+type readerFunc func(p []byte) (int, error)
+
+func (f readerFunc) Read(p []byte) (int, error) { return f(p) }
+
+// TestApprover_NonTerminalDoesNotReadInput proves a non-terminal approver never
+// touches its input stream. In MCP stdio proxy mode that stream is os.Stdin
+// carrying the JSON-RPC protocol; a background reader (spawned eagerly in New)
+// would steal the client's framing bytes and silently break the transport:
+// the issue #964 regression. Ask() already fails closed for non-terminal, so
+// no read is ever needed.
+func TestApprover_NonTerminalDoesNotReadInput(t *testing.T) {
+	readCalled := make(chan struct{}, 1)
+	r := readerFunc(func(_ []byte) (int, error) {
+		select {
+		case readCalled <- struct{}{}:
+		default:
+		}
+		return 0, io.EOF
+	})
+
+	a := New(1, WithInput(r), WithTerminal(false))
+	t.Cleanup(a.Close)
+
+	// Ask must still fail closed without ever reading input.
+	if d := a.Ask(&Request{URL: "https://attacker.example", Reason: "test"}); d != DecisionBlock {
+		t.Fatalf("Ask() = %d, want DecisionBlock", d)
+	}
+
+	select {
+	case <-readCalled:
+		t.Fatal("non-terminal approver read its input stream; in MCP stdio mode this steals JSON-RPC protocol bytes (issue #964)")
+	case <-time.After(200 * time.Millisecond):
+		// No read occurred; correct.
 	}
 }
 
@@ -171,7 +236,7 @@ func TestApprover_CloseBlocksPending(t *testing.T) {
 		_ = r.Close()
 	})
 
-	output := &bytes.Buffer{}
+	output := &lockedBuffer{}
 	a := New(30,
 		WithInput(r),
 		WithOutput(output),
@@ -180,11 +245,12 @@ func TestApprover_CloseBlocksPending(t *testing.T) {
 
 	done := make(chan Decision, 1)
 	go func() {
-		done <- a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+		done <- a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	}()
 
-	// Give the goroutine time to submit the request.
-	time.Sleep(50 * time.Millisecond)
+	testwait.For(t, time.Second, func() bool {
+		return output.contains("PIPELOCK: THREAT DETECTED")
+	}, "pending HITL prompt")
 	a.Close()
 
 	d := <-done
@@ -222,7 +288,7 @@ func TestApprover_PromptContent(t *testing.T) {
 func TestApprover_NoAgent(t *testing.T) {
 	a, output := testApprover(t, "n\n", 5)
 
-	_ = a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	_ = a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 
 	if strings.Contains(output.String(), "Agent:") {
 		t.Error("expected no Agent line when agent is empty")
@@ -232,7 +298,7 @@ func TestApprover_NoAgent(t *testing.T) {
 func TestApprover_NoPreview(t *testing.T) {
 	a, output := testApprover(t, "n\n", 5)
 
-	_ = a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	_ = a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 
 	if strings.Contains(output.String(), "Preview:") {
 		t.Error("expected no Preview line when preview is empty")
@@ -251,7 +317,7 @@ func TestApprover_Concurrent(t *testing.T) {
 		go func(idx int) {
 			defer wg.Done()
 			results[idx] = a.Ask(&Request{
-				URL:    "https://evil.com/" + string(rune('a'+idx)), //nolint:gosec // G115: idx bounded by loop [0,3)
+				URL:    "https://attacker.example/" + string(rune('a'+idx)), //nolint:gosec // G115: idx bounded by loop [0,3)
 				Reason: "test",
 			})
 		}(i)
@@ -269,7 +335,7 @@ func TestApprover_Concurrent(t *testing.T) {
 func TestApprover_CaseInsensitive(t *testing.T) {
 	a, _ := testApprover(t, "Y\n", 5)
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionAllow {
 		t.Fatalf("expected DecisionAllow for 'Y', got %d", d)
 	}
@@ -302,40 +368,41 @@ func TestApprover_TimeoutThenSuccess(t *testing.T) {
 	// First request times out (no input within timeout).
 	// Stale input arrives AFTER timeout. Second request drains it, then
 	// receives fresh "y\n" and returns allow.
-	r, w := io.Pipe()
-	output := &bytes.Buffer{}
-	a := New(1, // 1 second timeout
-		WithInput(r),
-		WithOutput(output),
-		WithTerminal(true),
-	)
-	t.Cleanup(func() {
-		_ = w.Close()
-		a.Close()
-	})
+	output := &lockedBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	a := &Approver{
+		timeout: 500 * time.Millisecond,
+		output:  output,
+		ctx:     ctx,
+	}
+	lines := make(chan string, 2)
 
 	// First request: no input → times out → sets lastPromptTimedOut = true.
-	d1 := a.Ask(&Request{URL: "https://test.com", Reason: "first"})
+	d1 := a.prompt(lines, &Request{URL: "https://example.com", Reason: "first"})
 	if d1 != DecisionBlock {
 		t.Fatalf("expected timeout block, got %d", d1)
 	}
 
-	// Write stale input that gets buffered in the lines channel.
-	// The readLines goroutine reads it and puts it in the channel.
+	lines <- "stale"
+	done := make(chan Decision, 1)
 	go func() {
-		_, _ = w.Write([]byte("stale\n"))
-		// Give time for readLines to buffer this, then write real response.
-		time.Sleep(200 * time.Millisecond)
-		_, _ = w.Write([]byte("y\n"))
+		done <- a.prompt(lines, &Request{URL: "https://example.com", Reason: "second"})
 	}()
 
-	// Give time for the stale line to be read into the channel.
-	time.Sleep(100 * time.Millisecond)
+	testwait.For(t, time.Second, func() bool {
+		return output.count("PIPELOCK: THREAT DETECTED") >= 2
+	}, "second HITL prompt after stale input drain")
+	lines <- "y"
 
 	// Second request: drainStaleLines removes "stale", then prompt reads "y".
-	d2 := a.Ask(&Request{URL: "https://test.com", Reason: "second"})
-	if d2 != DecisionAllow {
-		t.Fatalf("expected allow after drain, got %d", d2)
+	select {
+	case d2 := <-done:
+		if d2 != DecisionAllow {
+			t.Fatalf("expected allow after drain, got %d", d2)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for second HITL decision")
 	}
 }
 
@@ -346,20 +413,24 @@ func TestApprover_ContextCancel(t *testing.T) {
 		_ = w.Close()
 		_ = r.Close()
 	})
-	output := &bytes.Buffer{}
+	output := &lockedBuffer{}
 	a := New(30, // long timeout
 		WithInput(r),
 		WithOutput(output),
 		WithTerminal(true),
 	)
 
-	// Close the approver (cancels context) in background
+	done := make(chan Decision, 1)
 	go func() {
-		time.Sleep(200 * time.Millisecond)
-		a.Close()
+		done <- a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	}()
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	testwait.For(t, time.Second, func() bool {
+		return output.contains("PIPELOCK: THREAT DETECTED")
+	}, "pending HITL prompt before context cancel")
+	a.Close()
+
+	d := <-done
 	if d != DecisionBlock {
 		t.Fatalf("expected block on context cancel, got %d", d)
 	}
@@ -382,7 +453,7 @@ func TestApprover_QueueFullOnCancel(t *testing.T) {
 	// Cancel immediately
 	a.Close()
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionBlock {
 		t.Fatalf("expected block on cancelled context, got %d", d)
 	}
@@ -391,7 +462,7 @@ func TestApprover_QueueFullOnCancel(t *testing.T) {
 func TestApprover_StripResponse(t *testing.T) {
 	a, _ := testApprover(t, "s\n", 5)
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionStrip {
 		t.Fatalf("expected DecisionStrip, got %d", d)
 	}
@@ -400,7 +471,7 @@ func TestApprover_StripResponse(t *testing.T) {
 func TestApprover_YesResponse(t *testing.T) {
 	a, _ := testApprover(t, "yes\n", 5)
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionAllow {
 		t.Fatalf("expected DecisionAllow for 'yes', got %d", d)
 	}
@@ -409,7 +480,7 @@ func TestApprover_YesResponse(t *testing.T) {
 func TestApprover_StripWordResponse(t *testing.T) {
 	a, _ := testApprover(t, "strip\n", 5)
 
-	d := a.Ask(&Request{URL: "https://test.com", Reason: "test"})
+	d := a.Ask(&Request{URL: "https://example.com", Reason: "test"})
 	if d != DecisionStrip {
 		t.Fatalf("expected DecisionStrip for 'strip', got %d", d)
 	}

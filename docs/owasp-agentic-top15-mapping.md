@@ -48,7 +48,7 @@ This is separate from the [OWASP Top 10 for Agentic Applications](owasp-mapping.
 
 **Pipelock coverage:**
 
-- **Fetch proxy as controlled tool:** the agent's only network access is through the proxy. Every request goes through the 9-layer scanner pipeline.
+- **Fetch proxy as controlled tool:** in an enforced deployment, the agent's network access is routed through the proxy. Each mediated fetch traverses the ordered URL scanner pipeline.
 - **MCP proxy:** `pipelock mcp proxy` wraps MCP servers and scans tool responses for injection payloads.
 - **Tool description scanning:** `tools/list` responses are scanned for poisoned descriptions containing hidden instructions, file exfiltration directives, or cross-tool manipulation. Rug-pull detection tracks SHA256 hashes per session and alerts on mid-session changes.
 - **HITL approvals:** suspicious requests can trigger human-in-the-loop terminal approval before proceeding.
@@ -63,10 +63,10 @@ This is separate from the [OWASP Top 10 for Agentic Applications](owasp-mapping.
 
 **Pipelock coverage:**
 
-- **Capability separation:** the agent process (holds secrets, no network) and the proxy (has network, no secrets) run separately. Neither has both.
+- **Capability separation:** the agent process (holds secrets, no network) and the proxy (has network, no agent secrets) run separately. Deployment enforces the boundary. Neither has both capabilities.
 - **Domain allowlisting:** agents can only reach explicitly allowed API endpoints.
 - **SSRF protection:** blocks requests to internal/private IP ranges with DNS rebinding prevention.
-- **DLP scanning:** 22 built-in patterns detect API keys, tokens, and credentials in outbound traffic.
+- **DLP scanning:** 65 built-in patterns detect API keys, tokens, and credentials in outbound traffic.
 - **Environment variable leak detection:** detects the proxy's own env var values (raw + base64) in URLs.
 
 **Coverage: Strong.** Multiple layers prevent credential leakage and limit agent network access.
@@ -82,7 +82,9 @@ This is separate from the [OWASP Top 10 for Agentic Applications](owasp-mapping.
 - **DLP scanning:** catches API keys, tokens, and credentials in outbound URLs regardless of why the agent is sending them.
 - **Entropy analysis:** flags high-entropy URL segments that look like encoded secrets, even if they don't match known patterns.
 - **Domain blocklist:** known exfiltration targets (pastebin, transfer.sh, etc.) are blocked.
-- **Audit logging:** every request is logged with zerolog, creating a verifiable trail of all agent network activity.
+- **Audit and receipt evidence:** mediated scanner and policy events are logged
+  with zerolog. Signed receipts provide tamper evidence for recorded actions;
+  they do not prove completeness for traffic that bypasses Pipelock.
 
 **Coverage: Strong.** DLP + entropy + blocklist catches most exfiltration attempts. Audit trail enables post-incident analysis.
 
@@ -95,7 +97,7 @@ This is separate from the [OWASP Top 10 for Agentic Applications](owasp-mapping.
 **Pipelock coverage:**
 
 - **Structured audit logging:** every proxy request is logged as structured JSON (zerolog) with URL, domain, agent name, result (allowed/blocked), scanner reason, and timestamp.
-- **Per-agent identification:** agents identify via `X-Pipelock-Agent` header. All log entries include the agent name.
+- **Per-agent identification:** agents identify via listener binding (spoof-proof), `X-Pipelock-Agent` header, or `?agent=` query param. Each agent gets its own config profile with independent mode, allowlist, DLP, rate limits, and budget. All log entries include the agent name.
 - **Prometheus metrics:** `/metrics` endpoint exports request counts, scanner hits, and latency histograms for dashboards.
 - **JSON stats:** `/stats` endpoint provides real-time top domains and block reasons.
 - **Grafana dashboard:** `configs/grafana-dashboard.json` provides a ready-to-import security overview.
@@ -177,7 +179,7 @@ This is separate from the [OWASP Top 10 for Agentic Applications](owasp-mapping.
 
 **Threat:** Adversaries impersonate agents or users for unauthorized access.
 
-**Coverage: Partial.** Ed25519 signing provides agent identity verification for file-level operations. `X-Pipelock-Agent` header identifies agents in proxy traffic. No certificate-based agent authentication yet.
+**Coverage: Partial.** Ed25519 signing provides agent identity verification for file-level operations. Per-agent profiles with listener binding provide spoof-proof identity for proxy traffic. `X-Pipelock-Agent` header and `?agent=` query param provide convenience identification (trust the caller). No certificate-based agent authentication yet.
 
 ### T14: Human Attacks on Multi-Agent Systems
 

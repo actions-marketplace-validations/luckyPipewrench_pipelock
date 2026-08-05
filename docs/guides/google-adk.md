@@ -189,9 +189,9 @@ local = McpToolset(
     )
 )
 
-# Remote server: NOT scanned by pipelock
-# Pipelock's MCP proxy only wraps stdio servers.
-# For remote servers, vet the server before connecting.
+# Direct remote server: NOT scanned by Pipelock.
+# To scan this path, expose the remote endpoint through:
+# pipelock mcp proxy --upstream https://api.example.com/mcp/sse
 remote = McpToolset(
     connection_params=SseConnectionParams(url="https://api.example.com/mcp/sse")
 )
@@ -204,10 +204,22 @@ agent = Agent(
 )
 ```
 
-**Note:** Pipelock's MCP proxy only wraps stdio-based servers. Remote HTTP/SSE
-MCP connections go directly to the remote endpoint and bypass Pipelock. For
-outbound HTTP traffic from your agent code (API calls, web fetches), route those
-through `pipelock run` as a fetch proxy. See the
+**Note:** Direct `SseConnectionParams` / HTTP MCP connections go straight to the
+remote endpoint and bypass Pipelock. To scan remote MCP traffic you have two
+options:
+
+- `pipelock mcp proxy --upstream https://api.example.com/mcp/sse` registers
+  Pipelock as a stdio MCP server that bridges to the remote endpoint. Use this
+  when the upstream needs no client-supplied HTTP headers, since the stdio
+  bridge does not have a transparent path for the client's `Authorization` or
+  other custom headers.
+- HTTP reverse proxy mode (`pipelock run --mcp-listen ADDR --mcp-upstream URL`)
+  preserves request headers through to the upstream. Use this when the upstream
+  requires per-request `Authorization` or other client-supplied headers, or
+  when the client needs an HTTP MCP URL.
+
+For outbound HTTP traffic from your agent code (API calls, web fetches), route
+those through `pipelock run` as a fetch proxy. See the
 [HTTP fetch proxy](#http-fetch-proxy) section below.
 
 ### Pattern D: Sub-Agents
@@ -272,7 +284,7 @@ networks:
 
 services:
   pipelock:
-    # Pin to a specific version for production (e.g., ghcr.io/luckypipewrench/pipelock:v0.3.2)
+    # Pin to a specific version for production. See https://github.com/luckyPipewrench/pipelock/releases for available tags.
     image: ghcr.io/luckypipewrench/pipelock:latest
     networks:
       - pipelock-internal
@@ -337,14 +349,36 @@ def fetch_through_pipelock(url: str) -> str:
     return data.get("content", "")
 ```
 
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy (`HTTPS_PROXY`), CONNECT tunnels
+are opaque by default: pipelock only sees the hostname, not the request body or
+response content. Enabling TLS interception closes this gap by performing a MITM
+on HTTPS connections, giving you full DLP on request bodies and response
+injection detection through CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Trust the CA in your Python environment:
+
+```bash
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+# Or for requests/httpx specifically:
+export REQUESTS_CA_BUNDLE=~/.pipelock/ca.pem
+```
+
+MCP proxy mode (stdio wrapping) does not require TLS interception. It scans
+traffic in both directions without certificates.
+
 ## Choosing a Config
 
 | Config | Action | Best For |
 |--------|--------|----------|
 | `balanced` | warn (default) | Recommended starting point (`--preset balanced`) |
 | `strict` | block (default) | High-security, production (`--preset strict`) |
-| `generic-agent.yaml` | warn (default) | Agent-specific tuning (copy from `configs/`) |
-| `claude-code.yaml` | block (default) | Unattended coding agents (copy from `configs/`) |
+| `generic-agent` | warn (default) | Agent-specific tuning (`--preset generic-agent`) |
+| `claude-code` | block (default) | Unattended coding agents (`--preset claude-code`) |
 
 Start with `balanced` to log detections without blocking. Review the logs,
 tune thresholds, then switch to `strict` for production.

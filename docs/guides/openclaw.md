@@ -1,6 +1,6 @@
 # OpenClaw + Pipelock Deployment Guide
 
-Pipelock sits between your AI agent and the OpenClaw gateway, scanning all MCP traffic for secret exfiltration, prompt injection, and tool poisoning. This guide covers deploying pipelock as a security layer for OpenClaw.
+Pipelock sits between your AI agent and the OpenClaw gateway when the agent's MCP client is configured to use the Pipelock wrapper or generated MCP launcher contract. It scans that mediated MCP traffic for secret exfiltration, prompt injection, and tool poisoning. This guide covers deploying pipelock as a security layer for OpenClaw.
 
 ## Why
 
@@ -19,11 +19,15 @@ Pipelock blocks the post-compromise steps of this chain: tool policy blocks dang
 **1. Install pipelock:**
 
 ```bash
-# Homebrew
-brew install luckyPipewrench/tap/pipelock
+# From source (Go 1.25+)
+go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
 
 # Or download binary
-curl -L https://github.com/luckyPipewrench/pipelock/releases/latest/download/pipelock_linux_amd64.tar.gz | tar xz
+curl -fsSL https://github.com/luckyPipewrench/pipelock/releases/latest/download/pipelock_linux_amd64.tar.gz | tar xz
+sudo mv pipelock /usr/local/bin/
+
+# Or Homebrew (macOS)
+brew install luckyPipewrench/tap/pipelock
 ```
 
 **2. Generate a wrapped config:**
@@ -38,7 +42,7 @@ pipelock generate mcporter -i servers.json -o wrapped.json
 pipelock generate mcporter -i servers.json --in-place --backup
 ```
 
-**3. Restart your agent.** All MCP traffic now routes through pipelock.
+**3. Restart your agent.** MCP traffic from that wrapped config now routes through pipelock.
 
 ## Architecture
 
@@ -61,7 +65,11 @@ pipelock generate mcporter -i servers.json --in-place --backup
 └─────────────────────────────────────────────────────────┘
 ```
 
-The agent has secrets but no direct network access. Pipelock has no secrets but full network access. This capability separation prevents a compromised agent from exfiltrating secrets directly.
+In an enforced deployment, the agent has secrets but no direct network access.
+Pipelock has no agent secrets and provides policy-controlled network egress.
+Deployment controls such as Docker networking, host containment, firewall
+rules, or K8s NetworkPolicy enforce this boundary. This capability separation
+prevents a compromised agent from exfiltrating secrets directly.
 
 ## Two Protection Layers
 
@@ -80,7 +88,7 @@ Wraps the OpenClaw gateway connection with bidirectional scanning:
 
 When the agent makes outbound HTTP requests through pipelock's fetch proxy:
 
-- 9-layer URL scanning (blocklist, DLP, SSRF, rate limiting, entropy checks)
+- Ordered URL scanning (CRLF, path traversal, destination policy, DLP, SSRF, rate limiting, entropy checks)
 - Response injection detection on fetched content
 - Data budget tracking per domain
 
@@ -154,7 +162,25 @@ The generator is idempotent. Running it twice produces identical output. Servers
 
 ## Kubernetes Sidecar Deployment
 
-Run pipelock as a sidecar container alongside your agent. The init container copies the pipelock binary into a shared volume so the agent can use it for MCP stdio wrapping:
+For enforced cluster deployments, generate a companion-proxy topology and point it at the OpenClaw MCP endpoint:
+
+```bash
+pipelock init sidecar \
+  --inject-spec agent-deployment.yaml \
+  --mcp-upstream http://openclaw-gateway:3000/mcp \
+  --mcp-server-name openclaw \
+  --output enforced.yaml
+kubectl apply -f enforced.yaml
+```
+
+The generated agent workload gets `HTTPS_PROXY` and `HTTP_PROXY` for HTTP egress, plus two MCP launcher inputs:
+
+- `PIPELOCK_MCP_PROXY_URL=http://<pipelock-service>:8889`
+- `PIPELOCK_MCP_CONFIG=/etc/pipelock/mcp/mcp.json`
+
+The mounted `mcp.json` contains an `mcpServers.openclaw` entry whose URL points at Pipelock's MCP listener. Configure your agent launcher to read `PIPELOCK_MCP_CONFIG`, or configure the MCP client directly from `PIPELOCK_MCP_PROXY_URL`. The generated NetworkPolicy limits the agent pod to DNS plus the Pipelock HTTP and MCP proxy ports, so direct egress to the OpenClaw gateway is outside the generated agent boundary. That boundary only holds if your CNI actually enforces the policy — see [NetworkPolicy Semantics](../cli/init-sidecar.md#networkpolicy-semantics) for how to prove it with a positive control followed by a negative test.
+
+Same-pod sidecar wiring is still useful for local prototypes, but it relies on the agent honoring proxy settings and is not the generated enforced topology:
 
 ```yaml
 apiVersion: apps/v1
@@ -166,7 +192,7 @@ spec:
     spec:
       initContainers:
         - name: pipelock-init
-          image: ghcr.io/luckypipewrench/pipelock-init:0.3.2
+          image: ghcr.io/luckypipewrench/pipelock-init:latest
           command: ["cp", "/pipelock", "/shared-bin/pipelock"]
           volumeMounts:
             - name: shared-bin
@@ -187,7 +213,7 @@ spec:
               readOnly: true
 
         - name: pipelock
-          image: ghcr.io/luckypipewrench/pipelock:0.3.2
+          image: ghcr.io/luckypipewrench/pipelock:latest
           args: ["run", "--listen", "0.0.0.0:8888"]
           ports:
             - containerPort: 8888
@@ -204,7 +230,9 @@ spec:
           emptyDir: {}
 ```
 
-Add a NetworkPolicy to restrict the agent container's egress to only the pipelock sidecar:
+If you keep a same-pod prototype, do not treat a pod-level NetworkPolicy as a container-level wall between containers in that same pod. Kubernetes NetworkPolicy selects pods, not individual containers, so it cannot stop one container from reaching destinations another container in the same pod can reach. For enforced cluster isolation, prefer the generated companion-proxy topology above, where the agent pod and Pipelock service are separate policy subjects.
+
+For a separate-agent-pod topology, a NetworkPolicy should restrict the agent pod's egress to DNS and the Pipelock Service:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
@@ -224,12 +252,11 @@ spec:
       ports:
         - port: 53
           protocol: UDP
-    # Allow traffic only to the pipelock sidecar (localhost in same pod).
-    # This prevents the agent from making direct external connections.
+    # Allow traffic only to pods selected as the Pipelock proxy Service backend.
     - to:
         - podSelector:
             matchLabels:
-              app: agent
+              app: pipelock
       ports:
         - port: 8888
 ```
@@ -246,9 +273,33 @@ Mapped to the CVE-2026-25253 attack chain:
 | Data exfiltration via tool args | Input scanning catches secrets in outbound calls | MCP proxy |
 | Prompt injection in tool results | Response scanning detects injection attempts | MCP proxy |
 | Read-then-exfil tool sequences | Chain detection catches multi-step patterns | MCP proxy |
-| Outbound HTTP exfiltration | 9-layer URL scanning, DLP on request URLs | HTTP proxy |
+| Outbound HTTP exfiltration | Ordered URL scanning, DLP on request URLs | HTTP proxy |
 
-Pipelock does not patch the CVE itself (that requires OpenClaw origin validation). It adds defense-in-depth by scanning all traffic between agent and gateway, catching exploitation attempts at multiple points in the attack chain.
+Pipelock does not patch the CVE itself (that requires OpenClaw origin validation). It adds defense-in-depth by scanning the mediated traffic between agent and gateway, catching exploitation attempts at multiple points in the attack chain.
+
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy (`HTTPS_PROXY`), CONNECT tunnels
+are opaque by default: pipelock only sees the hostname, not the request body or
+response content. Enabling TLS interception closes this gap by performing a MITM
+on HTTPS connections, giving you full DLP on request bodies and response
+injection detection through CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Trust the CA in your agent's runtime:
+
+```bash
+# Node.js agents
+export NODE_EXTRA_CA_CERTS=~/.pipelock/ca.pem
+
+# Python agents
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+```
+
+MCP proxy mode (stdio wrapping and `--upstream`) does not require TLS
+interception. It scans traffic directly without certificates.
 
 ## Troubleshooting
 

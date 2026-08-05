@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package audit
 
 import (
@@ -25,6 +28,10 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 		{"databudget", "T1030"},
 		{"ratelimit", "T1030"},
 
+		// URL injection (scanner pipeline layers 2-3)
+		{"crlf_injection", "T1190"},
+		{"path_traversal", "T1083"},
+
 		// SSRF
 		{"ssrf", "T1046"},
 
@@ -49,6 +56,27 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 
 		// Session anomaly
 		{"session_anomaly", "T1078"},
+
+		// Domain fronting
+		{"sni_mismatch", "T1090.004"},
+
+		// Request body/header DLP
+		{"body_dlp", "T1048"},
+		{"body_entropy", "T1048"},
+		{"body_prompt_injection", "T1059"},
+		{"header_dlp", "T1048"},
+
+		// TLS interception
+		{"tls_intercept", "T1557"},
+		{"tls_response_blocked", "T1659"},
+		{"tls_authority_mismatch", "T1090.004"},
+		{"tls_handshake_error", "T1573"},
+
+		// Chain detection
+		{"chain_detection", "T1059"},
+
+		// Persistence
+		{"persist", "T1053"},
 	}
 
 	for _, tt := range tests {
@@ -56,6 +84,30 @@ func TestTechniqueForScanner_AllMappedEntries(t *testing.T) {
 			got := TechniqueForScanner(tt.scanner)
 			if got != tt.technique {
 				t.Errorf("TechniqueForScanner(%q) = %q, want %q", tt.scanner, got, tt.technique)
+			}
+		})
+	}
+}
+
+func TestTechniqueForChainPattern_PersistReturnsT1053(t *testing.T) {
+	tests := []struct {
+		pattern string
+		want    string
+	}{
+		{"write-persist", "T1053"},
+		{"persist-callback", "T1053"},
+		{"Write-Persist", "T1053"},
+		{"PERSIST-CALLBACK", "T1053"},
+		{"custom-persist-chain", "T1053"},
+		{"exfil_then_delete", "T1059"},
+		{"read-then-exec", "T1059"},
+		{"env-exfil", "T1059"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.pattern, func(t *testing.T) {
+			got := TechniqueForChainPattern(tt.pattern)
+			if got != tt.want {
+				t.Errorf("TechniqueForChainPattern(%q) = %q, want %q", tt.pattern, got, tt.want)
 			}
 		})
 	}
@@ -96,7 +148,7 @@ func TestTechniqueMap_NoDuplicateKeys(t *testing.T) {
 	// This test is a compile-time guarantee in Go (duplicate map keys are a
 	// compile error), but we verify the map has the expected number of entries
 	// to catch accidental deletions during refactoring.
-	const expectedEntries = 19
+	const expectedEntries = 36
 	if len(techniqueMap) != expectedEntries {
 		t.Errorf("techniqueMap has %d entries, expected %d (was an entry added or removed?)", len(techniqueMap), expectedEntries)
 	}

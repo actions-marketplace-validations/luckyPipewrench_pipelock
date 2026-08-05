@@ -1,7 +1,10 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 // Package integrity provides file integrity monitoring for agent workspaces.
 //
 // It generates SHA256 manifests of directory contents and detects unauthorized
-// modifications, additions, and deletions — the foundation for securing
+// modifications, additions, and deletions - the foundation for securing
 // inter-agent communication channels.
 package integrity
 
@@ -13,10 +16,16 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/atomicfile"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/securefile"
 )
 
 // ManifestVersion is the current manifest schema version.
 const ManifestVersion = 1
+
+const maxManifestBytes = 32 << 20
 
 // DefaultManifestFile is the default manifest filename within a workspace.
 const DefaultManifestFile = ".integrity-manifest.json"
@@ -39,12 +48,15 @@ type FileEntry struct {
 
 // Load reads and parses a manifest from disk.
 func Load(path string) (*Manifest, error) {
-	data, err := os.ReadFile(path) //nolint:gosec // G304: caller controls path
+	data, err := securefile.Read(path, securefile.Options{MaxBytes: maxManifestBytes, DisallowedPerms: securefile.DisallowGroupOrWorldWrite})
 	if err != nil {
 		return nil, fmt.Errorf("reading manifest: %w", err)
 	}
 
 	var m Manifest
+	if err := jsonscan.RejectDuplicateKeys(data); err != nil {
+		return nil, fmt.Errorf("parsing manifest: %w", err)
+	}
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing manifest: %w", err)
 	}
@@ -69,38 +81,12 @@ func (m *Manifest) Save(path string) error {
 
 	data = append(data, '\n')
 
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".manifest-*.tmp")
-	if err != nil {
-		return fmt.Errorf("creating temp file: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()        //nolint:errcheck,gosec // cleanup
-		os.Remove(tmpName) //nolint:errcheck,gosec // cleanup
-		return fmt.Errorf("writing manifest: %w", err)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()        //nolint:errcheck,gosec // cleanup
-		os.Remove(tmpName) //nolint:errcheck,gosec // cleanup
-		return fmt.Errorf("setting manifest permissions: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpName) //nolint:errcheck,gosec // cleanup
-		return fmt.Errorf("closing temp file: %w", err)
-	}
-	if err := os.Rename(tmpName, path); err != nil { //nolint:gosec // G703: path from caller, not user input
-		os.Remove(tmpName) //nolint:errcheck,gosec // cleanup
-		return fmt.Errorf("writing manifest: %w", err)
-	}
-
-	return nil
+	return atomicfile.Write(path, data, 0o600)
 }
 
 // HashFile computes the SHA256 hash and stats a single file.
 func HashFile(path string) (FileEntry, error) {
-	f, err := os.Open(path) //nolint:gosec // G304: caller controls path
+	f, err := os.Open(filepath.Clean(path))
 	if err != nil {
 		return FileEntry{}, fmt.Errorf("opening file: %w", err)
 	}

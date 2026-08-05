@@ -1,36 +1,80 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package proxy
+
+import "github.com/luckyPipewrench/pipelock/internal/identitykey"
 
 import (
 	"net/http"
-	"regexp"
+
+	"github.com/luckyPipewrench/pipelock/internal/edition"
 )
 
-// AgentHeader is the HTTP header used to identify the calling agent.
-const AgentHeader = "X-Pipelock-Agent"
+// agentAnonymous is the fallback agent name when no header/query/context
+// override identifies the caller. Used by proxy handlers for display.
+// Agent resolution logic lives in internal/edition/.
+// agentAnonymous mirrors identitykey.AnonymousAgent by reference, not by copy,
+// so the two cannot drift. See that constant for why the agreement matters.
+const agentAnonymous = identitykey.AnonymousAgent
 
-// maxAgentNameLen limits agent names to prevent log bloat.
-const maxAgentNameLen = 64
+// AgentHeader re-exports the canonical agent header from edition.
+// Used by proxy tests and any proxy-internal code that needs it.
+const AgentHeader = edition.AgentHeader
 
-// agentNameRe matches characters NOT allowed in agent names.
-var agentNameRe = regexp.MustCompile(`[^a-zA-Z0-9._-]`)
+// agentQueryParam is the URL query parameter pipelock uses as a
+// self-declared agent identity hint. Agent resolution in edition.Agent
+// reads it alongside AgentHeader.
+const agentQueryParam = "agent"
 
-// ExtractAgent reads the agent name from the request. It checks the
-// X-Pipelock-Agent header first, then the "agent" query parameter,
-// falling back to "anonymous". Names are sanitized to prevent log injection.
-func ExtractAgent(r *http.Request) string {
-	agent := r.Header.Get(AgentHeader)
-	if agent == "" {
-		agent = r.URL.Query().Get("agent")
+// forwardedClientHeaders are HTTP headers that allow a caller to
+// assert the original client IP or routing path downstream. When
+// pipelock acts as a forward proxy or TLS interception middlebox,
+// pass-through of these headers lets a malicious caller poison
+// destination log attribution, geo checks, abuse rate-limiters, and
+// any auth heuristic that keys off "origin". Pipelock has its own
+// verified client_ip available; it does not need attacker-supplied
+// hints and must not forward them blindly. Stripping matches what
+// production forward proxies typically do when they do NOT intend to
+// re-author the headers authoritatively.
+var forwardedClientHeaders = []string{
+	"X-Forwarded-For",
+	"X-Real-IP",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Forwarded-Port",
+	"Forwarded",
+	"Via",
+}
+
+// stripInternalIdentity removes both the X-Pipelock-Agent header and
+// the ?agent= query parameter from an outbound request so
+// attacker-supplied identity hints cannot bleed through to downstream
+// services. It also strips forwarded client-IP assertion headers
+// (X-Forwarded-For, X-Real-IP, Forwarded, Via, and the related
+// X-Forwarded-* family) because pipelock knows the verified client_ip
+// and must not pass an attacker-supplied lie through to the backend.
+//
+// Without these strips, round-2 of the pre-tag gate showed:
+//   - caller sending X-Pipelock-Agent: evil-actor lands that header
+//     on the destination despite bind_default_agent_identity;
+//   - caller sending X-Forwarded-For: 1.2.3.4 poisons the destination's
+//     `origin` attribution (httpbin reported "1.2.3.4, <real-ip>").
+func stripInternalIdentity(r *http.Request) {
+	if r == nil {
+		return
 	}
-	if agent == "" {
-		return "anonymous" //nolint:goconst // clarity over deduplication
+	r.Header.Del(AgentHeader)
+	for _, h := range forwardedClientHeaders {
+		r.Header.Del(h)
 	}
-	agent = agentNameRe.ReplaceAllString(agent, "_")
-	if len(agent) > maxAgentNameLen {
-		agent = agent[:maxAgentNameLen]
+	if r.URL == nil {
+		return
 	}
-	if agent == "" {
-		return "anonymous" //nolint:goconst // clarity over deduplication
+	q := r.URL.Query()
+	if !q.Has(agentQueryParam) {
+		return
 	}
-	return agent
+	q.Del(agentQueryParam)
+	r.URL.RawQuery = q.Encode()
 }

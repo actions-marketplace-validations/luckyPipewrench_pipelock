@@ -1,13 +1,15 @@
 # SIEM Integration Guide
 
 Pipelock pushes structured security events to external systems via webhook
-(HTTP POST) and syslog (RFC 5424) sinks. This guide covers the event schema,
-forwarding setup for common SIEM platforms, detection rule examples, and
-automated kill switch response.
+(HTTP POST), syslog (RFC 5424), and OTLP (OpenTelemetry HTTP/protobuf) sinks.
+Enterprise builds also provide a durable HTTP forwarder for at-least-once
+delivery from a local append-only spool.
+This guide covers the event schema, forwarding setup for common SIEM
+platforms, detection rule examples, and automated kill switch response.
 
 ## Event Schema
 
-Both sinks emit the same JSON envelope:
+All three sinks default to the same JSON envelope (OTLP wraps it as an OTLP LogRecord); the webhook and syslog sinks can also emit CEF (`format: cef`) or OCSF (`format: ocsf`) instead of JSON (see the format options below):
 
 ```json
 {
@@ -36,7 +38,7 @@ Both sinks emit the same JSON envelope:
 
 ## Event Types
 
-Only security events (critical and warn) are pushed to webhook and syslog.
+Only security events (critical and warn) are pushed to emit sinks (webhook, syslog, OTLP).
 Info-level events go to local logs only, with one exception noted below.
 
 ### Critical (requires immediate response)
@@ -44,9 +46,9 @@ Info-level events go to local logs only, with one exception noted below.
 | Type | Description | Key Fields |
 |------|-------------|------------|
 | `kill_switch_deny` | All traffic denied by emergency kill switch | `transport`, `endpoint`, `source`, `deny_message`, `client_ip` |
-| `adaptive_escalation`* | Session escalated to block level | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
+| `adaptive_escalation`* | Session threat score escalated. Adaptive enforcement v2 upgrades actions at all enforcement points (elevated, high, critical levels). | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
 
-\* Critical when `to` is `block`. Otherwise warn.
+\* Critical when `to` is `block`. Otherwise warn. In v1, escalation is scoring and event emission only.
 
 ### Warn (suspicious activity)
 
@@ -59,7 +61,7 @@ Info-level events go to local logs only, with one exception noted below.
 | `ws_blocked` | WebSocket frame blocked | `target`, `direction`, `scanner`, `reason`, `client_ip`, `request_id` |
 | `response_scan` | Prompt injection detected in response | `url`, `client_ip`, `request_id`, `action`, `match_count`, `patterns` |
 | `ws_scan` | Prompt injection in WebSocket frame | `target`, `direction`, `client_ip`, `request_id`, `action`, `match_count`, `patterns` |
-| `adaptive_escalation`* | Session escalated (not to block) | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
+| `adaptive_escalation`* | Session threat score escalated (not to block level) | `session`, `from`, `to`, `client_ip`, `request_id`, `score` |
 | `error` | Internal error during request processing | `method`, `url`, `client_ip`, `request_id`, `error` |
 
 ### Info (local logs only)
@@ -86,7 +88,7 @@ via a log collector (Promtail, Filebeat, Fluentd).
 
 ## Pipelock Configuration
 
-Add an `emit` block to your pipelock config to enable one or both sinks:
+Add an `emit` block to your pipelock config to enable any combination of sinks:
 
 ```yaml
 emit:
@@ -98,13 +100,124 @@ emit:
     auth_token: "your-bearer-token"   # optional Authorization header
     timeout_seconds: 5
     queue_size: 64                    # async buffer capacity
+    format: "ocsf"                   # json, cef, or ocsf
 
   syslog:
     address: "udp://syslog.example.com:514"
     min_severity: "warn"
     facility: "local0"                # local0-local7, auth, daemon, etc.
     tag: "pipelock"
+    format: "json"                    # json, cef, or ocsf
 ```
+
+### Durable HTTP forwarding (Enterprise)
+
+Use `emit.forwarder` when delivery must resume after a restart. This is a
+narrow forwarding pipe into an operator-owned endpoint; it is not a SIEM,
+search index, or second evidence database.
+
+```yaml
+# pipelock-enterprise-skip-id: siem-durable-forwarder
+emit:
+  forwarder:
+    url: "https://api.vendor.example/events"
+    destination_allowlist: ["api.vendor.example"]
+    spool_file: "/var/lib/pipelock/siem-forward.spool"
+    cursor_file: "/var/lib/pipelock/siem-forward.cursor"
+    auth_token: "" # optional Bearer token; requires an https:// url
+    min_severity: "warn"
+    timeout_seconds: 5
+    queue_size: 256
+    max_spool_bytes: 104857600 # 100 MiB spool ceiling (default)
+    allow_insecure_http: false # permit plaintext http to a non-loopback host
+```
+
+The destination allowlist is mandatory and matches exact hostnames only. The
+forwarder resolves and rejects loopback, private, link-local, multicast, and
+cloud-metadata addresses at startup and again in the connection path. The
+connection uses the already-checked address, which closes the DNS-rebinding
+gap. Redirects are refused. An empty allowlist or invalid destination prevents
+startup; there is no forward-anywhere default.
+
+Transport confidentiality is enforced. A plaintext `http://` url to a
+non-loopback host is rejected unless `allow_insecure_http: true` is set, and an
+`auth_token` over `http://` to a non-loopback host is rejected regardless —
+a bearer token must not travel in cleartext. Loopback destinations (a local
+collector) may use `http://` without the flag.
+
+An operator may deliberately target an internal service only by using that IP
+literal as the URL host and listing the same literal exactly. An allowlisted
+hostname that later resolves to an internal address is still denied.
+If DNS is unavailable at startup, Pipelock starts with forwarding degraded
+rather than taking down the mediation proxy. No event is sent until a later
+dial-time resolution succeeds and passes the same SSRF checks.
+
+Accepted events are appended to `spool_file` with mode `0600`. After the
+endpoint returns a 2xx response, `cursor_file` advances atomically with the
+source path, byte offset, and SHA-256 hash of the acknowledged record. A
+restart verifies that binding before replay. A corrupt cursor fails closed
+instead of silently skipping evidence. Delivery is at least once, so a remote
+receiver should deduplicate if a response is lost after it accepted an event.
+Once every spooled record has been acknowledged the spool is truncated, so
+healthy operation stays bounded rather than growing without limit.
+
+The on-disk spool is capped at `max_spool_bytes` (default 100 MiB). When the
+endpoint is unreachable and an append would exceed the cap, the new event is
+dropped and counted rather than retried, so a stalled endpoint cannot exhaust
+host disk. An event that can never be encoded (for example a non-finite number
+in its fields) is likewise dropped with a sanitized diagnostic instead of
+blocking every later event behind an unencodable one.
+
+The producer-facing queue remains bounded and non-blocking. A full queue drops
+the new event and increments `pipelock_siem_forwarder_dropped_total`; it does
+not stall proxy traffic. The durable guarantee begins after an event reaches
+the spool. Health is exposed through these Prometheus series:
+
+- `pipelock_siem_forwarder_queued`
+- `pipelock_siem_forwarder_delivered_total`
+- `pipelock_siem_forwarder_failed_total`
+- `pipelock_siem_forwarder_dropped_total`
+- `pipelock_siem_forwarder_last_success_timestamp_seconds`
+- `pipelock_siem_forwarder_spool_bytes`
+
+The durable wire envelope is versioned:
+
+```json
+{
+  "schema": "pipelock.siem.event.v1",
+  "event": {
+    "severity": "warn",
+    "type": "blocked",
+    "timestamp": "2026-02-25T12:34:56.789Z",
+    "pipelock_instance": "agent-a",
+    "fields": {"scanner": "dlp", "action": "block"}
+  }
+}
+```
+
+The existing syslog sink supports JSON, CEF (`format: cef`), and OCSF
+(`format: ocsf`) for receivers that require one of those wire formats, but it
+is best-effort and does not use the durable cursor.
+
+Operator lifecycle:
+
+- Create: configure both state paths; Pipelock creates parent directories and
+  files with restrictive permissions. Give every Pipelock process its own
+  spool/cursor pair; the files are not a shared multi-process queue. This is
+  enforced by an exclusive advisory lock on a `<spool_file>.lock` sidecar — a
+  second process pointed at the same spool fails to start delivery rather than
+  racing the cursor.
+- Inspect: watch the forwarder metrics and the cursor's offset/hash while
+  treating the spool as the delivery source of truth.
+- Rotate: stop Pipelock, confirm the cursor offset equals the spool size,
+  archive the pair, then restart with new paths. Never rotate only one file.
+- Recover: restore a matching spool/cursor pair. If only the cursor is corrupt,
+  moving it aside replays the spool from offset zero (duplicates, but no silent
+  skip). Preserve the corrupt pair for investigation first.
+- Revoke: remove `emit.forwarder.url` and reload; Pipelock closes the worker and
+  leaves state files for operator-controlled retention or deletion.
+- Approve changes: destination or state-path changes are config-controlled and
+  revalidated before the replacement worker starts.
 
 **Severity filtering:** Events below `min_severity` are silently dropped before
 reaching the sink. Set to `warn` for all security events (recommended), or
@@ -118,6 +231,14 @@ events. All other info-level events are local-only and never sent to sinks.
 control is the emission *threshold* (`min_severity`). This is intentional: it
 prevents misconfiguration from silently hiding critical events.
 
+### OCSF over HTTP
+
+Set `emit.webhook.format: ocsf` for SIEM HTTP ingestion endpoints that accept
+OCSF Detection Finding JSON. Webhook and syslog use the same OCSF encoder, so
+the class, severity, finding, network, and Pipelock extension fields stay
+identical across transports. OCSF webhook requests use
+`Content-Type: application/json`.
+
 ## Forwarding Patterns
 
 ### Webhook to Splunk HEC
@@ -128,6 +249,7 @@ emit:
     url: "https://splunk.example.com:8088/services/collector/event"
     auth_token: "your-splunk-hec-token"
     min_severity: "warn"
+    format: "json"
 ```
 
 Splunk HEC expects `Authorization: Splunk <token>`, but pipelock sends
@@ -186,6 +308,7 @@ emit:
     facility: "local0"
     tag: "pipelock"
     min_severity: "warn"
+    format: "json"                    # json, cef, or ocsf
 ```
 
 On the receiver, filter by program name:
@@ -272,7 +395,7 @@ index=pipelock type IN ("anomaly", "session_anomaly") fields.score>0.7
 | timechart span=5m count by type
 ```
 
-Adaptive escalation to block (agent misbehaving):
+Adaptive escalation events reaching block level:
 
 ```spl
 index=pipelock type="adaptive_escalation" fields.to="block"
@@ -417,15 +540,19 @@ curl http://pipelock:9090/api/v1/killswitch/status \
   "sources": {
     "config": false,
     "api": true,
+    "conductor_remote": false,
+    "conductor_stale": false,
     "signal": false,
     "sentinel": false
   }
 }
 ```
 
-The kill switch uses OR logic across four independent sources (config, API,
-SIGUSR1 signal, sentinel file). If *any* source is active, all traffic is
-denied. Deactivating one doesn't affect the others.
+The kill switch uses OR logic across six independent sources (config, API,
+Conductor remote kill, Conductor stale-bundle detection, SIGUSR1 signal, and
+sentinel file). If *any* source is active, all traffic is denied. Deactivating
+one doesn't affect the others. The Conductor sources remain false when the
+enterprise follower is not in use.
 
 **Rate limiting:** `POST /api/v1/killswitch` is limited to 10 requests per
 60-second window. Exceeding it returns `429` with a `Retry-After: 60` header.
@@ -531,4 +658,12 @@ check:
 1. Is `emit.webhook.url` (or `emit.syslog.address`) reachable from the
    pipelock host?
 2. Is `min_severity` set low enough? A `blocked` event is severity `warn`.
-3. Check pipelock's stderr for sink errors (`emit: webhook send error: ...`).
+3. Scrape the sink-health metrics below and inspect stderr for the matching
+   sanitized delivery diagnostic.
+
+The Prometheus endpoint exposes current delivery accounting for every built-in
+audit sink under `pipelock_audit_sink_*`, labeled only by `sink` (`webhook`,
+`syslog`, or `otlp`). Alert on `pipelock_audit_sink_degraded == 1` or increases
+in the `failed_total`, `dropped_total`, and `abandoned_total` series. The
+`last_error_present` gauge reports unresolved error state without exporting
+error text or endpoint secrets as labels.

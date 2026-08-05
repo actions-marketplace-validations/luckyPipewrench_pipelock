@@ -1,15 +1,21 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package scanner
 
 import (
+	"context"
 	"strings"
 	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
 func FuzzScanResponseContent(f *testing.F) {
 	cfg := testConfig()
 	cfg.ResponseScanning.Enabled = true
-	cfg.ResponseScanning.Action = "warn" //nolint:goconst // test value
-	sc := New(cfg)
+	cfg.ResponseScanning.Action = config.ActionWarn
+	sc := MustNew(cfg)
 	defer sc.Close()
 
 	// Clean content
@@ -34,7 +40,7 @@ func FuzzScanResponseContent(f *testing.F) {
 	f.Add(strings.Repeat("a", 100000))
 
 	f.Fuzz(func(t *testing.T, content string) {
-		result := sc.ScanResponse(content)
+		result := sc.ScanResponse(context.Background(), content)
 
 		// Clean results must have no matches
 		if result.Clean && len(result.Matches) > 0 {

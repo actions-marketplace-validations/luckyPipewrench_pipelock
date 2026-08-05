@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package mcp
 
 import (
@@ -10,9 +13,10 @@ import (
 func FuzzScanResponse(f *testing.F) {
 	cfg := config.Defaults()
 	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
 	cfg.ResponseScanning.Enabled = true
-	cfg.ResponseScanning.Action = "warn" //nolint:goconst // test value
-	sc := scanner.New(cfg)
+	cfg.ResponseScanning.Action = "warn"
+	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 
 	// Valid clean response

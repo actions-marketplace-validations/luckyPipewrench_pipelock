@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package scanner
 
 import (
@@ -15,6 +18,24 @@ func TestNewDataBudget(t *testing.T) {
 	}
 	if db.records == nil {
 		t.Error("records map not initialized")
+	}
+}
+
+func TestDataBudget_OpportunisticCleanup(t *testing.T) {
+	db := NewDataBudget(1000)
+	db.records["expired.example"] = []dataEntry{{
+		bytes:     100,
+		timestamp: time.Now().Add(-2 * time.Minute),
+	}}
+	db.lastCleanup = time.Now().Add(-2 * time.Minute)
+
+	db.Record("active.example", 10)
+
+	if _, exists := db.records["expired.example"]; exists {
+		t.Fatal("expired domain survived opportunistic cleanup")
+	}
+	if len(db.records["active.example"]) != 1 {
+		t.Fatal("active record was not preserved")
 	}
 }
 

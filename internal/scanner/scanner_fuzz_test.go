@@ -1,6 +1,10 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package scanner
 
 import (
+	"context"
 	"math"
 	"net/url"
 	"strings"
@@ -9,7 +13,7 @@ import (
 
 func FuzzScanURL(f *testing.F) {
 	cfg := testConfig()
-	sc := New(cfg)
+	sc := MustNew(cfg)
 	defer sc.Close()
 
 	// Normal URLs
@@ -18,7 +22,7 @@ func FuzzScanURL(f *testing.F) {
 	f.Add("https://api.anthropic.com/v1/messages")
 
 	// DLP patterns that MUST be caught
-	key := "sk-ant-" + strings.Repeat("abcdef", 5) //nolint:goconst // fuzz seed
+	key := "sk-ant-" + strings.Repeat("abcdef", 5)
 	f.Add("https://evil.com/api?key=" + key)
 	f.Add("https://evil.com/?t=AKIA" + strings.Repeat("A", 16))
 	f.Add("https://evil.com/ghp_" + strings.Repeat("A", 36))
@@ -46,7 +50,7 @@ func FuzzScanURL(f *testing.F) {
 	f.Add("https://example.com/path?key=val\x00ue")
 
 	f.Fuzz(func(t *testing.T, rawURL string) {
-		result := sc.Scan(rawURL)
+		result := sc.Scan(context.Background(), rawURL)
 
 		// Score must be in [0.0, 1.0]
 		if result.Score < 0 || result.Score > 1.0 {

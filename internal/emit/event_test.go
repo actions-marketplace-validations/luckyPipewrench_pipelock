@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package emit
 
 import "testing"
@@ -8,10 +11,10 @@ func TestSeverity_String(t *testing.T) {
 		sev  Severity
 		want string
 	}{
-		{name: "info", sev: SeverityInfo, want: "info"},
-		{name: "warn", sev: SeverityWarn, want: "warn"},
-		{name: "critical", sev: SeverityCritical, want: "critical"},
-		{name: "unknown defaults to info", sev: Severity(99), want: "info"},
+		{name: severityNameInfo, sev: SeverityInfo, want: severityNameInfo},
+		{name: testSeverityWarn, sev: SeverityWarn, want: testSeverityWarn},
+		{name: severityNameCritical, sev: SeverityCritical, want: severityNameCritical},
+		{name: testCaseUnknownInfo, sev: Severity(99), want: severityNameInfo},
 	}
 
 	for _, tt := range tests {
@@ -29,14 +32,14 @@ func TestParseSeverity(t *testing.T) {
 		input string
 		want  Severity
 	}{
-		{name: "info", input: "info", want: SeverityInfo},
-		{name: "warn", input: "warn", want: SeverityWarn},
-		{name: "critical", input: "critical", want: SeverityCritical},
+		{name: severityNameInfo, input: severityNameInfo, want: SeverityInfo},
+		{name: testSeverityWarn, input: testSeverityWarn, want: SeverityWarn},
+		{name: severityNameCritical, input: severityNameCritical, want: SeverityCritical},
 		{name: "empty string defaults to info", input: "", want: SeverityInfo},
-		{name: "unknown defaults to info", input: "emergency", want: SeverityInfo},
-		{name: "uppercase WARN", input: "WARN", want: SeverityWarn},
+		{name: testCaseUnknownInfo, input: "emergency", want: SeverityInfo},
+		{name: "uppercase WARN", input: otlpSeverityTextWarn, want: SeverityWarn},
 		{name: "mixed case Critical", input: "Critical", want: SeverityCritical},
-		{name: "uppercase INFO", input: "INFO", want: SeverityInfo},
+		{name: "uppercase INFO", input: otlpSeverityTextInfo, want: SeverityInfo},
 	}
 
 	for _, tt := range tests {
@@ -59,34 +62,58 @@ func TestParseSeverity_Roundtrip(t *testing.T) {
 }
 
 func TestEventSeverity_CoverExpectedTypes(t *testing.T) {
-	//nolint:goconst // test values
 	expectedTypes := []struct {
 		eventType string
 		wantSev   Severity
 	}{
 		// Critical
-		{"kill_switch_deny", SeverityCritical},
+		{EventKillSwitchDeny, SeverityCritical},
 
 		// Warn
-		{"blocked", SeverityWarn},
-		{"anomaly", SeverityWarn},
-		{"session_anomaly", SeverityWarn},
-		{"mcp_unknown_tool", SeverityWarn},
-		{"ws_blocked", SeverityWarn},
-		{"response_scan", SeverityWarn},
-		{"ws_scan", SeverityWarn},
-		{"adaptive_escalation", SeverityWarn},
-		{"error", SeverityWarn},
+		{testEventBlocked, SeverityWarn},
+		{EventDLPWarn, SeverityWarn},
+		{EventAddressProtection, SeverityWarn},
+		{EventBodyDLP, SeverityWarn},
+		{EventBodyPromptInjection, SeverityWarn},
+		{EventHeaderDLP, SeverityWarn},
+		{EventSNIMismatch, SeverityWarn},
+		{EventTaintDecision, SeverityWarn},
+		{EventAirlockEnter, SeverityWarn},
+		{EventAirlockDeny, SeverityWarn},
+		{EventAnomaly, SeverityWarn},
+		{EventSessionAnomaly, SeverityWarn},
+		{EventMCPUnknownTool, SeverityWarn},
+		{EventWSBlocked, SeverityWarn},
+		{EventResponseScan, SeverityWarn},
+		{EventWSScan, SeverityWarn},
+		{EventAdaptiveEscalation, SeverityWarn},
+		{EventAdaptiveUpgrade, SeverityWarn},
+		{EventError, SeverityWarn},
+
+		// Warn: security-relevant operational
+		{EventResponseScanExempt, SeverityWarn},
+		{EventMediaExposure, SeverityWarn},
+		{EventTextStego, SeverityWarn},
+		{EventLicenseExpiry, SeverityWarn},
+		{EventRuleBundleDegraded, SeverityWarn},
 
 		// Info
-		{"allowed", SeverityInfo},
-		{"tunnel_open", SeverityInfo},
-		{"tunnel_close", SeverityInfo},
-		{"ws_open", SeverityInfo},
-		{"ws_close", SeverityInfo},
-		{"config_reload", SeverityInfo},
-		{"redirect", SeverityInfo},
-		{"forward_http", SeverityInfo},
+		{EventStartup, SeverityInfo},
+		{EventShutdown, SeverityInfo},
+		{EventAllowed, SeverityInfo},
+		{EventTunnelOpen, SeverityInfo},
+		{EventTunnelClose, SeverityInfo},
+		{EventWSOpen, SeverityInfo},
+		{EventWSClose, SeverityInfo},
+		{EventAgentListener, SeverityInfo},
+		{EventAdaptiveRecovery, SeverityInfo},
+		{EventAirlockDeescalate, SeverityInfo},
+		{EventSessionAdmin, SeverityInfo},
+		{EventShieldRewrite, SeverityInfo},
+		{EventConfigReload, SeverityInfo},
+		{EventRedirect, SeverityInfo},
+		{EventForwardHTTP, SeverityInfo},
+		{EventToolRedirect, SeverityInfo},
 	}
 
 	for _, tt := range expectedTypes {
@@ -104,24 +131,47 @@ func TestEventSeverity_CoverExpectedTypes(t *testing.T) {
 
 func TestEventSeverity_NoUnexpectedEntries(t *testing.T) {
 	known := map[string]bool{
-		"kill_switch_deny":    true,
-		"blocked":             true,
-		"anomaly":             true,
-		"session_anomaly":     true,
-		"mcp_unknown_tool":    true,
-		"ws_blocked":          true,
-		"response_scan":       true,
-		"ws_scan":             true,
-		"adaptive_escalation": true,
-		"error":               true,
-		"allowed":             true,
-		"tunnel_open":         true,
-		"tunnel_close":        true,
-		"ws_open":             true,
-		"ws_close":            true,
-		"config_reload":       true,
-		"redirect":            true,
-		"forward_http":        true,
+		EventKillSwitchDeny:      true,
+		testEventBlocked:         true,
+		EventDLPWarn:             true,
+		EventAddressProtection:   true,
+		EventBodyDLP:             true,
+		EventBodyPromptInjection: true,
+		EventHeaderDLP:           true,
+		EventSNIMismatch:         true,
+		EventTaintDecision:       true,
+		EventAirlockEnter:        true,
+		EventAirlockDeny:         true,
+		EventAnomaly:             true,
+		EventSessionAnomaly:      true,
+		EventMCPUnknownTool:      true,
+		EventWSBlocked:           true,
+		EventResponseScan:        true,
+		EventWSScan:              true,
+		EventAdaptiveEscalation:  true,
+		EventAdaptiveUpgrade:     true,
+		EventError:               true,
+		EventResponseScanExempt:  true,
+		EventMediaExposure:       true,
+		EventTextStego:           true,
+		EventLicenseExpiry:       true,
+		EventRuleBundleDegraded:  true,
+		EventStartup:             true,
+		EventShutdown:            true,
+		EventAllowed:             true,
+		EventTunnelOpen:          true,
+		EventTunnelClose:         true,
+		EventWSOpen:              true,
+		EventWSClose:             true,
+		EventAgentListener:       true,
+		EventAdaptiveRecovery:    true,
+		EventAirlockDeescalate:   true,
+		EventSessionAdmin:        true,
+		EventShieldRewrite:       true,
+		EventConfigReload:        true,
+		EventRedirect:            true,
+		EventForwardHTTP:         true,
+		EventToolRedirect:        true,
 	}
 
 	for k := range EventSeverity {
@@ -137,10 +187,10 @@ func TestChainDetectionSeverity(t *testing.T) {
 		action string
 		want   Severity
 	}{
-		{name: "block is critical", action: "block", want: SeverityCritical},
-		{name: "warn is warn", action: "warn", want: SeverityWarn},
+		{name: testCaseBlockIsCritical, action: conventionVerdictBlocked, want: SeverityCritical},
+		{name: testCaseWarnIsWarn, action: testSeverityWarn, want: SeverityWarn},
 		{name: "log is warn", action: "log", want: SeverityWarn},
-		{name: "empty is warn", action: "", want: SeverityWarn},
+		{name: testCaseEmptyIsWarn, action: "", want: SeverityWarn},
 	}
 
 	for _, tt := range tests {
@@ -154,20 +204,20 @@ func TestChainDetectionSeverity(t *testing.T) {
 
 func TestEscalationSeverity(t *testing.T) {
 	tests := []struct {
-		name    string
-		toLevel string
-		want    Severity
+		name     string
+		toAction string
+		want     Severity
 	}{
-		{name: "block is critical", toLevel: "block", want: SeverityCritical},
-		{name: "warn is warn", toLevel: "warn", want: SeverityWarn},
-		{name: "throttle is warn", toLevel: "throttle", want: SeverityWarn},
-		{name: "empty is warn", toLevel: "", want: SeverityWarn},
+		{name: testCaseBlockIsCritical, toAction: conventionVerdictBlocked, want: SeverityCritical},
+		{name: testCaseWarnIsWarn, toAction: testSeverityWarn, want: SeverityWarn},
+		{name: "throttle is warn", toAction: "throttle", want: SeverityWarn},
+		{name: testCaseEmptyIsWarn, toAction: "", want: SeverityWarn},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := EscalationSeverity(tt.toLevel); got != tt.want {
-				t.Errorf("EscalationSeverity(%q) = %v, want %v", tt.toLevel, got, tt.want)
+			if got := EscalationSeverity(tt.toAction); got != tt.want {
+				t.Errorf("EscalationSeverity(%q) = %v, want %v", tt.toAction, got, tt.want)
 			}
 		})
 	}
@@ -177,5 +227,36 @@ func TestDefaultInstanceID_NonEmpty(t *testing.T) {
 	id := DefaultInstanceID()
 	if id == "" {
 		t.Error("DefaultInstanceID() returned empty string")
+	}
+}
+
+func TestUpgradeSeverity(t *testing.T) {
+	tests := []struct {
+		name     string
+		toAction string
+		want     Severity
+	}{
+		{name: testCaseBlockIsCritical, toAction: conventionVerdictBlocked, want: SeverityCritical},
+		{name: testCaseWarnIsWarn, toAction: testSeverityWarn, want: SeverityWarn},
+		{name: "strip is warn", toAction: testActionStrip, want: SeverityWarn},
+		{name: testCaseEmptyIsWarn, toAction: "", want: SeverityWarn},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := UpgradeSeverity(tt.toAction); got != tt.want {
+				t.Errorf("UpgradeSeverity(%q) = %v, want %v", tt.toAction, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEventAdaptiveUpgrade_InMap(t *testing.T) {
+	sev, ok := EventSeverity[EventAdaptiveUpgrade]
+	if !ok {
+		t.Fatalf("EventSeverity missing entry for EventAdaptiveUpgrade (%q)", EventAdaptiveUpgrade)
+	}
+	if sev != SeverityWarn {
+		t.Errorf("EventSeverity[EventAdaptiveUpgrade] = %v, want warn", sev)
 	}
 }

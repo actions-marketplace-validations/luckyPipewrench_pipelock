@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -17,6 +20,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 // doReq is a test helper that creates and executes an HTTP request with context.
@@ -46,6 +50,7 @@ func doReq(t *testing.T, client *http.Client, method, url string, body string, h
 func TestKillSwitchPortIsolation_APIOnSeparatePort(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Internal = nil // disable SSRF for tests
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
 	cfg.ApplyDefaults()
 
 	// Allocate a free port for the API server.
@@ -59,7 +64,7 @@ func TestKillSwitchPortIsolation_APIOnSeparatePort(t *testing.T) {
 
 	logger, _ := audit.New("json", "stdout", "", false, false)
 	defer logger.Close()
-	sc := scanner.New(cfg)
+	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 	m := metrics.New()
 
@@ -68,7 +73,10 @@ func TestKillSwitchPortIsolation_APIOnSeparatePort(t *testing.T) {
 	ksAPI := killswitch.NewAPIHandler(ks)
 
 	// Build proxy WITHOUT kill switch API routes (simulates api_listen set).
-	p := New(cfg, logger, sc, m, WithKillSwitch(ks))
+	p, err := New(cfg, logger, sc, m, WithKillSwitch(ks))
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	// Start the main proxy on a free port.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -131,7 +139,7 @@ func TestKillSwitchPortIsolation_APIOnSeparatePort(t *testing.T) {
 		t.Fatalf("expected 200 on API port activation, got %d", resp.StatusCode)
 	}
 
-	// 2b. Main port: /fetch should be denied (503) — core security property.
+	// 2b. Main port: /fetch should be denied (503) - core security property.
 	resp = doReq(t, client, http.MethodGet,
 		fmt.Sprintf("http://%s/fetch?url=http://example.com", proxyAddr), "", nil)
 	_, _ = io.ReadAll(resp.Body)
@@ -209,12 +217,13 @@ func TestKillSwitchPortIsolation_APIOnSeparatePort(t *testing.T) {
 func TestKillSwitchPortIsolation_DefaultBehavior(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
 	cfg.ApplyDefaults()
 	cfg.KillSwitch.APIToken = "test-token-default" //nolint:gosec // test value
 
 	logger, _ := audit.New("json", "stdout", "", false, false)
 	defer logger.Close()
-	sc := scanner.New(cfg)
+	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 	m := metrics.New()
 
@@ -222,7 +231,10 @@ func TestKillSwitchPortIsolation_DefaultBehavior(t *testing.T) {
 	ksAPI := killswitch.NewAPIHandler(ks)
 
 	// Build proxy WITH kill switch API routes (default behavior).
-	p := New(cfg, logger, sc, m, WithKillSwitch(ks), WithKillSwitchAPI(ksAPI))
+	p, err := New(cfg, logger, sc, m, WithKillSwitch(ks), WithKillSwitchAPI(ksAPI))
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	// Allocate a free port by binding and immediately closing.
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp4", "127.0.0.1:0")
@@ -240,26 +252,25 @@ func TestKillSwitchPortIsolation_DefaultBehavior(t *testing.T) {
 	// Wait for the server to start by polling /health.
 	// Use raw client.Get (not doReq) because connection refused is expected during startup.
 	client := &http.Client{Timeout: 5 * time.Second}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	testwait.For(t, 2*time.Second, func() bool {
 		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet,
 			fmt.Sprintf("http://%s/health", addr), nil)
 		resp, reqErr := client.Do(req)
 		if reqErr == nil {
 			resp.Body.Close() //nolint:errcheck,gosec // test
 			if resp.StatusCode == http.StatusOK {
-				break
+				return true
 			}
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
+		return false
+	}, "proxy health endpoint on %s", addr)
 
 	// API route should be reachable on the main port.
 	resp := doReq(t, client, http.MethodGet,
 		fmt.Sprintf("http://%s/api/v1/killswitch/status", addr),
 		"", map[string]string{"Authorization": "Bearer test-token-default"})
 	resp.Body.Close() //nolint:errcheck,gosec // test
-	// Should NOT be 404 — route is registered.
+	// Should NOT be 404 - route is registered.
 	if resp.StatusCode == http.StatusNotFound {
 		t.Error("expected API route to be registered on main port when api_listen is empty")
 	}
@@ -272,20 +283,24 @@ func TestKillSwitchPortIsolation_DefaultBehavior(t *testing.T) {
 func TestKillSwitchHealthReportsActive(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
 	cfg.ApplyDefaults()
 
 	logger, _ := audit.New("json", "stdout", "", false, false)
 	defer logger.Close()
-	sc := scanner.New(cfg)
+	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 	m := metrics.New()
 
 	ks := killswitch.New(cfg)
-	p := New(cfg, logger, sc, m, WithKillSwitch(ks))
+	p, err := New(cfg, logger, sc, m, WithKillSwitch(ks))
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
 
 	// Health with kill switch inactive.
 	w := httptest.NewRecorder()
-	p.handleHealth(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+	p.handleHealth(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil))
 	var h1 healthResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &h1); err != nil {
 		t.Fatalf("unmarshal: %v", err)
@@ -297,7 +312,7 @@ func TestKillSwitchHealthReportsActive(t *testing.T) {
 	// Activate via API source.
 	ks.SetAPI(true)
 	w = httptest.NewRecorder()
-	p.handleHealth(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+	p.handleHealth(w, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil))
 	var h2 healthResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &h2); err != nil {
 		t.Fatalf("unmarshal: %v", err)

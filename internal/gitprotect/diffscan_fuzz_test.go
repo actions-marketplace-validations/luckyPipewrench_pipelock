@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package gitprotect
 
 import (
@@ -64,7 +67,7 @@ func FuzzScanDiff(f *testing.F) {
 	patterns := CompileDLPPatterns(config.Defaults().DLP.Patterns)
 
 	// Diff with secret
-	f.Add("+++ b/config.go\n@@ -0,0 +1 @@\n+apiKey := \"AKIA" + "IOSFODNN7EXAMPLE\"\n") //nolint:goconst // fuzz seed
+	f.Add("+++ b/config.go\n@@ -0,0 +1 @@\n+apiKey := \"AKIA" + "IOSFODNN7EXAMPLE\"\n")
 
 	// Clean diff
 	f.Add("+++ b/safe.go\n@@ -0,0 +1 @@\n+fmt.Println(\"hello\")\n")
@@ -76,9 +79,9 @@ func FuzzScanDiff(f *testing.F) {
 	f.Add("+++ b/file.go\n@@ -1,2 +1 @@\n-removed\n context\n")
 
 	f.Fuzz(func(t *testing.T, diffText string) {
-		findings, _ := ScanDiff(diffText, patterns)
+		result, _ := ScanDiff(diffText, patterns)
 
-		for _, finding := range findings {
+		for _, finding := range result.Findings {
 			if finding.File == "" {
 				t.Error("finding with empty file")
 			}

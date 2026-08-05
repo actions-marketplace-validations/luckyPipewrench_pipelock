@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package config
 
 import (
@@ -7,20 +10,23 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 // Reloader watches a config file for changes and emits new validated
-// configs on a channel. It supports both fsnotify file watching and
-// SIGHUP signal-based reload.
+// configs on a channel. It supports fsnotify file watching and
+// signal-based reload (SIGHUP on Unix).
 type Reloader struct {
 	path      string
 	onChange  chan *Config
 	done      chan struct{}
+	ready     chan struct{}
+	readyOnce sync.Once
 	closeOnce sync.Once
+	startMu   sync.Mutex
+	started   bool
 }
 
 // NewReloader creates a config reloader that watches path for changes.
@@ -30,6 +36,7 @@ func NewReloader(path string) *Reloader {
 		path:     path,
 		onChange: make(chan *Config, 1),
 		done:     make(chan struct{}),
+		ready:    make(chan struct{}),
 	}
 }
 
@@ -38,12 +45,34 @@ func (r *Reloader) Changes() <-chan *Config {
 	return r.onChange
 }
 
-// Start watches the config file and listens for SIGHUP. It blocks until
+// Ready returns a channel closed once the file watch is established (or once
+// Start has exited without establishing it, so a waiter never deadlocks on a
+// watcher-setup failure). Callers that mutate the config after observing the
+// process as live should wait on this first: otherwise an edit made in the
+// window before the watch is active is silently missed until the next write.
+func (r *Reloader) Ready() <-chan struct{} {
+	return r.ready
+}
+
+// Start watches the config file and listens for reload signals (SIGHUP on Unix). It blocks until
 // ctx is cancelled or Close is called. When Start returns, the onChange
 // channel is closed. Reload failures are logged to stderr via tryReload;
 // the old config remains active.
 func (r *Reloader) Start(ctx context.Context) error {
+	r.startMu.Lock()
+	if r.started {
+		r.startMu.Unlock()
+		return fmt.Errorf("config reloader already started")
+	}
+	r.started = true
+	r.startMu.Unlock()
+
 	defer close(r.onChange)
+	// Guarantee Ready() resolves on every exit path. The success path closes it
+	// below once watcher.Add succeeds; this backstop closes it if Start returns
+	// first (e.g. watcher creation/Add failure) so a Ready() waiter cannot
+	// deadlock when the watch never came up. Idempotent via readyOnce.
+	defer r.readyOnce.Do(func() { close(r.ready) })
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -51,18 +80,26 @@ func (r *Reloader) Start(ctx context.Context) error {
 	}
 	defer func() { _ = watcher.Close() }()
 
+	watchPath, err := filepath.Abs(filepath.Clean(r.path))
+	if err != nil {
+		return fmt.Errorf("resolving config watch path %s: %w", r.path, err)
+	}
 	// Watch the directory (not the file) so we catch editors that
-	// write-to-temp-then-rename (vim, sed -i, etc.).
-	dir := filepath.Dir(r.path)
+	// write-to-temp-then-rename (vim, sed -i, etc.). Event matching below is
+	// still narrowed to this exact config path; watching the parent is only a
+	// portability requirement for atomic replacement.
+	dir := filepath.Dir(watchPath)
 	if err := watcher.Add(dir); err != nil {
 		return fmt.Errorf("watching directory %s: %w", dir, err)
 	}
 
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGHUP)
+	notifyReloadSignal(sigCh) // SIGHUP on Unix, no-op on Windows
 	defer signal.Stop(sigCh)
-
-	baseName := filepath.Base(r.path)
+	// Readiness signaling is idempotent. Start itself is one-shot because it
+	// closes Changes() on return and rejects later calls before touching
+	// watcher/channel state.
+	r.readyOnce.Do(func() { close(r.ready) })
 
 	// Debounce: editors may fire multiple events in quick succession.
 	var debounce <-chan time.Time
@@ -77,10 +114,11 @@ func (r *Reloader) Start(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
-			// Only react to writes/creates/renames of our config file.
-			if filepath.Base(event.Name) != baseName {
+			eventPath, err := filepath.Abs(filepath.Clean(event.Name))
+			if err != nil || eventPath != watchPath {
 				continue
 			}
+			// Only react to writes/creates/renames of our exact config file.
 			if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) || event.Has(fsnotify.Rename) {
 				debounce = time.After(100 * time.Millisecond)
 			}
@@ -108,11 +146,30 @@ func (r *Reloader) tryReload() {
 		return
 	}
 
-	// Non-blocking send: if the consumer hasn't drained the last reload,
-	// drop this one (it will be superseded by the next change anyway).
-	select {
-	case r.onChange <- cfg:
-	default:
+	// Coalesce-to-latest: the buffer holds one pending config. If the consumer
+	// has not drained the previous reload, replace it with this fresher one
+	// rather than dropping the new config. Dropping the NEW config would strand
+	// the proxy on a STALE pending config - e.g. write a weak config, then
+	// quickly write a stronger one before the slow reload (scanner rebuild)
+	// drains: the strong config would be lost and the weak one applied. Always
+	// keeping the latest Load() result avoids that security-relevant inversion.
+	//
+	// Safe because Start() is the sole sender (debounce + SIGHUP share one
+	// select loop), so there is no competing producer between the drain and the
+	// re-send. The drain itself is non-blocking: if the consumer drained in the
+	// meantime, the buffer is empty and we just enqueue.
+	for {
+		select {
+		case r.onChange <- cfg:
+			return
+		default:
+			// Buffer full: discard the stale pending config and retry. The
+			// discarded value is older than cfg by construction.
+			select {
+			case <-r.onChange:
+			default:
+			}
+		}
 	}
 }
 

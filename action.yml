@@ -1,5 +1,5 @@
 name: 'Pipelock Agent Security Scan'
-description: 'Scan your project for AI agent security risks. Detects secrets, misconfigurations, and generates a tailored security config.'
+description: 'Scan your project for AI agent security risks. Pattern-based detection of credentials and misconfigurations with tailored config generation. See docs for coverage details.'
 author: 'luckyPipewrench'
 
 branding:
@@ -8,7 +8,7 @@ branding:
 
 inputs:
   version:
-    description: 'Pipelock version to use (e.g., "0.3.2"). Defaults to latest release.'
+    description: 'Pipelock version to use. Defaults to latest release.'
     required: false
     default: 'latest'
   config:
@@ -38,7 +38,7 @@ inputs:
 
 outputs:
   score:
-    description: 'Security score (0-100) for the scanned project.'
+    description: 'Risk score (0-100) based on pattern-matched findings. Higher means more issues detected. Not an absolute security rating.'
     value: ${{ steps.audit.outputs.score }}
   findings-count:
     description: 'Total number of findings.'
@@ -68,7 +68,7 @@ runs:
         VERSION="$PIPELOCK_VERSION"
         if [ "$VERSION" = "latest" ]; then
           # Use GitHub API directly (no gh CLI dependency)
-          VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+          VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 8 --retry-max-time 120 --retry-all-errors \
             -H "Authorization: token $GH_TOKEN" \
             "https://api.github.com/repos/luckyPipewrench/pipelock/releases/latest" \
             | jq -r '.tag_name' | sed 's/^v//')
@@ -104,8 +104,13 @@ runs:
         mkdir -p "$INSTALL_DIR"
 
         echo "Downloading pipelock v${VERSION} (${GOOS}/${GOARCH})..."
-        curl -fsSL --connect-timeout 10 --max-time 60 --retry 3 --retry-delay 2 --retry-all-errors "${BASE_URL}/${ASSET}" -o "${INSTALL_DIR}/pipelock.tar.gz"
-        curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors "${BASE_URL}/checksums.txt" -o "${INSTALL_DIR}/checksums.txt"
+        # Retry budget ~2 min absorbs transient 504s from the release-assets
+        # CDN (Azure Blob behind Fastly) without stalling on real outages.
+        # Omitting --retry-delay lets curl use exponential backoff inside the
+        # --retry-max-time window, spacing later retries to give the CDN time
+        # to heal rather than hammering a degraded edge.
+        curl -fsSL --connect-timeout 10 --max-time 60 --retry 8 --retry-max-time 120 --retry-all-errors "${BASE_URL}/${ASSET}" -o "${INSTALL_DIR}/pipelock.tar.gz"
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 8 --retry-max-time 120 --retry-all-errors "${BASE_URL}/checksums.txt" -o "${INSTALL_DIR}/checksums.txt"
 
         # Verify checksum (portable: sha256sum on Linux, shasum on macOS)
         EXPECTED=$(awk -v asset="$ASSET" '$2 == asset || $NF == asset {print $1; exit}' "${INSTALL_DIR}/checksums.txt")
@@ -131,18 +136,24 @@ runs:
         # Graceful: warns if cosign unavailable or artifacts missing (older releases).
         COSIGN_SIG="${INSTALL_DIR}/checksums.txt.sig"
         COSIGN_PEM="${INSTALL_DIR}/checksums.txt.pem"
-        curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+        # Optional fallback: older releases may 404. No --retry-all-errors so 404
+        # fails fast instead of consuming the full retry window; 5xx still retries
+        # with exponential backoff inside --retry-max-time.
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 5 --retry-max-time 60 \
           "${BASE_URL}/checksums.txt.sig" -o "$COSIGN_SIG" 2>/dev/null || true
-        curl -fsSL --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+        curl -fsSL --connect-timeout 10 --max-time 30 --retry 5 --retry-max-time 60 \
           "${BASE_URL}/checksums.txt.pem" -o "$COSIGN_PEM" 2>/dev/null || true
 
         if [ -s "$COSIGN_SIG" ] && [ -s "$COSIGN_PEM" ]; then
           if command -v cosign &>/dev/null; then
             echo "Verifying cosign signature..."
+            # Bind the certificate to the exact release whose assets were
+            # downloaded. Accepting any valid-looking release tag here would
+            # prove the signer ran for some release, not necessarily this one.
             if ! cosign verify-blob \
               --certificate "$COSIGN_PEM" \
               --signature "$COSIGN_SIG" \
-              --certificate-identity-regexp "^https://github\\.com/luckyPipewrench/pipelock/\\.github/workflows/release\\.yaml@refs/tags/v[0-9]+\\.[0-9]+\\.[0-9]+$" \
+              --certificate-identity "https://github.com/luckyPipewrench/pipelock/.github/workflows/release.yaml@refs/tags/v${VERSION}" \
               --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
               "${INSTALL_DIR}/checksums.txt"; then
               echo "::error::Cosign signature verification failed for checksums.txt"
@@ -321,7 +332,7 @@ runs:
 
     - name: Upload audit report
       if: always()
-      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
       with:
         name: pipelock-audit-report
         path: ${{ runner.temp }}/pipelock-reports/

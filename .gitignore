@@ -1,6 +1,8 @@
 # Binaries
 /pipelock
 /pipelock-static
+/bench-egress
+/bench-mcpstdio
 *.exe
 *.exe~
 *.dll
@@ -47,5 +49,19 @@ pipelock-audit.log
 .claude/
 .claude
 
-# ClawHub
-.clawdhub/
+
+# Temp build dir for generate.sh
+.gen-shadow-*
+/pipelock-playground-demo
+/pipelock-playground-broker
+/pipelock-playground-live
+/pipelock-playground-llm-agent
+/pipelock-playground-toyagent
+/pipelock-playground-webtool
+/ui/kits/*.zip
+
+# Generated WASM browser-verifier build artifacts
+deploy/wasm-verify/out/*.wasm
+deploy/wasm-verify/out/wasm_exec.js
+deploy/wasm-verify/*.tar.gz
+scripts/__pycache__/

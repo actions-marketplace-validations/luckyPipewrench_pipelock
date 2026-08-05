@@ -1,6 +1,10 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package scanner
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -59,7 +63,7 @@ func TestRateLimiter_SlidingWindowEviction(t *testing.T) {
 	}
 	rl.mu.Unlock()
 
-	// All timestamps are older than 1 minute — IsAllowed should evict them
+	// All timestamps are older than 1 minute - IsAllowed should evict them
 	if !rl.IsAllowed("example.com") {
 		t.Error("expected allowed after stale timestamps evicted")
 	}
@@ -143,6 +147,30 @@ func TestRateLimiter_CleanupKeepsRecentEntries(t *testing.T) {
 	}
 }
 
+func TestRateLimiter_RequestOpportunisticallyCleansStaleDomains(t *testing.T) {
+	rl := NewRateLimiter(10)
+
+	rl.mu.Lock()
+	rl.requests["old.example"] = []time.Time{time.Now().Add(-2 * time.Minute)}
+	rl.lastCleanup = time.Now().Add(-2 * time.Minute)
+	rl.mu.Unlock()
+
+	if !rl.CheckAndRecord("active.example") {
+		t.Fatal("active domain should be allowed")
+	}
+
+	rl.mu.Lock()
+	_, staleExists := rl.requests["old.example"]
+	activeCount := len(rl.requests["active.example"])
+	rl.mu.Unlock()
+	if staleExists {
+		t.Fatal("stale inactive domain survived opportunistic cleanup")
+	}
+	if activeCount != 1 {
+		t.Fatalf("active domain count = %d, want 1", activeCount)
+	}
+}
+
 func TestRateLimiter_CloseIsIdempotent(_ *testing.T) {
 	rl := NewRateLimiter(10)
 	rl.Close()
@@ -152,7 +180,7 @@ func TestRateLimiter_CloseIsIdempotent(_ *testing.T) {
 func TestScanner_CheckRateLimit_Disabled(t *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 0
-	s := New(cfg)
+	s := MustNew(cfg)
 
 	result := s.checkRateLimit("example.com")
 	if !result.Allowed {
@@ -163,7 +191,7 @@ func TestScanner_CheckRateLimit_Disabled(t *testing.T) {
 func TestScanner_CheckRateLimit_Blocked(t *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 2
-	s := New(cfg)
+	s := MustNew(cfg)
 	defer s.Close()
 
 	s.rateLimiter.Record("example.com")
@@ -184,19 +212,19 @@ func TestScanner_CheckRateLimit_Blocked(t *testing.T) {
 func TestScanner_Scan_RateLimitIntegration(t *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 3
-	s := New(cfg)
+	s := MustNew(cfg)
 	defer s.Close()
 
 	// CheckAndRecord records each allowed request atomically.
 	// With limit=3, first 3 scans should pass, 4th should be blocked.
 	for i := 0; i < 3; i++ {
-		result := s.Scan("https://example.com/page")
+		result := s.Scan(context.Background(), "https://example.com/page")
 		if !result.Allowed {
 			t.Errorf("scan %d should be allowed", i)
 		}
 	}
 
-	result := s.Scan("https://example.com/page")
+	result := s.Scan(context.Background(), "https://example.com/page")
 	if result.Allowed {
 		t.Error("fourth scan should be blocked by rate limiter")
 	}
@@ -208,7 +236,7 @@ func TestScanner_Scan_RateLimitIntegration(t *testing.T) {
 func TestScanner_RecordRequest_NilRateLimiter(_ *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 0
-	s := New(cfg)
+	s := MustNew(cfg)
 
 	// Should not panic
 	s.RecordRequest("example.com", 0)
@@ -217,7 +245,7 @@ func TestScanner_RecordRequest_NilRateLimiter(_ *testing.T) {
 func TestScanner_Close_NilRateLimiter(_ *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 0
-	s := New(cfg)
+	s := MustNew(cfg)
 
 	// Should not panic
 	s.Close()
@@ -226,23 +254,23 @@ func TestScanner_Close_NilRateLimiter(_ *testing.T) {
 func TestScanner_RateLimit_DifferentDomainsIndependent(t *testing.T) {
 	cfg := testConfig()
 	cfg.FetchProxy.Monitoring.MaxReqPerMinute = 1
-	s := New(cfg)
+	s := MustNew(cfg)
 	defer s.Close()
 
 	// First scan for a.com is allowed (CheckAndRecord records it)
-	result := s.Scan("https://a.com/page")
+	result := s.Scan(context.Background(), "https://a.com/page")
 	if !result.Allowed {
 		t.Error("first a.com request should be allowed")
 	}
 
 	// a.com should now be blocked (limit=1, already used)
-	result = s.Scan("https://a.com/page")
+	result = s.Scan(context.Background(), "https://a.com/page")
 	if result.Allowed {
 		t.Error("expected a.com blocked after rate limit reached")
 	}
 
 	// b.com should still work (independent counter)
-	result = s.Scan("https://b.com/page")
+	result = s.Scan(context.Background(), "https://b.com/page")
 	if !result.Allowed {
 		t.Errorf("expected b.com allowed (independent limit), got: %s", result.Reason)
 	}

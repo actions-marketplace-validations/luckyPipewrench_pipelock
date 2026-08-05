@@ -1,6 +1,10 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package killswitch
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -8,6 +12,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
 const (
@@ -46,7 +52,7 @@ func (h *APIHandler) HandleToggle(w http.ResponseWriter, r *http.Request) {
 	// Auth check
 	rt := h.ctrl.cfg.Load()
 	if rt.apiToken == "" {
-		// No token configured — API disabled
+		// No token configured - API disabled
 		http.Error(w, "kill switch API not configured (no api_token)", http.StatusServiceUnavailable)
 		return
 	}
@@ -70,7 +76,16 @@ func (h *APIHandler) HandleToggle(w http.ResponseWriter, r *http.Request) {
 		Active *bool `json:"active"`
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, 1024)
-	dec := json.NewDecoder(r.Body)
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := jsonscan.RejectDuplicateKeys(raw); err != nil {
+		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		http.Error(w, fmt.Sprintf("invalid request body: %v", err), http.StatusBadRequest)

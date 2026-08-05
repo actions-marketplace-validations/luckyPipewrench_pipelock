@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package proxy
 
 import (
@@ -6,118 +9,132 @@ import (
 	"testing"
 )
 
-func TestExtractAgent_Header(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, "my-agent")
+// TestStripInternalIdentity covers the pre-tag gate-found bug where the
+// X-Pipelock-Agent header and ?agent= query parameter both bled
+// through to destinations on the TLS-interception outbound path.
+// The strip must always remove the header and, when present, also
+// remove the query parameter without disturbing sibling params.
+func TestStripInternalIdentity(t *testing.T) {
+	t.Parallel()
 
-	got := ExtractAgent(req)
-	if got != "my-agent" {
-		t.Errorf("expected my-agent, got %s", got)
+	const attackerAgent = "evil-actor"
+
+	tests := []struct {
+		name          string
+		path          string
+		setAgentHdr   bool
+		wantQuery     string
+		wantHdrEmpty  bool
+		wantOtherHdrs map[string]string
+	}{
+		{
+			name:         "header only",
+			path:         "/anything",
+			setAgentHdr:  true,
+			wantQuery:    "",
+			wantHdrEmpty: true,
+		},
+		{
+			name:         "query only",
+			path:         "/anything?agent=" + attackerAgent,
+			setAgentHdr:  false,
+			wantQuery:    "",
+			wantHdrEmpty: true,
+		},
+		{
+			name:         "header and query both set",
+			path:         "/anything?agent=" + attackerAgent,
+			setAgentHdr:  true,
+			wantQuery:    "",
+			wantHdrEmpty: true,
+		},
+		{
+			name:         "unrelated query preserved",
+			path:         "/anything?foo=bar&agent=" + attackerAgent + "&baz=qux",
+			setAgentHdr:  false,
+			wantQuery:    "baz=qux&foo=bar",
+			wantHdrEmpty: true,
+		},
+		{
+			name:         "no agent markers leaves request untouched",
+			path:         "/anything?foo=bar",
+			setAgentHdr:  false,
+			wantQuery:    "foo=bar",
+			wantHdrEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com"+tt.path, http.NoBody)
+			if tt.setAgentHdr {
+				req.Header.Set(AgentHeader, attackerAgent)
+			}
+			req.Header.Set("X-Other", "keep-me")
+
+			stripInternalIdentity(req)
+
+			if tt.wantHdrEmpty && req.Header.Get(AgentHeader) != "" {
+				t.Errorf("%s leaked downstream: %q", AgentHeader, req.Header.Get(AgentHeader))
+			}
+			if got := req.URL.RawQuery; got != tt.wantQuery {
+				t.Errorf("raw query mismatch: got %q, want %q", got, tt.wantQuery)
+			}
+			if got := req.Header.Get("X-Other"); got != "keep-me" {
+				t.Errorf("unrelated header lost: got %q, want %q", got, "keep-me")
+			}
+		})
 	}
 }
 
-func TestExtractAgent_QueryParam(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com&agent=query-bot", nil)
+// TestStripInternalIdentity_ForwardedHeaders covers the round-2 of the pre-tag gate
+// finding that X-Forwarded-For / X-Real-IP / Forwarded / Via bleed
+// downstream even though pipelock already knows the verified client_ip.
+// An attacker could otherwise poison destination log attribution or
+// abuse controls with a crafted header. The strip must remove every
+// header in forwardedClientHeaders regardless of case.
+func TestStripInternalIdentity_ForwardedHeaders(t *testing.T) {
+	t.Parallel()
 
-	got := ExtractAgent(req)
-	if got != "query-bot" {
-		t.Errorf("expected query-bot, got %s", got)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/", http.NoBody)
+	req.Header.Set("X-Forwarded-For", "1.2.3.4")
+	req.Header.Set("X-Real-IP", "5.6.7.8")
+	req.Header.Set("X-Forwarded-Host", "evil.example")
+	req.Header.Set("X-Forwarded-Proto", "http")
+	req.Header.Set("X-Forwarded-Port", "80")
+	req.Header.Set("Forwarded", "for=1.2.3.4;proto=http;host=evil")
+	req.Header.Set("Via", "1.1 evil-proxy")
+	req.Header.Set("X-Keep", "ok")
+
+	stripInternalIdentity(req)
+
+	for _, name := range []string{
+		"X-Forwarded-For", "X-Real-IP", "X-Forwarded-Host",
+		"X-Forwarded-Proto", "X-Forwarded-Port", "Forwarded", "Via",
+	} {
+		if got := req.Header.Get(name); got != "" {
+			t.Errorf("%s leaked downstream: %q", name, got)
+		}
+	}
+	if got := req.Header.Get("X-Keep"); got != "ok" {
+		t.Errorf("unrelated header lost: got %q, want ok", got)
 	}
 }
 
-func TestExtractAgent_HeaderTakesPrecedence(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com&agent=query-bot", nil)
-	req.Header.Set(AgentHeader, "header-bot")
+// TestStripInternalIdentity_NilSafe confirms the helper does not panic
+// on nil inputs. Both nil request and nil URL are valid zero states
+// pipelock code sometimes hands to header filters.
+func TestStripInternalIdentity_NilSafe(t *testing.T) {
+	t.Parallel()
 
-	got := ExtractAgent(req)
-	if got != "header-bot" {
-		t.Errorf("expected header-bot (header precedence), got %s", got)
-	}
-}
+	stripInternalIdentity(nil)
 
-func TestExtractAgent_DefaultAnonymous(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-
-	got := ExtractAgent(req)
-	if got != "anonymous" { //nolint:goconst // test value
-		t.Errorf("expected anonymous, got %s", got)
-	}
-}
-
-func TestExtractAgent_SanitizesSpecialChars(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, "evil\nagent\": {\"inject\":true}")
-
-	got := ExtractAgent(req)
-	// Newline, quotes, colon, space, braces all become underscores
-	if got != "evil_agent_____inject__true_" { //nolint:goconst // test value
-		t.Errorf("expected sanitized agent name, got %q", got)
-	}
-}
-
-func TestExtractAgent_TruncatesLongNames(t *testing.T) {
-	long := ""
-	for i := 0; i < 200; i++ {
-		long += "a"
-	}
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, long)
-
-	got := ExtractAgent(req)
-	if len(got) != maxAgentNameLen {
-		t.Errorf("expected length %d, got %d", maxAgentNameLen, len(got))
-	}
-}
-
-func TestExtractAgent_WhitespaceBecomesUnderscores(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, "   ")
-
-	got := ExtractAgent(req)
-	// Spaces become underscores, so should be "___"
-	if got != "___" {
-		t.Errorf("expected ___, got %q", got)
-	}
-}
-
-func TestExtractAgent_AllowsDots(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, "claude-code.v2")
-
-	got := ExtractAgent(req)
-	if got != "claude-code.v2" {
-		t.Errorf("expected claude-code.v2, got %q", got)
-	}
-}
-
-func TestExtractAgent_EmptyQueryParam(t *testing.T) {
-	// Both header and query param empty → anonymous
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com&agent=", nil)
-	got := ExtractAgent(req)
-	if got != "anonymous" { //nolint:goconst // test value
-		t.Errorf("expected anonymous for empty query param, got %q", got)
-	}
-}
-
-func TestExtractAgent_OnlyDashesAndDots(t *testing.T) {
-	// Agent name with only allowed chars: dashes, dots, underscores
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com", nil)
-	req.Header.Set(AgentHeader, "-._.-.") //nolint:goconst // test value
-	got := ExtractAgent(req)
-	if got != "-._.-." {
-		t.Errorf("expected -._.-., got %q", got)
-	}
-}
-
-func TestExtractAgent_AllSpecialChars_BecomesAnonymous(t *testing.T) {
-	// Agent name that is ALL special chars → regex replaces all with "_"
-	// But underscores ARE allowed, so the result is "___" not empty.
-	// Need chars that become empty: none exist because _ replaces them.
-	// Instead use a name in query param that's something like emoji-only.
-	req := httptest.NewRequest(http.MethodGet, "/fetch?url=https://example.com&agent=%E2%9C%93%E2%9C%93", nil)
-	got := ExtractAgent(req)
-	// Unicode checkmarks → replaced with underscores → "__" (not empty)
-	if got == "" {
-		t.Error("should not return empty string")
+	req := &http.Request{Header: http.Header{}}
+	req.Header.Set(AgentHeader, "would-leak")
+	stripInternalIdentity(req)
+	if req.Header.Get(AgentHeader) != "" {
+		t.Errorf("nil URL path did not strip header: %q", req.Header.Get(AgentHeader))
 	}
 }

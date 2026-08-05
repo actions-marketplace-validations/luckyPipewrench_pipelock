@@ -158,9 +158,9 @@ agent = Agent(
             args=["mcp", "proxy", "--config", "pipelock.yaml", "--",
                   "npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
         ),
-        # Remote server: NOT scanned by pipelock
-        # Pipelock's MCP proxy only wraps stdio servers.
-        # For remote SSE/HTTP servers, vet the server before connecting.
+        # Direct remote server: NOT scanned by Pipelock.
+        # To scan this path, expose the remote endpoint through:
+        # pipelock mcp proxy --upstream https://api.example.com/mcp/sse
         MCPServerSSE(
             url="https://api.example.com/mcp/sse",
             headers={"Authorization": "Bearer token"},
@@ -169,10 +169,21 @@ agent = Agent(
 )
 ```
 
-**Note:** Pipelock's MCP proxy only wraps stdio-based servers. Remote SSE/HTTP
-MCP connections go directly to the remote endpoint and bypass Pipelock. For
-outbound HTTP traffic from your agent code (API calls, web fetches), you can
-route those through `pipelock run` as a fetch proxy. See the
+**Note:** Direct `MCPServerSSE` / HTTP MCP connections go straight to the remote
+endpoint and bypass Pipelock. To scan remote MCP traffic you have two options:
+
+- `pipelock mcp proxy --upstream https://api.example.com/mcp/sse` registers
+  Pipelock as a stdio MCP server that bridges to the remote endpoint. Use this
+  when the upstream needs no client-supplied HTTP headers, since the stdio
+  bridge does not have a transparent path for the client's `Authorization` or
+  other custom headers.
+- HTTP reverse proxy mode (`pipelock run --mcp-listen ADDR --mcp-upstream URL`)
+  preserves request headers through to the upstream. Use this when the upstream
+  requires per-request `Authorization` or other client-supplied headers, or
+  when the client needs an HTTP MCP URL.
+
+For outbound HTTP traffic from your agent code (API calls, web fetches), route
+those through `pipelock run` as a fetch proxy. See the
 [HTTP fetch proxy](#http-fetch-proxy) section below.
 
 ## What Pipelock Catches
@@ -182,7 +193,7 @@ identifies several threats. Here's what Pipelock detects at runtime:
 
 | Threat | CrewAI's Guidance | Pipelock's Detection |
 |--------|-------------------|---------------------|
-| Credential exposure | "Use trusted servers" | DLP scanner catches 22 built-in credential patterns in tool arguments (API keys, tokens, private keys) |
+| Credential exposure | "Use trusted servers" | DLP scanner catches 65 built-in credential patterns in tool arguments (API keys, tokens, private keys) |
 | Prompt injection via tool metadata | "Only connect to trusted servers" | Tool description scanning detects hidden instructions, exfiltration directives, cross-tool manipulation |
 | Tool behavior changes mid-session | Not addressed | Rug-pull detection tracks tool definition hashes per session, alerts on changes |
 | DNS exfiltration via subdomains | Not addressed | Dot-collapse scanning and subdomain entropy analysis |
@@ -248,7 +259,7 @@ For scanning HTTP traffic from CrewAI agents (web searches, API calls), run
 Pipelock as a fetch proxy:
 
 ```bash
-pipelock run --config configs/balanced.yaml
+pipelock run --preset balanced
 ```
 
 Configure your agent to route HTTP requests through `http://localhost:8888/fetch`.
@@ -269,17 +280,39 @@ def fetch_through_pipelock(url: str) -> str:
     return data.get("content", "")
 ```
 
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy (`HTTPS_PROXY`), CONNECT tunnels
+are opaque by default: pipelock only sees the hostname, not the request body or
+response content. Enabling TLS interception closes this gap by performing a MITM
+on HTTPS connections, giving you full DLP on request bodies and response
+injection detection through CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Trust the CA in your Python environment:
+
+```bash
+export SSL_CERT_FILE=~/.pipelock/ca.pem
+# Or for requests/httpx specifically:
+export REQUESTS_CA_BUNDLE=~/.pipelock/ca.pem
+```
+
+MCP proxy mode (stdio wrapping) does not require TLS interception. It scans
+traffic in both directions without certificates.
+
 ## Choosing a Config
 
 | Preset | Action | Best For |
 |--------|--------|----------|
-| `generic-agent.yaml` | warn | New agent integrations (recommended starting point) |
-| `balanced.yaml` | warn | General purpose, fetch proxy tuning |
-| `claude-code.yaml` | block | Claude Code, unattended agents |
-| `strict.yaml` | block | High-security, production |
+| `generic-agent` | warn | New agent integrations (recommended starting point) |
+| `balanced` | warn | General purpose, fetch proxy tuning |
+| `claude-code` | block | Claude Code, unattended agents |
+| `strict` | block | High-security, production |
 
-Start with `generic-agent.yaml` to log detections without blocking. Review the
-logs, tune thresholds, then switch to `strict.yaml` for production.
+Start with `generic-agent` to log detections without blocking. Review the
+logs, tune thresholds, then switch to `strict` for production.
 
 ## Troubleshooting
 

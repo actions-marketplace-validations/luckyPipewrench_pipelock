@@ -1,6 +1,6 @@
 # Pipelock Quickstart
 
-Run any AI agent behind pipelock with enforced network isolation. The agent gets secrets but no internet. Pipelock gets internet but no secrets. Docker's `internal: true` network flag enforces this at the iptables level, not the `HTTPS_PROXY` honor system.
+Run any AI agent behind pipelock with enforced network isolation. The agent gets secrets but no internet. Pipelock gets internet but no agent secrets. Docker's `internal: true` network flag enforces this at the iptables level, not the `HTTPS_PROXY` honor system.
 
 ## Start
 
@@ -15,7 +15,7 @@ This starts two containers:
 
 Set your agent's `HTTP_PROXY` and `HTTPS_PROXY` to `http://pipelock:8888`. The agent container already has these configured.
 
-Pin a specific version with `PIPELOCK_VERSION=0.3.2 docker compose up`.
+Pin a specific version with `PIPELOCK_VERSION=<tag> docker compose up`. See [Releases](https://github.com/luckyPipewrench/pipelock/releases) for available tags.
 
 ## Verify
 

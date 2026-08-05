@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 // Package transport provides message framing for MCP JSON-RPC 2.0 transports.
 // It includes stdio (newline-delimited), SSE (Server-Sent Events), and HTTP
 // client implementations.
@@ -50,7 +53,7 @@ func (sr *StdioReader) ReadMessage() ([]byte, error) {
 		if len(line) == 0 {
 			continue
 		}
-		// Return a copy — bufio.Scanner reuses the backing array.
+		// Return a copy - bufio.Scanner reuses the backing array.
 		msg := make([]byte, len(line))
 		copy(msg, line)
 		return msg, nil

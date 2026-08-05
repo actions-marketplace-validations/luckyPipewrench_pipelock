@@ -1,10 +1,12 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package config
 
 import (
 	"context"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -14,6 +16,73 @@ func writeTestConfig(t *testing.T, path, mode string) {
 	content := []byte("version: 1\nmode: " + mode + "\n")
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func waitForReloaderReady(t *testing.T, r *Reloader) {
+	t.Helper()
+	select {
+	case <-r.ready:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reloader did not become ready")
+	}
+}
+
+func waitForReload(t *testing.T, r *Reloader, mode string) *Config {
+	t.Helper()
+	select {
+	case cfg, ok := <-r.Changes():
+		if !ok {
+			t.Fatal("changes channel closed before config reload")
+		}
+		if cfg.Mode != mode {
+			t.Fatalf("expected mode %s, got %s", mode, cfg.Mode)
+		}
+		return cfg
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for config reload to mode %s", mode)
+	}
+	return nil
+}
+
+func writeAndWaitForReload(t *testing.T, r *Reloader, path, mode string) {
+	t.Helper()
+	writeTestConfig(t, path, mode)
+	waitForReload(t, r, mode)
+}
+
+func renameUntilReload(t *testing.T, r *Reloader, dir, cfgPath, mode string) *Config {
+	t.Helper()
+	tmpPath := filepath.Join(dir, "pipelock.yaml.tmp")
+	writeTestConfig(t, tmpPath, mode)
+	if err := os.Rename(tmpPath, cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	return waitForReload(t, r, mode)
+}
+
+// TestReloader_ReadyAccessorResolves locks the exported Ready() contract that
+// the server's startup uses to avoid serving before the config watch is live.
+func TestReloader_ReadyAccessorResolves(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+	writeTestConfig(t, cfgPath, "balanced")
+
+	r := NewReloader(cfgPath)
+	defer r.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() {
+		if err := r.Start(ctx); err != nil {
+			t.Errorf("reloader error: %v", err)
+		}
+	}()
+
+	select {
+	case <-r.Ready():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Ready() did not resolve after the watch was established")
 	}
 }
 
@@ -34,19 +103,48 @@ func TestReloader_FileChange(t *testing.T) {
 		}
 	}()
 
-	// Give watcher time to start
-	time.Sleep(200 * time.Millisecond)
+	waitForReloaderReady(t, r)
+	writeAndWaitForReload(t, r, cfgPath, ModeAudit)
+}
 
-	// Modify config
-	writeTestConfig(t, cfgPath, "audit")
+// TestReloader_CoalesceKeepsLatest proves the reload buffer coalesces to the
+// LATEST config when the consumer is slow, instead of dropping the new config
+// and stranding the proxy on a stale pending one. Two reloads fire before the
+// single-slot buffer is drained; the drained value must be the second
+// (stronger) config, not the first. Before the fix, the second send was dropped
+// non-blocking and the consumer would have applied the first config.
+func TestReloader_CoalesceKeepsLatest(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "pipelock.yaml")
+
+	r := NewReloader(cfgPath)
+	defer r.Close()
+
+	// First reload: balanced. Lands in the single-slot buffer, undrained.
+	// (Both modes here are valid without extra config - strict would fail
+	// validation for lack of api_allowlist and never reach the buffer.)
+	writeTestConfig(t, cfgPath, ModeBalanced)
+	r.tryReload()
+
+	// Second reload: audit. Buffer is full, so the fix must discard the stale
+	// balanced config and enqueue audit rather than dropping audit.
+	writeTestConfig(t, cfgPath, ModeAudit)
+	r.tryReload()
 
 	select {
 	case cfg := <-r.Changes():
-		if cfg.Mode != "audit" { //nolint:goconst // test values
-			t.Errorf("expected mode audit, got %s", cfg.Mode)
+		if cfg.Mode != ModeAudit {
+			t.Fatalf("coalesce kept stale config: got mode %q, want %q (the latest reload)", cfg.Mode, ModeAudit)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for config reload")
+	default:
+		t.Fatal("expected a coalesced config in the buffer, got none")
+	}
+
+	// Only one slot: after draining the latest there must be nothing stale left.
+	select {
+	case cfg := <-r.Changes():
+		t.Fatalf("expected empty buffer after draining latest, got stale mode %q", cfg.Mode)
+	default:
 	}
 }
 
@@ -67,7 +165,8 @@ func TestReloader_InvalidConfig(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(200 * time.Millisecond)
+	waitForReloaderReady(t, r)
+	writeAndWaitForReload(t, r, cfgPath, ModeAudit)
 
 	// Write invalid config
 	if err := os.WriteFile(cfgPath, []byte("mode: invalid_mode\n"), 0o600); err != nil {
@@ -80,6 +179,23 @@ func TestReloader_InvalidConfig(t *testing.T) {
 		t.Fatalf("expected no config for invalid file, got mode=%s", cfg.Mode)
 	case <-time.After(500 * time.Millisecond):
 		// Expected: no config emitted for invalid file
+	}
+}
+
+func TestReloader_RejectsUnenforcedConcurrentToolLimit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(path, []byte("agents:\n  _default:\n    budget:\n      max_concurrent_tool_calls: 3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewReloader(path)
+	defer r.Close()
+	r.tryReload()
+
+	select {
+	case cfg := <-r.Changes():
+		t.Fatalf("invalid reserved concurrency config reached reload channel: %+v", cfg.Agents)
+	default:
 	}
 }
 
@@ -96,7 +212,7 @@ func TestReloader_CloseStopsStart(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waitForReloaderReady(t, r)
 	r.Close()
 
 	select {
@@ -133,7 +249,7 @@ func TestReloader_ContextCancellation(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waitForReloaderReady(t, r)
 	cancel()
 
 	select {
@@ -144,7 +260,7 @@ func TestReloader_ContextCancellation(t *testing.T) {
 	}
 }
 
-func TestReloader_SIGHUPReload(t *testing.T) {
+func TestReloader_StartIsOneShot(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "pipelock.yaml")
 	writeTestConfig(t, cfgPath, "balanced")
@@ -152,36 +268,26 @@ func TestReloader_SIGHUPReload(t *testing.T) {
 	r := NewReloader(cfgPath)
 	defer r.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
 	go func() {
-		if err := r.Start(ctx); err != nil {
-			t.Errorf("reloader error: %v", err)
-		}
+		done <- r.Start(ctx)
 	}()
 
-	// Give watcher time to start
-	time.Sleep(200 * time.Millisecond)
-
-	// Update config file (SIGHUP reloads from disk, so the file must change)
-	writeTestConfig(t, cfgPath, "audit")
-
-	// Small delay so the file is written before signal
-	time.Sleep(50 * time.Millisecond)
-
-	// Send SIGHUP to ourselves
-	if err := syscall.Kill(syscall.Getpid(), syscall.SIGHUP); err != nil {
-		t.Fatalf("failed to send SIGHUP: %v", err)
-	}
+	waitForReloaderReady(t, r)
+	cancel()
 
 	select {
-	case cfg := <-r.Changes():
-		if cfg.Mode != "audit" { //nolint:goconst // test value
-			t.Errorf("expected mode audit after SIGHUP, got %s", cfg.Mode)
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first Start returned error: %v", err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for SIGHUP-based reload")
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Start did not return after context cancellation")
+	}
+
+	if err := r.Start(context.Background()); err == nil {
+		t.Fatal("second Start succeeded; expected one-shot error")
 	}
 }
 
@@ -202,10 +308,10 @@ func TestReloader_NonMatchingFileIgnored(t *testing.T) {
 		}
 	}()
 
-	// Give watcher time to start
-	time.Sleep(200 * time.Millisecond)
+	waitForReloaderReady(t, r)
+	writeAndWaitForReload(t, r, cfgPath, ModeAudit)
 
-	// Write a different file in the same directory — should be ignored
+	// Write a different file in the same directory - should be ignored
 	otherPath := filepath.Join(dir, "other.yaml")
 	if err := os.WriteFile(otherPath, []byte("version: 1\nmode: strict\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -235,7 +341,7 @@ func TestReloader_ChangesClosedAfterStart(t *testing.T) {
 		close(done)
 	}()
 
-	time.Sleep(100 * time.Millisecond)
+	waitForReloaderReady(t, r)
 	cancel()
 
 	<-done
@@ -265,21 +371,6 @@ func TestReloader_RenameReload(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(200 * time.Millisecond)
-
-	// Write to temp, then rename (vim pattern)
-	tmpPath := filepath.Join(dir, "pipelock.yaml.tmp")
-	writeTestConfig(t, tmpPath, "audit")
-	if err := os.Rename(tmpPath, cfgPath); err != nil {
-		t.Fatal(err)
-	}
-
-	select {
-	case cfg := <-r.Changes():
-		if cfg.Mode != "audit" { //nolint:goconst // test values
-			t.Errorf("expected mode audit, got %s", cfg.Mode)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for rename-based reload")
-	}
+	waitForReloaderReady(t, r)
+	renameUntilReload(t, r, dir, cfgPath, ModeAudit)
 }

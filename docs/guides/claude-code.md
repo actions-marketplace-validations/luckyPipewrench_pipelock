@@ -14,7 +14,7 @@ go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
 pipelock version
 
 # 3. Wrap an MCP server
-pipelock mcp proxy --config configs/claude-code.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+pipelock mcp proxy --preset claude-code -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 ## MCP Proxy Mode
@@ -154,7 +154,7 @@ pipelock as an HTTP proxy server:
 
 ```bash
 # Start the proxy (background or separate terminal)
-pipelock run --config configs/claude-code.yaml
+pipelock run --preset claude-code
 ```
 
 The proxy listens on `127.0.0.1:8888` by default and exposes:
@@ -166,35 +166,97 @@ The proxy listens on `127.0.0.1:8888` by default and exposes:
 | `/metrics` | Prometheus metrics |
 | `/stats` | JSON statistics |
 
-### Claude Code Hooks
+### Claude Code Hooks (PreToolUse)
 
-You can configure a Claude Code hook to route WebFetch requests through
-pipelock. Example hook script:
+Pipelock integrates with Claude Code's hook system to scan tool calls before
+execution. The `pipelock claude setup` command installs hooks automatically:
 
 ```bash
-#!/bin/bash
-# pipelock-scan.sh: scan URLs before Claude Code fetches them
-URL="$1"
-ENCODED=$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" "$URL")
-RESULT=$(curl -s "http://127.0.0.1:8888/fetch?url=${ENCODED}")
-echo "$RESULT"
+# Install hooks (writes to ~/.claude/settings.json)
+pipelock claude setup
+
+# Install hooks with an explicit policy file
+pipelock claude setup --config ~/.config/pipelock/pipelock.yaml
+
+# Or install to a project-local settings file
+pipelock claude setup --project
+
+# Preview without writing
+pipelock claude setup --dry-run
+
+# Remove hooks
+pipelock claude remove
 ```
+
+At install time, Pipelock validates the config path, embeds the resolved
+absolute path into the generated hook command, and prints the config source. If
+no standard config is available, the hook is installed with built-in defaults
+and the setup output says so.
+
+This registers pipelock as a `PreToolUse` hook for security-relevant tools:
+
+| Matcher | Tools | What's scanned |
+|---------|-------|----------------|
+| `Bash\|WebFetch\|Write\|Edit` | Built-in tools | Commands, URLs, file content for DLP and policy |
+| `mcp__.*` | All MCP tools | Tool arguments for DLP and injection |
+
+### Fail-closed defaults
+
+The hook fails closed (denies) on every supported input path it cannot positively classify as safe. Concretely:
+
+- **Unsupported hook events** — any `hook_event_name` outside the supported set deny rather than fall through to allow.
+- **Unknown tools** — unrecognized `tool_name` values route through the generic tool-use scanner with their full `tool_name` and `tool_input` instead of falling through to allow.
+- **Malformed payloads** — missing or unparseable JSON returns a deny verdict.
+- **Null tool input** — a null `tool_input` returns an explicit error rather than bypassing tool-use inspection.
+
+The closed default applies in both `JSON-decision` mode (`permissionDecision: "deny"`) and `--exit-code` mode (exit 2). The black-box pen-test suite covers both decision modes for unsupported-event and unknown-tool paths.
+
+The hook reads JSON from stdin and returns allow/deny decisions. An `--exit-code`
+mode is also available (exit 0 for allow, exit 2 for deny):
+
+```bash
+# Default mode (JSON response on stdout)
+echo '{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1"}' | pipelock claude hook
+
+# Exit-code mode
+echo '...' | pipelock claude hook --exit-code
+```
+
+## TLS Interception
+
+When using pipelock as an HTTP forward proxy, CONNECT tunnels are opaque by
+default: pipelock only sees the hostname, not the request body or response
+content. Enabling TLS interception closes this gap by performing a MITM on
+HTTPS connections, giving you full DLP and response injection detection through
+CONNECT tunnels.
+
+To enable it:
+
+1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
+2. Trust the CA for Node.js (used by Claude Code's MCP servers):
+
+```bash
+export NODE_EXTRA_CA_CERTS=~/.pipelock/ca.pem
+```
+
+MCP proxy mode (stdio wrapping) and Claude Code hooks do not require TLS
+interception. They scan traffic directly without certificates.
 
 ## Choosing a Config
 
-Pipelock ships with agent-specific presets in `configs/`:
+Pipelock ships with agent-specific presets selectable via `--preset`:
 
 | Preset | Action | Entropy | Rate Limit | Best For |
 |--------|--------|---------|------------|----------|
-| `claude-code.yaml` | block | 5.0 | 120/min | Claude Code (unattended) |
-| `cursor.yaml` | block | 5.0 | 120/min | Cursor IDE (unattended) |
-| `generic-agent.yaml` | warn | 5.5 | 120/min | New agents (tuning phase) |
-| `balanced.yaml` | warn | 4.5 | 60/min | General purpose |
-| `strict.yaml` | block | 3.5 | 30/min | High-security environments |
+| `claude-code` | block | 5.0 | 120/min | Claude Code (unattended) |
+| `cursor` | block | 5.0 | 120/min | Cursor IDE (unattended) |
+| `generic-agent` | warn | 5.5 | 120/min | New agents (tuning phase) |
+| `balanced` | warn | 4.5 | 60/min | General purpose |
+| `strict` | block | 3.5 | 30/min | High-security environments |
 
-Start with `generic-agent.yaml` if you're unsure. Once you've verified there
-are no false positives for your workflow, switch to `claude-code.yaml` or
-`strict.yaml`.
+Start with `generic-agent` if you're unsure. Once you've verified there
+are no false positives for your workflow, switch to `claude-code` or
+`strict`.
 
 ## Troubleshooting
 
@@ -243,5 +305,5 @@ during development, run the MCP server manually:
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
-  pipelock mcp proxy --config configs/claude-code.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  pipelock mcp proxy --preset claude-code -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```

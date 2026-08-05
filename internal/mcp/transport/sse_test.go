@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package transport
 
 import (
@@ -16,8 +19,8 @@ func TestSSEReader_SingleEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if string(msg) != `{"id":1}` { //nolint:goconst // test value
-		t.Errorf("got %q, want %q", string(msg), `{"id":1}`)
+	if string(msg) != testJSONID1 {
+		t.Errorf("got %q, want %q", string(msg), testJSONID1)
 	}
 
 	// Next read should return io.EOF.
@@ -35,16 +38,16 @@ func TestSSEReader_MultipleEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("msg1: unexpected error: %v", err)
 	}
-	if string(msg1) != `{"id":1}` { //nolint:goconst // test value
-		t.Errorf("msg1 = %q, want %q", string(msg1), `{"id":1}`)
+	if string(msg1) != testJSONID1 {
+		t.Errorf("msg1 = %q, want %q", string(msg1), testJSONID1)
 	}
 
 	msg2, err := r.ReadMessage()
 	if err != nil {
 		t.Fatalf("msg2: unexpected error: %v", err)
 	}
-	if string(msg2) != `{"id":2}` { //nolint:goconst // test value
-		t.Errorf("msg2 = %q, want %q", string(msg2), `{"id":2}`)
+	if string(msg2) != testJSONID2 {
+		t.Errorf("msg2 = %q, want %q", string(msg2), testJSONID2)
 	}
 
 	_, err = r.ReadMessage()
@@ -65,6 +68,83 @@ func TestSSEReader_MultiLineData(t *testing.T) {
 	want := "{\"part\":\n\"one\"}"
 	if string(msg) != want {
 		t.Errorf("got %q, want %q", string(msg), want)
+	}
+}
+
+func newCappedSSEReader(t *testing.T, input string, maxEventBytes int) *SSEReader {
+	t.Helper()
+	s := bufio.NewScanner(strings.NewReader(input))
+	s.Buffer(make([]byte, 0, 64), MaxLineSize)
+	return &SSEReader{scanner: s, maxEventBytes: maxEventBytes}
+}
+
+func TestSSEReader_CumulativeDataTooLarge(t *testing.T) {
+	// The joined payload is "hello\nworld" (11 bytes). This proves the
+	// cumulative event cap counts the newline inserted between data: fields.
+	allowed := newCappedSSEReader(t, "data: hello\ndata: world\n\n", len("hello\nworld"))
+	msg, err := allowed.ReadMessage()
+	if err != nil {
+		t.Fatalf("exact-limit event should pass: %v", err)
+	}
+	if string(msg) != "hello\nworld" {
+		t.Fatalf("msg = %q, want %q", string(msg), "hello\nworld")
+	}
+
+	blocked := newCappedSSEReader(t, "data: hello\ndata: world\n\n", len("hello\nworld")-1)
+	_, err = blocked.ReadMessage()
+	if err == nil {
+		t.Fatal("expected cumulative event-size error")
+	}
+	if !strings.Contains(err.Error(), "sse event too large") {
+		t.Fatalf("error = %v, want sse event too large", err)
+	}
+}
+
+func TestSSEReader_CumulativeEmptyDataTooLarge(t *testing.T) {
+	allowed := newCappedSSEReader(t, "data:\ndata:\ndata:\n\n", len("\n\n"))
+	msg, err := allowed.ReadMessage()
+	if err != nil {
+		t.Fatalf("exact-limit empty-data event should pass: %v", err)
+	}
+	if string(msg) != "\n\n" {
+		t.Fatalf("msg = %q, want %q", string(msg), "\n\n")
+	}
+
+	blocked := newCappedSSEReader(t, "data:\ndata:\ndata:\n\n", len("\n\n")-1)
+	_, err = blocked.ReadMessage()
+	if err == nil {
+		t.Fatal("expected cumulative event-size error")
+	}
+	if !strings.Contains(err.Error(), "sse event too large") {
+		t.Fatalf("error = %v, want sse event too large", err)
+	}
+}
+
+func TestSSEReader_NonPositiveMaxEventBytesUsesTransportCeiling(t *testing.T) {
+	var b strings.Builder
+	chunk := strings.Repeat("x", 1024)
+	eventBytes := 0
+	for eventBytes <= MaxLineSize {
+		if eventBytes > 0 {
+			eventBytes++
+		}
+		eventBytes += len(chunk)
+		b.WriteString("data: ")
+		b.WriteString(chunk)
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+
+	s := bufio.NewScanner(strings.NewReader(b.String()))
+	s.Buffer(make([]byte, 0, 64*1024), MaxLineSize)
+	r := &SSEReader{scanner: s, maxEventBytes: 0}
+
+	_, err := r.ReadMessage()
+	if err == nil {
+		t.Fatal("expected cumulative event-size error")
+	}
+	if !strings.Contains(err.Error(), "sse event too large") {
+		t.Fatalf("error = %v, want sse event too large", err)
 	}
 }
 
@@ -135,7 +215,7 @@ func TestSSEReader_IDWithNULLIgnored(t *testing.T) {
 		t.Errorf("after first event: LastEventID() = %q, want %q", r.LastEventID(), "valid-id")
 	}
 
-	// Second event: id contains NULL — should be ignored, keeping previous id.
+	// Second event: id contains NULL - should be ignored, keeping previous id.
 	msg2, err := r.ReadMessage()
 	if err != nil {
 		t.Fatalf("msg2: unexpected error: %v", err)
@@ -177,7 +257,7 @@ func TestSSEReader_ScannerError(t *testing.T) {
 	sr := &SSEReader{
 		scanner: func() *bufio.Scanner {
 			s := bufio.NewScanner(strings.NewReader(longLine))
-			s.Buffer(make([]byte, 0, 64), 100) // 100 byte max — line won't fit
+			s.Buffer(make([]byte, 0, 64), 100) // 100 byte max - line won't fit
 			return s
 		}(),
 	}

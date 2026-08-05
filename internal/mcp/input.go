@@ -1,393 +1,177 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package mcp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
-	"github.com/luckyPipewrench/pipelock/internal/killswitch"
-	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	decide "github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/deferred"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	session "github.com/luckyPipewrench/pipelock/internal/session"
 )
+
+const (
+	adaptiveRecoveryTimer = "time_based_recovery"
+	adaptiveRecoveryClean = "clean_request_recovery"
+	adaptiveBlockedReason = "pipelock: blocked by adaptive enforcement"
+)
+
+type adaptiveRecoveryContext struct {
+	sessionKey string
+	scope      string
+	reason     string
+	clientIP   string
+	requestID  string
+	logger     *audit.Logger
+	metrics    *metrics.Metrics
+}
+
+func adaptiveRecoveryContextWithWarnContext(ctx adaptiveRecoveryContext, warnCtx context.Context) adaptiveRecoveryContext {
+	wc := scanner.DLPWarnContextFromCtx(warnCtx)
+	ctx.clientIP = firstNonEmpty(ctx.clientIP, wc.ClientIP)
+	ctx.requestID = firstNonEmpty(ctx.requestID, wc.RequestID)
+	return ctx
+}
+
+// tryRecoverSession attempts autonomous de-escalation on the session recorder.
+// No-op if rec does not implement session.Recoverer or adaptive enforcement is disabled.
+func tryRecoverSession(rec session.Recorder, adaptiveCfg *config.AdaptiveEnforcement, ctx adaptiveRecoveryContext) {
+	if adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return
+	}
+	r, ok := rec.(session.Recoverer)
+	if !ok {
+		return
+	}
+	blockAllCheck := func(level int) bool {
+		return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+	}
+	levelDuration := time.Duration(adaptiveCfg.LevelDurationSeconds) * time.Second
+	if levelDuration <= 0 {
+		levelDuration = 5 * time.Minute
+	}
+	if changed, from, to := r.TryAutoRecover(levelDuration, blockAllCheck); changed {
+		ctx.reason = firstNonEmpty(ctx.reason, adaptiveRecoveryTimer)
+		emitAdaptiveRecovery(rec, from, to, ctx)
+	}
+}
+
+func recordCleanSession(rec session.Recorder, adaptiveCfg *config.AdaptiveEnforcement, eligibleForCleanRecovery bool, ctx adaptiveRecoveryContext) {
+	if rec == nil || adaptiveCfg == nil || !adaptiveCfg.Enabled {
+		return
+	}
+	if !eligibleForCleanRecovery {
+		rec.RecordClean(adaptiveCfg.DecayPerCleanRequest)
+		return
+	}
+	if r, ok := rec.(session.CleanRecoverer); ok {
+		blockAllCheck := func(level int) bool {
+			return decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock
+		}
+		changed, from, to := r.RecordCleanWithRecovery(adaptiveCfg.DecayPerCleanRequest, adaptiveCfg.CleanRequestsToDeescalate, blockAllCheck)
+		if changed {
+			ctx.reason = firstNonEmpty(ctx.reason, adaptiveRecoveryClean)
+			emitAdaptiveRecovery(rec, from, to, ctx)
+		}
+		return
+	}
+	rec.RecordClean(adaptiveCfg.DecayPerCleanRequest)
+}
+
+func emitAdaptiveRecovery(rec session.Recorder, from, to int, ctx adaptiveRecoveryContext) {
+	fromLabel := session.EscalationLabel(from)
+	toLabel := session.EscalationLabel(to)
+	if ctx.metrics != nil {
+		ctx.metrics.RecordSessionAutoDeescalation(fromLabel, toLabel)
+		if from > 0 {
+			ctx.metrics.SetAdaptiveSessionLevel(fromLabel, -1)
+		}
+		if to > 0 {
+			ctx.metrics.SetAdaptiveSessionLevel(toLabel, 1)
+		}
+	}
+	if ctx.logger != nil {
+		ctx.logger.LogAdaptiveRecovery(audit.LogAdaptiveRecoveryOptions{
+			SessionKey: ctx.sessionKey,
+			Scope:      ctx.scope,
+			From:       fromLabel,
+			To:         toLabel,
+			Reason:     ctx.reason,
+			ClientIP:   ctx.clientIP,
+			RequestID:  ctx.requestID,
+		})
+	}
+	if eventRec, ok := rec.(session.RecoveryEventRecorder); ok {
+		eventRec.RecordAdaptiveRecoveryEvent(ctx.scope, ctx.reason, from, to)
+	}
+}
+
+// methodToolsCall is the JSON-RPC method for MCP tool invocations.
+const methodToolsCall = "tools/call"
+
+// methodResourcesRead is the JSON-RPC method for MCP resource reads.
+const methodResourcesRead = "resources/read"
+
+// errPolicyBlocked is the error message returned when a tool call is denied by policy.
+const errPolicyBlocked = "pipelock: request blocked by tool call policy"
+
+// patternUnknown is the fallback DLP pattern name when Matches is empty but Clean is false.
+const patternUnknown = "unknown"
+
+// ceeStdioKey is the fixed CEE session key for stdio MCP proxies. A single
+// subprocess means one session per process, so a static key is correct.
+const ceeStdioKey = "_default|stdio"
 
 // InputVerdict describes the outcome of scanning a single MCP request.
 type InputVerdict struct {
-	ID      json.RawMessage         `json:"id"`
-	Method  string                  `json:"method,omitempty"`
-	Clean   bool                    `json:"clean"`
-	Action  string                  `json:"action,omitempty"`
-	Matches []scanner.TextDLPMatch  `json:"dlp_matches,omitempty"`
-	Inject  []scanner.ResponseMatch `json:"injection_matches,omitempty"`
-	Error   string                  `json:"error,omitempty"`
-}
-
-// extractAllStringsFromJSON recursively extracts all string values AND keys
-// from arbitrary JSON. Unlike jsonrpc.ExtractStringsFromJSON (values only), this
-// version also extracts map keys because an agent can exfiltrate secrets
-// by encoding them as JSON object keys in tool arguments.
-// Recursion is bounded by jsonrpc.maxExtractDepth (via the same constant) to
-// prevent stack overflow from deeply-nested payloads.
-func extractAllStringsFromJSON(raw json.RawMessage) []string {
-	var result []string
-	var extract func(v interface{}, depth int)
-	extract = func(v interface{}, depth int) {
-		if depth > 64 { // matches jsonrpc.maxExtractDepth
-			return
-		}
-		switch val := v.(type) {
-		case string:
-			result = append(result, val)
-		case float64:
-			// Numeric values could encode secrets (e.g., ASCII code points).
-			result = append(result, strconv.FormatFloat(val, 'f', -1, 64))
-		case bool:
-			result = append(result, strconv.FormatBool(val))
-		case []interface{}:
-			for _, item := range val {
-				extract(item, depth+1)
-			}
-		case map[string]interface{}:
-			for _, k := range jsonrpc.SortedKeys(val) {
-				result = append(result, k) // Extract keys too.
-				extract(val[k], depth+1)
-			}
-		}
-	}
-	var parsed interface{}
-	if err := json.Unmarshal(raw, &parsed); err == nil {
-		extract(parsed, 0)
-	}
-	return result
-}
-
-// extractToolCallName extracts the tool name from a tools/call JSON-RPC request.
-// Returns "" if the message is not a tools/call or the name cannot be extracted.
-func extractToolCallName(line []byte) string {
-	var req struct {
-		Method string `json:"method"`
-		Params struct {
-			Name string `json:"name"`
-		} `json:"params"`
-	}
-	if json.Unmarshal(line, &req) != nil {
-		return ""
-	}
-	if req.Method != "tools/call" { //nolint:goconst // MCP method name used across packages
-		return ""
-	}
-	return req.Params.Name
-}
-
-// ScanRequest parses a JSON-RPC 2.0 request and scans its params for
-// DLP patterns, injection patterns, and env secret leaks. Fail-closed
-// on parse errors (configurable via onParseError).
-func ScanRequest(line []byte, sc *scanner.Scanner, action, onParseError string) InputVerdict {
-	// Detect batch request (JSON array).
-	trimmed := bytes.TrimSpace(line)
-	if len(trimmed) > 0 && trimmed[0] == '[' {
-		return scanRequestBatch(trimmed, sc, action, onParseError)
-	}
-
-	var rpc jsonrpc.RPCResponse // Reuse struct — has Method and Params fields.
-	if err := json.Unmarshal(trimmed, &rpc); err != nil {
-		if onParseError == config.ActionForward {
-			// Still scan raw text for secrets/injection before forwarding.
-			return scanRawBeforeForward(trimmed, sc, action)
-		}
-		return InputVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
-	}
-
-	if rpc.JSONRPC != jsonrpc.Version {
-		if onParseError == config.ActionForward {
-			// Still scan raw text for secrets/injection before forwarding.
-			return scanRawBeforeForward(trimmed, sc, action)
-		}
-		return InputVerdict{
-			ID:    rpc.ID,
-			Clean: false,
-			Error: fmt.Sprintf("not a JSON-RPC 2.0 message: jsonrpc=%q", rpc.JSONRPC),
-		}
-	}
-
-	// No params — but result/error/unknown fields may carry exfiltrable
-	// content (e.g., a compromised agent sending response-shaped messages).
-	// Extract individual string values and scan each one separately so that
-	// encoded-secret detection (base64, hex) works on field values, not on
-	// the whole JSON blob (which is never valid base64/hex as a unit).
-	if len(rpc.Params) == 0 || string(rpc.Params) == jsonrpc.Null {
-		raw := string(trimmed)
-
-		// Extract individual strings for per-field encoded DLP checks.
-		strs := extractAllStringsFromJSON(trimmed)
-		joined := joinStrings(strs)
-
-		// Run DLP on joined strings first (catches raw patterns).
-		dlpResult := sc.ScanTextForDLP(joined)
-
-		// Catch secrets split across multiple JSON fields.
-		dlpResult = scanSplitSecret(trimmed, joined, sc, dlpResult)
-
-		// Scan each extracted string individually for encoded secrets
-		// (base64, hex). The joined string is not valid base64/hex as a
-		// unit, so encoding checks only work on individual field values.
-		if dlpResult.Clean {
-			for _, s := range strs {
-				if r := sc.ScanTextForDLP(s); !r.Clean {
-					dlpResult = r
-					break
-				}
-			}
-		}
-
-		// Fall back to scanning full raw JSON for DLP patterns that span
-		// across JSON structure (catches patterns split by JSON syntax).
-		if dlpResult.Clean {
-			dlpResult = sc.ScanTextForDLP(raw)
-		}
-
-		// Run injection patterns on the full raw text (injection patterns
-		// match phrases, not encoded blobs -- full text is appropriate).
-		injResult := sc.ScanResponse(raw)
-
-		// Also scan each extracted string individually for encoded injection
-		// (e.g. base64-encoded phrases) that don't decode in the full blob.
-		if injResult.Clean {
-			for _, s := range strs {
-				if r := sc.ScanResponse(s); !r.Clean {
-					injResult = r
-					break
-				}
-			}
-		}
-
-		if dlpResult.Clean && injResult.Clean {
-			return InputVerdict{ID: rpc.ID, Method: rpc.Method, Clean: true}
-		}
-		var dlpMatches []scanner.TextDLPMatch
-		var injMatches []scanner.ResponseMatch
-		if !dlpResult.Clean {
-			dlpMatches = dlpResult.Matches
-		}
-		if !injResult.Clean {
-			injMatches = injResult.Matches
-		}
-		return InputVerdict{
-			ID:      rpc.ID,
-			Method:  rpc.Method,
-			Clean:   false,
-			Action:  action,
-			Matches: dlpMatches,
-			Inject:  injMatches,
-		}
-	}
-
-	// Extract all strings (keys + values) from params.
-	strs := extractAllStringsFromJSON(rpc.Params)
-	if len(strs) == 0 {
-		// Fallback: serialize params to string for non-string JSON values.
-		strs = []string{string(rpc.Params)}
-	}
-
-	// Include method name and ID in DLP scan — agents can exfiltrate
-	// secrets by encoding them into method names or request IDs.
-	if rpc.Method != "" {
-		strs = append(strs, rpc.Method)
-	}
-	if len(rpc.ID) > 0 && string(rpc.ID) != jsonrpc.Null {
-		strs = append(strs, string(rpc.ID))
-	}
-
-	joined := joinStrings(strs)
-
-	// Run DLP patterns + env leak checks.
-	dlpResult := sc.ScanTextForDLP(joined)
-
-	// Catch secrets split across multiple JSON fields.
-	dlpResult = scanSplitSecret(rpc.Params, joined, sc, dlpResult)
-
-	// Scan each extracted string individually for encoded secrets (base64,
-	// hex). The joined string is not valid base64/hex as a unit, so encoding
-	// checks only work on individual field values.
-	if dlpResult.Clean {
-		for _, s := range strs {
-			if r := sc.ScanTextForDLP(s); !r.Clean {
-				dlpResult = r
-				break
-			}
-		}
-	}
-
-	// Run injection patterns (reuses response scanning patterns).
-	// First scan joined text for injection phrases that span fields.
-	injResult := sc.ScanResponse(joined)
-
-	// Also scan each extracted string individually for injection. Catches
-	// encoded injection (e.g. base64) in a single field that doesn't decode
-	// cleanly when concatenated with other fields.
-	if injResult.Clean {
-		for _, s := range strs {
-			if r := sc.ScanResponse(s); !r.Clean {
-				injResult = r
-				break
-			}
-		}
-	}
-
-	var dlpMatches []scanner.TextDLPMatch
-	var injMatches []scanner.ResponseMatch
-
-	if !dlpResult.Clean {
-		dlpMatches = dlpResult.Matches
-	}
-	if !injResult.Clean {
-		injMatches = injResult.Matches
-	}
-
-	if len(dlpMatches) == 0 && len(injMatches) == 0 {
-		return InputVerdict{ID: rpc.ID, Method: rpc.Method, Clean: true}
-	}
-
-	return InputVerdict{
-		ID:      rpc.ID,
-		Method:  rpc.Method,
-		Clean:   false,
-		Action:  action,
-		Matches: dlpMatches,
-		Inject:  injMatches,
-	}
-}
-
-// scanRawBeforeForward scans the raw bytes of an unparseable request for
-// DLP patterns and injection before forwarding in on_parse_error=forward mode.
-// This prevents malformed JSON from being a trivial bypass for all scanning.
-// Extracts individual strings for per-field encoded DLP checks (base64, hex).
-func scanRawBeforeForward(raw []byte, sc *scanner.Scanner, action string) InputVerdict {
-	text := string(raw)
-
-	// Extract individual strings for encoded DLP checks.
-	strs := extractAllStringsFromJSON(raw)
-	joined := joinStrings(strs)
-
-	dlpResult := sc.ScanTextForDLP(joined)
-
-	// Catch secrets split across multiple JSON fields.
-	dlpResult = scanSplitSecret(raw, joined, sc, dlpResult)
-
-	// Scan each extracted string individually for encoded secrets.
-	if dlpResult.Clean {
-		for _, s := range strs {
-			if r := sc.ScanTextForDLP(s); !r.Clean {
-				dlpResult = r
-				break
-			}
-		}
-	}
-
-	// Fall back to full raw text for cross-structure patterns.
-	if dlpResult.Clean {
-		dlpResult = sc.ScanTextForDLP(text)
-	}
-
-	injResult := sc.ScanResponse(text)
-
-	// Also scan each extracted string individually for encoded injection
-	// (e.g. base64-encoded phrases) that don't decode in the full blob.
-	if injResult.Clean {
-		for _, s := range strs {
-			if r := sc.ScanResponse(s); !r.Clean {
-				injResult = r
-				break
-			}
-		}
-	}
-
-	var dlpMatches []scanner.TextDLPMatch
-	var injMatches []scanner.ResponseMatch
-
-	if !dlpResult.Clean {
-		dlpMatches = dlpResult.Matches
-	}
-	if !injResult.Clean {
-		injMatches = injResult.Matches
-	}
-
-	if len(dlpMatches) == 0 && len(injMatches) == 0 {
-		return InputVerdict{Clean: true}
-	}
-
-	return InputVerdict{
-		Clean:   false,
-		Action:  action,
-		Matches: dlpMatches,
-		Inject:  injMatches,
-	}
-}
-
-// scanRequestBatch scans a JSON-RPC 2.0 batch request (array of requests).
-func scanRequestBatch(line []byte, sc *scanner.Scanner, action, onParseError string) InputVerdict {
-	var batch []json.RawMessage
-	if err := json.Unmarshal(line, &batch); err != nil {
-		if onParseError == config.ActionForward {
-			return scanRawBeforeForward(line, sc, action)
-		}
-		return InputVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON batch: %v", err)}
-	}
-
-	if len(batch) == 0 {
-		return InputVerdict{Clean: true}
-	}
-
-	var allDLP []scanner.TextDLPMatch
-	var allInj []scanner.ResponseMatch
-	var firstID json.RawMessage
-	var hasError bool
-
-	for _, elem := range batch {
-		v := ScanRequest(elem, sc, action, onParseError)
-		if firstID == nil && len(v.ID) > 0 {
-			firstID = v.ID
-		}
-		if v.Error != "" {
-			hasError = true
-		}
-		if !v.Clean && v.Error == "" {
-			allDLP = append(allDLP, v.Matches...)
-			allInj = append(allInj, v.Inject...)
-		}
-	}
-
-	if len(allDLP) == 0 && len(allInj) == 0 {
-		if hasError {
-			return InputVerdict{ID: firstID, Clean: false, Error: "one or more batch elements failed to parse"}
-		}
-		return InputVerdict{ID: firstID, Clean: true}
-	}
-	v := InputVerdict{
-		ID: firstID, Clean: false, Action: action, Matches: allDLP, Inject: allInj,
-	}
-	if hasError {
-		v.Error = "one or more batch elements also failed to parse"
-	}
-	return v
+	ID              json.RawMessage          `json:"id"`
+	Method          string                   `json:"method,omitempty"`
+	Clean           bool                     `json:"clean"`
+	Action          string                   `json:"action,omitempty"`
+	Matches         []scanner.TextDLPMatch   `json:"dlp_matches,omitempty"`
+	Inject          []scanner.ResponseMatch  `json:"injection_matches,omitempty"`
+	URLFindings     []scanner.Result         `json:"url_findings,omitempty"`
+	AddressFindings []addressprotect.Finding `json:"address_findings,omitempty"`
+	Error           string                   `json:"error,omitempty"`
 }
 
 // BlockedRequest holds the ID and notification status of a blocked MCP request,
 // sent from the input scanning goroutine to the main goroutine via channel.
+// When SyntheticResponse is non-nil, the consumer sends it as-is instead of
+// generating an error response (used for redirect success results).
 type BlockedRequest struct {
-	ID             json.RawMessage
-	IsNotification bool // Notifications have no ID — don't send error response.
-	LogMessage     string
-	ErrorCode      int    // 0 = use default -32001; -32002 = policy block
-	ErrorMessage   string // empty = use default message
+	ID                json.RawMessage
+	IsNotification    bool // Notifications have no ID - don't send error response.
+	LogMessage        string
+	ErrorCode         int    // 0 = use default -32001; -32002 = policy block
+	ErrorMessage      string // empty = use default message
+	ErrorData         json.RawMessage
+	SyntheticResponse []byte // if set, send this instead of an error response
 }
 
 // blockRequestResponse generates a JSON-RPC 2.0 error response for a blocked request.
@@ -407,6 +191,7 @@ func blockRequestResponse(br BlockedRequest) []byte {
 		Error: rpcErrorDetail{
 			Code:    code,
 			Message: msg,
+			Data:    br.ErrorData,
 		},
 	}
 	data, _ := json.Marshal(resp) //nolint:errcheck // marshaling known-good struct
@@ -425,25 +210,76 @@ type SessionBindingConfig struct {
 // ForwardScannedInput reads JSON-RPC 2.0 requests from reader, scans each for
 // DLP and injection patterns, and forwards clean requests to writer.
 // When policyCfg is non-nil, tool call policy rules are also checked
-// independently of content scanning — the strictest action wins.
+// independently of content scanning - the strictest action wins.
 // When bindingCfg is non-nil, tools/call requests are validated against the
 // session tool baseline.
+// When tracker is non-nil, each forwarded request's ID is recorded so the
+// response-side (ForwardScanned) can validate that response IDs were solicited.
+// When cee is non-nil, outbound payloads are recorded for cross-request
+// exfiltration detection (entropy budget and fragment reassembly DLP).
+// When rec is non-nil and adaptiveCfg is enabled, threat signals are recorded
+// and the effective action may be upgraded based on session escalation level.
 // Blocked request IDs are sent via blockedCh so the main goroutine (which owns
 // clientOut writes) can send error responses without concurrent write races.
 func ForwardScannedInput(
 	reader transport.MessageReader,
 	writer transport.MessageWriter,
 	logW io.Writer,
-	sc *scanner.Scanner,
 	action string,
 	onParseError string,
 	blockedCh chan<- BlockedRequest,
-	policyCfg *policy.Config,
 	bindingCfg *SessionBindingConfig,
-	ks *killswitch.Controller,
-	chainMatcher *chains.Matcher,
+	tracker *RequestTracker,
+	opts MCPProxyOpts,
 ) {
-	defer close(blockedCh)
+	sc := opts.scanner()
+	policyCfg := opts.policyCfg()
+	ks := opts.KillSwitch
+	auditLogger := opts.AuditLogger
+	cee := opts.cee()
+	rec := opts.Rec
+	adaptiveCfg := opts.adaptiveCfg()
+	m := opts.Metrics
+	obs := opts.captureObserver()
+	redactionCfg := opts.redactionConfig()
+	receiptEmitter := opts.receiptEmitter()
+	v2ReceiptEmitter := opts.v2ReceiptEmitter()
+	policyHash := opts.receiptPolicyHash()
+	envelopeEmitter := opts.envelopeEmitter()
+	redirectRT := opts.redirectRT()
+	resolverRuntime := opts.deferResolverRuntime()
+	if resolverRuntime == nil {
+		resolverRuntime = newDeferResolverRuntime(opts.warnContext())
+	}
+
+	defer func() {
+		resolverRuntime.Cancel()
+		if manager := opts.deferManager(); manager != nil {
+			manager.ResolveAll(config.ActionBlock, deferred.SourceCancel)
+		}
+		resolverRuntime.Wait()
+		close(blockedCh)
+	}()
+	var forwardMu sync.Mutex
+	forwardMessage := func(msg []byte) error {
+		forwardMu.Lock()
+		defer forwardMu.Unlock()
+		return writer.WriteMessage(msg)
+	}
+
+	// Helper: record an adaptive signal and handle escalation side-effects.
+	// Eliminates repeated nil/enabled guards at every call site.
+	recordAdaptiveSignal := func(sig session.SignalType) {
+		if adaptiveCfg != nil && adaptiveCfg.Enabled {
+			decide.RecordSignal(rec, sig, decide.EscalationParams{
+				Threshold:     adaptiveCfg.EscalationThreshold,
+				Logger:        auditLogger,
+				Metrics:       m,
+				ConsoleWriter: logW,
+				Session:       "default",
+			})
+		}
+	}
 
 	// lineNum counts non-empty messages, not raw lines. StdioReader skips
 	// empty lines internally, so this is a message index.
@@ -459,16 +295,32 @@ func ForwardScannedInput(
 		}
 		lineNum++
 
+		// Strip any inbound com.pipelock/mediation from _meta before
+		// scanning. Prevents spoofed mediation metadata from an agent
+		// or upstream from passing through to the MCP server.
+		line = stripInboundMCPMeta(line)
+
+		// Parse the inbound frame once per message. Every gate below
+		// reads ID / Method / tool fields from this frame instead of
+		// re-parsing the bytes. Redaction may rewrite the argument
+		// values later in the loop; the frame is re-parsed after the
+		// redaction step so downstream gates (DoW, taint) see the
+		// redacted args while ID / Method / ToolCallName stay stable.
+		frame := ParseMCPFrame(line)
+
 		// Kill switch: deny all messages when active.
 		if ks != nil {
 			if d := ks.IsActiveMCP(line); d.Active {
+				if manager := opts.deferManager(); manager != nil {
+					manager.ResolveAll(config.ActionBlock, deferred.SourceKillSwitch)
+				}
 				if d.IsNotification {
-					// Notifications have no ID — silently drop.
+					// Notifications have no ID - silently drop.
 					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: kill switch dropped notification (source=%s)\n",
 						lineNum, d.Source)
 				} else {
-					// Request with ID — send JSON-RPC error response.
-					rpcID := extractRPCID(line)
+					// Request with ID - send JSON-RPC error response.
+					rpcID := frame.ID
 					blockedCh <- BlockedRequest{
 						ID:             rpcID,
 						IsNotification: false,
@@ -481,113 +333,628 @@ func ForwardScannedInput(
 			}
 		}
 
-		verdict := ScanRequest(line, sc, action, onParseError)
-
-		// Tool call policy check — independent of content scanning.
-		policyVerdict := policy.Verdict{}
-		if policyCfg != nil {
-			policyVerdict = policyCfg.CheckRequest(line)
+		// On-entry de-escalation: recover sessions stuck at block_all.
+		// Runs before any per-message action so both clean and non-clean
+		// messages benefit from recovery.
+		if rec != nil {
+			tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				sessionKey: "default",
+				reason:     adaptiveRecoveryTimer,
+				logger:     auditLogger,
+				metrics:    m,
+			}, opts.warnContext()))
 		}
 
-		// Session binding: validate tools/call against baseline.
-		bindingAction := ""
-		bindingReason := ""
-
-		// Batch requests bypass per-method binding checks because the
-		// aggregate verdict has no single Method. Fail closed: treat
-		// batch requests as binding violations when session binding is
-		// active, since they could contain unvalidated tools/call messages.
+		// Reject JSON-RPC batch requests unconditionally. MCP does not
+		// use batch messages, and the response path already drops batch
+		// arrays. Forwarding would produce a response blackhole and
+		// bypass per-call checks (DoW, chain) due to the aggregated
+		// verdict having no Method field.
 		trimmedLine := bytes.TrimSpace(line)
-		if bindingCfg != nil && bindingCfg.Baseline != nil && len(trimmedLine) > 0 && trimmedLine[0] == '[' {
-			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: batch request with session binding active\n", lineNum)
-			bindingAction = bindingCfg.UnknownToolAction
-			bindingReason = "session_binding:batch_request"
-		}
-
-		// Extract tool name once for both binding and chain detection.
-		var toolCallName string
-		if verdict.Method == "tools/call" { //nolint:goconst // MCP method name used across packages
-			toolCallName = extractToolCallName(line)
-		}
-
-		if bindingCfg != nil && bindingCfg.Baseline != nil && verdict.Method == "tools/call" {
-			if toolCallName == "" {
-				// Fail closed: tools/call without a name is a binding violation.
-				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: tools/call missing params.name\n", lineNum)
-				bindingAction = bindingCfg.UnknownToolAction
-				bindingReason = "session_binding:missing_tool_name"
-			} else if !bindingCfg.Baseline.HasBaseline() {
-				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: tools/call %q before baseline established\n",
-					lineNum, toolCallName)
-				bindingAction = bindingCfg.NoBaselineAction
-				bindingReason = "session_binding:no_baseline"
-			} else if !bindingCfg.Baseline.IsKnownTool(toolCallName) {
-				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: tools/call %q not in session baseline\n",
-					lineNum, toolCallName)
-				bindingAction = bindingCfg.UnknownToolAction
-				bindingReason = "session_binding:unknown_tool"
+		if len(trimmedLine) > 0 && trimmedLine[0] == '[' {
+			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked batch request (not supported by MCP)\n", lineNum)
+			recordAdaptiveSignal(session.SignalBlock)
+			blockedCh <- BlockedRequest{
+				ID:           frame.ID,
+				ErrorCode:    -32600,
+				ErrorMessage: "pipelock: batch requests are not supported by MCP",
 			}
+			continue
 		}
 
-		// Chain detection: check if this tool call matches an attack pattern.
-		// Runs on every tools/call regardless of content scan results.
-		chainAction := ""
-		chainReason := ""
-		// Stdio proxy has exactly one client session per process instance.
-		// "default" is the correct session key for this 1:1 architecture.
-		if chainMatcher != nil && toolCallName != "" {
-			cv := chainMatcher.Record("default", toolCallName)
-			if cv.Matched {
-				_, _ = fmt.Fprintf(logW, "pipelock: chain detected: %s (severity=%s, action=%s)\n",
-					cv.PatternName, cv.Severity, cv.Action)
-				if cv.Action == config.ActionBlock {
-					// Use verdict.ID from the already-parsed ScanRequest result
-					// rather than re-parsing via extractRPCID. A tools/call always
-					// has an ID; using the parsed value avoids a silent-drop bug
-					// if re-parsing fails on unusual ID shapes.
-					blockedCh <- BlockedRequest{
-						ID:             verdict.ID,
-						IsNotification: isRPCNotification(verdict.ID),
-						LogMessage:     fmt.Sprintf("pipelock: input line %d: chain pattern %q blocked", lineNum, cv.PatternName),
-						ErrorCode:      -32004,
-						ErrorMessage:   fmt.Sprintf("tool call blocked: chain pattern %q detected", cv.PatternName),
+		pendingToolCallName := frame.ToolCallName
+		pendingMCPMethod := methodToolsCall
+		pendingReceiptTarget := pendingToolCallName
+		if pendingReceiptTarget == "" && IsA2AMethod(frame.Method) {
+			pendingMCPMethod = frame.Method
+			pendingReceiptTarget = frame.Method
+		}
+		pendingActionID := ""
+		if pendingReceiptTarget != "" {
+			pendingActionID = receipt.NewActionID()
+		}
+		rpcID := frame.ID
+		warnCtx := scanner.DLPWarnContextFromCtx(opts.warnContext())
+		warnCtx.Transport = transportMCPStdio
+		if policyHash != "" {
+			warnCtx.PolicyHash = policyHash
+		}
+		stdioInputCtx := scanner.WithDLPWarnContext(opts.warnContext(), warnCtx)
+		if redactionCfg.Matcher != nil {
+			originalVerdict := scanRequestForAgent(stdioInputCtx, line, sc, action, onParseError, opts.addressProtectionAgent())
+			if !originalVerdict.Clean && originalVerdict.Error == "" && inputVerdictEffectiveAction(originalVerdict, action) == config.ActionBlock {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked (%s)\n", lineNum, joinInputVerdictReasons(originalVerdict))
+				recordAdaptiveSignal(session.SignalBlock)
+				if pendingActionID != "" && receiptEmitter != nil {
+					layer, pattern, severity := contentScanAttribution(originalVerdict)
+					if _, emitErr := EmitMCPDecision(receiptEmitter, v2ReceiptEmitter, nil, MCPDecision{
+						Receipt: opts.withReceiptPolicyHash(receipt.EmitOpts{
+							ActionID:  pendingActionID,
+							Verdict:   config.ActionBlock,
+							Layer:     layer,
+							Pattern:   pattern,
+							Severity:  severity,
+							Transport: opts.Transport,
+							Target:    pendingReceiptTarget,
+							MCPMethod: pendingMCPMethod,
+							ToolName:  pendingToolCallName,
+						}),
+					}); emitErr != nil {
+						logReceiptEmitFailure(logW, emitErr, opts.requireReceipts(), config.ActionBlock)
 					}
-					continue
 				}
-				// warn action: record reason for inclusion in combined verdict.
-				chainAction = cv.Action
-				chainReason = "chain:" + cv.PatternName
+				blockedCh <- BlockedRequest{
+					ID:             originalVerdict.ID,
+					IsNotification: isRPCNotification(originalVerdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked", lineNum),
+					ErrorCode:      -32001,
+					ErrorMessage:   "pipelock: request blocked by MCP input scanning",
+					ErrorData:      mcpBlockReasonData(mcpScannerBlockReason(originalVerdict, policy.Verdict{}, false)),
+				}
+				continue
 			}
 		}
+		rewrittenLine, redactionReport, redactErr := applyMCPToolCallRedactionWithConfig(line, redactionCfg)
+		if redactErr != nil {
+			reason := redactErr.Error()
+			var blockErr *redact.BlockError
+			if errors.As(redactErr, &blockErr) {
+				reason = "tool arguments redaction blocked: " + string(blockErr.Reason)
+			}
+			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: %s\n", lineNum, reason)
+			recordAdaptiveSignal(session.SignalBlock)
+			if pendingActionID != "" && receiptEmitter != nil {
+				layer, pattern, severity := redactionBlockAttribution(redactErr)
+				if _, emitErr := EmitMCPDecision(receiptEmitter, v2ReceiptEmitter, nil, MCPDecision{
+					Receipt: opts.withReceiptPolicyHash(receipt.EmitOpts{
+						ActionID:         pendingActionID,
+						Verdict:          config.ActionBlock,
+						Layer:            layer,
+						Pattern:          pattern,
+						Severity:         severity,
+						RedactionProfile: redactionCfg.Profile,
+						Transport:        opts.Transport,
+						Target:           pendingReceiptTarget,
+						MCPMethod:        pendingMCPMethod,
+						ToolName:         pendingToolCallName,
+					}),
+				}); emitErr != nil {
+					logReceiptEmitFailure(logW, emitErr, opts.requireReceipts(), config.ActionBlock)
+				}
+			}
+			blockedCh <- BlockedRequest{
+				ID:             rpcID,
+				IsNotification: isRPCNotification(rpcID),
+				LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (redaction)", lineNum),
+				ErrorCode:      -32001,
+				ErrorMessage:   "pipelock: request blocked by MCP redaction",
+			}
+			continue
+		}
+		line = rewrittenLine
+		// Redaction may have rewritten argument values; re-parse so
+		// downstream gates (DoW, taint) see the redacted args. ID,
+		// Method, and ToolCallName are invariant under redaction but
+		// re-parsing keeps the frame the single source of truth.
+		frame = ParseMCPFrame(line)
 
-		// Parse error — block by default (policy doesn't override parse errors).
-		if verdict.Error != "" {
+		// Evaluate every configured gate in one pass. The helper returns
+		// a composite verdict and the first gate that short-circuited,
+		// preserving per-gate block semantics and stdio's gate ordering
+		// (policy before DoW, two-phase binding around DoW, frozen tool
+		// between DoW and chain, taint last).
+		eval := EvaluateMCPInputGatesStdio(stdioInputCtx, frame, line, trimmedLine, bindingCfg, opts, action, onParseError)
+		// Cross-agent contamination escalation. Fired regardless of the gate
+		// outcome: the contaminated session already emitted across the agent
+		// boundary, so the adaptive signal must accumulate even when the call
+		// is otherwise allowed.
+		if eval.CrossAgentEscalate {
+			recordAdaptiveSignal(session.SignalCrossAgentContamination)
+		}
+		verdict := eval.ContentVerdict
+		policyVerdict := eval.PolicyVerdict
+		taintDecision := eval.TaintDecision
+		bindingAction := eval.BindingAction
+		bindingReason := eval.BindingReason
+		chainAction := eval.ChainAction
+		chainReason := eval.ChainReason
+
+		var toolCallName string
+		if verdict.Method == methodToolsCall {
+			toolCallName = frame.ToolCallName
+		}
+		enforcementTarget := toolCallName
+		if enforcementTarget == "" {
+			enforcementTarget = eval.EnforcementIdentity
+		}
+		enforcementKind := "tools/call"
+		if toolCallName == "" && enforcementTarget != "" {
+			enforcementKind = "mcp method"
+		}
+		baselineIdentity := mcpFrameBaselineIdentity(frame)
+		captureActionClass := captureMCPFrameActionClass(enforcementTarget, verdict.Method, mcpFrameCallableArgs(frame))
+
+		// Session binding side effects. Fire the diagnostic log and
+		// capture observe for every binding violation regardless of
+		// which gate short-circuits later, preserving the pre-refactor
+		// ordering where binding observes run before frozen/chain/
+		// parse-error/taint have had a chance to fire.
+		if bindingReason != "" {
+			switch bindingReason {
+			case bindingReasonBatchRequest:
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: batch request with session binding active\n", lineNum)
+			case bindingReasonMissingToolName:
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: tools/call missing params.name\n", lineNum)
+			case bindingReasonNoBaseline:
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: %s %q before baseline established\n", lineNum, enforcementKind, enforcementTarget)
+			case bindingReasonUnknownTool:
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: %s %q not in session baseline\n", lineNum, enforcementKind, enforcementTarget)
+			}
+			obs.ObserveToolPolicyVerdict(context.Background(), &capture.ToolPolicyRecord{
+				Subsurface:        "session_binding",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request: capture.CaptureRequest{
+					ToolName:  enforcementTarget,
+					MCPMethod: verdict.Method,
+					RPCID:     captureRPCID(verdict.ID),
+				},
+				RawFindings: []capture.Finding{{
+					Kind:       capture.KindSessionBinding,
+					ToolName:   enforcementTarget,
+					PolicyRule: bindingReason,
+					Action:     bindingAction,
+				}},
+				EffectiveAction: bindingAction,
+				Outcome:         captureOutcome(bindingAction, false),
+			})
+		}
+
+		// Chain side effects. Log, audit, and capture observe on every
+		// match, block and warn alike. The block-dispatch switch below
+		// handles the block-specific adaptive signal + BlockedRequest;
+		// warn matches fall through into the effective-action merge
+		// below with chainAction / chainReason populated.
+		if eval.ChainMatched {
+			_, _ = fmt.Fprintf(logW, "pipelock: chain detected: %s (severity=%s, action=%s)\n",
+				eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction)
+			if auditLogger != nil {
+				auditLogger.LogChainDetection(eval.ChainPatternName, eval.ChainSeverity, eval.ChainAction, enforcementTarget, "default")
+			}
+			obs.ObserveToolPolicyVerdict(context.Background(), &capture.ToolPolicyRecord{
+				Subsurface:        "chain_detection",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request: capture.CaptureRequest{
+					ToolName:  enforcementTarget,
+					MCPMethod: verdict.Method,
+					RPCID:     captureRPCID(verdict.ID),
+				},
+				RawFindings: []capture.Finding{{
+					Kind:     capture.KindChainDetection,
+					Chain:    eval.ChainPatternName,
+					Severity: eval.ChainSeverity,
+					Action:   eval.ChainAction,
+				}},
+				EffectiveAction: eval.ChainAction,
+				Outcome:         captureOutcome(eval.ChainAction, false),
+			})
+		}
+
+		// Pre-generate actionID for receipt-bearing calls only. Metadata methods
+		// (tools/list, initialize) do not produce receipts, while A2A method
+		// calls use the JSON-RPC method as their receipt target.
+		actionID := ""
+		receiptTarget := toolCallName
+		receiptBearingMethod := verdict.Method == methodToolsCall
+		if receiptTarget == "" && IsA2AMethod(verdict.Method) {
+			receiptTarget = verdict.Method
+			receiptBearingMethod = true
+		}
+		if receiptBearingMethod {
+			if pendingActionID != "" {
+				actionID = pendingActionID
+			} else {
+				actionID = receipt.NewActionID()
+			}
+		}
+		receiptEmitted := false
+		receiptDecisionPhase := ""
+		receiptDeferID := ""
+		receiptResolutionPolicy := ""
+		receiptResolutionSource := ""
+		receiptSessionID := ""
+		receiptSessionIDOriginal := ""
+
+		emitToolReceipt := func(receiptVerdict string, contractGate ...mcpContractGateOutput) error {
+			if verdict.Method != methodToolsCall && receiptVerdict == config.ActionAllow && !opts.requireReceipts() {
+				return nil
+			}
+			// Delegate to the shared helper so stdio and HTTP/WS emit
+			// tool receipts through the same EmitMCPDecision entry.
+			layer, pattern, severity := pickAttribution(eval)
+			requireReceipts := opts.requireReceipts()
+			receiptOpts := mcpToolReceiptOpts{
+				Emitter:           receiptEmitter,
+				V2Emitter:         v2ReceiptEmitter,
+				PolicyHash:        policyHash,
+				Log:               logW,
+				Transport:         opts.Transport,
+				RedactionProfile:  redactionCfg.Profile,
+				ActionID:          actionID,
+				MCPMethod:         verdict.Method,
+				ToolName:          toolCallName,
+				Target:            receiptTarget,
+				Verdict:           receiptVerdict,
+				Layer:             layer,
+				Pattern:           pattern,
+				Severity:          severity,
+				Decision:          taintDecision,
+				Report:            redactionReport,
+				RequireReceipts:   requireReceipts,
+				RequireReceipt:    (requireReceipts && receiptVerdict != config.ActionBlock) || receiptVerdict == config.ActionDefer,
+				DecisionPhase:     receiptDecisionPhase,
+				DeferID:           receiptDeferID,
+				ResolutionPolicy:  receiptResolutionPolicy,
+				ResolutionSource:  receiptResolutionSource,
+				SessionID:         receiptSessionID,
+				SessionIDOriginal: receiptSessionIDOriginal,
+			}
+			if len(contractGate) > 0 {
+				receiptOpts.ContractGate = &contractGate[0]
+			}
+			return emitMCPToolReceipt(receiptOpts)
+		}
+
+		logTaintDecision := func() {
+			if auditLogger == nil {
+				return
+			}
+			decision := taintDecision
+			if eval.TaintAuditDecisionSet {
+				decision = eval.TaintAuditDecision
+			}
+			auditLogger.LogTaintDecision(
+				mustMCPAuditContext(auditLogger, "MCP", enforcementTarget),
+				audit.TaintDecision{
+					TaintLevel:  decision.Risk.Level.String(),
+					ActionClass: decision.ActionClass.String(),
+					Sensitivity: decision.Sensitivity.String(),
+					Authority:   decision.Authority.String(),
+					Decision:    decision.Result.Decision.String(),
+					Reason:      decision.Result.Reason,
+					SourceURL:   decision.Risk.LastExternalURL,
+					SourceKind:  decision.Risk.LastExternalKind,
+				},
+			)
+		}
+
+		// DoW diagnostic log. Runs on any !allowed outcome (block or
+		// warn). Held in a local so the block-dispatch case below can
+		// reuse it verbatim as the BlockedRequest.LogMessage.
+		var dowLogMsg string
+		if !eval.DoWAllowed && eval.DoWAction != "" {
+			dowLogMsg = fmt.Sprintf("pipelock: input line %d: %s %q DoW %s: %s (%s)",
+				lineNum, enforcementKind, enforcementTarget, eval.DoWAction, eval.DoWReason, eval.DoWBudgetType)
+			_, _ = fmt.Fprintln(logW, dowLogMsg)
+		}
+
+		// Block dispatch on the first gate that short-circuited. Per
+		// gate: audit + metrics + adaptive-signal + BlockedRequest.
+		// The response shape (JSON-RPC error code, LogMessage) stays
+		// here because it is transport-specific.
+		switch eval.BlockingGate {
+		case blockingGateA2ABody:
+			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: a2a input blocked (%s)\n", lineNum, eval.A2AResult.Reason)
+			switch {
+			case eval.A2AResult.IsAdaptiveNeutral():
+			case eval.A2AResult.IsConfigMismatch():
+				recordAdaptiveSignal(session.SignalNearMiss)
+			default:
+				recordAdaptiveSignal(session.SignalBlock)
+			}
+			blockedCh <- BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (a2a input scanning)", lineNum),
+				ErrorCode:      -32001,
+				ErrorMessage:   "pipelock: request blocked by A2A input scanning",
+			}
+			_ = emitToolReceipt(config.ActionBlock)
+			continue
+		case blockingGateDoW:
+			if auditLogger != nil {
+				auditLogger.LogBlocked(mustMCPAuditContext(auditLogger, "MCP", enforcementTarget), scanner.ScannerDenialOfWallet, eval.DoWReason)
+			}
+			if m != nil {
+				m.RecordBlocked("mcp", "denial_of_wallet", 0, "")
+			}
+			recordAdaptiveSignal(session.SignalBlock)
+			blockedCh <- BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     dowLogMsg,
+				ErrorCode:      -32600,
+				ErrorMessage:   "pipelock: " + eval.DoWReason,
+			}
+			_ = emitToolReceipt(config.ActionBlock)
+			continue
+		case blockingGateFrozenTool:
+			frozenMsg := fmt.Sprintf("pipelock: input line %d: tools/call %q blocked by frozen tool inventory", lineNum, eval.FrozenToolName)
+			_, _ = fmt.Fprintln(logW, frozenMsg)
+			if auditLogger != nil {
+				auditLogger.LogBlocked(mustMCPAuditContext(auditLogger, "MCP", eval.FrozenToolName), "frozen_tool", "tool not in frozen inventory")
+			}
+			if m != nil {
+				m.RecordBlocked("mcp", "frozen_tool", 0, "")
+			}
+			recordAdaptiveSignal(session.SignalBlock)
+			blockedCh <- BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     frozenMsg,
+				ErrorCode:      -32600,
+				ErrorMessage:   "pipelock: tool not in frozen inventory",
+			}
+			_ = emitToolReceipt(config.ActionBlock)
+			continue
+		case blockingGateChain:
+			recordAdaptiveSignal(session.SignalBlock)
+			blockedCh <- BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     fmt.Sprintf("pipelock: input line %d: chain pattern %q blocked", lineNum, eval.ChainPatternName),
+				ErrorCode:      -32004,
+				ErrorMessage:   fmt.Sprintf("tool call blocked: chain pattern %q detected", eval.ChainPatternName),
+			}
+			_ = emitToolReceipt(config.ActionBlock)
+			continue
+		case blockingGateParseError:
 			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: %s\n", lineNum, verdict.Error)
 			blockedCh <- BlockedRequest{
 				ID:             verdict.ID,
 				IsNotification: isRPCNotification(verdict.ID),
 				LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (parse error)", lineNum),
+				ErrorCode:      jsonRPCErrorCodeForInputError(verdict.Error),
 			}
+			_ = emitToolReceipt(config.ActionBlock)
+			continue
+		case blockingGateTaintBlock, blockingGateTaintAskDenied:
+			logTaintDecision()
+			blockedCh <- BlockedRequest{
+				ID:             verdict.ID,
+				IsNotification: isRPCNotification(verdict.ID),
+				LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked by taint policy", lineNum),
+				ErrorCode:      -32002,
+				ErrorMessage:   "pipelock: " + taintDecision.Result.Reason,
+			}
+			_ = emitToolReceipt(config.ActionBlock)
 			continue
 		}
 
-		// All clean — forward.
+		// Non-blocking warn-level side effects from gates that did not
+		// short-circuit. A2A warn logs and records a near-miss unless the
+		// finding is adaptive-neutral. DoW warn: audit anomaly + near-miss
+		// signal (the diagnostic log already ran above). Taint approved:
+		// audit the pre-approval decision so the operator sees the approval
+		// happened.
+		if !eval.A2AResult.Clean && eval.A2AEffectiveAction != "" && eval.A2AEffectiveAction != config.ActionBlock {
+			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: a2a input warning (%s)\n", lineNum, eval.A2AResult.Reason)
+			if !eval.A2AResult.IsAdaptiveNeutral() {
+				recordAdaptiveSignal(session.SignalNearMiss)
+			}
+		}
+		if !eval.DoWAllowed && eval.DoWAction != "" {
+			if auditLogger != nil {
+				auditLogger.LogAnomaly(mustMCPAuditContext(auditLogger, "MCP", enforcementTarget), scanner.ScannerDenialOfWallet, eval.DoWReason, 0)
+			}
+			recordAdaptiveSignal(session.SignalNearMiss)
+		}
+		if eval.TaintApproved {
+			logTaintDecision()
+		}
+
+		// All clean - forward (with block_all and CEE checks).
 		if verdict.Clean && !policyVerdict.Matched && bindingAction == "" && chainAction == "" {
-			if err := writer.WriteMessage(line); err != nil {
+			if baselineIdentity != "" {
+				baselineDecision := checkMCPToolCallBaselineAttempt(opts, baselineMetricsRecorder(opts, rec), baselineIdentity)
+				switch baselineDecision.Action {
+				case config.ActionBlock, config.ActionAsk:
+					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s)\n",
+						lineNum, verdict.Method, baselineDecision.Detail)
+					recordAdaptiveSignal(session.SignalBlock)
+					errMsg := ""
+					if baselineDecision.Action == config.ActionAsk {
+						errMsg = "pipelock: MCP request blocked by behavioral baseline"
+					}
+					blockedCh <- BlockedRequest{
+						ID:             verdict.ID,
+						IsNotification: isRPCNotification(verdict.ID),
+						LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (baseline deviation)", lineNum),
+						ErrorCode:      -32001,
+						ErrorMessage:   errMsg,
+					}
+					_ = emitToolReceipt(config.ActionBlock)
+					continue
+				case config.ActionWarn:
+					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: warning — %s request contains flagged content (%s)\n",
+						lineNum, verdict.Method, baselineDecision.Detail)
+					recordAdaptiveSignal(session.SignalNearMiss)
+				}
+			}
+			// block_all enforcement: deny ALL traffic (including clean) when the
+			// session is at an escalation level with block_all=true.
+			if rec != nil && decide.UpgradeAction("", rec.EscalationLevel(), adaptiveCfg) == config.ActionBlock {
+				_, _ = fmt.Fprintf(logW, "pipelock: adaptive upgrade (clean) -> block (level %s)\n", session.EscalationLabel(rec.EscalationLevel()))
+				if m != nil {
+					m.RecordAdaptiveUpgrade("", config.ActionBlock, session.EscalationLabel(rec.EscalationLevel()))
+				}
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (session deny)", lineNum),
+					ErrorCode:      -32001,
+					ErrorMessage:   adaptiveBlockedReason,
+				}
+				continue
+			}
+			// Cross-request exfiltration check on clean outbound messages.
+			if reason := ceeRecordMCP(ceeStdioKey, line, cee, sc, logW, auditLogger); reason != "" {
+				// Capture: record CEE verdict.
+				obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
+					Subsurface:        "cee_mcp_stdio",
+					Transport:         opts.Transport,
+					SessionID:         captureSessionID(opts.Transport),
+					SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+					ConfigHash:        opts.captureConfigHash(),
+					Profile:           opts.captureProfile(),
+					ActionClass:       captureActionClass,
+					Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+					RawFindings: []capture.Finding{{
+						Kind:   capture.KindCEE,
+						Action: config.ActionBlock,
+					}},
+					EffectiveAction: config.ActionBlock,
+					Outcome:         capture.OutcomeBlocked,
+				})
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: CEE blocked", lineNum),
+					ErrorCode:      -32005,
+					ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
+				}
+				continue
+			}
+			contractGate, contractErr := evaluateMCPToolGate(frame, config.ActionAllow, false, opts)
+			if contractErr != nil {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: contract tool-call evaluation failed: %v\n", lineNum, contractErr)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: contract tool-call evaluation failed", lineNum),
+					ErrorCode:      -32006,
+					ErrorMessage:   "pipelock: contract tool-call evaluation failed",
+				}
+				_ = emitToolReceipt(config.ActionBlock)
+				continue
+			}
+			if contractGate.Verdict == config.ActionBlock {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: contract blocked %s %q (%s)\n", lineNum, enforcementKind, enforcementTarget, contractGate.Reason)
+				blockedCh <- mcpContractBlockRequest(verdict.ID, contractGate, "pipelock: request blocked by live-lock contract")
+				_ = emitToolReceipt(config.ActionBlock, contractGate)
+				continue
+			}
+			fwdLine := line
+			if verdict.Method == methodToolsCall {
+				buildOpts := envelope.BuildOpts{
+					ActionID:       actionID,
+					Action:         string(receipt.ClassifyMCPTool(toolCallName, verdict.Method)),
+					Verdict:        config.ActionAllow,
+					SessionTaint:   taintDecision.Risk.Level.String(),
+					TaskID:         taintDecision.Task.CurrentTaskID,
+					AuthorityKind:  taintDecision.Authority.String(),
+					RequiresReauth: taintDecision.RequiresReauth,
+				}
+				var emitErr error
+				fwdLine, emitErr = EmitMCPDecision(nil, nil, envelopeEmitter, MCPDecision{
+					Envelope:   &buildOpts,
+					InboundMsg: line,
+				})
+				if emitErr != nil {
+					blockedCh <- BlockedRequest{
+						ID:             verdict.ID,
+						IsNotification: isRPCNotification(verdict.ID),
+						LogMessage:     "mediation envelope injection failed",
+						ErrorCode:      -32002,
+						ErrorMessage:   "pipelock: mediation envelope injection failed",
+					}
+					continue
+				}
+			}
+			if err := emitToolReceipt(config.ActionAllow, contractGate); err != nil {
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     "receipt emission failed",
+					ErrorCode:      -32007,
+					ErrorMessage:   "pipelock: receipt emission failed",
+					ErrorData:      mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
+				}
+				continue
+			}
+			// Track request ID immediately before forwarding so response-side
+			// can validate without leaving stale state when a required
+			// receipt fails before the request is written.
+			if opts.requireReceipts() && actionID != "" {
+				outcomeReceipt := opts.withReceiptPolicyHash(receipt.EmitOpts{
+					ActionID:            actionID,
+					Verdict:             config.ActionAllow,
+					Transport:           opts.Transport,
+					Target:              receiptTarget,
+					MCPMethod:           verdict.Method,
+					ToolName:            toolCallName,
+					SessionTaintLevel:   taintDecision.Risk.Level.String(),
+					SessionContaminated: taintDecision.Risk.Contaminated,
+					RecentTaintSources:  taintDecision.Risk.Sources,
+					SessionTaskID:       taintDecision.Task.CurrentTaskID,
+					SessionTaskLabel:    taintDecision.Task.CurrentTaskLabel,
+					AuthorityKind:       taintDecision.Authority.String(),
+					TaintDecision:       taintDecision.Result.Decision.String(),
+					TaintDecisionReason: taintDecision.Result.Reason,
+					TaskOverrideApplied: taintDecision.TaskOverrideApplied,
+					PolicyHash:          policyHash,
+				})
+				outcomeReceipt = mcpWithContractReceipt(outcomeReceipt, contractGate)
+				tracker.TrackOutcome(verdict.ID, TrackedRequestOutcome{Receipt: outcomeReceipt})
+			} else {
+				tracker.Track(verdict.ID)
+			}
+			if err := forwardMessage(fwdLine); err != nil {
 				_, _ = fmt.Fprintf(logW, "pipelock: input forward error: %v\n", err)
 				return
 			}
+			commitMCPToolCall(baselineMetricsRecorder(opts, rec), baselineIdentity)
+			recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				sessionKey: "default",
+				reason:     adaptiveRecoveryClean,
+				requestID:  canonicalID(verdict.ID),
+				logger:     auditLogger,
+				metrics:    m,
+			}, stdioInputCtx))
 			continue
 		}
 
 		// Build combined reasons from content scan, policy, and binding.
-		var reasons []string
-		for _, m := range verdict.Matches {
-			reasons = append(reasons, m.PatternName)
-		}
-		for _, m := range verdict.Inject {
-			reasons = append(reasons, m.PatternName)
-		}
+		reasons := inputVerdictReasons(verdict)
 		for _, r := range policyVerdict.Rules {
 			reasons = append(reasons, "policy:"+r)
 		}
@@ -601,7 +968,7 @@ func ForwardScannedInput(
 
 		method := verdict.Method
 		if method == "" {
-			method = "unknown"
+			method = patternUnknown
 		}
 
 		// Determine effective action: strictest of content scan, policy, and binding.
@@ -614,7 +981,7 @@ func ForwardScannedInput(
 			return policy.StricterAction(cur, next)
 		}
 		if !verdict.Clean {
-			effectiveAction = action
+			effectiveAction = inputVerdictEffectiveAction(verdict, action)
 		}
 		if policyVerdict.Matched {
 			effectiveAction = mergeAction(effectiveAction, policyVerdict.Action)
@@ -633,23 +1000,318 @@ func ForwardScannedInput(
 		errCode := 0 // default: -32001 (content scan)
 		errMsg := "" // default message
 		if isPolicyOnly {
-			errCode = -32002                                         // policy-specific error code
-			errMsg = "pipelock: request blocked by tool call policy" //nolint:goconst // shared error message with proxy_http.go, not worth extracting
+			errCode = -32002 // policy-specific error code
+			errMsg = errPolicyBlocked
 		}
 
+		// Escalation upgrade: may promote warn/ask to block for elevated sessions.
+		originalAction := effectiveAction
+		if rec != nil {
+			effectiveAction = decide.UpgradeAction(effectiveAction, rec.EscalationLevel(), adaptiveCfg)
+		}
+		if effectiveAction != originalAction {
+			_, _ = fmt.Fprintf(logW, "pipelock: adaptive upgrade %s -> %s (level %s)\n", originalAction, effectiveAction, session.EscalationLabel(rec.EscalationLevel()))
+			if m != nil {
+				m.RecordAdaptiveUpgrade(originalAction, effectiveAction, session.EscalationLabel(rec.EscalationLevel()))
+			}
+		}
+
+		if baselineIdentity != "" {
+			baselineDecision := checkMCPToolCallBaselineAttempt(opts, baselineMetricsRecorder(opts, rec), baselineIdentity)
+			if baselineDecision.Action != "" {
+				reasons = append(reasons, baselineDecision.Detail)
+				// Recompute so the block/warn reason includes the baseline
+				// deviation detail (reasonStr was built before this append).
+				reasonStr = joinStrings(reasons)
+				effectiveAction = mergeAction(effectiveAction, baselineDecision.Action)
+				if baselineDecision.Action == config.ActionAsk {
+					errCode = -32001
+					errMsg = "pipelock: MCP request blocked by behavioral baseline"
+				}
+			}
+		}
+
+		redirectSucceeded := false
+		var contractGateForReceipt *mcpContractGateOutput
 		switch effectiveAction {
 		case config.ActionBlock:
 			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s)\n",
 				lineNum, method, reasonStr)
+			blockReason := mcpScannerBlockReason(verdict, policyVerdict, chainAction != "")
+			if bindingReason != "" && bindingAction == config.ActionBlock {
+				blockReason = blockreason.SessionBinding
+				if errMsg == "" {
+					errMsg = "pipelock: " + bindingReason
+				}
+			}
 			blockedCh <- BlockedRequest{
 				ID:             verdict.ID,
 				IsNotification: isNotification,
 				LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked", lineNum),
 				ErrorCode:      errCode,
 				ErrorMessage:   errMsg,
+				ErrorData:      mcpBlockReasonData(blockReason),
 			}
+		case config.ActionRedirect:
+			// Batch requests cannot be redirected element-by-element.
+			// Fail closed: block the entire batch.
+			trimmed := bytes.TrimSpace(line)
+			if len(trimmed) > 0 && trimmed[0] == '[' {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked batch request (%s) [redirect not supported for batches]\n",
+					lineNum, reasonStr)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (batch redirect)", lineNum),
+					ErrorCode:      -32002,
+					ErrorMessage:   errPolicyBlocked,
+				}
+				break
+			}
+			profile, ok := policyCfg.RedirectProfiles[policyVerdict.RedirectProfile]
+			if !ok {
+				// Profile not found - fail closed to block.
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s) [redirect profile %q not found]\n",
+					lineNum, method, reasonStr, policyVerdict.RedirectProfile)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (redirect profile missing)", lineNum),
+					ErrorCode:      -32002,
+					ErrorMessage:   errPolicyBlocked,
+				}
+				break
+			}
+			toolName, toolArgs := extractToolCallFields(line)
+			policyRuleName := ""
+			if len(policyVerdict.Rules) > 0 {
+				policyRuleName = policyVerdict.Rules[0]
+			}
+			result := executeRedirect(profile, policyVerdict.RedirectProfile, verdict.ID, toolArgs, policyRuleName, redirectRT)
+			// Determine final outcome before audit logging so the event
+			// reflects the actual result delivered to the client.
+			finalResult := "blocked"
+			if result.Success {
+				// Scan redirect handler output for prompt injection AND DLP before
+				// sending to client. Handler output is untrusted.
+				scanVerdict := ScanResponse(result.Response, sc)
+				stdioWarnCtxMeta := scanner.DLPWarnContextFromCtx(stdioInputCtx)
+				stdioWarnCtxMeta.Transport = transportMCPStdio
+				stdioWarnCtxMeta.Method = mcpWarnMethod
+				stdioWarnCtxMeta.Resource = mcpWarnResource(verdict.Method, line)
+				if policyHash != "" {
+					stdioWarnCtxMeta.PolicyHash = policyHash
+				}
+				stdioWarnCtx := scanner.WithDLPWarnContext(stdioInputCtx, stdioWarnCtxMeta)
+				dlpResult := sc.ScanTextForDLP(stdioWarnCtx, string(result.Response))
+				// Capture: record redirect output scan verdict.
+				obs.ObserveResponseVerdict(context.Background(), &capture.ResponseVerdictRecord{
+					Subsurface:        "response_redirect_output",
+					Transport:         opts.Transport,
+					SessionID:         captureSessionID(opts.Transport),
+					SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+					ConfigHash:        opts.captureConfigHash(),
+					Profile:           opts.captureProfile(),
+					ActionClass:       captureActionClass,
+					Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+					TransformKind:     capture.TransformRedirectOutput,
+					WirePayload:       result.Response,
+					RawFindings:       responseMatchesToFindings(scanVerdict.Matches, config.ActionBlock),
+					EffectiveAction:   config.ActionBlock,
+					Outcome:           captureOutcome(config.ActionBlock, scanVerdict.Clean),
+				})
+				if !scanVerdict.Clean {
+					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked redirect response (injection detected in handler output)\n", lineNum)
+					blockedCh <- BlockedRequest{
+						ID:             verdict.ID,
+						IsNotification: isNotification,
+						LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (redirect output injection)", lineNum),
+						ErrorCode:      -32001,
+						ErrorMessage:   "pipelock: redirect handler output blocked by response scanning",
+					}
+				} else if !dlpResult.Clean {
+					pattern := patternUnknown
+					if len(dlpResult.Matches) > 0 {
+						pattern = dlpResult.Matches[0].PatternName
+					}
+					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked redirect response (DLP match in handler output: %s)\n", lineNum, pattern)
+					blockedCh <- BlockedRequest{
+						ID:             verdict.ID,
+						IsNotification: isNotification,
+						LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (redirect output DLP)", lineNum),
+						ErrorCode:      -32001,
+						ErrorMessage:   "pipelock: redirect handler output blocked by DLP scanning",
+					}
+				} else {
+					finalResult = "redirected"
+					redirectSucceeded = true
+					_, _ = fmt.Fprintf(logW, "pipelock: input line %d: redirected %s request via profile %q (%dms)\n",
+						lineNum, method, policyVerdict.RedirectProfile, result.LatencyMs)
+					blockedCh <- BlockedRequest{
+						ID:                verdict.ID,
+						IsNotification:    isNotification,
+						LogMessage:        fmt.Sprintf("pipelock: input line %d: redirected", lineNum),
+						SyntheticResponse: result.Response,
+					}
+				}
+			} else {
+				// Redirect handler failed - fall through to block (fail-closed).
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s) [redirect failed: %s]\n",
+					lineNum, method, reasonStr, result.Error)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (redirect failed)", lineNum),
+					ErrorCode:      -32002,
+					ErrorMessage:   errPolicyBlocked,
+				}
+			}
+			if auditLogger != nil {
+				auditLogger.LogToolRedirect(audit.ToolRedirectEvent{
+					ToolName:        toolName,
+					ArgsDigest:      argsDigest(toolArgs),
+					RedirectProfile: policyVerdict.RedirectProfile,
+					RedirectReason:  profile.Reason,
+					PolicyRule:      policyRuleName,
+					Result:          finalResult,
+					LatencyMs:       result.LatencyMs,
+				})
+			}
+		case config.ActionDefer:
+			manager := opts.deferManager()
+			if err := deferred.ValidateAction(opts.Transport, config.ActionDefer); err != nil {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s) [%v]\n",
+					lineNum, method, reasonStr, err)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (defer unsupported)", lineNum),
+					ErrorCode:      -32002,
+					ErrorMessage:   err.Error(),
+				}
+				effectiveAction = config.ActionBlock
+				break
+			}
+			if manager == nil || !manager.Enabled() {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s) [defer manager disabled]\n",
+					lineNum, method, reasonStr)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: blocked (defer disabled)", lineNum),
+					ErrorCode:      -32002,
+					ErrorMessage:   "pipelock: defer is disabled",
+				}
+				effectiveAction = config.ActionBlock
+				break
+			}
+			receiptDecisionPhase = receipt.DecisionPhaseDefer
+			receiptDeferID = actionID
+			receiptResolutionPolicy = deferred.ReceiptPolicyString(manager.Policy(), policyVerdict.ResolutionPolicy)
+			receiptSessionID = captureSessionID(opts.Transport)
+			receiptSessionIDOriginal = captureSessionIDOriginal(opts.Transport)
+			if err := emitToolReceipt(config.ActionDefer); err != nil {
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isNotification,
+					LogMessage:     "receipt emission failed",
+					ErrorCode:      -32007,
+					ErrorMessage:   "pipelock: receipt emission failed",
+					ErrorData:      mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
+				}
+				effectiveAction = config.ActionBlock
+				break
+			}
+			receiptEmitted = true
+			heldLine := append([]byte(nil), line...)
+			heldID := append(json.RawMessage(nil), verdict.ID...)
+			heldNotification := isNotification
+			heldToolName := toolCallName
+			heldBaselineIdentity := baselineIdentity
+			_, deferToolArgs := extractToolCallFields(line)
+			argDigest := argsDigest(deferToolArgs)
+			holdErr := manager.Hold(deferred.HeldAction{
+				DeferID:    actionID,
+				ActionID:   actionID,
+				Target:     heldToolName,
+				Reason:     reasonStr,
+				Surface:    opts.Transport,
+				Method:     verdict.Method,
+				SizeBytes:  len(heldLine),
+				RulePolicy: policyVerdict.ResolutionPolicy,
+				Payload:    append([]byte(nil), heldLine...),
+				ArgDigest:  argDigest,
+				Authority: deferred.AuthoritySnapshot{
+					SessionID:         receiptSessionID,
+					SessionIDOriginal: receiptSessionIDOriginal,
+				},
+				Resolve: func(res deferred.Resolution) {
+					if emitErr := emitDeferredResolutionReceipt(opts, logW, res); emitErr != nil {
+						if !heldNotification {
+							blockedCh <- BlockedRequest{
+								ID:           heldID,
+								ErrorCode:    -32007,
+								ErrorMessage: "pipelock: receipt emission failed",
+							}
+						}
+						return
+					}
+					switch res.FinalDecision {
+					case config.ActionAllow:
+						tracker.Track(heldID)
+						if err := forwardMessage(heldLine); err != nil {
+							_, _ = fmt.Fprintf(logW, "pipelock: input forward error: %v\n", err)
+							return
+						}
+						commitMCPToolCall(baselineMetricsRecorder(opts, rec), heldBaselineIdentity)
+					default:
+						if !heldNotification {
+							blockedCh <- BlockedRequest{
+								ID:           heldID,
+								ErrorCode:    -32002,
+								ErrorMessage: "pipelock: deferred action denied",
+							}
+						}
+					}
+				},
+			})
+			if holdErr != nil {
+				errorMessage, emitErr := emitHoldFailureResolution(opts, logW, holdErr, holdFailureResolution{
+					DeferID: actionID,
+					Authority: deferred.AuthoritySnapshot{
+						SessionID:         receiptSessionID,
+						SessionIDOriginal: receiptSessionIDOriginal,
+					},
+					Policy: manager.Policy(),
+					Target: toolCallName,
+					Method: verdict.Method,
+					Reason: reasonStr,
+				})
+				logHoldFailureReceiptGap(logW, actionID, emitErr)
+				if !isNotification {
+					blockedCh <- BlockedRequest{
+						ID:           verdict.ID,
+						ErrorCode:    -32002,
+						ErrorMessage: errorMessage,
+					}
+				}
+				effectiveAction = config.ActionBlock
+				break
+			}
+			if held, ok := manager.Held(actionID); ok {
+				profileName := policyVerdict.ResolutionPolicy.ResolverProfile
+				if profileName != "" {
+					profile, found := policyCfg.DeferResolverProfiles[profileName]
+					if !found {
+						_ = manager.Resolve(actionID, config.ActionBlock, deferred.SourceApproval)
+					} else {
+						maybeStartDeferApprovalResolver(resolverRuntime, manager, held, profileName, profile, deferToolArgs, opts.IntegrityCfg, logW)
+					}
+				}
+			}
+			continue
 		case config.ActionAsk:
-			// HITL for input scanning is impractical — fall back to block.
+			// HITL for input scanning is impractical - fall back to block.
 			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked %s request (%s) [ask not supported for input scanning]\n",
 				lineNum, method, reasonStr)
 			blockedCh <- BlockedRequest{
@@ -662,13 +1324,206 @@ func ForwardScannedInput(
 		default: // warn
 			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: warning — %s request contains flagged content (%s)\n",
 				lineNum, method, reasonStr)
+			// Cross-request exfiltration check even in warn mode.
+			if reason := ceeRecordMCP(ceeStdioKey, line, cee, sc, logW, auditLogger); reason != "" {
+				// Capture: record CEE verdict (warn-path).
+				obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
+					Subsurface:        "cee_mcp_stdio",
+					Transport:         opts.Transport,
+					SessionID:         captureSessionID(opts.Transport),
+					SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+					ConfigHash:        opts.captureConfigHash(),
+					Profile:           opts.captureProfile(),
+					ActionClass:       captureActionClass,
+					Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+					RawFindings: []capture.Finding{{
+						Kind:   capture.KindCEE,
+						Action: config.ActionBlock,
+					}},
+					EffectiveAction: config.ActionBlock,
+					Outcome:         capture.OutcomeBlocked,
+				})
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: CEE blocked", lineNum),
+					ErrorCode:      -32005,
+					ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
+				}
+				continue
+			}
+			contractGate, contractErr := evaluateMCPToolGate(frame, effectiveAction, len(reasons) > 0, opts)
+			if contractErr != nil {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: contract tool-call evaluation failed: %v\n", lineNum, contractErr)
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     fmt.Sprintf("pipelock: input line %d: contract tool-call evaluation failed", lineNum),
+					ErrorCode:      -32006,
+					ErrorMessage:   "pipelock: contract tool-call evaluation failed",
+				}
+				_ = emitToolReceipt(config.ActionBlock)
+				continue
+			}
+			if contractGate.Verdict == config.ActionBlock {
+				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: contract blocked %s %q (%s)\n", lineNum, enforcementKind, enforcementTarget, contractGate.Reason)
+				blockedCh <- mcpContractBlockRequest(verdict.ID, contractGate, "pipelock: request blocked by live-lock contract")
+				_ = emitToolReceipt(config.ActionBlock, contractGate)
+				continue
+			}
+			contractGateForReceipt = &contractGate
+			// Inject envelope for warn-mode tool calls before forwarding.
+			fwdLine := line
+			if verdict.Method == methodToolsCall {
+				buildOpts := envelope.BuildOpts{
+					ActionID:       actionID,
+					Action:         string(receipt.ClassifyMCPTool(toolCallName, verdict.Method)),
+					Verdict:        config.ActionWarn,
+					SessionTaint:   taintDecision.Risk.Level.String(),
+					TaskID:         taintDecision.Task.CurrentTaskID,
+					AuthorityKind:  taintDecision.Authority.String(),
+					RequiresReauth: taintDecision.RequiresReauth,
+				}
+				var emitErr error
+				fwdLine, emitErr = EmitMCPDecision(nil, nil, envelopeEmitter, MCPDecision{
+					Envelope:   &buildOpts,
+					InboundMsg: line,
+				})
+				if emitErr != nil {
+					blockedCh <- BlockedRequest{
+						ID:             verdict.ID,
+						IsNotification: isRPCNotification(verdict.ID),
+						LogMessage:     "mediation envelope injection failed",
+						ErrorCode:      -32002,
+						ErrorMessage:   "pipelock: mediation envelope injection failed",
+					}
+					continue
+				}
+			}
+			if err := emitToolReceipt(effectiveAction, contractGate); err != nil {
+				blockedCh <- BlockedRequest{
+					ID:             verdict.ID,
+					IsNotification: isRPCNotification(verdict.ID),
+					LogMessage:     "receipt emission failed",
+					ErrorCode:      -32007,
+					ErrorMessage:   "pipelock: receipt emission failed",
+					ErrorData:      mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
+				}
+				continue
+			}
+			receiptEmitted = true
 			// Forward anyway (warn mode).
-			if err := writer.WriteMessage(line); err != nil {
+			tracker.Track(verdict.ID)
+			if err := forwardMessage(fwdLine); err != nil {
 				_, _ = fmt.Fprintf(logW, "pipelock: input forward error: %v\n", err)
 				return
 			}
+			commitMCPToolCall(baselineMetricsRecorder(opts, rec), baselineIdentity)
+		}
+
+		// Signal recording: record after action is taken.
+		// Successful redirects are clean (not a block). Failed redirects escalate.
+		switch {
+		case effectiveAction == config.ActionBlock:
+			recordAdaptiveSignal(session.SignalBlock)
+		case effectiveAction == config.ActionRedirect && !redirectSucceeded:
+			recordAdaptiveSignal(session.SignalBlock)
+		case len(reasons) > 0:
+			recordAdaptiveSignal(session.SignalNearMiss)
+		default:
+			recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				sessionKey: "default",
+				reason:     adaptiveRecoveryClean,
+				requestID:  canonicalID(verdict.ID),
+				logger:     auditLogger,
+				metrics:    m,
+			}, stdioInputCtx))
+		}
+
+		// Action receipt: emit for tools/call decisions only.
+		if !receiptEmitted {
+			if contractGateForReceipt != nil {
+				_ = emitToolReceipt(effectiveAction, *contractGateForReceipt)
+			} else {
+				_ = emitToolReceipt(effectiveAction)
+			}
+		}
+
+		// Capture: record DLP/injection input verdict.
+		if !verdict.Clean {
+			var rawFindings []capture.Finding
+			rawFindings = append(rawFindings, dlpMatchesToFindings(verdict.Matches)...)
+			rawFindings = append(rawFindings, responseMatchesToFindings(verdict.Inject, effectiveAction)...)
+			rawFindings = append(rawFindings, urlFindingsToCapture(verdict.URLFindings)...)
+			rawFindings = append(rawFindings, addressFindingsToCapture(verdict.AddressFindings)...)
+			obs.ObserveDLPVerdict(context.Background(), &capture.DLPVerdictRecord{
+				Subsurface:        "dlp_mcp_input",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+				TransformKind:     capture.TransformJoinedFields,
+				RawFindings:       rawFindings,
+				EffectiveAction:   effectiveAction,
+				Outcome:           captureOutcome(effectiveAction, false),
+			})
+		}
+		// Capture: record tool policy verdict when policy matched.
+		if policyVerdict.Matched {
+			var policyFindings []capture.Finding
+			for _, r := range policyVerdict.Rules {
+				policyFindings = append(policyFindings, capture.Finding{
+					Kind:       capture.KindToolPolicy,
+					PolicyRule: r,
+					Action:     policyVerdict.Action,
+				})
+			}
+			obs.ObserveToolPolicyVerdict(context.Background(), &capture.ToolPolicyRecord{
+				Subsurface:        "mcp_tool_policy",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request: capture.CaptureRequest{
+					ToolName:     toolCallName,
+					ToolArgsJSON: string(frame.Args),
+					MCPMethod:    verdict.Method,
+					RPCID:        captureRPCID(verdict.ID),
+				},
+				RawFindings:     policyFindings,
+				EffectiveAction: effectiveAction,
+				Outcome:         captureOutcome(effectiveAction, false),
+			})
 		}
 	}
+}
+
+// jsonUnicodeEscapeRe matches JSON \uXXXX escape sequences (4 hex digits).
+var jsonUnicodeEscapeRe = regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
+
+// unescapeJSONUnicode resolves JSON \uXXXX escape sequences to their UTF-8
+// representation. Works on arbitrary text (including malformed JSON) by using
+// regex replacement rather than JSON parsing. Handles surrogate pairs by
+// replacing each \uXXXX independently (the high surrogate alone produces a
+// replacement character, but the concatenated result still matches DLP patterns).
+func unescapeJSONUnicode(s string) string {
+	if !strings.Contains(s, `\u`) {
+		return s
+	}
+	return jsonUnicodeEscapeRe.ReplaceAllStringFunc(s, func(match string) string {
+		// match is `\uXXXX` (6 chars). Parse the 4 hex digits into uint32.
+		// 4 hex digits max = 0xFFFF which fits in int32/rune without overflow.
+		code, err := strconv.ParseInt(match[2:], 16, 32)
+		if err != nil {
+			return match
+		}
+		return string(rune(code))
+	})
 }
 
 // isRPCNotification returns true if the JSON-RPC ID represents a notification.
@@ -683,22 +1538,202 @@ func joinStrings(ss []string) string {
 	return strings.Join(ss, "\n")
 }
 
-// scanSplitSecret checks for secrets split across multiple JSON fields by
-// concatenating values without separators. Keys are excluded (via
-// jsonrpc.ExtractStringsFromJSON, not extractAllStringsFromJSON) because interleaved
-// keys break DLP regex adjacency. Returns the original result if clean or if
-// concat adds no new information.
-func scanSplitSecret(raw json.RawMessage, joined string, sc *scanner.Scanner, result scanner.TextDLPResult) scanner.TextDLPResult {
-	if !result.Clean {
-		return result
+func inputVerdictReasons(verdict InputVerdict) []string {
+	reasons := make([]string, 0, len(verdict.Matches)+len(verdict.Inject)+len(verdict.URLFindings)+len(verdict.AddressFindings)+1)
+	for _, m := range verdict.Matches {
+		reasons = append(reasons, m.PatternName)
 	}
-	vals := jsonrpc.ExtractStringsFromJSON(raw)
-	if len(vals) <= 1 {
-		return result
+	for _, m := range verdict.Inject {
+		reasons = append(reasons, m.PatternName)
 	}
-	concat := strings.Join(vals, "")
-	if concat == joined {
-		return result
+	for _, f := range verdict.URLFindings {
+		reasons = append(reasons, "url:"+f.Scanner+":"+f.Reason)
 	}
-	return sc.ScanTextForDLP(concat)
+	for _, f := range verdict.AddressFindings {
+		reasons = append(reasons, "address:"+f.Explanation)
+	}
+	if verdict.Error != "" {
+		reasons = append(reasons, verdict.Error)
+	}
+	return reasons
+}
+
+func joinInputVerdictReasons(verdict InputVerdict) string {
+	reasons := inputVerdictReasons(verdict)
+	if len(reasons) == 0 {
+		return "input scanning"
+	}
+	return joinStrings(reasons)
+}
+
+// jsonRPCErrorCodeForInputError maps scanner parse failures onto JSON-RPC
+// protocol error codes.
+func jsonRPCErrorCodeForInputError(errText string) int {
+	if strings.HasPrefix(errText, "invalid JSON") || strings.HasPrefix(errText, "invalid JSON batch") {
+		return -32700
+	}
+	return -32600
+}
+
+// injectMCPEnvelope injects a mediation envelope into a JSON-RPC message's
+// params._meta field. Returns the modified message bytes, or the original
+// message unmodified if the message is not an envelope-bearing shape.
+// Malformed, null, or non-object params fail closed through a returned error.
+// A malformed _meta member is normalized to a fresh object so
+// attacker-controlled metadata cannot suppress required mediation.
+func injectMCPEnvelope(msg []byte, emitter *envelope.Emitter, buildOpts envelope.BuildOpts) ([]byte, error) {
+	if emitter == nil {
+		return msg, nil
+	}
+
+	var rpc map[string]json.RawMessage
+	if err := json.Unmarshal(msg, &rpc); err != nil {
+		return msg, nil
+	}
+
+	paramsRaw, ok := rpc["params"]
+	if !ok {
+		return msg, nil
+	}
+
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(paramsRaw, &params); err != nil {
+		return msg, fmt.Errorf("parse MCP params for mediation envelope: %w", err)
+	}
+	// json.Unmarshal of JSON null into a map succeeds with a nil map, so
+	// params:null reaches here without an error. Fail closed rather than
+	// normalizing it to an object: a tools/call never legitimately carries
+	// null params, and silently rewriting it would diverge from the
+	// non-object fail-closed path above.
+	if params == nil {
+		return msg, fmt.Errorf("parse MCP params for mediation envelope: params must be a JSON object")
+	}
+
+	// Use json.RawMessage to preserve existing _meta members byte-for-byte.
+	// map[string]any would round-trip through encoding/json and lose precision
+	// on large integer values from other extensions.
+	meta := make(map[string]json.RawMessage)
+	if metaRaw, exists := params["_meta"]; exists {
+		if err := json.Unmarshal(metaRaw, &meta); err != nil {
+			meta = make(map[string]json.RawMessage)
+		}
+	}
+	if meta == nil {
+		meta = make(map[string]json.RawMessage)
+	}
+
+	// Strip any existing mediation key, then inject.
+	delete(meta, envelope.MCPMetaKey)
+	env, err := emitter.Build(buildOpts)
+	if err != nil {
+		out := marshalMCPWithMeta(msg, rpc, params, meta)
+		return out, fmt.Errorf("inject MCP mediation envelope: %w", err)
+	}
+	envData := env.ToMCPMeta()
+	envBytes, err := marshalMCPMessage(envData)
+	if err != nil {
+		out := marshalMCPWithMeta(msg, rpc, params, meta)
+		return out, fmt.Errorf("marshal MCP mediation envelope: %w", err)
+	}
+	meta[envelope.MCPMetaKey] = envBytes
+
+	out := marshalMCPWithMeta(msg, rpc, params, meta)
+	if bytes.Equal(out, msg) {
+		return out, fmt.Errorf("marshal MCP message with mediation envelope")
+	}
+	return out, nil
+}
+
+func marshalMCPWithMeta(original []byte, rpc, params map[string]json.RawMessage, meta map[string]json.RawMessage) []byte {
+	// Re-serialize without HTML escaping so tool-call payloads containing
+	// <, >, or & keep those literal bytes. This matches marshalMCPMessage
+	// used on the redaction forward path; plain json.Marshal HTML-escapes
+	// those bytes (to their \u-prefixed escapes), which would mutate the
+	// request on the wire.
+	metaBytes, err := marshalMCPMessage(meta)
+	if err != nil {
+		return original
+	}
+	params["_meta"] = metaBytes
+
+	paramsBytes, err := marshalMCPMessage(params)
+	if err != nil {
+		return original
+	}
+	rpc["params"] = paramsBytes
+
+	out, err := marshalMCPMessage(rpc)
+	if err != nil {
+		return original
+	}
+	return out
+}
+
+// stripInboundMCPMeta removes the com.pipelock/mediation key from a
+// JSON-RPC message's params._meta before scanning. Prevents spoofed
+// mediation metadata from passing through unmodified.
+// Returns the modified message or the original if parsing fails.
+func stripInboundMCPMeta(msg []byte) []byte {
+	trimmed := bytes.TrimSpace(msg)
+	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+		// Do not unmarshal/remarshal duplicate-key payloads. The parser
+		// and scanner paths intentionally fail closed on duplicate keys;
+		// remarshal would collapse them before those checks can run.
+		return msg
+	}
+
+	var rpc map[string]json.RawMessage
+	if err := json.Unmarshal(msg, &rpc); err != nil {
+		return msg
+	}
+
+	paramsRaw, ok := rpc["params"]
+	if !ok {
+		return msg
+	}
+
+	var params map[string]json.RawMessage
+	if err := json.Unmarshal(paramsRaw, &params); err != nil {
+		return msg
+	}
+	if params == nil {
+		return msg
+	}
+
+	metaRaw, ok := params["_meta"]
+	if !ok {
+		return msg
+	}
+
+	var meta map[string]json.RawMessage
+	if err := json.Unmarshal(metaRaw, &meta); err != nil {
+		return msg
+	}
+
+	if meta == nil {
+		return msg
+	}
+	if _, exists := meta[envelope.MCPMetaKey]; !exists {
+		return msg
+	}
+
+	delete(meta, envelope.MCPMetaKey)
+
+	metaBytes, err := marshalMCPMessage(meta)
+	if err != nil {
+		return msg
+	}
+	params["_meta"] = metaBytes
+
+	paramsBytes, err := marshalMCPMessage(params)
+	if err != nil {
+		return msg
+	}
+	rpc["params"] = paramsBytes
+
+	out, err := marshalMCPMessage(rpc)
+	if err != nil {
+		return msg
+	}
+	return out
 }

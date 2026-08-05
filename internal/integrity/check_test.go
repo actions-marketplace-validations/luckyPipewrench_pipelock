@@ -1,3 +1,6 @@
+// Copyright 2026 Josh Waldrep
+// SPDX-License-Identifier: Apache-2.0
+
 package integrity
 
 import (
@@ -367,7 +370,7 @@ func TestCheck_RespectsExcludes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Add a .log file — should not appear as a violation.
+	// Add a .log file - should not appear as a violation.
 	writeFile(t, dir, "debug.log", "log output\n")
 
 	violations, err := Check(dir, m)
@@ -1147,5 +1150,20 @@ func TestGenerate_WalkError(t *testing.T) {
 	_, err := Generate(dir, nil)
 	if err == nil {
 		t.Fatal("expected error for unreadable subdirectory")
+	}
+}
+
+// TestMatchDoublestar_PatternWithoutStars covers the early-return branch
+// that fires when a caller passes a pattern that lacks the "**" wildcard.
+// strings.SplitN with no occurrence returns a single-element slice; the
+// function must refuse to match rather than treat the whole pattern as a
+// prefix. Other matchDoublestar tests only exercise patterns that already
+// contain "**".
+func TestMatchDoublestar_PatternWithoutStars(t *testing.T) {
+	if matchDoublestar("plain-pattern", "plain-pattern") {
+		t.Error("matchDoublestar must reject patterns with no '**' wildcard")
+	}
+	if matchDoublestar("dir/file.txt", "dir/file.txt") {
+		t.Error("matchDoublestar must reject literal path patterns")
 	}
 }
