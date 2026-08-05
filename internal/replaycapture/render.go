@@ -82,17 +82,57 @@ func decisiveVerdict(cs *CapturedScenario) string {
 	if decisiveReceiptAR(cs.Receipts, cs.Scenario.ExpectedVerdict) != nil {
 		return cs.Scenario.ExpectedVerdict
 	}
-	if len(cs.Receipts) > 0 {
-		return cs.Receipts[len(cs.Receipts)-1].ActionRecord.Verdict
-	}
 	return "unknown"
+}
+
+// validateExpectedDecision is the publish-time semantic gate behind the replay
+// claim. Cryptographic chain verification alone can succeed for a chain that
+// contains only its session-open anchor; publication additionally requires a
+// mediated action with the scenario's declared verdict and layer.
+func validateExpectedDecision(cs *CapturedScenario) error {
+	if cs == nil {
+		return fmt.Errorf("missing captured scenario")
+	}
+	if len(cs.Scenario.ExpectedSequence) > 0 {
+		actual := make([]receipt.ActionRecord, 0, len(cs.Receipts))
+		for i := range cs.Receipts {
+			if cs.Receipts[i].ActionRecord.SessionControl == nil {
+				actual = append(actual, cs.Receipts[i].ActionRecord)
+			}
+		}
+		if len(actual) != len(cs.Scenario.ExpectedSequence) {
+			return fmt.Errorf("expected %d mediated decisions, got %d", len(cs.Scenario.ExpectedSequence), len(actual))
+		}
+		for i, expected := range cs.Scenario.ExpectedSequence {
+			if actual[i].Verdict != expected.Verdict {
+				return fmt.Errorf("decision %d verdict = %q, want %q", i+1, actual[i].Verdict, expected.Verdict)
+			}
+			if expected.Layer != "" && actual[i].Layer != expected.Layer {
+				return fmt.Errorf("decision %d layer = %q, want %q", i+1, actual[i].Layer, expected.Layer)
+			}
+			if actual[i].Transport != cs.Scenario.Transport {
+				return fmt.Errorf("decision %d transport = %q, want %q", i+1, actual[i].Transport, cs.Scenario.Transport)
+			}
+		}
+	}
+	ar := decisiveReceiptAR(cs.Receipts, cs.Scenario.ExpectedVerdict)
+	if ar == nil {
+		return fmt.Errorf("missing expected %s mediated decision", cs.Scenario.ExpectedVerdict)
+	}
+	if ar.Transport != cs.Scenario.Transport {
+		return fmt.Errorf("expected %s transport %q, got %q", cs.Scenario.ExpectedVerdict, cs.Scenario.Transport, ar.Transport)
+	}
+	if cs.Scenario.ExpectedLayer != "" && ar.Layer != cs.Scenario.ExpectedLayer {
+		return fmt.Errorf("expected %s layer %q, got %q", cs.Scenario.ExpectedVerdict, cs.Scenario.ExpectedLayer, ar.Layer)
+	}
+	return nil
 }
 
 // decisiveReceiptAR returns the first receipt action record matching verdict, or
 // nil. Production sibling of the test-only helper.
 func decisiveReceiptAR(receipts []receipt.Receipt, verdict string) *receipt.ActionRecord {
 	for i := range receipts {
-		if receipts[i].ActionRecord.Verdict == verdict {
+		if receipts[i].ActionRecord.SessionControl == nil && receipts[i].ActionRecord.Verdict == verdict {
 			return &receipts[i].ActionRecord
 		}
 	}
