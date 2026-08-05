@@ -33,6 +33,10 @@ cd "$REPO_ROOT"
 # /tmp parent would make the gate itself manufacture a refusal after relocating a
 # documented /var/lib path, so keep the ephemeral sandbox beneath the checkout.
 WORK="$(mktemp -d "$REPO_ROOT/.config-examples.XXXXXX")"
+KEYRING_WORK_ROOT="$HOME/.cache/pipelock-config-examples"
+install -d -m 0750 "$KEYRING_WORK_ROOT"
+KEYRING_WORK="$(mktemp -d "$KEYRING_WORK_ROOT/run.XXXXXX")"
+chmod 0750 "$KEYRING_WORK"
 RUN_PID=""
 cleanup() {
     if [ -n "$RUN_PID" ]; then
@@ -40,6 +44,7 @@ cleanup() {
         wait "$RUN_PID" 2>/dev/null || true
     fi
     rm -rf "$WORK"
+    rm -rf "$KEYRING_WORK"
 }
 trap cleanup EXIT
 
@@ -237,6 +242,24 @@ probe() {
         sed -E "s@^([[:space:]]*signing_key_path:[[:space:]])(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#]([^#]*[^[:space:]#])?)([[:space:]]*#.*)?\$@\1\"$FIXTURE_KEY\"\4@" \
             "$run_cfg" >"$key_cfg"
         mv "$key_cfg" "$run_cfg"
+    fi
+
+    # commitment_keyring_path is an operator-owned input, but this harness can
+    # create a real one through the shipped lifecycle command. Relocate and
+    # initialize it so the example is booted rather than excused as unavailable.
+    if grep -qE '^[[:space:]]*commitment_keyring_path:' "$run_cfg"; then
+        local commitment_path="$KEYRING_WORK/commitment-keyring-$total.json"
+        local commitment_cfg="${run_cfg}.commitment.tmp"
+        sed -E "s@^([[:space:]]*commitment_keyring_path:[[:space:]])(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#]([^#]*[^[:space:]#])?)([[:space:]]*#.*)?\$@\1\"$commitment_path\"\4@" \
+            "$run_cfg" >"$commitment_cfg"
+        mv "$commitment_cfg" "$run_cfg"
+        local commitment_out="$WORK/commitment-init-$total.txt"
+        if ! HOME="$PROBE_HOME" "$BIN" commitment-key initialize \
+            --keyring "$commitment_path" >"$commitment_out" 2>&1; then
+            echo "config-examples: could not fixture a commitment keyring for $label" >&2
+            grep -vE '^[[:space:]]*$' "$commitment_out" | tail -3 >&2
+            exit 1
+        fi
     fi
 
     local check_ok=0 check_out="$WORK/check-$total.txt"
