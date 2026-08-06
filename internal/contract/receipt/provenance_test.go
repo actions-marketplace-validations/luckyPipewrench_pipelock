@@ -4,6 +4,7 @@
 package receipt
 
 import (
+	"encoding/hex"
 	"fmt"
 	"math"
 	"strings"
@@ -106,7 +107,7 @@ func TestEvidenceProvenanceProofValidateRejectsStructuralGaps(t *testing.T) {
 		{"unknown envelope profile", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Sources: valid}, "unknown profile"},
 		{"source profile differs", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Sources: []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: normalize.Recipe{TransformProfileDigest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, ViewCommitment: valid[0].ViewCommitment}}}, "differs from envelope"},
 		{"malformed view commitment", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Sources: []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: valid[0].Recipe, ViewCommitment: "sha256:bad"}}}, "view commitment"},
-		{"malformed match commitment", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Sources: []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: valid[0].Recipe, ViewCommitment: valid[0].ViewCommitment, Matches: []ProvenanceMatch{{ByteEnd: 1, MatchCommitment: "hmac-sha256:not-hex"}}}}}, "match 0 commitment"},
+		{"malformed match commitment", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Sources: []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: valid[0].Recipe, ViewCommitment: valid[0].ViewCommitment, Matches: []ProvenanceMatch{{ByteEnd: 1, MatchClass: "credential", MatchCommitment: "hmac-sha256:not-hex"}}}}}, "match 0 commitment"},
 		{"invalid operation", EvidenceProvenanceProof{Version: EvidenceProvenanceProofVersionV1, TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Sources: []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: normalize.Recipe{TransformProfileDigest: normalize.EvidenceProvenanceProfileV1Digest, Operations: []normalize.Operation{{Kind: normalize.OperationIdentity, Selector: "ignored"}}}, ViewCommitment: valid[0].ViewCommitment}}}, "unsupported selector"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -127,12 +128,13 @@ func TestEvidenceProvenanceProofValidateRejectsMatchStructure(t *testing.T) {
 		sources []ProvenanceSource
 		want    string
 	}{
-		{"zero-length interval", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 1, ByteEnd: 1, MatchCommitment: commitment}}}}, "byte end must be greater"},
-		{"reversed interval", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 2, ByteEnd: 1, MatchCommitment: commitment}}}}, "byte end must be greater"},
-		{"non-increasing match ordinal", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 2, ByteEnd: 3, MatchCommitment: commitment}}}}, "match ordinals must be strictly increasing"},
-		{"unsorted intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 2, ByteEnd: 3, MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchCommitment: commitment}}}}, "intervals are unsorted"},
-		{"duplicate intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 1, MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchCommitment: commitment}}}}, "duplicate interval start"},
-		{"overlapping intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 2, MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 1, ByteEnd: 3, MatchCommitment: commitment}}}}, "intervals overlap"},
+		{"zero-length interval", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 1, ByteEnd: 1, MatchClass: "credential", MatchCommitment: commitment}}}}, "byte end must be greater"},
+		{"reversed interval", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 2, ByteEnd: 1, MatchClass: "credential", MatchCommitment: commitment}}}}, "byte end must be greater"},
+		{"missing match class", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteEnd: 1, MatchCommitment: commitment}}}}, "missing match class"},
+		{"non-increasing match ordinal", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchClass: "first", MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 2, ByteEnd: 3, MatchClass: "second", MatchCommitment: commitment}}}}, "match ordinals must be strictly increasing"},
+		{"unsorted intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 2, ByteEnd: 3, MatchClass: "first", MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchClass: "second", MatchCommitment: commitment}}}}, "intervals are unsorted"},
+		{"duplicate intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 1, MatchClass: "first", MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 0, ByteEnd: 1, MatchClass: "second", MatchCommitment: commitment}}}}, "duplicate interval start"},
+		{"overlapping intervals", []ProvenanceSource{{SourceOrdinal: 1, SourceID: base.SourceID, Recipe: base.Recipe, ViewCommitment: base.ViewCommitment, Matches: []ProvenanceMatch{{MatchOrdinal: 1, ByteStart: 0, ByteEnd: 2, MatchClass: "first", MatchCommitment: commitment}, {MatchOrdinal: 2, ByteStart: 1, ByteEnd: 3, MatchClass: "second", MatchCommitment: commitment}}}}, "intervals overlap"},
 		{"duplicate source ordinal", []ProvenanceSource{{SourceOrdinal: 1, SourceID: "first", Recipe: base.Recipe, ViewCommitment: base.ViewCommitment}, {SourceOrdinal: 1, SourceID: "second", Recipe: base.Recipe, ViewCommitment: base.ViewCommitment}}, "duplicate source ordinal"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -302,6 +304,12 @@ func TestCommitmentEnumBytesAreStable(t *testing.T) {
 		normalize.OperationDLPNormalize: 4, normalize.OperationLowercase: 5, normalize.OperationInvisibleStrip: 6,
 		normalize.OperationHexDecode: 7, normalize.OperationBase32Decode: 8, normalize.OperationBase64Decode: 9,
 		normalize.OperationLeetspeak: 10, normalize.OperationVowelFold: 11,
+		normalize.OperationQueryUnescape: 12, normalize.OperationInvisibleSpace: 13, normalize.OperationMatchingNormalize: 14,
+		normalize.OperationHexDecodeLiberal: 15, normalize.OperationBase32DecodeLiberal: 16, normalize.OperationBase64DecodeLiberal: 17,
+		normalize.OperationEncodedTokenNormalize: 18, normalize.OperationTextSegment: 19, normalize.OperationHTMLEntityDecode: 20,
+		normalize.OperationWhitespaceCompact: 21, normalize.OperationURLNoiseStrip: 22, normalize.OperationOrderedQueryConcat: 23,
+		normalize.OperationQuerySubsequence: 24, normalize.OperationHostnameDotRemove: 25, normalize.OperationEncodedRun: 26,
+		normalize.OperationCanaryCanonicalize: 27,
 	}
 	for kind, want := range kinds {
 		t.Run("kind/"+string(kind), func(t *testing.T) {
@@ -326,6 +334,7 @@ func TestCommitmentEnumBytesAreStable(t *testing.T) {
 	components := map[normalize.Component]byte{
 		"": 0, normalize.ComponentURL: 1, normalize.ComponentHostname: 2,
 		normalize.ComponentPath: 3, normalize.ComponentQueryKey: 4, normalize.ComponentQueryVal: 5,
+		normalize.ComponentRawQuery: 6,
 	}
 	for component, want := range components {
 		t.Run("component/"+string(component), func(t *testing.T) {
@@ -340,6 +349,61 @@ func TestCommitmentEnumBytesAreStable(t *testing.T) {
 	}
 	if _, err := componentByte("unknown"); err == nil || !strings.Contains(err.Error(), "unknown URL component") {
 		t.Fatalf("componentByte unknown error = %v", err)
+	}
+}
+
+func TestAppendedOperationCommitmentTailBindsParameters(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		left  normalize.Operation
+		right normalize.Operation
+	}{
+		{"alphabet", normalize.Operation{Kind: normalize.OperationBase64DecodeLiberal, Alphabet: "standard"}, normalize.Operation{Kind: normalize.OperationBase64DecodeLiberal, Alphabet: "url"}},
+		{"indices", normalize.Operation{Kind: normalize.OperationQuerySubsequence, Indices: normalize.QueryIndices{0, 1}}, normalize.Operation{Kind: normalize.OperationQuerySubsequence, Indices: normalize.QueryIndices{0, 2}}},
+		{"minimum length", normalize.Operation{Kind: normalize.OperationEncodedRun, MinimumLength: 6}, normalize.Operation{Kind: normalize.OperationEncodedRun, MinimumLength: 7}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			left, err := operationBytes(tc.left)
+			if err != nil {
+				t.Fatal(err)
+			}
+			right, err := operationBytes(tc.right)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(left) == string(right) {
+				t.Fatal("operation commitment did not bind appended parameter")
+			}
+		})
+	}
+}
+
+func TestLegacyOperationCommitmentOmitsAppendedTail(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   normalize.Operation
+		want string
+	}{
+		{
+			name: "identity",
+			op:   normalize.Operation{Kind: normalize.OperationIdentity},
+			want: "00000000000000010100000000000000010000000000000000000000000000000004000000000000000000000001000000000000000000000000000000000100",
+		},
+		{
+			name: "vowel fold",
+			op:   normalize.Operation{Kind: normalize.OperationVowelFold},
+			want: "00000000000000010b00000000000000010000000000000000000000000000000004000000000000000000000001000000000000000000000000000000000100",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			encoded, err := operationBytes(tc.op)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := hex.EncodeToString(encoded); got != tc.want {
+				t.Fatalf("legacy operation preimage = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -368,8 +432,16 @@ func TestRecipeBytesEncodesAllOperationFields(t *testing.T) {
 		{Kind: normalize.OperationBase32Decode},
 		{Kind: normalize.OperationBase64Decode, DecodePadding: true},
 	}}
-	if _, err := recipeBytes(recipe); err != nil {
+	want, err := recipeBytes(recipe)
+	if err != nil {
 		t.Fatal(err)
+	}
+	got, err := CanonicalRecipeBytes(recipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("exported canonical recipe encoding differs from commitment encoding")
 	}
 	if _, err := recipeBytes(normalize.Recipe{}); err == nil || !strings.Contains(err.Error(), "missing transform profile digest") {
 		t.Fatalf("invalid recipe error = %v", err)

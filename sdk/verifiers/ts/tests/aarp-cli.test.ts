@@ -7,12 +7,19 @@
 // the built dist so exit-code wiring through main() is exercised.
 
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { findPackageRoot } from "./paths.js";
 
-const CLI = "dist/src/cli.js";
-const corpus = "../../conformance/testdata/aarp-corpus";
+const packageRoot = findPackageRoot(import.meta.url);
+const CLI = resolve(packageRoot, "dist/src/cli.js");
+const corpus = resolve(packageRoot, "../../conformance/testdata/aarp-corpus");
 const trust = `${corpus}/trust.json`;
+const provenanceFixture = resolve(
+  packageRoot,
+  "../../conformance/testdata/provenance/p00-valid.json",
+);
 
 interface RunResult {
   status: number;
@@ -146,4 +153,28 @@ test("cli aarp: no --trust runs with empty trust (every sig unknown_key)", () =>
   assert.equal(r.status, 0);
   assert.match(r.stdout, /"status":"unknown_key"/u);
   assert.match(r.stdout, /"assertion_signed":false/u);
+});
+
+test("cli provenance: incomplete verification requires explicit opt-in", () => {
+  const strict = runCLI(["provenance", provenanceFixture]);
+  assert.equal(strict.status, 1);
+  assert.equal(JSON.parse(strict.stdout).overall, "incomplete");
+
+  const inspection = runCLI(["provenance", provenanceFixture, "--allow-incomplete"]);
+  assert.equal(inspection.status, 0);
+  assert.equal(JSON.parse(inspection.stdout).overall, "incomplete");
+});
+
+test("cli provenance: unreadable and invalid fixtures remain rejected", () => {
+  const missing = runCLI(["provenance", resolve(packageRoot, "does-not-exist.json")]);
+  assert.equal(missing.status, 1);
+  assert.equal(JSON.parse(missing.stdout).overall, "invalid");
+
+  const invalidFixture = resolve(
+    packageRoot,
+    "../../conformance/testdata/provenance/p02-bad-signature.json",
+  );
+  const invalid = runCLI(["provenance", invalidFixture, "--allow-incomplete"]);
+  assert.equal(invalid.status, 1);
+  assert.equal(JSON.parse(invalid.stdout).overall, "invalid");
 });

@@ -7,6 +7,8 @@ pub mod canonical;
 pub mod chain;
 pub mod cli;
 pub mod output;
+pub mod provenance;
+pub(crate) mod provenance_proof;
 pub mod receipt;
 pub mod recorder;
 pub mod rotation;
