@@ -1,15 +1,10 @@
 # Copyright 2026 Josh Waldrep
 # SPDX-License-Identifier: Apache-2.0
 #
-# Hash-pinned dependencies for the AARP v0.1 Python verifier
-# (pipelock_aarp_verify). The verifier's only runtime dependency is
-# `cryptography` (for Ed25519 verification); its transitive tree (cffi ->
-# pycparser) is locked here with hashes so CI can install with
-# `pip install --require-hashes -r requirements.txt`.
-#
-# Regenerate after a cryptography bump:
-#   echo 'cryptography==<version>' > req.in
-#   pip-compile --generate-hashes --no-header --strip-extras -o requirements.txt req.in
+# Hash-pinned runtime dependencies for the AARP v0.1 Python verifier.
+# Regenerate with:
+#   uv pip compile pyproject.toml --generate-hashes --no-header --strip-extras -o requirements.txt
+
 cffi==2.0.0 \
     --hash=sha256:00bdf7acc5f795150faa6957054fbbca2439db2f775ce831222b66f192f03beb \
     --hash=sha256:07b271772c100085dd28b74fa0cd81c8fb1a3ba18b21e03d7c27f3436a10606b \
@@ -143,7 +138,7 @@ cryptography==50.0.0 \
     --hash=sha256:f59e38625469987d7ef6d495323c55e7db6c212eaf6112267e0d3b565a2e9c9f \
     --hash=sha256:f89831ef99dd7dd169ab06d63a831adb9e20a87aac6d380266bbda5823349169 \
     --hash=sha256:fd9192b7b70c573d7f214eb1ae35e00d359f6f5e4b27c7e21e30de1fc6204645
-    # via -r requirements.in
+    # via pipelock-aarp-verifier-py (pyproject.toml)
 pycparser==3.0 \
     --hash=sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29 \
     --hash=sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992

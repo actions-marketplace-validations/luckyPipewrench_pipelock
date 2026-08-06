@@ -17,6 +17,7 @@ from pipelock_aarp_verify.cli import (
     EXIT_USAGE,
     main,
 )
+from pipelock_aarp_verify.provenance_proof import MAX_FIXTURE_BYTES
 
 _CORPUS = (
     Path(__file__).resolve().parents[3] / "conformance" / "testdata" / "aarp-corpus"
@@ -25,6 +26,13 @@ _TRUST = _CORPUS / "trust.json"
 _G01 = _CORPUS / "golden" / "g01-single-ed25519-mediated.aarp.json"
 _M09 = _CORPUS / "malicious" / "m09-profile-mismatch.aarp.json"
 _C01 = _CORPUS / "chain" / "c01-valid-stream.aarp.jsonl"
+_PROVENANCE = (
+    Path(__file__).resolve().parents[3]
+    / "conformance"
+    / "testdata"
+    / "provenance"
+    / "p00-valid.json"
+)
 
 
 def run(args, monkeypatch_out=True):
@@ -104,6 +112,37 @@ def test_no_command_is_usage_error():
 def test_unknown_flag_is_usage_error():
     rc, _, _ = run(["aarp", str(_G01), "--bogus"])
     assert rc == EXIT_USAGE
+
+
+def test_provenance_requires_explicit_incomplete_opt_in():
+    rc, out, _ = run(["provenance", str(_PROVENANCE)])
+    assert rc == EXIT_GENERAL
+    assert json.loads(out)["overall"] == "incomplete"
+
+    rc, out, _ = run(["provenance", str(_PROVENANCE), "--allow-incomplete"])
+    assert rc == EXIT_OK
+    assert json.loads(out)["overall"] == "incomplete"
+
+
+def test_provenance_cli_bounds_the_file_read(monkeypatch):
+    read_sizes = []
+
+    class FixtureReader:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, size=-1):
+            read_sizes.append(size)
+            return b"{}"
+
+    monkeypatch.setattr("builtins.open", lambda *_args, **_kwargs: FixtureReader())
+    rc, out, _ = run(["provenance", "fixture.json"])
+    assert rc == EXIT_GENERAL
+    assert json.loads(out)["failure_stage"] == "proof_structure"
+    assert read_sizes == [MAX_FIXTURE_BYTES + 1]
 
 
 def test_bad_trust_unknown_field(tmp_path: Path):

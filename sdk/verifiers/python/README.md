@@ -66,8 +66,10 @@ PYTHONPATH=sdk/verifiers/python/src python -m pipelock_aarp_verify aarp \
     <envelope> --trust <trust.json> --json
 ```
 
-The only runtime dependency is `cryptography` (Ed25519 verification); no network
-access is performed in any code path.
+The only runtime dependency is `cryptography` (Ed25519 verification). Evidence-
+provenance transforms use Python 3.12's built-in Unicode 15.0.0 database; the
+package's `<3.13` upper bound prevents a newer Unicode table from silently
+changing canonicalization. No network access is performed in any code path.
 
 ## Install (hash-pinned, offline-friendly)
 
