@@ -37,6 +37,19 @@ func TestMain(m *testing.M) {
 		_, _ = fmt.Fprintf(os.Stderr, "TestMain: set XDG_DATA_HOME: %v\n", err)
 		os.Exit(1)
 	}
+	if err := os.Setenv("PIPELOCK_HOME", filepath.Join(dataHome, "pipelock-home")); err != nil {
+		_ = os.RemoveAll(tmp)
+		_, _ = fmt.Fprintf(os.Stderr, "TestMain: set PIPELOCK_HOME: %v\n", err)
+		os.Exit(1)
+	}
+	// resolveAssessSigningAgent falls back to PIPELOCK_AGENT before the
+	// built-in default, so an ambient value in the developer's shell would
+	// silently change which identity these tests sign under.
+	if err := os.Unsetenv("PIPELOCK_AGENT"); err != nil {
+		_ = os.RemoveAll(tmp)
+		_, _ = fmt.Fprintf(os.Stderr, "TestMain: unset PIPELOCK_AGENT: %v\n", err)
+		os.Exit(1)
+	}
 	code := m.Run()
 	_ = os.RemoveAll(tmp)
 	os.Exit(code)

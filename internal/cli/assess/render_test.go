@@ -83,9 +83,14 @@ func minimalSummary(grade string, score int) *Summary {
 		TopFindings: []SummaryFinding{
 			{ID: "find-001", Severity: assessSevHigh, Category: "DLP", Source: "simulate", Title: "Missed exfiltration"},
 		},
+		// Present on purpose. The free summary renders per-framework coverage
+		// counts, and the paid-leak assertions below are vacuous unless the
+		// fixture actually carries something that could leak.
+		Compliance: []compliance.CoverageSummary{
+			{FrameworkID: "owasp-mcp-top10", FrameworkName: "OWASP MCP Top 10", MappingVersion: 1, Total: 10, Covered: 7, Partial: 2, NotCovered: 1},
+		},
 		DetectionPct: 85,
 		Signed:       false,
-		Compliance:   []compliance.CoverageSummary{compliance.OWASPMCPTop10().CoverageSummary()},
 	}
 }
 
@@ -145,7 +150,20 @@ func TestRenderAssessmentHTML(t *testing.T) {
 }
 
 func TestRenderSummaryHTML(t *testing.T) {
-	s := minimalSummary(assessGradeB, 82)
+	// Project a paid assessment rather than hand-building a Summary. The
+	// paid-only assertions below are only meaningful if the values existed
+	// upstream and projectToSummary is what removed them.
+	paid := minimalAssessment(assessGradeB, 82)
+	paid.Compliance = []compliance.Framework{{
+		ID: "owasp-mcp-top10", Name: "OWASP MCP Top 10", MappingVersion: 1,
+		Controls: []compliance.ControlMapping{
+			{ID: "sentinel-control-alpha", Status: compliance.StatusCovered},
+			{ID: "sentinel-control-bravo", Status: compliance.StatusCovered},
+			{ID: "sentinel-control-charlie", Status: compliance.StatusPartial},
+		},
+	}}
+	projected := projectToSummary(*paid)
+	s := &projected
 
 	var buf bytes.Buffer
 	if err := renderSummaryHTML(&buf, s); err != nil {
@@ -179,21 +197,44 @@ func TestRenderSummaryHTML(t *testing.T) {
 		t.Error("summary should contain 'Not audit-grade'")
 	}
 
+	// Per-framework coverage counts are free. The per-control mapping detail
+	// is what the paid report adds. Assert the rendered numbers, not just the
+	// heading, so an empty or wrong rollup cannot pass.
 	if !strings.Contains(html, "Compliance Coverage") {
-		t.Error("summary should contain compliance coverage section")
+		t.Error("summary should render the per-framework coverage rollup")
+	}
+	if !strings.Contains(html, "OWASP MCP Top 10") {
+		t.Error("summary should name the covered framework")
+	}
+	if !strings.Contains(html, "Mapping v1") {
+		t.Error("summary should render the mapping version")
+	}
+	if !strings.Contains(html, "2 covered / 3 total") {
+		t.Error("summary should render the actual coverage counts")
+	}
+	// Search for the bare ID anywhere in the output. A leak into an attribute,
+	// a title, or text with surrounding punctuation is still a leak, and an
+	// assertion that only recognizes one exact shape would miss all of them.
+	for _, controlID := range []string{
+		"sentinel-control-alpha", "sentinel-control-bravo", "sentinel-control-charlie",
+	} {
+		if strings.Contains(html, controlID) {
+			t.Errorf("summary leaked per-control mapping detail %q", controlID)
+		}
 	}
 
-	// Must NOT contain remediation or evidence columns.
-	if strings.Contains(html, "remediation") {
-		t.Error("summary should not contain remediation field")
+	// The summary names its non-claims, but must not leak the paid values.
+	if strings.Contains(html, "Enable DLP pattern matching") {
+		t.Error("summary should not contain remediation value")
 	}
-	if strings.Contains(html, "evidence") {
-		t.Error("summary should not contain evidence field")
+	if strings.Contains(html, "AWS key transmitted in plain text") {
+		t.Error("summary should not contain evidence/detail value")
 	}
 
-	// Must contain finding title.
-	if !strings.Contains(html, "Missed exfiltration") {
-		t.Error("summary should contain top finding title")
+	// The finding title survives projection; the remediation and evidence
+	// attached to the same finding must not.
+	if !strings.Contains(html, "Secret exfiltration not blocked") {
+		t.Error("summary should contain the projected top finding title")
 	}
 }
 
