@@ -46,6 +46,15 @@ type serveListenCapture struct {
 	bytes.Buffer
 }
 
+func resolveTestEvidenceLocation(t *testing.T, dir string) recorder.EvidenceLocation {
+	t.Helper()
+	location, err := recorder.ResolveEvidenceLocation(dir, "")
+	if err != nil {
+		t.Fatalf("ResolveEvidenceLocation(%q): %v", dir, err)
+	}
+	return location
+}
+
 func newServeListenCapture() *serveListenCapture {
 	return &serveListenCapture{ch: make(chan string, 1)}
 }
@@ -391,6 +400,103 @@ func TestViewCmd_ExplicitSession(t *testing.T) {
 	}
 }
 
+func TestViewAndServeCmd_LocationSelector(t *testing.T) {
+	t.Parallel()
+	_, priv := genKey(t)
+	root := t.TempDir()
+	locationID := filepath.Join("recorder-a", "run-a")
+	locationDir := filepath.Join(root, locationID)
+	emitSingleSession(t, locationDir, priv, 1)
+
+	var stdout, stderr bytes.Buffer
+	cmd := Cmd()
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	if err := runView(cmd, viewOptions{
+		receiptDir: root,
+		locationID: filepath.ToSlash(locationID),
+	}); err != nil {
+		t.Fatalf("runView selected location: %v", err)
+	}
+	if !strings.Contains(stdout.String(), testActorAlpha) {
+		t.Fatalf("selected view missing actor %q", testActorAlpha)
+	}
+	stdout.Reset()
+	if err := runView(cmd, viewOptions{receiptDir: root}); err != nil {
+		t.Fatalf("runView implicit location: %v", err)
+	}
+
+	err := runServe(cmd, serveOptions{
+		receiptDir: root,
+		locationID: filepath.ToSlash(locationID),
+		listen:     "invalid-listen-address",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--listen") {
+		t.Fatalf("runServe selected location error = %v, want post-selection listen failure", err)
+	}
+	nestedDir := filepath.Join(locationDir, "nested")
+	emitSingleSession(t, nestedDir, priv, 1)
+	stdout.Reset()
+	if err := runView(cmd, viewOptions{
+		receiptDir: root,
+		locationID: filepath.ToSlash(locationID),
+	}); err != nil {
+		t.Fatalf("runView selected parent with nested location: %v", err)
+	}
+	err = runServe(cmd, serveOptions{
+		receiptDir: root,
+		locationID: filepath.ToSlash(locationID),
+		listen:     "invalid-listen-address",
+	})
+	if err == nil || !strings.Contains(err.Error(), "--listen") {
+		t.Fatalf("runServe selected parent with nested location error = %v, want post-selection listen failure", err)
+	}
+
+	for _, tt := range []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "view",
+			run: func() error {
+				return runView(cmd, viewOptions{receiptDir: root, locationID: "missing/run"})
+			},
+		},
+		{
+			name: "serve",
+			run: func() error {
+				return runServe(cmd, serveOptions{receiptDir: root, locationID: "missing/run", listen: "invalid-listen-address"})
+			},
+		},
+	} {
+		t.Run(tt.name+" rejects unknown location", func(t *testing.T) {
+			err := tt.run()
+			if err == nil || !strings.Contains(err.Error(), "resolve evidence location") {
+				t.Fatalf("error = %v, want location resolution failure", err)
+			}
+		})
+	}
+
+	secondLocation := filepath.Join(root, "recorder-b", "run-b")
+	emitSingleSession(t, secondLocation, priv, 1)
+	for _, tt := range []struct {
+		name string
+		run  func() error
+	}{
+		{name: "view", run: func() error { return runView(cmd, viewOptions{receiptDir: root}) }},
+		{name: "serve", run: func() error {
+			return runServe(cmd, serveOptions{receiptDir: root, listen: "invalid-listen-address"})
+		}},
+	} {
+		t.Run(tt.name+" rejects ambiguous root", func(t *testing.T) {
+			err := tt.run()
+			if err == nil || !strings.Contains(err.Error(), "multiple evidence locations") {
+				t.Fatalf("error = %v, want ambiguous-location failure", err)
+			}
+		})
+	}
+}
+
 func TestServeCmd_ExplicitSessionServesBoundReport(t *testing.T) {
 	t.Parallel()
 	_, priv := genKey(t)
@@ -400,7 +506,7 @@ func TestServeCmd_ExplicitSessionServesBoundReport(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolveServeSession: %v", err)
 	}
-	handler := evidenceServeHandler(dir, sessionID)
+	handler := evidenceServeHandler(resolveTestEvidenceLocation(t, dir), sessionID)
 
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
@@ -421,6 +527,20 @@ func TestServeCmd_ExplicitSessionServesBoundReport(t *testing.T) {
 		if got := rec.Header().Get(header); got != want {
 			t.Fatalf("%s = %q, want %q", header, got, want)
 		}
+	}
+}
+
+func TestResolveServeSessionErrors(t *testing.T) {
+	t.Parallel()
+	if _, err := resolveServeSession(filepath.Join(t.TempDir(), "missing"), ""); err == nil || !strings.Contains(err.Error(), "resolve evidence location") {
+		t.Fatalf("missing directory error = %v", err)
+	}
+	empty := resolveTestEvidenceLocation(t, t.TempDir())
+	if _, err := resolveServeSessionResolved(empty, "missing"); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("missing explicit session error = %v", err)
+	}
+	if _, err := resolveServeSessionResolved(empty, ""); err == nil || !strings.Contains(err.Error(), "no sessions") {
+		t.Fatalf("empty location error = %v", err)
 	}
 }
 
@@ -514,7 +634,7 @@ func TestServeCmd_MixedActorSessionFailsClosed(t *testing.T) {
 		return testActorBravo, "https://api.vendor.example/" + testBravoTargetSecret
 	})
 
-	handler := evidenceServeHandler(dir, "shared")
+	handler := evidenceServeHandler(resolveTestEvidenceLocation(t, dir), "shared")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/", nil))
 	if rec.Code != http.StatusInternalServerError {
@@ -577,7 +697,7 @@ func TestServeCmd_NoEndpointCanSwitchBoundSession(t *testing.T) {
 	_, priv := genKey(t)
 	dir := emitMultiSessionDir(t, priv)
 
-	handler := evidenceServeHandler(dir, "bravo")
+	handler := evidenceServeHandler(resolveTestEvidenceLocation(t, dir), "bravo")
 	for _, target := range []string{"/", "/?session=alpha", "/?agent=agent-alpha"} {
 		t.Run(target, func(t *testing.T) {
 			rec := httptest.NewRecorder()
@@ -613,7 +733,7 @@ func TestServeCmd_NonGETRootReturnsMethodNotAllowed(t *testing.T) {
 	dir := t.TempDir()
 	writeEvidenceSession(t, dir, priv, "alpha", testActorAlpha, 1)
 
-	handler := evidenceServeHandler(dir, "alpha")
+	handler := evidenceServeHandler(resolveTestEvidenceLocation(t, dir), "alpha")
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/", nil))
 	if rec.Code != http.StatusMethodNotAllowed {

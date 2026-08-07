@@ -16,6 +16,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/contract"
 	"github.com/luckyPipewrench/pipelock/internal/evidencename"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 )
 
 // GenesisHash is the chain_prev_hash of the first receipt in a v2 chain.
@@ -204,8 +205,17 @@ func ExtractEvidenceReceipts(path string) ([]EvidenceReceipt, error) {
 // session and returns v2 EvidenceReceipts in chain order. Files are ordered by
 // their numeric sequence suffix, matching recorder.QuerySession's v1 behavior.
 func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceReceipt, error) {
-	clean := filepath.Clean(dir)
-	entries, err := os.ReadDir(clean)
+	location, resolveErr := recorder.ResolveEvidenceLocation(dir, "")
+	if resolveErr != nil {
+		return nil, fmt.Errorf("resolve evidence location: %w", resolveErr)
+	}
+	return ExtractEvidenceReceiptsFromResolvedSessionDir(location, sessionID)
+}
+
+// ExtractEvidenceReceiptsFromResolvedSessionDir reads one already-resolved evidence location.
+func ExtractEvidenceReceiptsFromResolvedSessionDir(location recorder.EvidenceLocation, sessionID string) ([]EvidenceReceipt, error) {
+	clean := filepath.Clean(location.Dir)
+	entries, err := recorder.ReadEvidenceLocationEntries(location)
 	if err != nil {
 		return nil, fmt.Errorf("read evidence directory: %w", err)
 	}
@@ -219,8 +229,7 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 	// directory, and the two sibling scanners in this change already
 	// precompute the same way.
 	type shard struct {
-		path     string
-		base     string
+		name     string
 		seqStart uint64
 	}
 	shards := make([]shard, 0)
@@ -234,8 +243,7 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 			continue
 		}
 		shards = append(shards, shard{
-			path:     filepath.Join(clean, name),
-			base:     name,
+			name:     name,
 			seqStart: seqStart,
 		})
 	}
@@ -246,11 +254,11 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 		if shards[i].seqStart != shards[j].seqStart {
 			return shards[i].seqStart < shards[j].seqStart
 		}
-		return shards[i].base < shards[j].base
+		return shards[i].name < shards[j].name
 	})
 	files := make([]string, 0, len(shards))
 	for _, s := range shards {
-		files = append(files, s.path)
+		files = append(files, s.name)
 	}
 
 	// Refuse an ambiguous shard set rather than concatenating receipts in an
@@ -263,11 +271,18 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 
 	var out []EvidenceReceipt
 	for _, file := range files {
-		receipts, readErr := ExtractEvidenceReceipts(file)
+		data, readErr := recorder.ReadEvidenceLocationFileBounded(location, file, recorder.MaxEvidenceReadFileBytes)
+		if readErr == nil {
+			receipts, parseErr := extractEvidenceReceiptsFromBytes(data, filepath.Join(clean, file))
+			if parseErr != nil {
+				readErr = parseErr
+			} else {
+				out = append(out, receipts...)
+			}
+		}
 		if readErr != nil {
 			return nil, fmt.Errorf("read %s: %w", filepath.Base(file), readErr)
 		}
-		out = append(out, receipts...)
 	}
 	return out, nil
 }

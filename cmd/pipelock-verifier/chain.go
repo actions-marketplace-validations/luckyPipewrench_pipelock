@@ -17,12 +17,14 @@ import (
 	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
 	actionreceipt "github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 )
 
 // chainOptions holds resolved CLI flags for the chain subcommand.
 type chainOptions struct {
-	signerKey string
-	sessionID string
+	signerKey  string
+	sessionID  string
+	locationID string
 	evidenceBindingOptions
 	jsonOutput    bool
 	asDir         bool
@@ -56,6 +58,7 @@ key.`,
 
 	cmd.Flags().StringVar(&opts.signerKey, "key", "", "expected signer public key (hex, public-key text, or file path)")
 	cmd.Flags().StringVar(&opts.sessionID, "session", "proxy", "session ID inside the evidence directory (--dir)")
+	cmd.Flags().StringVar(&opts.locationID, "location", "", "location path relative to the evidence directory (--dir)")
 	cmd.Flags().StringVar(&opts.expectSignerKeyID, "expect-signer-id", "", "EvidenceReceipt v2: require signer_key_id")
 	cmd.Flags().StringVar(&opts.expectContractHash, "expect-contract", "", "EvidenceReceipt v2: require contract_hash")
 	cmd.Flags().StringVar(&opts.expectManifestHash, "expect-manifest", "", "EvidenceReceipt v2: require active_manifest_hash")
@@ -93,16 +96,24 @@ func runChain(stdout, stderr io.Writer, target string, opts chainOptions) error 
 	var label string
 	if opts.asDir {
 		clean := filepath.Clean(target)
+		location, locationErr := recorder.ResolveEvidenceLocation(clean, opts.locationID)
+		if locationErr != nil {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve evidence location: %w", locationErr))
+		}
+		clean = location.Dir
 		label = fmt.Sprintf("%s (session %s)", clean, opts.sessionID)
-		if handled, handleErr := runEvidenceChainFromDir(stdout, stderr, clean, label, keyHex, opts); handled || handleErr != nil {
+		if handled, handleErr := runEvidenceChainFromDir(stdout, stderr, location, label, keyHex, opts); handled || handleErr != nil {
 			return handleErr
 		}
-		receipts, extractErr := actionreceipt.ExtractReceiptsFromSessionDir(clean, opts.sessionID)
+		receipts, extractErr := actionreceipt.ExtractReceiptsFromResolvedSessionDir(location, opts.sessionID)
 		if extractErr != nil {
 			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("extract receipts: %w", extractErr))
 		}
 		return verifyActionChain(stdout, stderr, label, receipts, keyHex, opts)
 	} else {
+		if opts.locationID != "" {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("--location requires --dir"))
+		}
 		clean := filepath.Clean(target)
 		info, statErr := os.Stat(clean)
 		if statErr != nil {
@@ -194,9 +205,9 @@ func runEvidenceChainFromFile(stdout, stderr io.Writer, clean, label, keyHex str
 	})
 }
 
-func runEvidenceChainFromDir(stdout, stderr io.Writer, clean, label, keyHex string, opts chainOptions) (bool, error) {
+func runEvidenceChainFromDir(stdout, stderr io.Writer, location recorder.EvidenceLocation, label, keyHex string, opts chainOptions) (bool, error) {
 	return runEvidenceChainWith(stdout, stderr, label, keyHex, opts, func() ([]contractreceipt.EvidenceReceipt, error) {
-		return contractreceipt.ExtractEvidenceReceiptsFromSessionDir(clean, opts.sessionID)
+		return contractreceipt.ExtractEvidenceReceiptsFromResolvedSessionDir(location, opts.sessionID)
 	})
 }
 
