@@ -430,14 +430,14 @@ func TestProjectToSummary_RedactsDiscoverTitles(t *testing.T) {
 	}
 }
 
-func TestProjectToSummary_AlwaysUnsigned(t *testing.T) {
+func TestProjectToSummary_PreservesSignedState(t *testing.T) {
 	a := *minimalAssessment(assessGradeA, 95)
-	a.Signed = true // even if assessment claims signed
+	a.Signed = true
 
 	summary := projectToSummary(a)
 
-	if summary.Signed {
-		t.Error("summary Signed should always be false")
+	if !summary.Signed {
+		t.Error("summary Signed should preserve the finalized assessment state")
 	}
 }
 

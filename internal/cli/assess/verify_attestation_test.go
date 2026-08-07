@@ -171,3 +171,44 @@ func TestAssessFinalize_AttestationArtifacts(t *testing.T) {
 		t.Error("badge.svg should contain badge text")
 	}
 }
+
+// TestAssessVerifyAttestation_ResolvesRecordedAgent covers the case where the
+// assessment was signed under a custom identity and the verifier names no agent.
+// Falling back to the built-in default here would look for a key that never
+// signed anything and fail on a bundle that is perfectly valid.
+func TestAssessVerifyAttestation_ResolvesRecordedAgent(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+	// The empty value is what an operator who passes no --agent has. Pin it
+	// here rather than rely on TestMain, since this variable is the thing under test.
+	t.Setenv("PIPELOCK_AGENT", "")
+	if agentName == assessDefaultSigningAgent {
+		t.Fatalf("fixture agent %q must differ from the default for this test to mean anything", agentName)
+	}
+
+	exitCode, err := runAssessVerifyAttestation(runDir, "", keystoreDir)
+	if err != nil {
+		t.Fatalf("runAssessVerifyAttestation with no agent: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+}
+
+// The manifest signature path has the same requirement, and had the same bug.
+func TestAssessVerify_ResolvesRecordedAgent(t *testing.T) {
+	runDir, keystoreDir, agentName := setupFinalizedRunWithAttestation(t)
+	// The empty value is what an operator who passes no --agent has. Pin it
+	// here rather than rely on TestMain, since this variable is the thing under test.
+	t.Setenv("PIPELOCK_AGENT", "")
+	if agentName == assessDefaultSigningAgent {
+		t.Fatalf("fixture agent %q must differ from the default", agentName)
+	}
+
+	exitCode, err := runAssessVerify(runDir, "", keystoreDir)
+	if err != nil {
+		t.Fatalf("runAssessVerify with no agent: %v", err)
+	}
+	if exitCode != 0 {
+		t.Errorf("exit code = %d, want 0", exitCode)
+	}
+}
