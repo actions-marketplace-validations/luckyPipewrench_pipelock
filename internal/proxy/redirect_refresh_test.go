@@ -21,6 +21,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -270,6 +271,182 @@ func TestCheckRedirect_PreservesRequiresReauth(t *testing.T) {
 	}
 	if refreshed.Hop != 1 {
 		t.Errorf("Hop = %d, want 1", refreshed.Hop)
+	}
+}
+
+func TestCheckRedirect_DropsAuthorityOnRedirect(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		authorityKind string
+		authorityRef  string
+	}{
+		{
+			name:          "kind and reference",
+			authorityKind: "user-exact",
+			authorityRef:  "grant-123",
+		},
+		{
+			name:          "kind only",
+			authorityKind: "delegated",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := newSigningProxyForTest(t)
+			em := p.envelopeEmitterPtr.Load()
+			if em == nil {
+				t.Fatal("expected startup signing emitter")
+			}
+
+			original := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "https://origin.example/start", nil)
+			prev, err := em.Build(envelope.BuildOpts{
+				ActionID:       "01961f3a-7b2c-7000-8000-000000000022",
+				Action:         "write",
+				Verdict:        config.ActionAllow,
+				Actor:          "agent",
+				ActorAuth:      envelope.ActorAuthBound,
+				SessionTaint:   "restricted",
+				TaskID:         "task-123",
+				AuthorityKind:  tt.authorityKind,
+				AuthorityRef:   tt.authorityRef,
+				RequiresReauth: true,
+			})
+			if err != nil {
+				t.Fatalf("build previous envelope: %v", err)
+			}
+			if err := envelope.InjectHTTP(original.Header, prev); err != nil {
+				t.Fatalf("inject previous envelope: %v", err)
+			}
+
+			// Prove authority actually crossed the serialized boundary
+			// before asserting the redirect removed it. Without this, an
+			// emitter that silently dropped authority would make the
+			// removal assertion below pass even with the carry-over
+			// restored, so the test would prove nothing about redirects.
+			injected, err := envelope.Parse(original.Header.Get(envelope.HeaderName))
+			if err != nil {
+				t.Fatalf("parse injected envelope: %v", err)
+			}
+			if injected.AuthorityKind != tt.authorityKind || injected.AuthorityRef != tt.authorityRef {
+				t.Fatalf("injected authority = %q/%q, want %q/%q",
+					injected.AuthorityKind, injected.AuthorityRef, tt.authorityKind, tt.authorityRef)
+			}
+
+			redirected := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://redirected.example/final", nil)
+			if err := p.refreshEnvelopeForRedirect(redirected, []*http.Request{original}, p.cfgPtr.Load()); err != nil {
+				t.Fatalf("refreshEnvelopeForRedirect: %v", err)
+			}
+
+			refreshed, err := envelope.Parse(redirected.Header.Get(envelope.HeaderName))
+			if err != nil {
+				t.Fatalf("parse refreshed envelope: %v", err)
+			}
+			if refreshed.AuthorityKind != "" || refreshed.AuthorityRef != "" {
+				t.Fatalf("redirected authority = %q/%q, want empty", refreshed.AuthorityKind, refreshed.AuthorityRef)
+			}
+			// The redirect switched POST to GET, so the action must be
+			// recomputed from the new method rather than carried over.
+			// Preserving "write" here would misreport the hop.
+			if wantAction := string(receipt.ClassifyHTTP(http.MethodGet)); refreshed.Action != wantAction {
+				t.Fatalf("refreshed Action = %q, want %q recomputed from the redirected method",
+					refreshed.Action, wantAction)
+			}
+			if refreshed.Actor != prev.Actor || refreshed.ActorAuth != prev.ActorAuth ||
+				refreshed.ReceiptID != prev.ReceiptID || refreshed.SessionTaint != prev.SessionTaint ||
+				refreshed.TaskID != prev.TaskID || refreshed.RequiresReauth != prev.RequiresReauth {
+				t.Fatalf("redirect lost identity metadata: got %+v, want actor=%q actor_auth=%q receipt=%q taint=%q task=%q reauth=%t",
+					refreshed, prev.Actor, prev.ActorAuth, prev.ReceiptID, prev.SessionTaint, prev.TaskID, prev.RequiresReauth)
+			}
+			if refreshed.Hop != 1 {
+				t.Errorf("Hop = %d, want 1", refreshed.Hop)
+			}
+		})
+	}
+}
+
+func TestCheckRedirect_MalformedPriorEnvelopeBlocks(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		raw  string
+		// extra values are Added after raw, so the header carries more
+		// than one value. Header.Get reads only the first, so without a
+		// Values-based read a malformed later value reads as absent and
+		// skips the block entirely.
+		extra []string
+		// validFirst makes the FIRST header value a genuinely valid signed
+		// envelope. Without it a repeated-header case proves nothing about
+		// the repeated-header guard, because an incomplete first value is
+		// rejected by envelope.Parse whether or not that guard exists.
+		validFirst bool
+	}{
+		{name: "invalid structured field", raw: "not a valid dictionary ((("},
+		{name: "missing required verdict", raw: "v=1, act=\"read\", rid=\"01961f3a-7b2c-7000-8000-000000000023\", ts=1"},
+		{name: "present but empty", raw: ""},
+		{name: "present but whitespace only", raw: "   "},
+		{name: "empty then malformed", raw: "", extra: []string{"not a valid dictionary ((("}},
+		{
+			name:       "valid then malformed",
+			validFirst: true,
+			extra:      []string{"not a valid dictionary ((("},
+		},
+		{
+			name:       "valid then valid",
+			validFirst: true,
+			extra:      []string{"v=1, act=\"read\", rid=\"01961f3a-7b2c-7000-8000-000000000024\", ts=1, vd=\"allow\""},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := newSigningProxyForTest(t)
+			original := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://origin.example/start", nil)
+			if tt.validFirst {
+				em := p.envelopeEmitterPtr.Load()
+				if em == nil {
+					t.Fatal("expected startup signing emitter")
+				}
+				prev, err := em.Build(envelope.BuildOpts{
+					ActionID:  "01961f3a-7b2c-7000-8000-000000000025",
+					Action:    "read",
+					Verdict:   config.ActionAllow,
+					Actor:     "agent",
+					ActorAuth: envelope.ActorAuthBound,
+				})
+				if err != nil {
+					t.Fatalf("build valid first envelope: %v", err)
+				}
+				if err := envelope.InjectHTTP(original.Header, prev); err != nil {
+					t.Fatalf("inject valid first envelope: %v", err)
+				}
+			} else {
+				original.Header.Set(envelope.HeaderName, tt.raw)
+			}
+			for _, value := range tt.extra {
+				original.Header.Add(envelope.HeaderName, value)
+			}
+			redirected := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://redirected.example/final", nil)
+
+			err := p.refreshEnvelopeForRedirect(redirected, []*http.Request{original}, p.cfgPtr.Load())
+			if err == nil {
+				t.Fatal("malformed prior envelope was allowed")
+			}
+			blocked, ok := blockedRequestErrorFrom(err)
+			if !ok {
+				t.Fatalf("expected blockedRequestError, got %T", err)
+			}
+			if blocked.layer != blockLayerMediationEnvelope {
+				t.Fatalf("blocked layer = %q, want %q", blocked.layer, blockLayerMediationEnvelope)
+			}
+		})
 	}
 }
 
