@@ -89,40 +89,90 @@ func TestClassifyMCPToolCall_ActionRefIsStableAcrossRuns(t *testing.T) {
 	}
 }
 
-// TestClassifyMCPToolCall_ShellCommandOrderIsStable covers the second
-// consumer of the same flattened slice. The exec path joins every extracted
-// string into one command line and scans it for multi-token shell patterns
-// such as "git push", so an unordered walk can push two tokens together
-// across a join boundary and manufacture a match that the same input does not
-// produce on the next run.
-//
-// These arguments are built for exactly that. The walk emits each key before
-// its value, so the value "git" landing immediately before the key "push"
-// spells the pattern, and whether that adjacency happens depends entirely on
-// which key is visited first. Sorted keys settle it the same way every time.
+// TestClassifyMCPToolCall_ShellCommandOrderIsStable proves shell classification
+// scans declared command vectors, never object keys or a flattened mix of
+// unrelated values. It retains the repeated-run assertion because command
+// field extraction must remain deterministic.
 func TestClassifyMCPToolCall_ShellCommandOrderIsStable(t *testing.T) {
 	t.Parallel()
 
-	const argsJSON = `{"x":"git","push":"origin main"}`
+	tests := []struct {
+		name            string
+		argsJSON        string
+		wantSensitivity session.ActionSensitivity
+	}{
+		{
+			name:            "keys cannot manufacture a command",
+			argsJSON:        `{"a":"git","push":"origin main"}`,
+			wantSensitivity: session.SensitivityProtected,
+		},
+		{
+			name:            "command and argv form one vector despite unrelated fields",
+			argsJSON:        `{"argv":["push","origin","main"],"command":"git","decoy":"status"}`,
+			wantSensitivity: session.SensitivityElevated,
+		},
+		{
+			name:            "array command vector is scanned",
+			argsJSON:        `{"args":["git","push","origin","main"]}`,
+			wantSensitivity: session.SensitivityElevated,
+		},
+		{
+			// Arguments that are not JSON at all yield no command vector.
+			// The call must still be treated as a protected exec rather
+			// than read as benign for lack of a parseable command.
+			name:            "unparseable arguments stay protected",
+			argsJSON:        `{"command": "git push`,
+			wantSensitivity: session.SensitivityProtected,
+		},
+		{
+			// A top-level array still has to be walked, or a command
+			// nested one level up from an object would be missed.
+			name:            "top level array is walked",
+			argsJSON:        `[{"command":"git push origin main"}]`,
+			wantSensitivity: session.SensitivityElevated,
+		},
+		{
+			// A vector field holding no strings contributes nothing, and
+			// the base command alone decides the verdict.
+			name:            "non string vector contributes no command text",
+			argsJSON:        `{"command":"status","argv":[1,2,{"push":"origin"}]}`,
+			wantSensitivity: session.SensitivityProtected,
+		},
+		{
+			// A recognized field can hold a nested container. Without a
+			// recursive walk into it the command never reaches the matcher
+			// and a real mutation is scanned as if it were absent.
+			name:            "nested container under a recognized field is scanned",
+			argsJSON:        `{"command":{"cmd":"git","argv":["push","origin","main"]}}`,
+			wantSensitivity: session.SensitivityElevated,
+		},
+		{
+			// program marks an exec in hasExecIntent, so extraction has to
+			// recognize it too or its command goes unscanned.
+			name:            "program field is a command base",
+			argsJSON:        `{"program":"git","argv":["push","origin","main"]}`,
+			wantSensitivity: session.SensitivityElevated,
+		},
+		{
+			// Two vector fields are two independent command candidates. A
+			// regression that flattened them back into one would spell a
+			// mutation out of tokens that were never one command.
+			name:            "separate vectors do not form one command",
+			argsJSON:        `{"args":["git"],"argv":["push"]}`,
+			wantSensitivity: session.SensitivityProtected,
+		},
+	}
 
-	// Pinned, not taken from the first run. Using run zero as the oracle
-	// would let a deterministic regression that changes the verdict pass,
-	// because every later run would agree with the new wrong answer.
-	//
-	// Sorted keys emit push, origin main, x, git, which spells no mutating
-	// pattern, so this is a non-mutating exec and sensitivity stays
-	// protected. Unsorted, the value git can land before the key push and
-	// form "git push", which flips sensitivity to elevated.
-	const (
-		wantClass       = session.ActionClassExec
-		wantSensitivity = session.SensitivityProtected
-	)
-
-	for run := range classifyRuns {
-		class, sensitivity, _ := session.ClassifyMCPToolCall("shell", argsJSON, nil, nil)
-		if class != wantClass || sensitivity != wantSensitivity {
-			t.Fatalf("run %d: class/sensitivity = %v/%v, want %v/%v on every run",
-				run, class, sensitivity, wantClass, wantSensitivity)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for run := range classifyRuns {
+				class, sensitivity, _ := session.ClassifyMCPToolCall("shell", tt.argsJSON, nil, nil)
+				if class != session.ActionClassExec || sensitivity != tt.wantSensitivity {
+					t.Fatalf("run %d: class/sensitivity = %v/%v, want %v/%v on every run",
+						run, class, sensitivity, session.ActionClassExec, tt.wantSensitivity)
+				}
+			}
+		})
 	}
 }
