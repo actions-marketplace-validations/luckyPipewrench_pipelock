@@ -38,7 +38,7 @@ class PayloadTest(unittest.TestCase):
         payload = pr_review.build_llm_payload("gpt-5.5", "system", "diff")
         self.assertEqual(payload["reasoning_effort"], pr_review.FAST_REASONING_EFFORT)
 
-    def test_gpt5_deep_payload_can_use_medium_reasoning_effort(self) -> None:
+    def test_gpt5_deep_payload_uses_review_reasoning_effort(self) -> None:
         payload = pr_review.build_llm_payload(
             "gpt-5.5",
             "system",
@@ -107,6 +107,34 @@ class ModelRoutingTest(unittest.TestCase):
             workflow,
         )
         self.assertNotRegex(workflow, r"PR_REVIEW_MODEL_(?:FAST|DEEP): gpt-")
+
+    def test_deep_review_has_distinct_adversarial_prompt(self) -> None:
+        self.assertIsNot(pr_review.PROMPT_DEEP, pr_review.PROMPT_SECURITY)
+        for section in (
+            "1. STATES",
+            "2. DIRECTION",
+            "3. BLAST RADIUS",
+            "4. APPROACH",
+            "5. CLASS",
+            "6. VACUITY",
+            "7. PREDECESSOR",
+            "8. OUR OWN ARTIFACTS",
+            "9. AVAILABILITY",
+            "10. HONEST CONVERGENCE",
+        ):
+            with self.subTest(section=section):
+                self.assertIn(section, pr_review.PROMPT_DEEP)
+        self.assertIn("static pull-request diff", pr_review.PROMPT_DEEP)
+        self.assertIn("neutralization was not executed", pr_review.PROMPT_DEEP)
+
+    def test_deep_mode_routes_to_adversarial_prompt_and_larger_diff(self) -> None:
+        self.assertIs(pr_review.prompt_for_mode("deep"), pr_review.PROMPT_DEEP)
+        self.assertIs(pr_review.prompt_for_mode("default"), pr_review.PROMPT_SECURITY)
+        self.assertEqual(pr_review.diff_limit_for_mode("default"), 100_000)
+        self.assertEqual(pr_review.diff_limit_for_mode("deep"), 200_000)
+
+    def test_deep_review_uses_xhigh_reasoning(self) -> None:
+        self.assertEqual(pr_review.DEEP_REASONING_EFFORT, "xhigh")
 
     def test_workflow_passes_documented_llm_credentials(self) -> None:
         workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
@@ -270,6 +298,37 @@ class CallLLMTest(unittest.TestCase):
                 "No LLM API configured",
             ):
                 pr_review.call_llm("diff", "default", "system")
+
+
+class MainFlowTest(unittest.TestCase):
+    def test_deep_comment_exposes_static_review_scope(self) -> None:
+        with mock.patch.dict(
+            pr_review.os.environ,
+            {
+                "GITHUB_TOKEN": "test-token",
+                "REPO": "owner/repo",
+                "PR_NUMBER": "42",
+                "REVIEW_MODE": "deep",
+            },
+            clear=True,
+        ), mock.patch.object(
+            pr_review, "get_pr_diff", return_value="diff --git a/a b/a"
+        ), mock.patch.object(
+            pr_review, "call_llm", return_value="review result"
+        ) as call_llm, mock.patch.object(
+            pr_review, "post_comment"
+        ) as post_comment:
+            pr_review.main()
+
+        call_llm.assert_called_once_with(
+            "diff --git a/a b/a", "deep", pr_review.PROMPT_DEEP
+        )
+        post_comment.assert_called_once()
+        repo, pr_number, token, body = post_comment.call_args.args
+        self.assertEqual((repo, pr_number, token), ("owner/repo", "42", "test-token"))
+        self.assertIn("**Scope:** Static diff review", body)
+        self.assertIn("no tests or repository-wide search were executed", body)
+        self.assertIn("review result", body)
 
 
 class StatsSafetyTest(unittest.TestCase):
