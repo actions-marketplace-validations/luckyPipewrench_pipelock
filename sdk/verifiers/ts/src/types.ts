@@ -134,10 +134,18 @@ export interface ShieldSummary {
 
 export interface RecorderEntry {
   v?: number;
-  seq?: number;
+  seq?: number | string;
   ts?: string;
   session_id?: string;
+  chain_kind?: string;
+  writer_instance_id?: string;
+  trace_id?: string;
   type?: string;
+  event_kind?: string;
+  transport?: string;
+  summary?: string;
+  raw_ref?: string;
+  prev_hash?: string;
   detail?: unknown;
 }
 

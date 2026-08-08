@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import * as ed25519 from "@noble/ed25519";
 import { canonicalizeBytes } from "../src/aarp/canonical.js";
 import { canonicalizeActionRecord } from "../src/canonical.js";
-import { extractReceipts } from "../src/recorder.js";
+import { extractReceipts, readEntries } from "../src/recorder.js";
 import { computeSessionOpenGenesis, receiptHash, verifyChain } from "../src/chain.js";
 import {
   loadRotationEndorsementFile,
@@ -577,6 +577,270 @@ test("malformed JSONL raises an error", () => {
       { mode: 0o600 },
     );
     assert.throws(() => extractReceipts(file), /line 2/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader accepts namespaced v3 entries", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  const file = join(dir, "v3.jsonl");
+  try {
+    writeFileSync(
+      file,
+      '{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}\n',
+      { mode: 0o600 },
+    );
+    assert.equal(extractReceipts(file).length, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects v3 entries without a complete namespace", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const [name, namespace] of [
+      ["missing-kind", '"writer_instance_id":"writer-a",'],
+      ["missing-writer", '"chain_kind":"recorder",'],
+    ]) {
+      const file = join(dir, `${name}.jsonl`);
+      writeFileSync(
+        file,
+        `{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s",${namespace}"type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => extractReceipts(file), /v3 (chain_kind|writer_instance_id) required/u);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects namespace fields on legacy entries", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  const file = join(dir, "v2-namespace.jsonl");
+  try {
+    writeFileSync(
+      file,
+      '{"v":2,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}\n',
+      { mode: 0o600 },
+    );
+    assert.throws(() => extractReceipts(file), /legacy entry cannot carry/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects NUL in legacy projected strings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const version of [1, 2]) {
+      const file = join(dir, `v${version}-nul.jsonl`);
+      writeFileSync(
+        file,
+        `${JSON.stringify({ v: version, seq: 0, ts: "2026-08-07T00:00:00Z", session_id: "x\0y", type: "checkpoint", transport: "x", summary: "", detail: {}, prev_hash: "genesis", hash: "h" })}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => extractReceipts(file), /cannot contain NUL/u);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader preserves legacy null compatibility", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const version of [1, 2]) {
+      const file = join(dir, `v${version}-null.jsonl`);
+      writeFileSync(
+        file,
+        `${JSON.stringify({ v: version, seq: 0, ts: "2026-08-07T00:00:00Z", session_id: "s", trace_id: null, type: "checkpoint", transport: "x", summary: "", detail: {}, prev_hash: "genesis", hash: "h" })}\n`,
+        { mode: 0o600 },
+      );
+      assert.doesNotThrow(() => extractReceipts(file));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects malformed legacy namespace field types", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const [name, value] of [
+      ["object", "{}"],
+      ["array", "[]"],
+      ["number", "1"],
+      ["boolean", "true"],
+    ]) {
+      const file = join(dir, `${name}.jsonl`);
+      writeFileSync(
+        file,
+        `{"v":2,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":${value},"type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => extractReceipts(file), /legacy entry cannot carry/u);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects NUL in every v3 projected string", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const field of [
+      "ts",
+      "session_id",
+      "chain_kind",
+      "writer_instance_id",
+      "trace_id",
+      "type",
+      "event_kind",
+      "transport",
+      "summary",
+      "raw_ref",
+      "prev_hash",
+    ]) {
+      const file = join(dir, `v3-nul-${field}.jsonl`);
+      const entry: Record<string, unknown> = {
+        v: 3,
+        seq: 0,
+        ts: "2026-08-07T00:00:00Z",
+        session_id: "s",
+        chain_kind: "recorder",
+        writer_instance_id: "writer-a",
+        type: "checkpoint",
+        transport: "x",
+        summary: "",
+        detail: {},
+        prev_hash: "genesis",
+        hash: "h",
+      };
+      entry[field] = "a\0b";
+      writeFileSync(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+      assert.throws(() => extractReceipts(file), new RegExp(`${field} cannot contain NUL`, "u"));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects v3 delimiter-collision pair", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  const file = join(dir, "v3-collision.jsonl");
+  try {
+    const base = {
+      v: 3,
+      seq: 0,
+      ts: "2026-08-07T00:00:00Z",
+      session_id: "s",
+      chain_kind: "recorder",
+      writer_instance_id: "writer-a",
+      type: "z",
+      transport: "x",
+      summary: "",
+      detail: {},
+      prev_hash: "genesis",
+      hash: "h",
+    };
+    const colliding = [
+      { ...base, trace_id: "x\0y", type: "z" },
+      { ...base, trace_id: "x", type: "y\0z" },
+    ];
+    writeFileSync(file, `${colliding.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
+      mode: 0o600,
+    });
+    assert.throws(() => extractReceipts(file), /trace_id cannot contain NUL/u);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects non-string v3 projected fields", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const field of ["ts", "session_id", "trace_id", "type", "prev_hash"]) {
+      const file = join(dir, `v3-type-${field}.jsonl`);
+      const entry: Record<string, unknown> = {
+        v: 3,
+        seq: 0,
+        ts: "2026-08-07T00:00:00Z",
+        session_id: "s",
+        chain_kind: "recorder",
+        writer_instance_id: "writer-a",
+        type: "checkpoint",
+        transport: "x",
+        summary: "",
+        prev_hash: "genesis",
+      };
+      entry[field] = 1;
+      writeFileSync(file, `${JSON.stringify(entry)}\n`, { mode: 0o600 });
+      assert.throws(() => extractReceipts(file), new RegExp(`${field} must be a string`, "u"));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects null and malformed v3 timestamps", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const [name, ts] of [
+      ["omitted", undefined],
+      ["null", null],
+      ["malformed", "not-a-time"],
+    ]) {
+      const file = join(dir, `v3-ts-${name}.jsonl`);
+      writeFileSync(
+        file,
+        `${JSON.stringify({ v: 3, seq: 0, ts, session_id: "s", chain_kind: "recorder", writer_instance_id: "writer-a", type: "checkpoint", transport: "x", summary: "", prev_hash: "genesis" })}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => extractReceipts(file), /ts required|recorder ts|ts must be a string/u);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader rejects invalid v3 sequences", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  try {
+    for (const [name, seqField] of [
+      ["missing", ""],
+      ["null", '"seq":null,'],
+      ["negative", '"seq":-1,'],
+      ["fractional", '"seq":1.5,'],
+      ["overflow", '"seq":18446744073709551616,'],
+    ]) {
+      const file = join(dir, `v3-seq-${name}.jsonl`);
+      writeFileSync(
+        file,
+        `{"v":3,${seqField}"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","type":"checkpoint","transport":"x","summary":"","prev_hash":"genesis"}\n`,
+        { mode: 0o600 },
+      );
+      assert.throws(() => extractReceipts(file), /v3 seq|exceeds cross-language exact range/u);
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("JSONL recorder reader preserves maximum uint64 v3 sequence", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pipelock-ts-verifier-"));
+  const file = join(dir, "v3-seq-max.jsonl");
+  try {
+    writeFileSync(
+      file,
+      '{"v":3,"seq":18446744073709551615,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","type":"checkpoint","transport":"x","summary":"","prev_hash":"genesis"}\n',
+      { mode: 0o600 },
+    );
+    const entries = readEntries(file);
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.seq, "18446744073709551615");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

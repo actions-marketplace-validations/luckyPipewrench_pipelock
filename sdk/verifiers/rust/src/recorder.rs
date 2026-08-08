@@ -35,12 +35,41 @@ pub fn read_entries(path: &Path) -> Result<Vec<serde_json::Value>> {
         reject_duplicate_keys(line)
             .map_err(|err| VerifierError::Invalid(format!("line {}: {}", index + 1, err)))?;
         let version = entry.get("v").and_then(serde_json::Value::as_u64);
-        if version != Some(1) && version != Some(2) {
+        if version != Some(1) && version != Some(2) && version != Some(3) {
             errors_unsupported(index + 1, version)?;
+        }
+        validate_projected_strings(&entry, index + 1, version.unwrap_or_default())?;
+        if version == Some(3)
+            && entry
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .is_none()
+        {
+            return Err(VerifierError::Runtime(format!(
+                "line {}: v3 seq must be an unsigned 64-bit integer",
+                index + 1
+            )));
+        }
+        if version != Some(3)
+            && (legacy_namespace_field_is_set(&entry, "chain_kind")
+                || legacy_namespace_field_is_set(&entry, "writer_instance_id"))
+        {
+            return Err(VerifierError::Invalid(format!(
+                "line {}: legacy entry cannot carry v3 recorder namespace fields",
+                index + 1
+            )));
         }
         entries.push(entry);
     }
     Ok(entries)
+}
+
+fn legacy_namespace_field_is_set(entry: &serde_json::Value, field: &str) -> bool {
+    match entry.get(field) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::String(value)) => !value.is_empty(),
+        Some(_) => true,
+    }
 }
 
 pub fn extract_receipts(path: &Path) -> Result<Vec<Receipt>> {
@@ -152,9 +181,68 @@ fn seq_start(path: &Path) -> Result<u64> {
 
 fn errors_unsupported(line: usize, version: Option<u64>) -> Result<()> {
     Err(VerifierError::Runtime(format!(
-        "line {line}: unsupported entry version {} (accepted: 1, 2)",
+        "line {line}: unsupported entry version {} (accepted: 1, 2, 3)",
         version.map_or_else(|| "null".to_string(), |value| value.to_string())
     )))
+}
+
+fn validate_projected_strings(entry: &serde_json::Value, line: usize, version: u64) -> Result<()> {
+    let mut fields = vec![
+        "ts",
+        "session_id",
+        "trace_id",
+        "type",
+        "event_kind",
+        "transport",
+        "summary",
+        "raw_ref",
+        "prev_hash",
+    ];
+    if version == 3 {
+        fields.extend(["chain_kind", "writer_instance_id"]);
+    }
+    for field in fields {
+        let missing = entry.get(field).is_none();
+        let value = match entry.get(field) {
+            None => "",
+            Some(value) => match value.as_str() {
+                Some(value) => value,
+                None if version != 3 => continue,
+                None => {
+                    return Err(VerifierError::Runtime(format!(
+                        "line {line}: v3 {field} must be a string"
+                    )))
+                }
+            },
+        };
+        let required = version == 3
+            && matches!(
+                field,
+                "ts" | "session_id"
+                    | "chain_kind"
+                    | "writer_instance_id"
+                    | "type"
+                    | "transport"
+                    | "summary"
+                    | "prev_hash"
+            );
+        let namespace_required = field == "chain_kind" || field == "writer_instance_id";
+        if (required && missing) || (version == 3 && namespace_required && value.is_empty()) {
+            return Err(VerifierError::Runtime(format!(
+                "line {line}: v3 {field} required"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(VerifierError::Runtime(format!(
+                "line {line}: v{version} {field} cannot contain NUL"
+            )));
+        }
+        if version == 3 && field == "ts" {
+            crate::aarp::envelope::validate_timestamp(value, "recorder ts")
+                .map_err(|err| VerifierError::Runtime(format!("line {line}: {err}")))?;
+        }
+    }
+    Ok(())
 }
 
 fn display_path(path: &Path) -> String {

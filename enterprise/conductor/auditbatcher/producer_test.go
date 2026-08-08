@@ -25,6 +25,154 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
+func TestHomogeneousRecorderNamespace(t *testing.T) {
+	base := recorder.Entry{Version: recorder.LatestEntryVersion, SessionID: "session-a", ChainKind: recorder.ChainKindRecorder, WriterInstanceID: "writer-a"}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*recorder.Entry)
+	}{
+		{"version", func(e *recorder.Entry) { e.Version = recorder.CurrentWriteEntryVersion }},
+		{"session_id", func(e *recorder.Entry) { e.SessionID = "session-b" }},
+		{"chain_kind", func(e *recorder.Entry) { e.ChainKind = "receipt" }},
+		{"writer_instance_id", func(e *recorder.Entry) { e.WriterInstanceID = "writer-b" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := base
+			tc.mutate(&changed)
+			if homogeneousRecorderNamespace([]recorder.Entry{base, changed}) {
+				t.Fatalf("homogeneousRecorderNamespace() = true after %s change", tc.name)
+			}
+		})
+	}
+	if !homogeneousRecorderNamespace([]recorder.Entry{base, base}) {
+		t.Fatal("homogeneousRecorderNamespace() = false for identical namespace")
+	}
+	legacy := recorder.Entry{Version: recorder.CurrentWriteEntryVersion}
+	if !homogeneousRecorderNamespace([]recorder.Entry{legacy, legacy}) {
+		t.Fatal("homogeneousRecorderNamespace() = false for v2 entries without namespace")
+	}
+}
+
+func TestRecorderNamespaceLimit(t *testing.T) {
+	known := make(map[string]struct{})
+	for i := 0; i < maxActiveRecorderNamespaces; i++ {
+		if !admitRecorderNamespace(known, fmt.Sprintf("v3-%d", i)) {
+			t.Fatalf("namespace %d rejected below limit", i)
+		}
+	}
+	if admitRecorderNamespace(known, "overflow") {
+		t.Fatal("namespace above limit accepted")
+	}
+	if !admitRecorderNamespace(known, "v3-0") {
+		t.Fatal("known namespace rejected at limit")
+	}
+}
+
+func TestProducerRejectsTransportUnsupportedV1Segment(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+	segment := checkpointSegment(0)
+	for i := range segment {
+		segment[i].Version = 1
+		p.ObserveRecorderEntry(segment[i])
+	}
+	for _, entry := range checkpointSegment(2) {
+		p.ObserveRecorderEntry(entry)
+	}
+	for _, entry := range namespacedCheckpointSegment(0, "writer-a") {
+		p.ObserveRecorderEntry(entry)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := q.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Pending != 1 || p.previousSegmentTail != "" {
+		t.Fatalf("v1 segment pending=%d tail=%q, want legacy quarantined and v3 pending", stats.Pending, p.previousSegmentTail)
+	}
+}
+
+func TestProducerRejectsLegacyNamespaceBeforeEnvelope(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+	segment := checkpointSegment(0)
+	for i := range segment {
+		segment[i].ChainKind = recorder.ChainKindRecorder
+		segment[i].WriterInstanceID = "unhashed"
+		p.ObserveRecorderEntry(segment[i])
+	}
+	for _, entry := range checkpointSegment(2) {
+		p.ObserveRecorderEntry(entry)
+	}
+	for _, entry := range namespacedCheckpointSegment(0, "writer-a") {
+		p.ObserveRecorderEntry(entry)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := q.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Pending != 1 || p.previousSegmentTail != "" {
+		t.Fatalf("invalid namespace pending=%d tail=%q, want legacy quarantined and v3 pending", stats.Pending, p.previousSegmentTail)
+	}
+	lease, err := q.Claim()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := lease.Batch.Envelope.Chain.WriterInstanceID; got != "writer-a" {
+		t.Fatalf("independent v3 writer = %q, want writer-a", got)
+	}
+}
+
+func TestProducerQuarantinesOnlyInvalidV3Namespace(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+	invalid := namespacedCheckpointSegment(0, "writer-bad")
+	for i := range invalid {
+		invalid[i].WriterInstanceID = ""
+		invalid[i].Hash = recorder.ComputeHash(invalid[i])
+		p.ObserveRecorderEntry(invalid[i])
+	}
+	for _, entry := range namespacedCheckpointSegment(0, "writer-good") {
+		p.ObserveRecorderEntry(entry)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := q.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Pending != 1 {
+		t.Fatalf("pending = %d, want independent valid namespace queued", stats.Pending)
+	}
+}
+
 func TestProducer_EnqueuesSignedCheckpointSegment(t *testing.T) {
 	auditPub, auditPriv, err := ed25519.GenerateKey(nil)
 	if err != nil {
@@ -77,6 +225,9 @@ func TestProducer_EnqueuesSignedCheckpointSegment(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	batch := lease.Batch
+	if batch.Envelope.Chain.SessionID != "" {
+		t.Fatalf("v2 chain session_id = %q, want omitted for wire compatibility", batch.Envelope.Chain.SessionID)
+	}
 	if err := batch.Envelope.VerifySignatures(func(id string) (conductor.SignatureKey, error) {
 		if id != "audit-key-1" {
 			return conductor.SignatureKey{}, errors.New("unknown key")
@@ -313,11 +464,10 @@ func TestProducer_AdvancesChainTailOnDroppedSegment(t *testing.T) {
 	}
 }
 
-// TestProducer_AdvancesTailAndRecordsMetricOnInvalidCheckpoint covers the
-// invalid-checkpoint drop path: the tail still advances (the recorder wrote
-// the checkpoint) and the drop metric carries the right reason. Nothing is
-// enqueued.
-func TestProducer_AdvancesTailAndRecordsMetricOnInvalidCheckpoint(t *testing.T) {
+// TestProducer_QuarantinesInvalidCheckpoint covers the fail-closed boundary:
+// an invalid checkpoint cannot become a trusted tail, and later entries in the
+// same namespace cannot be emitted with stale continuity.
+func TestProducer_QuarantinesInvalidCheckpoint(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(nil)
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -328,25 +478,126 @@ func TestProducer_AdvancesTailAndRecordsMetricOnInvalidCheckpoint(t *testing.T) 
 	}
 	metrics := &transportMetricsRecorder{}
 	p := newTestProducer(t, q, metrics, priv)
-	defer func() { _ = p.Close() }()
 
 	seg := checkpointSegment(0)
 	seg[1].Detail = recorder.CheckpointDetail{} // strip the checkpoint signature
-	if err := p.enqueueSegment(seg); err == nil {
-		t.Fatal("expected invalid checkpoint error")
+	for _, entry := range append(seg, checkpointSegment(2)...) {
+		p.ObserveRecorderEntry(entry)
 	}
-	if p.previousSegmentTail != seg[1].Hash {
-		t.Fatalf("tail not advanced on invalid checkpoint: %q", p.previousSegmentTail)
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if got := metrics.delivery["drop:invalid_checkpoint"]; got != 1 {
-		t.Fatalf("invalid_checkpoint drop metric = %d, want 1", got)
+	if p.previousSegmentTail != "" {
+		t.Fatalf("tail advanced from invalid checkpoint: %q", p.previousSegmentTail)
+	}
+	if got := metrics.delivery["drop:invalid_checkpoint"]; got != 2 {
+		t.Fatalf("invalid_checkpoint drop metric = %d, want 2", got)
 	}
 	stats, err := q.Stats()
 	if err != nil {
 		t.Fatalf("Stats: %v", err)
 	}
 	if stats.Pending != 0 {
-		t.Fatalf("pending = %d, want 0 (nothing enqueued)", stats.Pending)
+		t.Fatalf("pending = %d, want 0 after namespace quarantine", stats.Pending)
+	}
+}
+
+func TestProducer_AdvancesTailOnMixedNamespaceRejection(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+	defer func() { _ = p.Close() }()
+	seg := checkpointSegment(0)
+	seg[1].Version = recorder.LatestEntryVersion
+	seg[1].ChainKind = recorder.ChainKindRecorder
+	seg[1].WriterInstanceID = "writer-a"
+	if err := p.enqueueSegment(seg); err == nil {
+		t.Fatal("mixed namespace segment accepted")
+	}
+	key := recorderNamespaceKey(seg[1])
+	if got := p.previousSegmentTailFor(key); got != "" {
+		t.Fatalf("tail advanced after mixed namespace rejection: %q", got)
+	}
+}
+
+func TestProducer_IsolatesInterleavedV3Namespaces(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+
+	firstA := namespacedCheckpointSegment(0, "writer-a")
+	firstB := namespacedCheckpointSegment(0, "writer-b")
+	for _, entry := range []recorder.Entry{firstA[0], firstB[0], firstA[1], firstB[1]} {
+		p.ObserveRecorderEntry(entry)
+	}
+	secondA := namespacedCheckpointSegment(2, "writer-a")
+	secondB := namespacedCheckpointSegment(2, "writer-b")
+	for _, entry := range append(secondA, secondB...) {
+		p.ObserveRecorderEntry(entry)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPrevious := []string{"", "", firstA[1].Hash, firstB[1].Hash}
+	wantWriters := []string{"writer-a", "writer-b", "writer-a", "writer-b"}
+	for i := range wantPrevious {
+		lease, err := q.Claim()
+		if err != nil {
+			t.Fatalf("Claim batch %d: %v", i, err)
+		}
+		chain := lease.Batch.Envelope.Chain
+		if chain.WriterInstanceID != wantWriters[i] || chain.PreviousSegmentTail != wantPrevious[i] {
+			t.Fatalf("batch %d writer/tail = %q/%q, want %q/%q", i, chain.WriterInstanceID, chain.PreviousSegmentTail, wantWriters[i], wantPrevious[i])
+		}
+	}
+}
+
+func TestProducer_IsolatesInterleavedV3Sessions(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q, err := testOpen(t, Config{Dir: filepath.Join(t.TempDir(), "queue")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestProducer(t, q, &transportMetricsRecorder{}, priv)
+
+	first := namespacedCheckpointSegment(0, "writer-a")
+	second := namespacedCheckpointSegment(0, "writer-a")
+	for i := range first {
+		first[i].SessionID = "session-a"
+		second[i].SessionID = "session-b"
+	}
+	for _, entry := range []recorder.Entry{first[0], second[0], first[1], second[1]} {
+		p.ObserveRecorderEntry(entry)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, wantSession := range []string{"session-a", "session-b"} {
+		lease, err := q.Claim()
+		if err != nil {
+			t.Fatalf("Claim batch %d: %v", i, err)
+		}
+		chain := lease.Batch.Envelope.Chain
+		if chain.SessionID != wantSession || chain.PreviousSegmentTail != "" {
+			t.Fatalf("batch %d session/tail = %q/%q, want %q/empty", i, chain.SessionID, chain.PreviousSegmentTail, wantSession)
+		}
 	}
 }
 
@@ -457,8 +708,15 @@ func TestProducerHelpers(t *testing.T) {
 	if got := ed25519SignatureString("abc"); got != "ed25519:abc" {
 		t.Fatalf("unprefixed signature = %q", got)
 	}
-	if got := segmentID("", 1, 2); got != "segment-recorder-00000000000000000001-00000000000000000002" {
+	if got := segmentID(recorder.Entry{Sequence: 1}, 2); got != "segment-recorder-00000000000000000001-00000000000000000002" {
 		t.Fatalf("segmentID(empty) = %q", got)
+	}
+	entry := recorder.Entry{
+		Version: recorder.LatestEntryVersion, SessionID: "proxy", Sequence: 1,
+		ChainKind: recorder.ChainKindRecorder, WriterInstanceID: "writer-a",
+	}
+	if got := segmentID(entry, 2); got != "segment-proxy-840f4f71315f14ee-00000000000000000001-00000000000000000002" {
+		t.Fatalf("segmentID(v3) = %q", got)
 	}
 	if got := safeSegmentPart("a/b:c"); got != "abc" {
 		t.Fatalf("safeSegmentPart() = %q", got)
@@ -514,6 +772,16 @@ func checkpointSegment(start uint64) []recorder.Entry {
 		},
 	}
 	return []recorder.Entry{reg, cp}
+}
+
+func namespacedCheckpointSegment(start uint64, writer string) []recorder.Entry {
+	segment := checkpointSegment(start)
+	for i := range segment {
+		segment[i].Version = 3
+		segment[i].ChainKind = recorder.ChainKindRecorder
+		segment[i].WriterInstanceID = writer
+	}
+	return segment
 }
 
 func segmentHashHex(seed string) string {

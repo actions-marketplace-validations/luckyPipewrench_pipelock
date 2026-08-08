@@ -5,6 +5,8 @@ import { readFileSync, readdirSync, statSync } from "node:fs";
 import * as path from "node:path";
 import type { Receipt, RecorderEntry } from "./types.js";
 import { validateV1Receipt } from "./strict.js";
+import { validateTimestamp } from "./aarp/numbers.js";
+import { parseJSONStrict, RawNumber } from "./aarp/strictjson.js";
 import { InvalidError, RuntimeError, decodeUTF8, parseJSON, rejectDuplicateKeys } from "./util.js";
 
 const actionReceiptType = "action_receipt";
@@ -31,15 +33,93 @@ export function readEntries(file: string): RecorderEntry[] {
     const line = lines[i]?.trim() ?? "";
     if (line === "") continue;
     const entry = parseJSON<RecorderEntry>(line, `line ${i + 1}`);
-    rejectDuplicateKeys(line);
-    if (entry.v !== 1 && entry.v !== 2) {
+    if (entry.v !== 1 && entry.v !== 2 && entry.v !== 3) {
       throw new RuntimeError(
-        `line ${i + 1}: unsupported entry version ${String(entry.v)} (accepted: 1, 2)`,
+        `line ${i + 1}: unsupported entry version ${String(entry.v)} (accepted: 1, 2, 3)`,
+      );
+    }
+    if (entry.v === 3) {
+      entry.seq = validateV3Sequence(line, i + 1);
+    } else {
+      rejectDuplicateKeys(line);
+    }
+    validateProjectedStrings(entry, i + 1, entry.v);
+    if (
+      entry.v !== 3 &&
+      (legacyNamespaceFieldIsSet(entry.chain_kind) ||
+        legacyNamespaceFieldIsSet(entry.writer_instance_id))
+    ) {
+      throw new RuntimeError(
+        `line ${i + 1}: legacy entry cannot carry v3 recorder namespace fields`,
       );
     }
     entries.push(entry);
   }
   return entries;
+}
+
+function validateV3Sequence(rawLine: string, line: number): string {
+  const raw = parseJSONStrict(rawLine) as Record<string, unknown>;
+  const seq = raw.seq;
+  if (!(seq instanceof RawNumber) || !/^(?:0|[1-9][0-9]*)$/u.test(seq.literal)) {
+    throw new RuntimeError(`line ${line}: v3 seq must be an unsigned 64-bit integer`);
+  }
+  if (BigInt(seq.literal) > 18446744073709551615n) {
+    throw new RuntimeError(`line ${line}: v3 seq must be an unsigned 64-bit integer`);
+  }
+  return seq.literal;
+}
+
+function validateProjectedStrings(entry: RecorderEntry, line: number, version: number): void {
+  const fields: (keyof RecorderEntry)[] = [
+    "ts",
+    "session_id",
+    "trace_id",
+    "type",
+    "event_kind",
+    "transport",
+    "summary",
+    "raw_ref",
+    "prev_hash",
+  ];
+  if (version === 3) fields.push("chain_kind", "writer_instance_id");
+  for (const field of fields) {
+    const value = entry[field];
+    if (value !== undefined && typeof value !== "string") {
+      if (version !== 3) continue;
+      throw new RuntimeError(`line ${line}: v3 ${field} must be a string`);
+    }
+    const required =
+      version === 3 &&
+      [
+        "ts",
+        "session_id",
+        "chain_kind",
+        "writer_instance_id",
+        "type",
+        "transport",
+        "summary",
+        "prev_hash",
+      ].includes(field);
+    const namespaceRequired = field === "chain_kind" || field === "writer_instance_id";
+    if ((required && value === undefined) || (version === 3 && namespaceRequired && value === "")) {
+      throw new RuntimeError(`line ${line}: v3 ${field} required`);
+    }
+    if (typeof value === "string" && value.includes("\0")) {
+      throw new RuntimeError(`line ${line}: v${version} ${field} cannot contain NUL`);
+    }
+    if (version === 3 && field === "ts" && typeof value === "string") {
+      try {
+        validateTimestamp(value);
+      } catch (err) {
+        throw new RuntimeError(`line ${line}: recorder ts ${(err as Error).message}`);
+      }
+    }
+  }
+}
+
+function legacyNamespaceFieldIsSet(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== "";
 }
 
 export function extractReceipts(file: string): Receipt[] {

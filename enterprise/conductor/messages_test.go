@@ -19,6 +19,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/cli/presets"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"gopkg.in/yaml.v3"
 )
@@ -162,6 +163,84 @@ func TestAuditBatchEnvelope_ValidateV2ChainAndForkDetection(t *testing.T) {
 	nonOverlap.SeqEnd = batch.SeqEnd + 10
 	if batch.ForksWith(nonOverlap) {
 		t.Fatal("ForksWith() = true for non-overlapping seq range")
+	}
+}
+
+func TestEvidenceChainAcceptsNamespacedV3AndForksPerWriter(t *testing.T) {
+	chain := testAuditBatch().Chain
+	chain.EntryVersion = recorder.LatestEntryVersion
+	chain.SessionID = "session-a"
+	chain.ChainKind = recorder.ChainKindRecorder
+	chain.WriterInstanceID = "writer-a"
+	if err := chain.Validate(10, 20); err != nil {
+		t.Fatalf("Validate(v3) = %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*EvidenceChain)
+	}{
+		{"missing_chain_kind", func(c *EvidenceChain) { c.ChainKind = "" }},
+		{"missing_writer_instance_id", func(c *EvidenceChain) { c.WriterInstanceID = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			invalid := chain
+			tc.edit(&invalid)
+			if err := invalid.Validate(10, 20); !errors.Is(err, ErrMissingField) {
+				t.Fatalf("Validate() = %v, want ErrMissingField", err)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		edit func(*EvidenceChain)
+	}{
+		{"entry_version", func(c *EvidenceChain) { c.EntryVersion = recorder.CurrentWriteEntryVersion }},
+		{"session_id", func(c *EvidenceChain) { c.SessionID = "session-b" }},
+		{"chain_kind", func(c *EvidenceChain) { c.ChainKind = "import" }},
+		{"writer_instance_id", func(c *EvidenceChain) { c.WriterInstanceID = "writer-b" }},
+	} {
+		t.Run("separate_chain_"+tc.name, func(t *testing.T) {
+			first := testAuditBatch()
+			first.Chain = chain
+			second := first
+			tc.edit(&second.Chain)
+			second.PayloadSHA256 = testHash("20")
+			second.Chain.SegmentTailHash = testHash("21")
+			if first.ForksWith(second) {
+				t.Fatalf("ForksWith() = true across separate %s identity", tc.name)
+			}
+		})
+	}
+
+	t.Run("same_namespaced_chain_detects_fork", func(t *testing.T) {
+		first := testAuditBatch()
+		first.Chain = chain
+		second := first
+		second.PayloadSHA256 = testHash("20")
+		second.Chain.SegmentTailHash = testHash("21")
+		if !first.ForksWith(second) {
+			t.Fatal("ForksWith() = false for conflicting batches in the same v3 namespace")
+		}
+	})
+}
+
+func TestEvidenceChainRejectsVersionInappropriateNamespace(t *testing.T) {
+	legacy := testAuditBatch().Chain
+	legacy.EntryVersion = recorder.CurrentWriteEntryVersion
+	legacy.ChainKind = recorder.ChainKindRecorder
+	legacy.WriterInstanceID = "writer-a"
+	if err := legacy.Validate(legacy.SeqStart, legacy.SeqEnd); err == nil {
+		t.Fatal("EvidenceChain.Validate() accepted unhashed namespace on v2")
+	}
+
+	v3 := testAuditBatch().Chain
+	v3.EntryVersion = recorder.LatestEntryVersion
+	v3.ChainKind = ""
+	v3.WriterInstanceID = ""
+	if err := v3.Validate(v3.SeqStart, v3.SeqEnd); err == nil {
+		t.Fatal("EvidenceChain.Validate() accepted incomplete v3 namespace")
 	}
 }
 
@@ -1752,7 +1831,7 @@ func TestEvidenceChain_ValidateErrors(t *testing.T) {
 		edit func(*EvidenceChain)
 		want error
 	}{
-		{"wrong_entry_version", func(c *EvidenceChain) { c.EntryVersion = 3 }, ErrInvalidSequenceRange},
+		{"wrong_entry_version", func(c *EvidenceChain) { c.EntryVersion = 4 }, ErrInvalidSequenceRange},
 		{"missing_segment", func(c *EvidenceChain) { c.SegmentID = "" }, ErrMissingField},
 		{"seq_mismatch", func(c *EvidenceChain) { c.SeqStart++ }, ErrInvalidSequenceRange},
 		{"bad_hash", func(c *EvidenceChain) { c.CheckpointHash = "bad" }, ErrInvalidHash},
