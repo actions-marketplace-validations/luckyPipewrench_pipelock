@@ -69,6 +69,35 @@ func TestEvidenceCorpusAuditorRenderersQuotePathsAndRemainOutOfBand(t *testing.T
 	}
 }
 
+// TestEvidenceCorpusAuditorAlertRemediationNamesAShippedSurface keeps the
+// annotation honest. It previously told the operator to "stop evidence export",
+// and Pipelock ships no evidence-export surface to stop: `pipelock evidence`
+// offers view, expire, serve, verify-cert and doctor, so the instruction was
+// advisory against whatever external workflow the operator had built. A
+// remediation that names a control the product does not have teaches operators
+// the alert is not worth reading. The remediation must point at something that
+// actually exists, and `evidence doctor` is the command this same file's
+// service unit already runs.
+func TestEvidenceCorpusAuditorAlertRemediationNamesAShippedSurface(t *testing.T) {
+	alert := renderEvidenceCorpusAuditorAlert()
+	if strings.Contains(alert, "evidence export") {
+		t.Fatalf("corpus alert instructs an evidence-export control that does not ship:\n%s", alert)
+	}
+	// The full command, not the bare phrase: `evidence doctor` alone would still
+	// match a remediation that named no binary or omitted the required
+	// directory argument, which is the same half-usable instruction this
+	// annotation was rewritten to stop giving.
+	if !strings.Contains(alert, "pipelock evidence doctor DIR") {
+		t.Fatalf("corpus alert remediation is not the runnable command:\n%s", alert)
+	}
+	// The other half of the remediation: damage to the corpus says something
+	// about evidence already handed out, and an operator who is not told that
+	// has no reason to revisit it.
+	if !strings.Contains(alert, "Treat this corpus as unverified for any evidence already published or handed to an auditor") {
+		t.Fatalf("corpus alert does not tell operators to treat already-published evidence as unverified:\n%s", alert)
+	}
+}
+
 func TestEvidenceCorpusAuditorRerunRepairsManagedTimerButRefusesUnmanagedFile(t *testing.T) {
 	home := t.TempDir()
 	configPath := filepath.Join(home, "pipelock.yaml")
