@@ -775,6 +775,9 @@ func TestApplyConductorPolicyBundleReloadsAndActivates(t *testing.T) {
 	oldCfg := s.proxy.CurrentConfig()
 	oldCfg.FetchProxy.Listen = "127.0.0.1:18897"
 	oldCfg.ForwardProxy.Enabled = true
+	sniOn := true
+	oldCfg.ForwardProxy.SNIVerification = &sniOn
+	oldCfg.ForwardProxy.SNIRequireTLS = &sniOn
 	oldCfg.WebSocketProxy.Enabled = true
 	oldCfg.MCPInputScanning.Enabled = true
 	oldCfg.MCPToolScanning.Enabled = true
@@ -801,6 +804,12 @@ func TestApplyConductorPolicyBundleReloadsAndActivates(t *testing.T) {
 	oldCfg.MCPSessionBinding.Enabled = true
 	oldCfg.A2AScanning.Enabled = true
 	oldCfg.A2AScanning.Action = config.ActionBlock
+	oldCfg.A2AScanning.RequireSignedAgentCards = true
+	oldCfg.A2AScanning.TrustedAgentCardKeys = []config.A2ATrustedCardKey{{
+		KeyID:          "follower-agent-card",
+		PublicKey:      hex.EncodeToString(signer.pub),
+		AllowedOrigins: []string{"https://agent.vendor.example"},
+	}}
 	oldCfg.ToolChainDetection.Enabled = true
 	oldCfg.CrossRequestDetection.Enabled = true
 	oldCfg.CrossRequestDetection.Action = config.ActionBlock
@@ -812,6 +821,24 @@ func TestApplyConductorPolicyBundleReloadsAndActivates(t *testing.T) {
 	oldCfg.AddressProtection.Enabled = true
 	oldCfg.AddressProtection.Action = config.ActionBlock
 	oldCfg.AddressProtection.UnknownAction = config.ActionBlock
+	oldCfg.FlightRecorder.RequireReceipts = true
+	oldCfg.MCPBinaryIntegrity.Enabled = true
+	oldCfg.MCPBinaryIntegrity.ManifestPath = "/etc/pipelock/mcp-integrity.json"
+	oldCfg.MCPBinaryIntegrity.RequireSignature = true
+	oldCfg.MCPBinaryIntegrity.TrustedSigner = "follower-release"
+	// Non-default values for the remaining inputs, so the whole-struct
+	// comparison below can actually detect them being cleared. Left at their
+	// zero values they would compare equal either way and prove nothing.
+	oldCfg.MCPBinaryIntegrity.SignaturePath = "/etc/pipelock/mcp-integrity.json.sig"
+	oldCfg.MCPBinaryIntegrity.Keystore = "/var/lib/pipelock/mcp-keystore"
+	oldCfg.MediationEnvelope.VerifyInbound.Enabled = true
+	oldCfg.MediationEnvelope.VerifyInbound.TrustList = []config.MediationEnvelopeTrustedKey{{
+		KeyID:     "follower-mediator",
+		PublicKey: hex.EncodeToString(signer.pub),
+	}}
+	requireIntermediate := true
+	oldCfg.LicenseRequireIntermediate = &requireIntermediate
+	oldCfg.LicenseRequireIntermediateResolved = true
 	oldCfg.FileSentry.Enabled = true
 	oldCfg.FileSentry.Action = config.ActionBlock
 	oldCfg.FileSentry.WatchPaths = []config.WatchPath{{Path: "/tmp/pipelock-watch"}}
@@ -901,6 +928,43 @@ func TestApplyConductorPolicyBundleReloadsAndActivates(t *testing.T) {
 	}
 	if live.Emit.Syslog.Address != oldCfg.Emit.Syslog.Address {
 		t.Fatalf("emit.syslog.address = %q, want preserved %q", live.Emit.Syslog.Address, oldCfg.Emit.Syslog.Address)
+	}
+	for _, required := range []struct {
+		name string
+		got  bool
+	}{
+		{"flight_recorder.require_receipts", live.FlightRecorder.RequireReceipts},
+		{"a2a_scanning.require_signed_agent_cards", live.A2AScanning.Enabled && live.A2AScanning.RequireSignedAgentCards},
+		{"mcp_binary_integrity.require_signature", live.MCPBinaryIntegrity.Enabled && live.MCPBinaryIntegrity.RequireSignature},
+		{"mediation_envelope.verify_inbound.enabled", live.MediationEnvelope.VerifyInbound.Enabled},
+		{"license_require_intermediate", live.LicenseRequireIntermediateResolved},
+		{"forward_proxy.sni_require_tls", live.ForwardProxy.SNIVerificationEnabled() && live.ForwardProxy.SNIRequireTLSEnabled()},
+	} {
+		t.Run(required.name, func(t *testing.T) {
+			if !required.got {
+				t.Fatalf("enforcement-only conductor bundle cleared follower-local %s", required.name)
+			}
+		})
+	}
+	// The booleans above are necessary and not sufficient. Each one gates a
+	// check whose MEANING comes from local trust material, so a bundle that
+	// left every flag true while clearing the keys, the manifest path, or the
+	// inbound trust list would pass the loop and still change who is
+	// authorized, or deny everything. Assert the material itself.
+	if !reflect.DeepEqual(live.A2AScanning.TrustedAgentCardKeys, oldCfg.A2AScanning.TrustedAgentCardKeys) {
+		t.Fatalf("a2a trusted agent card keys = %+v, want preserved %+v",
+			live.A2AScanning.TrustedAgentCardKeys, oldCfg.A2AScanning.TrustedAgentCardKeys)
+	}
+	// Whole struct, not a chosen pair of fields: naming two inputs leaves a
+	// reload free to clear SignaturePath or Keystore while the assertion still
+	// passes, which is the same subset problem this block was added to fix.
+	if !reflect.DeepEqual(live.MCPBinaryIntegrity, oldCfg.MCPBinaryIntegrity) {
+		t.Fatalf("mcp binary integrity = %+v, want preserved %+v",
+			live.MCPBinaryIntegrity, oldCfg.MCPBinaryIntegrity)
+	}
+	if !reflect.DeepEqual(live.MediationEnvelope.VerifyInbound, oldCfg.MediationEnvelope.VerifyInbound) {
+		t.Fatalf("mediation inbound verification = %+v, want preserved %+v",
+			live.MediationEnvelope.VerifyInbound, oldCfg.MediationEnvelope.VerifyInbound)
 	}
 	if !reflect.DeepEqual(live.Sandbox, oldCfg.Sandbox) {
 		t.Fatalf("sandbox config = %+v, want preserved %+v", live.Sandbox, oldCfg.Sandbox)

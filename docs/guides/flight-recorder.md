@@ -15,6 +15,27 @@ and forensic replay.
 
 **On by default.** `enabled` defaults to `true` so receipts are available out of the box ("verify the boundary"). It only *records* once a `dir` is configured, and because `sign_checkpoints` defaults to `true` a signing key is required alongside it unless you opt into an unsigned recorder with `sign_checkpoints: false`. Without a `dir` the recorder is inert and writes nothing, so the default flip never breaks an existing config. `pipelock init` generates a recorder directory and an Ed25519 signing key and writes them into the config, which is what makes receipts live. Receipt emission is best-effort by default; set `require_receipts: true` when allow-path receipt failures must fail closed before traffic is forwarded.
 
+## Whole-Corpus Auditor
+
+On Linux, `pipelock init` installs and enables the user-systemd
+`pipelock-evidence-corpus-auditor.timer`. Every 15 minutes it runs
+`pipelock evidence doctor` across the configured recorder directory and writes
+`pipelock_evidence_corpus_integrity_ok` plus its audit timestamp in Prometheus
+textfile format. The generated alert rule is
+`PipelockEvidenceCorpusIntegrityFailed` under
+`$XDG_CONFIG_HOME/pipelock/prometheus/rules/`.
+
+Point the Prometheus node-exporter textfile collector at
+`$XDG_CONFIG_HOME/pipelock/prometheus/textfile/`, and add a rule-file GLOB such
+as `$XDG_CONFIG_HOME/pipelock/prometheus/rules/*` to Prometheus `rule_files`.
+`rule_files` accepts file paths and globs, not directories, so naming the
+directory alone loads no rules and the alert never fires. The alert fires for
+damage, an incomplete scan, a stale audit, or no metric. Stop evidence export for
+investigation; the auditor never gates proxy requests. A process-local
+`require_receipts` failure can
+still stop that process's own mediated actions, but a different writer's
+historical damage cannot.
+
 ## What Gets Recorded
 
 The recorder captures two categories of evidence:
@@ -96,8 +117,18 @@ Two operational notes:
   emitter every request would fail closed, so `pipelock run` and
   `pipelock mcp proxy` **refuse to start** in that state rather than serve an
   all-blocked proxy. `require_receipts` is hot-reloadable, but because the
-  recorder is built once at startup, enabling it via reload without a recorder
-  only logs a warning — restart with a recorder configured to actually use it.
+  recorder is built once at startup, what a reload does depends on whether a
+  recorder and `signing_key_path` were bound at startup:
+    - **Neither bound:** enabling it is **ignored**. Pipelock writes a warning to
+      stderr and the audit channel, then keeps the previous setting. Restart with
+      a configured recorder to enable receipt enforcement.
+    - **Both bound, emitter unhealthy or absent:** reload rebuilds the emitter,
+      whether receipts are already required or are being enabled by this reload.
+      A successful rebuild applies the setting. A failed rebuild rejects the whole
+      reload and keeps the existing setting, so an enable attempted in this state
+      is refused rather than ignored.
+  Turning `require_receipts` **off** through a reload is rejected in every case
+  and takes a restart, because it is a required security contract.
 - **An allowed request that is later blocked carries two receipts.** The
   pre-egress allow receipt attests the egress *decision*; if response scanning
   then blocks the reply, a block receipt is emitted under the **same
@@ -290,10 +321,12 @@ Fields:
 
 | Field | Description |
 |-------|-------------|
-| `v` | Schema version. Readers must reject unknown versions. |
+| `v` | Schema version. This release writes v2 and reads v1, v2, and v3. Readers reject other versions. |
 | `seq` | Monotonically increasing sequence number within the session. |
 | `ts` | RFC 3339 timestamp with nanosecond precision. |
 | `session_id` | Proxy session identifier. |
+| `chain_kind` | v3 chain namespace kind. Omitted from v1 and v2 records. |
+| `writer_instance_id` | v3 per-process namespace claim. Omitted from v1 and v2 records. This field separates cooperating writers; it does not authenticate the writer. |
 | `type` | Entry type: `decision`, `checkpoint`. |
 | `transport` | Proxy transport: `fetch`, `forward`, `connect`, `websocket`, `mcp-stdio`, `mcp-http`. |
 | `summary` | One-line human-readable description. |
@@ -304,13 +337,17 @@ Fields:
 
 ## Hash Chain
 
-The hash covers all entry fields joined with null-byte separators:
+Each schema version has a frozen field projection joined with null-byte separators. V1 uses:
 
-```
+```text
 SHA256(v \0 seq \0 ts \0 session_id \0 trace_id \0 type \0 transport \0 summary \0 detail_json \0 raw_ref \0 prev_hash)
 ```
 
-The first entry in a writer chain has `prev_hash: "genesis"`. Each subsequent entry's `prev_hash` must equal the `hash` of the previous entry from that writer. Any gap, deletion, modification, or concurrent-writer fork breaks the chain. Current releases do not reject multiple processes sharing a recorder directory; run `pipelock evidence doctor DIR` when a verifier reports a `prev_hash` mismatch to surface the structural damage for investigation. The doctor reports symptoms rather than causes; a concurrent-writer fork and a deliberate edit can produce the same structure.
+V2 inserts `event_kind` after `type`. V3 inserts `chain_kind` and
+`writer_instance_id` after `session_id`. The recorder continues writing v2
+during the reader-first compatibility window.
+
+The first entry in a writer chain has `prev_hash: "genesis"`. Each subsequent entry's `prev_hash` must equal the `hash` of the previous entry from that writer. Any gap, deletion, modification, or concurrent-writer fork breaks the chain. Current releases do not reject multiple processes sharing a recorder directory. The whole-corpus auditor installed by `pipelock init` detects the resulting damage; run `pipelock evidence doctor DIR` manually when investigating its alert. The doctor reports symptoms rather than causes; a concurrent-writer fork and a deliberate edit can produce the same structure.
 
 To verify a chain:
 
@@ -378,8 +415,11 @@ When `raw_escrow: true`, the unredacted detail is preserved in an encrypted side
 Raw escrow writes an encrypted sidecar file alongside each evidence entry:
 
 ```
-evidence-abc123-42.raw.enc
+evidence-abc123-42-raw-4b6f5a8c9d0e1f23456789abcdef0123.raw.enc
 ```
+
+The final 32-hex-character token is generated for each payload. It keeps
+sidecars distinct when multiple recorder processes share a session and sequence.
 
 The sidecar is encrypted with X25519 NaCl box using an ephemeral key pair. The format is:
 

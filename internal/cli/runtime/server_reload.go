@@ -162,14 +162,40 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 			newCfg.FlightRecorder.EvidenceHealth.MaxAnchorLag = evidenceHealth.MaxAnchorLag
 			newCfg.FlightRecorder.Anchor = anchorCfg
 		}
-		// require_receipts reloads freely, but it only has a live emitter to
-		// gate on when one was built at Start (the recorder is restart-only).
-		// Enabling it without one fails every request closed with
-		// receipt_emission_failed. Warn loudly; the value still applies so the
-		// posture is honest (fail-closed), but restart with a configured
-		// recorder is the real fix.
+		// require_receipts reloads freely, but it only has an emitter to gate on
+		// when a recorder was built at Start (the recorder is restart-only).
+		// Enabling it without one fails EVERY request closed with
+		// receipt_emission_failed - a total egress black-hole from a config
+		// edit. NewServer already refuses to start in exactly that state
+		// (server.go, "instead of as an all-403 outage at runtime"); honouring
+		// it on reload produced the outage startup exists to prevent, so the
+		// enable is ignored here and joins its restart-only recorder siblings.
+		//
+		// This is not a downgrade. No emitter means no receipt is written
+		// either way, so the alternative is not "receipts enforced" but "no
+		// traffic at all"; the reachable outcomes are unreceipted traffic or
+		// none. Restarting with a configured recorder is what actually grants
+		// the operator's intent, and the startup guard then enforces it hard.
+		//
+		// Scoped to the ENABLE transition when no restart-time recorder backing
+		// exists. If the recorder and key are already bound but the current
+		// emitter is absent or unhealthy, proxy.Reload stages a replacement
+		// emitter before publishing the config. Let that recovery run: it either
+		// installs a healthy emitter and applies the enable atomically or rejects
+		// the reload while the old posture remains live.
 		if newCfg.FlightRecorder.RequireReceipts && !s.liveReceiptEmitterReady() {
-			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_receipts is enabled but no healthy live signed receipt emitter exists — every request will fail closed with receipt_emission_failed. Configure flight_recorder.dir + signing_key_path, fix any receipt-chain resume error, and restart.\n")
+			if oldCfg.FlightRecorder.RequireReceipts {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_receipts is enabled but the current signed receipt emitter is unhealthy — the reload will attempt to rebuild it and will be rejected if recovery fails; the required posture remains fail-closed.\n")
+			} else if s.recorder == nil || strings.TrimSpace(newCfg.FlightRecorder.SigningKeyPath) == "" {
+				attemptedHash := newCfg.Hash()
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_receipts cannot be enabled at runtime without a healthy live signed receipt emitter — the recorder is built at startup, so every request would fail closed with receipt_emission_failed. Ignoring (restart required). Configure flight_recorder.dir + signing_key_path, fix any receipt-chain resume error, and restart.\n")
+				// Surface to the audit channel as well as stderr: an operator
+				// who asked for receipt enforcement and did not get it must be
+				// able to see that from a monitoring tool, not only from a
+				// process's stderr.
+				s.logger.LogConfigReload("ignored", "require_receipts enable without live receipt emitter restart-only", attemptedHash)
+				newCfg.FlightRecorder.RequireReceipts = oldCfg.FlightRecorder.RequireReceipts
+			}
 		}
 		// Block file_sentry changes via reload. The watcher is built
 		// once at Start from the startup snapshot; reloading would
@@ -406,7 +432,7 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		// Block downgrades from strict mode and from explicit "required"
 		// security contracts. A required evidence/signature mode should not
 		// keep forwarding under a warning-only weakening reload.
-		if reason := reloadDowngradeRejectReason(oldCfg, warnings); reason != "" {
+		if reason := reloadDowngradeRejectReason(oldCfg, newCfg, warnings); reason != "" {
 			rejectErr := fmt.Errorf("rejected: security downgrade from %s", reason)
 			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
 			return rejectErr
@@ -646,8 +672,79 @@ func implausibleReloadTeardownReasons(oldCfg, newCfg *config.Config) []string {
 	return reasons
 }
 
-func reloadDowngradeRejectReason(oldCfg *config.Config, warnings []config.ReloadWarning) string {
-	if oldCfg == nil || len(warnings) == 0 {
+// requiredModeTeardowns reports the "required" security contracts that this
+// reload turns OFF, comparing the old and candidate configs DIRECTLY.
+//
+// It exists because the rejection below is otherwise reachable only through
+// warning emission, in a different package, that nobody is forced to write. That
+// coupling is what let a reload silently clear an active
+// flight_recorder.require_receipts: reloadDowngradeRejectReason already NAMED
+// the field in the reason it reports, and the field was in the required list
+// below, but config.ValidateReload emitted no ReloadWarning for it, so
+// hasRejectableDowngradeWarning never saw one and the whole gate was
+// unreachable outside strict mode. Everything about it read as coverage in
+// review. It checked nothing.
+//
+// It is not only defence in depth. It was written as such, on the belief that
+// every contract already had a warning, and then re-deriving the list from the
+// schema turned up forward_proxy.sni_require_tls, which had none and was
+// therefore a live silent downgrade. The lesson is in the mechanism: this list
+// was first seeded by COPYING the required list below, so it inherited that
+// list's blind spot exactly. Add to it by re-deriving from the schema, never by
+// copying an existing list.
+//
+// The value of comparing directly is that it cannot be forgotten. A contract
+// added here fails closed on its own transition, with no second edit in a second
+// package to remember.
+//
+// Runs AFTER the restart-only preservation earlier in Reload, so newCfg already
+// holds the effective candidate values. A field preserved as restart-only (the
+// license require-intermediate set) therefore compares equal and never fires.
+func requiredModeTeardowns(oldCfg, newCfg *config.Config) []string {
+	if oldCfg == nil || newCfg == nil {
+		return nil
+	}
+	var torn []string
+	tornDown := func(field string, oldRequired, newRequired bool) {
+		if oldRequired && !newRequired {
+			torn = append(torn, field)
+		}
+	}
+	tornDown("flight_recorder.require_receipts",
+		oldCfg.FlightRecorder.RequireReceipts, newCfg.FlightRecorder.RequireReceipts)
+	tornDown("license_require_intermediate",
+		oldCfg.LicenseRequireIntermediateResolved, newCfg.LicenseRequireIntermediateResolved)
+	tornDown("a2a_scanning.require_signed_agent_cards",
+		oldCfg.A2AScanning.Enabled && oldCfg.A2AScanning.RequireSignedAgentCards,
+		newCfg.A2AScanning.Enabled && newCfg.A2AScanning.RequireSignedAgentCards)
+	tornDown("mcp_binary_integrity.require_signature",
+		oldCfg.MCPBinaryIntegrity.Enabled && oldCfg.MCPBinaryIntegrity.RequireSignature,
+		newCfg.MCPBinaryIntegrity.Enabled && newCfg.MCPBinaryIntegrity.RequireSignature)
+	tornDown("mediation_envelope.verify_inbound.enabled",
+		oldCfg.MediationEnvelope.VerifyInbound.Enabled, newCfg.MediationEnvelope.VerifyInbound.Enabled)
+	// sni_require_tls refuses to splice an opaque CONNECT tunnel when the
+	// client sends no TLS or a ClientHello with no SNI extension. Such a tunnel
+	// bypasses DLP entirely, so switching it off hands the agent a one-tunnel
+	// exfiltration channel. It was absent from the pre-existing required list
+	// this helper was seeded from, and a balanced reload silently applied the
+	// teardown. Parent-gated: forward.go only consults it inside the SNI
+	// verification branch, so verification being off means it was never in force.
+	tornDown("forward_proxy.sni_require_tls",
+		oldCfg.ForwardProxy.SNIVerificationEnabled() && oldCfg.ForwardProxy.SNIRequireTLSEnabled(),
+		newCfg.ForwardProxy.SNIVerificationEnabled() && newCfg.ForwardProxy.SNIRequireTLSEnabled())
+	return torn
+}
+
+func reloadDowngradeRejectReason(oldCfg, newCfg *config.Config, warnings []config.ReloadWarning) string {
+	if oldCfg == nil {
+		return ""
+	}
+	// Independent of warning emission: a required contract being torn down is
+	// itself the rejection, whether or not anyone wrote a warning for it.
+	if torn := requiredModeTeardowns(oldCfg, newCfg); len(torn) > 0 {
+		return "required security mode (" + strings.Join(torn, ", ") + ")"
+	}
+	if len(warnings) == 0 {
 		return ""
 	}
 	if oldCfg.Mode == config.ModeStrict {
@@ -657,6 +754,13 @@ func reloadDowngradeRejectReason(oldCfg *config.Config, warnings []config.Reload
 		return ""
 	}
 
+	// Fallback path: some OTHER non-advisory downgrade is in play, and this
+	// reports which required contracts are in force to explain why it is
+	// refused. It deliberately lists what is ACTIVE, not what was torn down —
+	// requiredModeTeardowns above owns teardown detection and has already
+	// returned by the time any contract here is being dismantled. Do not treat
+	// this as the authoritative contract list; it is shorter, and seeding a new
+	// list from it is what hid forward_proxy.sni_require_tls.
 	var required []string
 	if oldCfg.FlightRecorder.RequireReceipts {
 		required = append(required, "flight_recorder.require_receipts")

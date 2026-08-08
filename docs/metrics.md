@@ -128,6 +128,8 @@ health sampler is not measuring that fact in the current runtime.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `pipelock_evidence_local_recorder_operational` | gauge | (none) | One when this process's recorder and emitter are running with no locally observed sequence gap, self-audit failure, or ungated fsync failure. This does not check for a competing writer, prove corpus-wide integrity, or award an AEL grade. |
+| `pipelock_evidence_corpus_integrity_ok` | textfile gauge | (none) | One when the most recent complete deployment-managed whole-corpus audit found no structural damage. `pipelock init` installs the producer as a user-systemd timer; Prometheus must scrape its configured textfile directory. This metric never gates proxy traffic. |
+| `pipelock_evidence_corpus_last_audit_timestamp_seconds` | textfile gauge | (none) | Unix timestamp of the most recent whole-corpus audit. The generated corpus-integrity alert treats an audit older than 30 minutes as unhealthy. |
 | `pipelock_evidence_current_ael` | gauge | (none) | **Deprecated.** Always `NaN` (not a number). A live process cannot independently grade its own in-memory state. The series remains for one compatibility window so dashboards fail visibly instead of silently changing meaning. |
 | `pipelock_evidence_ael_requirement_ok` | gauge | `requirement` | **Deprecated.** Diagnostic inputs from the former live AEL estimate. Requirement labels are `recorder_enabled`, `emitter_healthy`, `durability_gate`, `heartbeats`, `anchoring_fresh`, `cpc_active`, and `selfaudit_ok`. These values do not award an AEL grade. |
 | `pipelock_evidence_chain_head_seq` | gauge | (none) | Last emitted in-memory receipt sequence, omitted when evidence health is not measured. |
@@ -148,6 +150,9 @@ The `/stats` endpoint also includes a nullable `evidence_health` object. In the
   window. The string is deliberate: numeric clients fail visibly instead of
   silently turning JSON `null` into the valid-looking number zero.
 - `local_recorder_operational` is the same process-local status as the new gauge.
+- `requirements.heartbeats` becomes true only after this process has recorded a
+  heartbeat. A fresh process is pending until its first scheduled heartbeat;
+  the generated corpus alert does not consume this process-local diagnostic.
 - `run_state` is `OPEN` while the recorder process is running. `run_id` is `null`
   until bounded per-run recording exists. These are lifecycle facts, not
   verification states.
@@ -176,7 +181,7 @@ metrics are both observability and enforcement context.
 | `pipelock_session_escalations_total` | counter | `from`, `to` | Escalation events by session enforcement level transition (e.g. `elevated` → `high`, `high` → `critical`). These transitions feed adaptive enforcement decisions on later requests. |
 | `pipelock_sessions_active` | gauge | (none) | Currently tracked sessions. |
 | `pipelock_sessions_evicted_total` | counter | (none) | Sessions evicted by TTL or capacity limit. |
-| `pipelock_adaptive_sessions_current` | gauge | `level` | Currently escalated sessions by enforcement level. |
+| `pipelock_adaptive_sessions_current` | gauge | `level` | Currently escalated sessions. Each logical session is counted once at its strongest effective global or destination-scoped level. |
 | `pipelock_session_auto_deescalation_total` | counter | `from`, `to` | Autonomous time-based session de-escalations. |
 
 ## Adaptive Enforcement Metrics
@@ -406,6 +411,11 @@ in this document.
 
 Example Prometheus alert rules are available at
 [`examples/prometheus/pipelock-alerts.yaml`](../examples/prometheus/pipelock-alerts.yaml).
+`pipelock init` also writes the corpus-integrity rule named
+`PipelockEvidenceCorpusIntegrityFailed` to
+`$XDG_CONFIG_HOME/pipelock/prometheus/rules/`. Include that directory through
+Prometheus `rule_files`; its metric comes from the textfile collector path
+described in the [Flight Recorder Guide](guides/flight-recorder.md#whole-corpus-auditor).
 See the [SIEM Integration Guide](guides/siem-integration.md) for
 Alertmanager routing and automated response patterns.
 

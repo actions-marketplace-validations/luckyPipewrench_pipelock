@@ -17,6 +17,14 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+struct TempFixture(std::path::PathBuf);
+
+impl Drop for TempFixture {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 const V2_GOLDEN_PUBLIC_KEY: &str =
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
 const V2_PRIVATE_SEED_HEX: &str = concat!(
@@ -722,6 +730,231 @@ fn recorder_extraction_rejects_duplicate_keys_inside_receipt_detail() {
     let err = extract_receipts(&path).expect_err("duplicate key should reject");
     let _ = fs::remove_file(&path);
     assert!(err.to_string().contains("duplicate object key"));
+}
+
+#[test]
+fn recorder_reader_accepts_namespaced_v3_entries() {
+    let fixture = TempFixture(recorder_fixture_path("v3-valid"));
+    let path = &fixture.0;
+    let line = r#"{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}"#;
+    fs::write(path, format!("{line}\n")).expect("write JSONL");
+    let receipts = extract_receipts(path).expect("v3 entry should parse");
+    assert!(receipts.is_empty());
+}
+
+#[test]
+fn recorder_reader_rejects_v3_entries_without_complete_namespace() {
+    for (name, namespace, expected) in [
+        (
+            "v3-missing-kind",
+            r#""writer_instance_id":"writer-a","#,
+            "chain_kind required",
+        ),
+        (
+            "v3-missing-writer",
+            r#""chain_kind":"recorder","#,
+            "writer_instance_id required",
+        ),
+    ] {
+        let fixture = TempFixture(recorder_fixture_path(name));
+        let path = &fixture.0;
+        let line = format!(
+            r#"{{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s",{namespace}"type":"checkpoint","transport":"x","summary":"","detail":{{}},"prev_hash":"genesis","hash":"h"}}"#
+        );
+        fs::write(path, format!("{line}\n")).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("incomplete v3 namespace should reject");
+        assert!(err.to_string().contains(expected), "{err}");
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_namespace_fields_on_legacy_entries() {
+    let fixture = TempFixture(recorder_fixture_path("v2-namespace"));
+    let path = &fixture.0;
+    let line = r#"{"v":2,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","type":"checkpoint","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}"#;
+    fs::write(path, format!("{line}\n")).expect("write JSONL");
+    let err = extract_receipts(path).expect_err("legacy namespace should reject");
+    assert!(err.to_string().contains("legacy entry cannot carry"));
+}
+
+#[test]
+fn recorder_reader_rejects_nul_in_legacy_projected_strings() {
+    for version in [1, 2] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v{version}-nul")));
+        let path = &fixture.0;
+        let entry = serde_json::json!({
+            "v": version, "seq": 0, "ts": "2026-08-07T00:00:00Z", "session_id": "x\0y",
+            "type": "checkpoint", "transport": "x", "summary": "", "detail": {},
+            "prev_hash": "genesis", "hash": "h"
+        });
+        fs::write(path, format!("{}\n", entry)).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("legacy NUL should reject");
+        assert!(err.to_string().contains("cannot contain NUL"));
+    }
+}
+
+#[test]
+fn recorder_reader_preserves_legacy_null_compatibility() {
+    for version in [1, 2] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v{version}-null")));
+        let path = &fixture.0;
+        let entry = serde_json::json!({
+            "v": version, "seq": 0, "ts": "2026-08-07T00:00:00Z", "session_id": "s",
+            "trace_id": null, "type": "checkpoint", "transport": "x", "summary": "",
+            "detail": {}, "prev_hash": "genesis", "hash": "h"
+        });
+        fs::write(path, format!("{}\n", entry)).expect("write JSONL");
+        extract_receipts(path).expect("legacy null should remain accepted");
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_malformed_legacy_namespace_types() {
+    for (name, value) in [
+        ("object", "{}"),
+        ("array", "[]"),
+        ("number", "1"),
+        ("boolean", "true"),
+    ] {
+        let fixture = TempFixture(recorder_fixture_path(name));
+        let path = &fixture.0;
+        let line = format!(
+            r#"{{"v":2,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":{value},"type":"checkpoint","transport":"x","summary":"","detail":{{}},"prev_hash":"genesis","hash":"h"}}"#
+        );
+        fs::write(path, format!("{line}\n")).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("malformed legacy namespace should reject");
+        assert!(err.to_string().contains("legacy entry cannot carry"));
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_nul_in_every_v3_projected_string() {
+    for field in [
+        "ts",
+        "session_id",
+        "chain_kind",
+        "writer_instance_id",
+        "trace_id",
+        "type",
+        "event_kind",
+        "transport",
+        "summary",
+        "raw_ref",
+        "prev_hash",
+    ] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v3-nul-{field}")));
+        let path = &fixture.0;
+        let mut entry = serde_json::json!({
+            "v": 3, "seq": 0, "ts": "2026-08-07T00:00:00Z", "session_id": "s",
+            "chain_kind": "recorder", "writer_instance_id": "writer-a", "type": "checkpoint",
+            "transport": "x", "summary": "", "detail": {}, "prev_hash": "genesis", "hash": "h"
+        });
+        entry[field] = serde_json::Value::String("a\0b".to_string());
+        fs::write(path, format!("{}\n", entry)).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("NUL projected field should reject");
+        assert!(err
+            .to_string()
+            .contains(&format!("{field} cannot contain NUL")));
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_v3_delimiter_collision_pair() {
+    let fixture = TempFixture(recorder_fixture_path("v3-collision"));
+    let path = &fixture.0;
+    let first = r#"{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","trace_id":"x\u0000y","type":"z","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}"#;
+    let second = r#"{"v":3,"seq":0,"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","trace_id":"x","type":"y\u0000z","transport":"x","summary":"","detail":{},"prev_hash":"genesis","hash":"h"}"#;
+    fs::write(path, format!("{first}\n{second}\n")).expect("write JSONL");
+    let err = extract_receipts(path).expect_err("delimiter collision should reject");
+    assert!(err.to_string().contains("trace_id cannot contain NUL"));
+}
+
+#[test]
+fn recorder_reader_rejects_non_string_v3_projected_fields() {
+    for field in ["ts", "session_id", "trace_id", "type", "prev_hash"] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v3-type-{field}")));
+        let path = &fixture.0;
+        let mut entry = serde_json::json!({
+            "v": 3, "seq": 0, "ts": "2026-08-07T00:00:00Z", "session_id": "s",
+            "chain_kind": "recorder", "writer_instance_id": "writer-a", "type": "checkpoint",
+            "transport": "x", "summary": "", "prev_hash": "genesis"
+        });
+        entry[field] = serde_json::json!(1);
+        fs::write(path, format!("{}\n", entry)).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("non-string projected field should reject");
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{field} must be a string")),
+            "field {field}: {message}"
+        );
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_null_and_malformed_v3_timestamps() {
+    for (name, timestamp) in [
+        ("omitted", None),
+        ("null", Some(serde_json::Value::Null)),
+        ("malformed", Some(serde_json::json!("not-a-time"))),
+    ] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v3-ts-{name}")));
+        let path = &fixture.0;
+        let mut entry = serde_json::json!({
+            "v": 3, "seq": 0, "session_id": "s", "chain_kind": "recorder",
+            "writer_instance_id": "writer-a", "type": "checkpoint", "transport": "x",
+            "summary": "", "prev_hash": "genesis"
+        });
+        if let Some(timestamp) = timestamp {
+            entry["ts"] = timestamp;
+        }
+        fs::write(path, format!("{}\n", entry)).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("invalid timestamp should reject");
+        assert!(
+            err.to_string().contains("ts required")
+                || err.to_string().contains("timestamp")
+                || err.to_string().contains("ts must be a string")
+        );
+    }
+}
+
+#[test]
+fn recorder_reader_rejects_invalid_v3_sequences() {
+    for (name, seq) in [
+        ("missing", None),
+        ("null", Some("null")),
+        ("negative", Some("-1")),
+        ("fractional", Some("1.5")),
+        ("overflow", Some("18446744073709551616")),
+    ] {
+        let fixture = TempFixture(recorder_fixture_path(&format!("v3-seq-{name}")));
+        let path = &fixture.0;
+        let seq_field = seq.map_or_else(String::new, |value| format!(r#""seq":{value},"#));
+        let line = format!(
+            r#"{{"v":3,{seq_field}"ts":"2026-08-07T00:00:00Z","session_id":"s","chain_kind":"recorder","writer_instance_id":"writer-a","type":"checkpoint","transport":"x","summary":"","prev_hash":"genesis"}}"#
+        );
+        fs::write(path, format!("{line}\n")).expect("write JSONL");
+        let err = extract_receipts(path).expect_err("invalid v3 seq should reject");
+        assert!(
+            err.to_string().contains("seq")
+                || (name == "overflow"
+                    && (err.to_string().contains("number out of range")
+                        || err
+                            .to_string()
+                            .contains("exceeds cross-language exact range"))),
+            "{name}: {err}"
+        );
+    }
+}
+
+fn recorder_fixture_path(name: &str) -> std::path::PathBuf {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "pipelock-rs-verifier-{name}-{}-{suffix}.jsonl",
+        std::process::id()
+    ))
 }
 
 fn build_evidence_chain(count: usize) -> Vec<Value> {

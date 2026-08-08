@@ -7,7 +7,7 @@ Manual-trigger AI security review for pull requests. Comment `/review` on any PR
 | Command | Model | Use When |
 |---------|-------|----------|
 | `/review` | Efficient (default: gpt-5.6-luna, low reasoning) | Quick check, most PRs |
-| `/review deep` | Balanced (default: gpt-5.6-terra, medium reasoning) | Complex changes, security-sensitive code |
+| `/review deep` | Balanced (default: gpt-5.6-terra, xhigh reasoning) | Adversarial static-diff review (findings-first) |
 
 ## What It Reviews
 
@@ -22,7 +22,17 @@ The reviewer is tuned for Pipelock's security model. It flags:
 - Logging or audit gaps
 - Prompt injection escape vectors
 
-It ignores style nits and generic suggestions. If nothing is wrong, it says so explicitly.
+It ignores style nits and generic suggestions. `/review deep` separately checks
+production states, failure direction, blast radius, approach, sibling patterns,
+test vacuity, predecessor fixes, self-produced artifacts, availability, and
+honest convergence. A fixed scope banner says that no tests or repository-wide
+search ran; the review does not replace CodeQL or CI.
+The ten questions are an internal checklist; the posted comment is a concise,
+findings-first report rather than ten narrated sections. It uses `Findings` and
+`Audit coverage` headings and targets fewer than 1,200 words without dropping
+independently material findings. The workflow validates that shape before
+posting, retries one malformed response for correction, and fails closed if the
+replacement still violates the contract.
 
 ## Setup
 
@@ -78,9 +88,9 @@ PR_REVIEW_MODEL_FAST=groq/llama-3.3-70b-versatile
 ## Cost Control
 
 - Only runs when manually triggered (no auto-review on push)
-- Diff is truncated to ~100k chars (~25k tokens) to cap costs
+- Standard reviews truncate diffs at 100k characters; deep reviews allow 200k
 - `/review` uses the efficient model by default
-- `/review deep` is opt-in for thorough analysis
+- `/review deep` is opt-in for the xhigh adversarial pass
 
 ## Files
 

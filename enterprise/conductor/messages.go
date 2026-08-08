@@ -403,6 +403,9 @@ type StreamSwitchAuthorization struct {
 
 type EvidenceChain struct {
 	EntryVersion           int    `json:"entry_version"`
+	SessionID              string `json:"session_id,omitempty"`
+	ChainKind              string `json:"chain_kind,omitempty"`
+	WriterInstanceID       string `json:"writer_instance_id,omitempty"`
 	SegmentID              string `json:"segment_id"`
 	SeqStart               uint64 `json:"seq_start"`
 	SeqEnd                 uint64 `json:"seq_end"`
@@ -1377,15 +1380,52 @@ func (a AuditBatchEnvelope) ForksWith(other AuditBatchEnvelope) bool {
 	if a.OrgID != other.OrgID || a.FleetID != other.FleetID || a.InstanceID != other.InstanceID {
 		return false
 	}
+	if !auditChainIdentityEqual(a.Chain, other.Chain) {
+		return false
+	}
 	if a.SeqEnd < other.SeqStart || other.SeqEnd < a.SeqStart {
 		return false
 	}
 	return a.PayloadSHA256 != other.PayloadSHA256 || a.Chain.SegmentTailHash != other.Chain.SegmentTailHash
 }
 
+func auditChainIdentityEqual(a, b EvidenceChain) bool {
+	aNamespaced := recorder.EntryVersionHasNamespace(a.EntryVersion)
+	bNamespaced := recorder.EntryVersionHasNamespace(b.EntryVersion)
+	if aNamespaced != bNamespaced {
+		return false
+	}
+	if !aNamespaced {
+		return true
+	}
+	return a.EntryVersion == b.EntryVersion && a.SessionID == b.SessionID && a.ChainKind == b.ChainKind && a.WriterInstanceID == b.WriterInstanceID
+}
+
+// IsSupportedAuditEntryVersion reports whether audit transport accepts version.
+func IsSupportedAuditEntryVersion(version int) bool {
+	return version == 2 || recorder.EntryVersionHasNamespace(version)
+}
+
+// SupportedAuditEntryVersions returns the versions advertised to followers.
+func SupportedAuditEntryVersions() []int { return []int{2, 3} }
+
 func (c EvidenceChain) Validate(seqStart, seqEnd uint64) error {
-	if c.EntryVersion != 2 {
+	if !IsSupportedAuditEntryVersion(c.EntryVersion) {
 		return fmt.Errorf("%w: entry_version=%d", ErrInvalidSequenceRange, c.EntryVersion)
+	}
+	if recorder.EntryVersionHasNamespace(c.EntryVersion) {
+		if err := validateIdentifier("chain.session_id", c.SessionID); err != nil {
+			return err
+		}
+		if err := validateIdentifier("chain.chain_kind", c.ChainKind); err != nil {
+			return err
+		}
+		if err := validateIdentifier("chain.writer_instance_id", c.WriterInstanceID); err != nil {
+			return err
+		}
+	}
+	if err := recorder.ValidateEntryNamespace(c.EntryVersion, c.ChainKind, c.WriterInstanceID); err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidSequenceRange, err)
 	}
 	if err := validateIdentifier("chain.segment_id", c.SegmentID); err != nil {
 		return err
@@ -1452,13 +1492,13 @@ func (c CapabilitiesResponse) ValidateWithLocalThresholdCap(maxThreshold int) er
 			return err
 		}
 	}
-	// Couple to recorder.EntryVersion - the version the local recorder
-	// actively WRITES - so a recorder bump (v2→v3) automatically tightens
-	// the handshake instead of leaving this stranded on a hardcoded "2".
+	// Couple to the version the local recorder actively writes, not the latest
+	// version its readers accept. A reader-first bump must not strand older
+	// conductors during a rolling upgrade.
 	// Conductor must advertise that version or the follower can never produce
 	// ingestable batches.
-	if !slices.Contains(c.ReceiptEntryVersions, recorder.EntryVersion) {
-		return fmt.Errorf("%w: receipt_entry_versions must include recorder write version %d", ErrInvalidState, recorder.EntryVersion)
+	if !slices.Contains(c.ReceiptEntryVersions, recorder.CurrentWriteEntryVersion) {
+		return fmt.Errorf("%w: receipt_entry_versions must include recorder write version %d", ErrInvalidState, recorder.CurrentWriteEntryVersion)
 	}
 	if c.MaxCreatedSkewSeconds <= 0 || time.Duration(c.MaxCreatedSkewSeconds)*time.Second > MaxAllowedAuditSkew {
 		return fmt.Errorf("%w: max_created_skew_seconds=%d", ErrSkewExceeded, c.MaxCreatedSkewSeconds)

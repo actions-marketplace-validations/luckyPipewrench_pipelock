@@ -791,7 +791,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 // Steps:
 //  1. Parse the inbound Pipelock-Mediation header to recover the
 //     original envelope fields we want to preserve (Actor, ActorAuth,
-//     ReceiptID, AuthorityKind, SessionTaint, TaskID, Action).
+//     ReceiptID, SessionTaint, TaskID, RequiresReauth, Verdict).
 //  2. Increment Hop.
 //  3. Derive fresh body bytes via req.GetBody when the redirect
 //     preserves method + body (307/308). On method-switching
@@ -828,7 +828,7 @@ func (p *Proxy) refreshEnvelopeForRedirect(req *http.Request, via []*http.Reques
 	actx := newHTTPAuditContext(p.logger, req.Method, req.URL.String(), clientIP, requestID, agentName)
 
 	// 1. Parse the ORIGINAL envelope. Identity fields (Actor,
-	//    ActorAuth, ReceiptID, Authority, Taint, TaskID, RequiresReauth)
+	//    ActorAuth, ReceiptID, Taint, TaskID, RequiresReauth)
 	//    are immutable across a redirect chain, so we always read
 	//    them from the first request in the chain. In the live
 	//    CheckRedirect path via[] is always non-empty and via[0] is
@@ -845,18 +845,41 @@ func (p *Proxy) refreshEnvelopeForRedirect(req *http.Request, via []*http.Reques
 		prev    envelope.Envelope
 		rawPrev string
 	)
+	// Read every value, not just the first. Header.Get returns only the
+	// first, so a sequence like ["", "not a dictionary ((("] would read as
+	// empty and take the no-prior-envelope path, silently reclassifying a
+	// malformed mediation header as an absent one and skipping the block
+	// below. A genuinely absent header is still the legitimate first-hop
+	// case; a header that is PRESENT but empty or repeated is ambiguous
+	// about which envelope governs this chain, so it fails closed.
+	priorHeader := envelope.HeaderName
+	var priorValues []string
 	if len(via) > 0 {
-		rawPrev = via[0].Header.Get(envelope.HeaderName)
+		priorValues = via[0].Header.Values(priorHeader)
 	} else {
-		rawPrev = req.Header.Get(envelope.HeaderName)
+		priorValues = req.Header.Values(priorHeader)
+	}
+	if len(priorValues) > 1 {
+		return newRedirectEnvelopeBlockedRequest(
+			fmt.Errorf("prior envelope header repeated %d times", len(priorValues)),
+		)
+	}
+	if len(priorValues) == 1 {
+		rawPrev = priorValues[0]
+		if strings.TrimSpace(rawPrev) == "" {
+			return newRedirectEnvelopeBlockedRequest(
+				errors.New("prior envelope header present but empty"),
+			)
+		}
 	}
 	if rawPrev != "" {
 		parsed, parseErr := envelope.Parse(rawPrev)
 		if parseErr != nil {
 			p.logger.LogAnomaly(actx, "",
 				fmt.Sprintf("envelope refresh: parsing prior envelope failed: %v", parseErr), 0.1)
-			// Fall through with zero-value prev - the refresh will
-			// still install a new envelope.
+			return newRedirectEnvelopeBlockedRequest(
+				fmt.Errorf("parsing prior envelope: %w", parseErr),
+			)
 		} else {
 			prev = parsed
 		}
@@ -918,9 +941,11 @@ func (p *Proxy) refreshEnvelopeForRedirect(req *http.Request, via []*http.Reques
 	req.Header.Del("Content-Digest")
 
 	// 5. Rebuild BuildOpts from prev + redirect context. Preserve
-	//    Actor / ActorAuth / ReceiptID / AuthorityKind / SessionTaint
-	//    / TaskID from the original envelope so the redirect chain
-	//    threads through as one logical action. Recompute Action
+	//    Actor / ActorAuth / ReceiptID / SessionTaint / TaskID from
+	//    the original envelope so the redirect chain threads through
+	//    as one logical action. Do not carry authority: it grants
+	//    permission for the original action and destination, neither
+	//    of which describes this redirected hop. Recompute Action
 	//    from the new method because the redirect could have
 	//    downgraded a POST to a GET (303).
 	actionID := prev.ReceiptID
@@ -938,8 +963,6 @@ func (p *Proxy) refreshEnvelopeForRedirect(req *http.Request, via []*http.Reques
 		ActorAuth:      prev.ActorAuth,
 		SessionTaint:   prev.SessionTaint,
 		TaskID:         prev.TaskID,
-		AuthorityKind:  prev.AuthorityKind,
-		AuthorityRef:   prev.AuthorityRef,
 		RequiresReauth: prev.RequiresReauth,
 		PolicyHash:     envelope.PolicyHashFromHex(cfg.CanonicalPolicyHash()),
 	}
@@ -1324,7 +1347,7 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 	// recorder's outer hash chain provides tamper-evidence across restarts.
 	resumeSeq, resumePrev := p.v2EmitterPtr.Load().ChainState()
 	currentKeyHex := fmt.Sprintf("%x", privKey.Public().(ed25519.PublicKey))
-	if current := p.receiptEmitterPtr.Load(); current != nil && current.InitError() == nil && current.SignerKeyHex() == currentKeyHex {
+	if current := p.receiptEmitterPtr.Load(); current != nil && current.InitError() == nil && current.HealthError() == nil && current.SignerKeyHex() == currentKeyHex {
 		v2 := p.v2EmitterPtr.Load()
 		if v2 == nil {
 			v2 = proxydecision.NewEmitter(proxydecision.EmitterConfig{

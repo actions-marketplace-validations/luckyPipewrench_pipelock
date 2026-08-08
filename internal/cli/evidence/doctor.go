@@ -5,15 +5,16 @@ package evidence
 
 import (
 	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -96,6 +97,7 @@ type doctorChainRef struct {
 
 type evidenceDoctor struct {
 	dir           string
+	location      recorder.EvidenceLocation
 	filesRead     int
 	findings      []evidenceDoctorFinding
 	truncated     bool
@@ -108,6 +110,7 @@ type evidenceDoctor struct {
 }
 
 func doctorCmd() *cobra.Command {
+	var prometheusTextfile string
 	cmd := &cobra.Command{
 		Use:   "doctor DIR",
 		Short: "Detect structural damage in a flight-recorder evidence directory",
@@ -121,9 +124,16 @@ can use it in CI.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			report, err := runEvidenceDoctor(args[0])
 			if err != nil {
+				if writeErr := writeEvidenceCorpusMetric(prometheusTextfile, false); writeErr != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, writeErr)
+				}
 				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
 			}
 			printEvidenceDoctorReport(cmd, report)
+			healthy := !report.Damaged() && report.Conclusive()
+			if err := writeEvidenceCorpusMetric(prometheusTextfile, healthy); err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+			}
 			if report.Damaged() {
 				return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("evidence doctor found structural damage"))
 			}
@@ -135,7 +145,48 @@ can use it in CI.`,
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&prometheusTextfile, "prometheus-textfile", "", "write the corpus-integrity result in Prometheus textfile format")
 	return cmd
+}
+
+// writeEvidenceCorpusMetric publishes the result of a whole-corpus audit for a
+// Prometheus textfile collector. It deliberately lives on the doctor command,
+// outside every proxy process: another writer's damaged historical branch must
+// alert operators without becoming an in-band request gate.
+func writeEvidenceCorpusMetric(path string, healthy bool) error {
+	if strings.TrimSpace(path) == "" {
+		return nil
+	}
+	value := 0
+	if healthy {
+		value = 1
+	}
+	data := fmt.Sprintf("# HELP pipelock_evidence_corpus_integrity_ok One when the most recent complete whole-corpus evidence audit found no structural damage.\n# TYPE pipelock_evidence_corpus_integrity_ok gauge\npipelock_evidence_corpus_integrity_ok %d\n# HELP pipelock_evidence_corpus_last_audit_timestamp_seconds Unix timestamp of the most recent whole-corpus evidence audit.\n# TYPE pipelock_evidence_corpus_last_audit_timestamp_seconds gauge\npipelock_evidence_corpus_last_audit_timestamp_seconds %d\n", value, time.Now().Unix())
+	cleanPath := filepath.Clean(path)
+	if err := os.MkdirAll(filepath.Dir(cleanPath), 0o750); err != nil {
+		return fmt.Errorf("creating Prometheus textfile directory: %w", err)
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(cleanPath), ".pipelock-evidence-corpus-*.prom")
+	if err != nil {
+		return fmt.Errorf("creating Prometheus textfile: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.WriteString(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("writing Prometheus textfile: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("setting Prometheus textfile mode: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("closing Prometheus textfile: %w", err)
+	}
+	if err := os.Rename(tmpName, cleanPath); err != nil {
+		return fmt.Errorf("installing Prometheus textfile: %w", err)
+	}
+	return nil
 }
 
 func runEvidenceDoctor(dir string) (evidenceDoctorReport, error) {
@@ -148,25 +199,43 @@ func runEvidenceDoctor(dir string) (evidenceDoctorReport, error) {
 		return evidenceDoctorReport{}, fmt.Errorf("%q is not a directory", dir)
 	}
 
-	d := &evidenceDoctor{
-		dir:          cleanDir,
-		sidecarFiles: make(map[string]struct{}),
-		receiptRefs:  make(map[string][]doctorChainRef),
-		escrowRefs:   make(map[string][]doctorEntryRef),
+	locations, err := recorder.DiscoverEvidenceLocations(cleanDir)
+	if err != nil {
+		// Discovery failures are structural evidence findings, not command
+		// configuration errors. Preserve the doctor's established fail-closed
+		// report contract for an unreadable evidence root.
+		return evidenceDoctorReport{
+			Dir: cleanDir,
+			Findings: []evidenceDoctorFinding{{
+				Kind:    "directory_read_error",
+				Message: "discover evidence locations: " + err.Error(),
+			}},
+		}, nil
 	}
-	d.scan()
-	return evidenceDoctorReport{
-		Dir:           cleanDir,
-		FilesRead:     d.filesRead,
-		Findings:      d.findings,
-		Truncated:     d.truncated,
-		ScanTruncated: d.scanTruncated,
-		FilesSkipped:  d.filesSkipped,
-	}, nil
+	if len(locations) == 0 {
+		locations = []recorder.EvidenceLocation{{Root: cleanDir, Dir: cleanDir}}
+	}
+	report := evidenceDoctorReport{Dir: cleanDir}
+	for _, location := range locations {
+		d := &evidenceDoctor{
+			dir:          location.Dir,
+			location:     location,
+			sidecarFiles: make(map[string]struct{}),
+			receiptRefs:  make(map[string][]doctorChainRef),
+			escrowRefs:   make(map[string][]doctorEntryRef),
+		}
+		d.scan()
+		report.FilesRead += d.filesRead
+		report.Findings = append(report.Findings, d.findings...)
+		report.Truncated = report.Truncated || d.truncated
+		report.ScanTruncated = report.ScanTruncated || d.scanTruncated
+		report.FilesSkipped += d.filesSkipped
+	}
+	return report, nil
 }
 
 func (d *evidenceDoctor) scan() {
-	dirEntries, skipped, err := readEvidenceDoctorDir(d.dir)
+	dirEntries, skipped, err := readEvidenceDoctorDir(d.location)
 	if err != nil {
 		d.addFinding("directory_read_error", "read evidence directory: "+err.Error())
 		return
@@ -187,7 +256,7 @@ func (d *evidenceDoctor) scan() {
 		name := entry.Name()
 		switch {
 		case isDoctorEvidenceJSONL(name):
-			jsonlFiles = append(jsonlFiles, filepath.Join(d.dir, name))
+			jsonlFiles = append(jsonlFiles, name)
 		case isDoctorRawSidecar(name):
 			d.sidecarFiles[name] = struct{}{}
 		}
@@ -209,49 +278,38 @@ func (d *evidenceDoctor) scan() {
 	d.detectReceiptDamage()
 }
 
-func readEvidenceDoctorDir(dir string) ([]os.DirEntry, int, error) {
-	directory, err := os.Open(filepath.Clean(dir))
+func readEvidenceDoctorDir(location recorder.EvidenceLocation) ([]os.DirEntry, int, error) {
+	dirEntries, err := recorder.ReadEvidenceLocationEntries(location)
 	if err != nil {
 		return nil, 0, err
 	}
-	defer func() { _ = directory.Close() }()
-
 	out := make([]os.DirEntry, 0)
 	skipped := 0
-	for {
-		dirEntries, readErr := directory.ReadDir(128)
-		for _, de := range dirEntries {
-			if de.IsDir() {
+	for _, de := range dirEntries {
+		if de.IsDir() {
+			continue
+		}
+		name := de.Name()
+		if isDoctorEvidenceJSONL(name) || isDoctorRawSidecar(name) {
+			if len(out) >= maxEvidenceDoctorFiles {
+				skipped++
 				continue
 			}
-			name := de.Name()
-			if isDoctorEvidenceJSONL(name) || isDoctorRawSidecar(name) {
-				if len(out) >= maxEvidenceDoctorFiles {
-					skipped++
-					continue
-				}
-				out = append(out, de)
-			}
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			return nil, 0, readErr
+			out = append(out, de)
 		}
 	}
 	return out, skipped, nil
 }
 
-func (d *evidenceDoctor) scanJSONL(path string) {
-	data, err := recorder.ReadEvidenceFileBounded(path, recorder.MaxEvidenceReadFileBytes)
+func (d *evidenceDoctor) scanJSONL(name string) {
+	data, err := recorder.ReadEvidenceLocationFileBounded(d.location, name, recorder.MaxEvidenceReadFileBytes)
 	if err != nil {
-		d.addFinding("file_read_error", fmt.Sprintf("%s: %v", filepath.Base(path), err))
+		d.addFinding("file_read_error", fmt.Sprintf("%s: %v", name, err))
 		return
 	}
 	entries, err := recorder.ReadEntriesFromReader(bytes.NewReader(data))
 	if err != nil {
-		d.addFinding("malformed_jsonl", fmt.Sprintf("%s: %v", filepath.Base(path), err))
+		d.addFinding("malformed_jsonl", fmt.Sprintf("%s: %v", name, err))
 		return
 	}
 	d.filesRead++
@@ -260,7 +318,7 @@ func (d *evidenceDoctor) scanJSONL(path string) {
 		// Report it rather than letting it contribute nothing: an emptied or
 		// truncated shard produces no refs, so every downstream linkage check
 		// would silently pass over it.
-		d.addFinding("empty_evidence_file", fmt.Sprintf("%s: contains no entries", filepath.Base(path)))
+		d.addFinding("empty_evidence_file", fmt.Sprintf("%s: contains no entries", name))
 		return
 	}
 	for _, entry := range entries {
@@ -273,11 +331,11 @@ func (d *evidenceDoctor) scanJSONL(path string) {
 		if computed != entry.Hash {
 			d.addFinding("entry_hash_mismatch", fmt.Sprintf(
 				"%s seq %d: stored hash %s does not match contents (computed %s)",
-				filepath.Base(path), entry.Sequence, shortDoctorHash(entry.Hash), shortDoctorHash(computed)))
+				name, entry.Sequence, shortDoctorHash(entry.Hash), shortDoctorHash(computed)))
 		}
 		ref := doctorEntryRef{
 			Session: entry.SessionID,
-			File:    filepath.Base(path),
+			File:    name,
 			Seq:     entry.Sequence,
 			// Linkage is checked against the recomputed hash so a tampered
 			// record cannot present a self-consistent chain.
@@ -289,7 +347,7 @@ func (d *evidenceDoctor) scanJSONL(path string) {
 		if entry.RawRef != "" {
 			d.escrowRefs[entry.RawRef] = append(d.escrowRefs[entry.RawRef], ref)
 		}
-		d.scanReceiptEntry(path, entry)
+		d.scanReceiptEntry(name, entry)
 	}
 }
 
@@ -601,6 +659,10 @@ func parseDoctorEvidenceName(name, suffix string) (string, uint64, bool) {
 	rest := strings.TrimPrefix(name, "evidence-")
 	rest = strings.TrimSuffix(rest, suffix)
 	lastDash := strings.LastIndex(rest, "-")
+	if tokenStart := strings.LastIndex(rest, "-raw-"); suffix == ".raw.enc" && tokenStart >= 0 && isDoctorEscrowNameToken(rest[tokenStart+len("-raw-"):]) {
+		rest = rest[:tokenStart]
+		lastDash = strings.LastIndex(rest, "-")
+	}
 	if lastDash < 0 {
 		return "", 0, false
 	}
@@ -613,6 +675,14 @@ func parseDoctorEvidenceName(name, suffix string) (string, uint64, bool) {
 		return "", 0, false
 	}
 	return sessionID, seq, true
+}
+
+func isDoctorEscrowNameToken(token string) bool {
+	if len(token) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(token)
+	return err == nil
 }
 
 func uniquePrevHashes(refs []doctorEntryRef) map[string]struct{} {

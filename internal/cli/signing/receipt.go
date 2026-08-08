@@ -23,6 +23,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/fleetreceipt"
 	"github.com/luckyPipewrench/pipelock/internal/posture"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	sigutil "github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
@@ -33,6 +34,7 @@ func VerifyReceiptCmd() *cobra.Command {
 	var expectedKeys []string
 	var chainDir string
 	var sessionID string
+	var locationID string
 	var allowUnpinned bool
 	var fleetReport bool
 	var cleanReport string
@@ -115,6 +117,9 @@ Examples:
 				verifyOpts.RotationEndorsements = append(verifyOpts.RotationEndorsements, endorsement)
 			}
 			if fleetReport {
+				if locationID != "" {
+					return fmt.Errorf("--location requires --chain")
+				}
 				if chainDir != "" {
 					return fmt.Errorf("--fleet-report cannot be combined with --chain")
 				}
@@ -124,15 +129,23 @@ Examples:
 				return verifyFleetReportWithOptions(out, args[0], trustedKeys, allowUnpinned)
 			}
 			if chainDir != "" {
-				if cleanReport == "" {
-					return verifyChainFromSessionDirDetailed(out, chainDir, sessionID, trustedKeys, verifyOpts)
+				location, locationErr := recorder.ResolveEvidenceLocation(chainDir, locationID)
+				if locationErr != nil {
+					return fmt.Errorf("extracting session receipts: resolve evidence location: %w", locationErr)
 				}
-				receipts, extractErr := receipt.ExtractReceiptsFromSessionDir(chainDir, sessionID)
+				chainDir = location.Dir
+				if cleanReport == "" {
+					return verifyChainFromResolvedSessionDirDetailed(out, location, sessionID, trustedKeys, verifyOpts)
+				}
+				receipts, extractErr := receipt.ExtractReceiptsFromResolvedSessionDir(location, sessionID)
 				if extractErr != nil {
 					return fmt.Errorf("extracting session receipts: %w", extractErr)
 				}
 				label := fmt.Sprintf("%s (session %s)", chainDir, sessionID)
 				return verifyCleanReport(out, label, receipts, trustedKeys, allowUnpinned, cleanReport)
+			}
+			if locationID != "" {
+				return fmt.Errorf("--location requires --chain")
 			}
 
 			path := args[0]
@@ -161,6 +174,7 @@ Examples:
 	cmd.Flags().StringArrayVar(&expectedKeys, "key", nil, "trusted signer public key (hex or file path); repeat for rotated chains")
 	cmd.Flags().StringVar(&chainDir, "chain", "", "verify the full receipt chain from an evidence directory")
 	cmd.Flags().StringVar(&sessionID, "session", "proxy", "receipt chain session ID inside the evidence directory")
+	cmd.Flags().StringVar(&locationID, "location", "", "location path relative to the evidence directory")
 	cmd.Flags().BoolVar(&allowUnpinned, "allow-unpinned", false, "allow structural-only verification without a trusted signer key")
 	cmd.Flags().BoolVar(&fleetReport, "fleet-report", false, "verify a Fleet Receipt Report DSSE envelope")
 	cmd.Flags().StringVar(&cleanReport, "clean-report", "", "write minimal offline-verifiable action report after chain and defer-pair validation")
@@ -365,12 +379,12 @@ func verifyChainFromFileDetailed(out io.Writer, path string, trustedKeys []strin
 	return verifyChainDetailed(out, path, receipts, trustedKeys, opts)
 }
 
-func verifyChainFromSessionDirDetailed(out io.Writer, dir, sessionID string, trustedKeys []string, opts verifyReceiptOptions) error {
-	receipts, err := receipt.ExtractReceiptsFromSessionDir(dir, sessionID)
+func verifyChainFromResolvedSessionDirDetailed(out io.Writer, location recorder.EvidenceLocation, sessionID string, trustedKeys []string, opts verifyReceiptOptions) error {
+	receipts, err := receipt.ExtractReceiptsFromResolvedSessionDir(location, sessionID)
 	if err != nil {
 		return fmt.Errorf("extracting session receipts: %w", err)
 	}
-	label := fmt.Sprintf("%s (session %s)", dir, sessionID)
+	label := fmt.Sprintf("%s (session %s)", location.Dir, sessionID)
 	return verifyChainDetailed(out, label, receipts, trustedKeys, opts)
 }
 
@@ -822,6 +836,7 @@ func TranscriptRootCmd() *cobra.Command {
 	var expectedKeys []string
 	var chainDir string
 	var sessionID string
+	var locationID string
 
 	cmd := &cobra.Command{
 		Use:   "transcript-root [file]",
@@ -856,12 +871,20 @@ Examples:
 			var label string
 			var receipts []receipt.Receipt
 			if chainDir != "" {
-				receipts, err = receipt.ExtractReceiptsFromSessionDir(chainDir, sessionID)
+				location, locationErr := recorder.ResolveEvidenceLocation(chainDir, locationID)
+				if locationErr != nil {
+					return fmt.Errorf("extracting session receipts: resolve evidence location: %w", locationErr)
+				}
+				chainDir = location.Dir
+				receipts, err = receipt.ExtractReceiptsFromResolvedSessionDir(location, sessionID)
 				if err != nil {
 					return fmt.Errorf("extracting session receipts: %w", err)
 				}
 				label = fmt.Sprintf("%s (session %s)", chainDir, sessionID)
 			} else {
+				if locationID != "" {
+					return fmt.Errorf("--location requires --chain")
+				}
 				path := args[0]
 				label = path
 				var fileSessionID string
@@ -899,6 +922,7 @@ Examples:
 	cmd.Flags().StringArrayVar(&expectedKeys, "key", nil, "trusted signer public key (hex or file path); repeat for rotated chains")
 	cmd.Flags().StringVar(&chainDir, "chain", "", "read the receipt chain from an evidence directory")
 	cmd.Flags().StringVar(&sessionID, "session", "proxy", "receipt chain session ID inside the evidence directory")
+	cmd.Flags().StringVar(&locationID, "location", "", "location path relative to the evidence directory")
 	return cmd
 }
 

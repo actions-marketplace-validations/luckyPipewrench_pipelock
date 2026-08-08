@@ -58,6 +58,30 @@ func TestEvidenceHealthSeparatesLiveStateFromAELCapability(t *testing.T) {
 	}
 }
 
+func TestEvidenceHealthHeartbeatRequirementUsesObservedReceipt(t *testing.T) {
+	h, _, e, _ := newEvidenceHealthTestMonitor(t, nil)
+	emitEvidenceHealthTestReceipt(t, e, "https://api.vendor.example/baseline")
+
+	before, ok := h.stats()
+	if !ok {
+		t.Fatal("stats unavailable before first heartbeat")
+	}
+	if before.Requirements[metrics.EvidenceRequirementHeartbeats] {
+		t.Fatal("heartbeats requirement is true before any heartbeat was recorded")
+	}
+
+	if err := e.EmitHeartbeat(); err != nil {
+		t.Fatalf("EmitHeartbeat: %v", err)
+	}
+	after, ok := h.stats()
+	if !ok {
+		t.Fatal("stats unavailable after heartbeat")
+	}
+	if !after.Requirements[metrics.EvidenceRequirementHeartbeats] {
+		t.Fatal("heartbeats requirement is false after a successful heartbeat")
+	}
+}
+
 func TestEvidenceHealthSelfAuditDurabilityInvariantLatchesAndEmits(t *testing.T) {
 	t.Run("positive_divergence", func(t *testing.T) {
 		h, m, e, _ := newEvidenceHealthTestMonitor(t, func(cfg *config.Config) {
@@ -431,28 +455,31 @@ func TestEvidenceHealthParserHelpersRejectMalformedInputs(t *testing.T) {
 	if err := os.WriteFile(noAction, []byte("{\"type\":\"heartbeat\"}\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile noAction: %v", err)
 	}
-	if _, err := readLastReceiptTailFromFile(noAction); !errors.Is(err, errNoReceiptTail) {
+	if _, err := readLastReceiptTailFromTestFile(t, noAction); !errors.Is(err, errNoReceiptTail) {
 		t.Fatalf("readLastReceiptTailFromFile no-action err = %v, want errNoReceiptTail", err)
 	}
 	malformedOuter := filepath.Join(dir, "malformed-outer.jsonl")
 	if err := os.WriteFile(malformedOuter, []byte("{not-json}\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile malformedOuter: %v", err)
 	}
-	if _, err := readLastReceiptTailFromFile(malformedOuter); err == nil {
+	if _, err := readLastReceiptTailFromTestFile(t, malformedOuter); err == nil {
 		t.Fatal("readLastReceiptTailFromFile malformed outer err = nil, want failure")
 	}
 	malformedDetail := filepath.Join(dir, "malformed-detail.jsonl")
 	if err := os.WriteFile(malformedDetail, []byte(`{"type":"action_receipt","detail":"not-an-object"}`+"\n"), 0o600); err != nil {
 		t.Fatalf("WriteFile malformedDetail: %v", err)
 	}
-	if _, err := readLastReceiptTailFromFile(malformedDetail); err == nil {
+	if _, err := readLastReceiptTailFromTestFile(t, malformedDetail); err == nil {
 		t.Fatal("readLastReceiptTailFromFile malformed detail err = nil, want failure")
 	}
-	if _, err := readLastReceiptTailFromFile(filepath.Join(dir, "missing.jsonl")); err == nil {
+	if _, err := readLastReceiptTailFromTestFile(t, filepath.Join(dir, "missing.jsonl")); err == nil {
 		t.Fatal("readLastReceiptTailFromFile missing file err = nil, want failure")
 	}
 	if _, err := readLastReceiptTail(filepath.Join(dir, "missing-dir"), transcriptRootSessionID); !errors.Is(err, errNoReceiptTail) {
 		t.Fatalf("readLastReceiptTail missing dir err = %v, want errNoReceiptTail", err)
+	}
+	if _, err := readLastReceiptTail("\x00", transcriptRootSessionID); err == nil || errors.Is(err, errNoReceiptTail) {
+		t.Fatalf("readLastReceiptTail invalid path err = %v, want surfaced stat failure", err)
 	}
 }
 
@@ -474,13 +501,22 @@ func TestReadLastReceiptTailFromFileLargeTailWindow(t *testing.T) {
 	if err := os.WriteFile(path, big.Bytes(), 0o600); err != nil {
 		t.Fatalf("WriteFile large tail: %v", err)
 	}
-	tail, err := readLastReceiptTailFromFile(path)
+	tail, err := readLastReceiptTailFromTestFile(t, path)
 	if err != nil {
 		t.Fatalf("readLastReceiptTailFromFile large tail: %v", err)
 	}
 	if tail.hash == "" {
 		t.Fatalf("large tail hash is empty: %+v", tail)
 	}
+}
+
+func readLastReceiptTailFromTestFile(t *testing.T, path string) (receiptTail, error) {
+	t.Helper()
+	location, err := recorder.ResolveEvidenceLocation(filepath.Dir(path), "")
+	if err != nil {
+		t.Fatalf("ResolveEvidenceLocation(%q): %v", filepath.Dir(path), err)
+	}
+	return readLastReceiptTailFromFile(location, filepath.Base(path))
 }
 
 func TestReadAnchorStateStrictJSON(t *testing.T) {

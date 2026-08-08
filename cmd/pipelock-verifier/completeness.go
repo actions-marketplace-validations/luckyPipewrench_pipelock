@@ -15,11 +15,13 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
 	actionreceipt "github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 )
 
 type completenessOptions struct {
 	signerKey     string
 	sessionID     string
+	locationID    string
 	jsonOutput    bool
 	allowUnpinned bool
 }
@@ -51,6 +53,7 @@ Exit-code contract:
 	cmd.SetFlagErrorFunc(usageFlagError)
 	cmd.Flags().StringVar(&opts.signerKey, "key", "", "expected signer public key (hex, public-key text, or file path)")
 	cmd.Flags().StringVar(&opts.sessionID, "session", "proxy", "session ID inside an evidence directory")
+	cmd.Flags().StringVar(&opts.locationID, "location", "", "location path relative to the evidence directory")
 	cmd.Flags().BoolVar(&opts.jsonOutput, "json", false, "emit a structured JSON report on stdout")
 	cmd.Flags().BoolVar(&opts.allowUnpinned, "allow-unpinned", false, "allow structural-only verification without a trusted signer key")
 	return cmd
@@ -62,7 +65,22 @@ func runCompleteness(stdout, stderr io.Writer, target string, opts completenessO
 		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve signer key: %w", err))
 	}
 	clean := filepath.Clean(target)
-	receipts, label, err := extractCompletenessReceipts(clean, opts.sessionID)
+	var resolvedLocation *recorder.EvidenceLocation
+	info, statErr := os.Stat(clean)
+	if statErr != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("stat %q: %w", clean, statErr))
+	}
+	if info.IsDir() {
+		location, locationErr := recorder.ResolveEvidenceLocation(clean, opts.locationID)
+		if locationErr != nil {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("resolve evidence location: %w", locationErr))
+		}
+		clean = location.Dir
+		resolvedLocation = &location
+	} else if opts.locationID != "" {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("--location requires an evidence directory"))
+	}
+	receipts, label, err := extractCompletenessReceipts(clean, opts.sessionID, resolvedLocation)
 	if err != nil {
 		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
 	}
@@ -93,7 +111,15 @@ func runCompleteness(stdout, stderr io.Writer, target string, opts completenessO
 	return nil
 }
 
-func extractCompletenessReceipts(clean, sessionID string) ([]actionreceipt.Receipt, string, error) {
+func extractCompletenessReceipts(clean, sessionID string, resolvedLocation *recorder.EvidenceLocation) ([]actionreceipt.Receipt, string, error) {
+	if resolvedLocation != nil {
+		receipts, err := actionreceipt.ExtractReceiptsFromResolvedSessionDir(*resolvedLocation, sessionID)
+		if err != nil {
+			return nil, "", fmt.Errorf("extract receipts: %w", err)
+		}
+		return receipts, fmt.Sprintf("%s (session %s)", resolvedLocation.Dir, sessionID), nil
+	}
+
 	info, err := os.Stat(clean)
 	if err != nil {
 		return nil, "", fmt.Errorf("stat %q: %w", clean, err)
