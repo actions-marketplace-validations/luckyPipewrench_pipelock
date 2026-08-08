@@ -161,7 +161,7 @@ func buildMCPExplainReport(cfg *config.Config, cfgLabel, serverName string, line
 		Version:    cliutil.Version,
 		ServerName: serverName,
 		Target:     mcpResponseTargetDisplay(serverName),
-		Scanned:    []string{jsonrpc.ScanScopeResponseInjection},
+		Scanned:    []string{jsonrpc.ScanScopeResponseInjection, jsonrpc.ScanScopeResponseDLP},
 	}
 
 	// Merge installed rule bundles exactly as the runtime scanner would so
@@ -208,11 +208,14 @@ func buildMCPExplainReport(cfg *config.Config, cfgLabel, serverName string, line
 	}
 
 	report.Scanner = explainMCPResponseScanner
-	report.Action = verdict.Action
-	report.Patterns = dedupePatternNames(verdict.Matches)
-	report.Allowed = verdict.Action == config.ActionWarn
-	if !report.Allowed {
+	report.Action = effectiveMCPExplainAction(verdict)
+	report.Patterns = dedupeMCPResponsePatternNames(verdict.Matches, verdict.DLPMatches)
+	report.Allowed = report.Action == config.ActionWarn
+	if !report.Allowed && len(verdict.DLPMatches) == 0 {
 		report.Remediation = mcpExplainRemediationFor(report.Patterns, serverName)
+	}
+	if len(verdict.DLPMatches) > 0 {
+		report.Notes = append(report.Notes, "inbound DLP findings cannot be suppressed through response_scanning; Pipelock blocks them when this server's trust action is block.")
 	}
 	if report.Allowed {
 		report.Notes = append(report.Notes, "MCP response trust class "+trust+" maps this finding to warn; runtime forwards the response and logs the match.")
@@ -225,10 +228,26 @@ func buildMCPExplainReport(cfg *config.Config, cfgLabel, serverName string, line
 	return report, nil
 }
 
-// dedupePatternNames returns the unique blocking pattern names in sorted order.
-func dedupePatternNames(matches []scanner.ResponseMatch) []string {
-	seen := make(map[string]struct{}, len(matches))
-	for _, m := range matches {
+// effectiveMCPExplainAction matches inbound DLP enforcement: stripping a
+// response cannot safely remove every credential representation, so strip
+// becomes a block when DLP matched.
+func effectiveMCPExplainAction(verdict jsonrpc.ScanVerdict) string {
+	if len(verdict.DLPMatches) > 0 && verdict.Action == config.ActionStrip {
+		return config.ActionBlock
+	}
+	return verdict.Action
+}
+
+// dedupeMCPResponsePatternNames returns the unique blocking response and DLP
+// pattern names in sorted order.
+func dedupeMCPResponsePatternNames(responseMatches []scanner.ResponseMatch, dlpMatches []scanner.TextDLPMatch) []string {
+	seen := make(map[string]struct{}, len(responseMatches)+len(dlpMatches))
+	for _, m := range responseMatches {
+		if m.PatternName != "" {
+			seen[m.PatternName] = struct{}{}
+		}
+	}
+	for _, m := range dlpMatches {
 		if m.PatternName != "" {
 			seen[m.PatternName] = struct{}{}
 		}

@@ -24,6 +24,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/emit"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
@@ -2053,9 +2054,11 @@ func TestForwardScannedInput_PolicyRedirectOutputDLP(t *testing.T) {
 	var serverIn bytes.Buffer
 	var logW bytes.Buffer
 	blockedCh := make(chan BlockedRequest, 10)
+	obs := &mcpResponseCaptureObserver{got: make(chan capture.ResponseVerdictRecord, 1)}
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
 
 	clientIn := strings.NewReader(req)
-	ForwardScannedInput(transport.NewStdioReader(clientIn), transport.NewStdioWriter(&serverIn), &logW, config.ActionBlock, config.ActionBlock, blockedCh, nil, nil, MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
+	ForwardScannedInput(transport.NewStdioReader(clientIn), transport.NewStdioWriter(&serverIn), &logW, config.ActionBlock, config.ActionBlock, blockedCh, nil, nil, MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg, CaptureObs: obs, ReceiptEmitter: emitter, Transport: transportMCPStdio})
 
 	// Request must NOT be forwarded to server.
 	if strings.Contains(serverIn.String(), "tools/call") {
@@ -2081,6 +2084,16 @@ func TestForwardScannedInput_PolicyRedirectOutputDLP(t *testing.T) {
 	if !strings.Contains(logW.String(), "DLP match in handler output") {
 		t.Errorf("expected 'DLP match in handler output' in log, got: %s", logW.String())
 	}
+	var captureRecord capture.ResponseVerdictRecord
+	select {
+	case captureRecord = <-obs.got:
+	case <-time.After(testWarnContextTimeout):
+		t.Fatal("expected redirect-output DLP capture")
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	assertBlockedDLPEvidence(t, captureRecord, readActionReceipts(t, dir), mcpReceiptLayerResponse)
 }
 
 func TestForwardScannedInput_PolicyRedirectOutputClean(t *testing.T) {

@@ -28,6 +28,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
+	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/deferred"
@@ -3719,11 +3720,20 @@ func TestHTTPListener_SSEUpstream_MultipleEvents(t *testing.T) {
 	sc := testScannerForHTTP(t)
 	baseURL, _, _ := startListenerProxy(t, upstream.URL, sc, nil, nil, nil)
 
-	resp, err := http.Post(baseURL+"/", "application/json", strings.NewReader(jsonToolsCallEcho)) //nolint:gosec,noctx // test
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/", strings.NewReader(jsonToolsCallEcho))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck // test
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("Close response body: %v", err)
+		}
+	}()
 
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		t.Errorf("Content-Type = %q, want text/event-stream prefix", ct)
@@ -3945,6 +3955,47 @@ func TestHTTPListener_SSEUpstream_BlocksInjection(t *testing.T) {
 	if bytes.Contains(respBody, []byte("IGNORE ALL PREVIOUS INSTRUCTIONS")) {
 		t.Errorf("injection content leaked through to client: %s", respBody)
 	}
+}
+
+func TestHTTPListener_SSEUpstream_BlocksInboundDLP(t *testing.T) {
+	accessKey := "AKIA" + "IOSFODNN7EXAMPLE"
+	dirty := makeResponse(1, "server credential: "+accessKey)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: " + dirty + "\n\n"))
+	}))
+	defer upstream.Close()
+
+	sc := testScannerWithAction(t, config.ActionBlock)
+	obs := &mcpResponseCaptureObserver{got: make(chan capture.ResponseVerdictRecord, 1)}
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
+		Scanner: sc, CaptureObs: obs, ReceiptEmitter: emitter, Transport: transportMCPHTTP,
+	})
+
+	resp, err := http.Post(baseURL+"/", "application/json", strings.NewReader(jsonToolsCallEcho)) //nolint:gosec,noctx // test
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // test
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(respBody, []byte(`"code":-32000`)) {
+		t.Errorf("expected inbound DLP block (code -32000), got: %s", respBody)
+	}
+	if bytes.Contains(respBody, []byte(accessKey)) {
+		t.Errorf("inbound credential leaked through streamable HTTP: %s", respBody)
+	}
+	var captureRecord capture.ResponseVerdictRecord
+	select {
+	case captureRecord = <-obs.got:
+	case <-time.After(testWarnContextTimeout):
+		t.Fatal("expected SSE inbound-DLP capture")
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	assertBlockedDLPEvidence(t, captureRecord, readActionReceipts(t, dir), "mcp_response_scan")
 }
 
 // TestHTTPListener_SSEUpstream_ScanErrorReturns502 covers the fail-closed
@@ -5491,7 +5542,9 @@ func TestScanHTTPInput_RedirectOutputDLP(t *testing.T) {
 	})
 
 	var logBuf bytes.Buffer
-	blocked := scanHTTPInput(msg, &logBuf, "sess", "sess", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
+	obs := &mcpResponseCaptureObserver{got: make(chan capture.ResponseVerdictRecord, 1)}
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	blocked := scanHTTPInput(msg, &logBuf, "sess", "sess", MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg, CaptureObs: obs, ReceiptEmitter: emitter, Transport: transportMCPHTTP})
 	if blocked == nil {
 		t.Fatal("expected redirect output DLP to be blocked")
 	}
@@ -5504,6 +5557,16 @@ func TestScanHTTPInput_RedirectOutputDLP(t *testing.T) {
 	if blocked.SyntheticResponse != nil {
 		t.Error("expected nil SyntheticResponse for DLP-blocked redirect")
 	}
+	var captureRecord capture.ResponseVerdictRecord
+	select {
+	case captureRecord = <-obs.got:
+	case <-time.After(testWarnContextTimeout):
+		t.Fatal("expected redirect-output DLP capture")
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	assertBlockedDLPEvidence(t, captureRecord, readActionReceipts(t, dir), mcpReceiptLayerResponse)
 }
 
 func TestScanHTTPInput_RedirectOutputWarnPreservesWarnContext(t *testing.T) {
