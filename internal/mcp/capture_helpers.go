@@ -72,6 +72,12 @@ func captureSessionIDOriginal(transport string) string {
 
 // dlpMatchesToFindings converts scanner.TextDLPMatch slice to capture findings.
 func dlpMatchesToFindings(matches []scanner.TextDLPMatch) []capture.Finding {
+	return dlpMatchesToFindingsWithAction(matches, config.ActionBlock)
+}
+
+// dlpMatchesToFindingsWithAction converts scanner.TextDLPMatch slice to capture
+// findings and records the action ultimately taken at this response surface.
+func dlpMatchesToFindingsWithAction(matches []scanner.TextDLPMatch, action string) []capture.Finding {
 	if len(matches) == 0 {
 		return nil
 	}
@@ -82,7 +88,7 @@ func dlpMatchesToFindings(matches []scanner.TextDLPMatch) []capture.Finding {
 			PatternName: m.PatternName,
 			Severity:    m.Severity,
 			Encoded:     m.Encoded,
-			Action:      config.ActionBlock,
+			Action:      action,
 		}
 	}
 	return findings
@@ -103,6 +109,16 @@ func responseMatchesToFindings(matches []scanner.ResponseMatch, action string) [
 		}
 	}
 	return findings
+}
+
+func redirectResponseAttribution(verdict jsonrpc.ScanVerdict) (pattern, severity string) {
+	if len(verdict.Matches) > 0 {
+		return verdict.Matches[0].PatternName, config.SeverityHigh
+	}
+	if len(verdict.DLPMatches) > 0 {
+		return verdict.DLPMatches[0].PatternName, firstNonEmpty(verdict.DLPMatches[0].Severity, config.SeverityHigh)
+	}
+	return "", ""
 }
 
 // urlFindingsToCapture converts scanner.Result URL findings to capture findings.

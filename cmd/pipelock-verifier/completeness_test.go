@@ -565,6 +565,56 @@ func writeChainRecorderJSONL(t *testing.T, receipts []receipt.Receipt) string {
 	return path
 }
 
+func TestChainAndCompletenessAcceptSameBareV1JSONL(t *testing.T) {
+	t.Parallel()
+	fixture := newCompletenessFixture(t)
+	path := writeCompletenessJSONL(t, []receipt.Receipt{
+		fixture.open("run-bare-v1", "open-bare-v1"),
+		fixture.close("run-bare-v1", "open-bare-v1"),
+	})
+
+	for _, command := range []string{"chain", "completeness"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			stdout, stderr, code := runRoot(t, command, "--json", "--key", fixture.keyHex, path)
+			if code != cliutil.ExitOK {
+				t.Fatalf("bare v1 %s should verify: code=%d stdout=%q stderr=%q", command, code, stdout, stderr)
+			}
+		})
+	}
+}
+
+func TestChainAndCompletenessRejectMalformedBareV1JSONL(t *testing.T) {
+	t.Parallel()
+	fixture := newCompletenessFixture(t)
+	path := writeCompletenessJSONL(t, []receipt.Receipt{
+		fixture.open("run-malformed-bare-v1", "open-malformed-bare-v1"),
+	})
+	file, err := os.OpenFile(filepath.Clean(path), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	if _, err := file.WriteString(`{"record_type":"evidence_receipt_v2"}` + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append mixed record: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close fixture: %v", err)
+	}
+
+	for _, command := range []string{"chain", "completeness"} {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			stdout, stderr, code := runRoot(t, command, "--json", "--key", fixture.keyHex, path)
+			if code == cliutil.ExitOK {
+				t.Fatalf("mixed bare v1 %s input accepted: stdout=%q stderr=%q", command, stdout, stderr)
+			}
+		})
+	}
+}
+
 // TestChainCLIShowsCompletenessReasonForATailDroppedChain proves the PATH, not
 // the formatter. The sibling unit test hands emitScorecard a reason and checks
 // it prints; that cannot fail if the analyzer stopped classifying a missing
@@ -621,5 +671,65 @@ func TestChainCLIShowsCompletenessReasonForATailDroppedChain(t *testing.T) {
 	droppedLine := scorecardLine(t, droppedOut)
 	if closedLine == droppedLine {
 		t.Fatalf("a bounded chain and a tail-dropped one print the same completeness line: %s", closedLine)
+	}
+}
+
+// The bare-v1 detector reads the whole file before deciding a route, so its
+// failure paths decide whether an unreadable or oversized file is refused or
+// silently falls through to the v2 route. Each case below drives the real
+// command so the exit path is proven, not just the helper.
+
+func TestChainRefusesOversizedEvidenceFile(t *testing.T) {
+	t.Parallel()
+	fixture := newCompletenessFixture(t)
+	dir := t.TempDir()
+	path := filepath.Join(dir, "oversized.jsonl")
+	line := append(bytes.Repeat([]byte("a"), 11<<20), '\n')
+	if err := os.WriteFile(path, line, 0o600); err != nil {
+		t.Fatalf("write oversized fixture: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := runChain(&stdout, &stderr, path, chainOptions{signerKey: fixture.keyHex})
+	if err == nil {
+		t.Fatalf("oversized evidence line accepted: stdout=%q", stdout.String())
+	}
+	// Ordinary malformed input is classified as not-bare-v1 and refused later on
+	// a different route. Pinning the detector scan error is what proves this test
+	// exercises the line-length bound rather than generic rejection.
+	// The detector reads the whole file before classifying it, so the reader's
+	// total-size bound is what stops an oversized input from being buffered.
+	// Pinning that message is what proves this test exercises the size bound
+	// rather than ordinary malformed-input rejection.
+	if !strings.Contains(err.Error(), "input exceeds") {
+		t.Fatalf("oversized file must fail on the reader size bound: err=%v", err)
+	}
+	if got := exitCodeFor(err); got != cliutil.ExitConfig {
+		t.Fatalf("oversized line exit=%d, want %d", got, cliutil.ExitConfig)
+	}
+}
+
+func TestChainAcceptsBareV1JSONLWithBlankLines(t *testing.T) {
+	t.Parallel()
+	fixture := newCompletenessFixture(t)
+	path := writeCompletenessJSONL(t, []receipt.Receipt{
+		fixture.open("run-blank-lines", "open-blank-lines"),
+		fixture.close("run-blank-lines", "open-blank-lines"),
+	})
+	file, err := os.OpenFile(filepath.Clean(path), os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	if _, err := file.WriteString("\n   \n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append blank lines: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close fixture: %v", err)
+	}
+
+	stdout, stderr, code := runRoot(t, "chain", "--json", "--key", fixture.keyHex, path)
+	if code != cliutil.ExitOK {
+		t.Fatalf("blank-line bare v1 chain should verify: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }

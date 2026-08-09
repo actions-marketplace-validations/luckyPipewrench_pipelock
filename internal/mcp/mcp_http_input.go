@@ -885,7 +885,7 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			// Scan redirect handler output for prompt injection AND DLP before
 			// sending to client. Handler output is untrusted - it could contain
 			// secrets or injection payloads.
-			scanVerdict := ScanResponse(redirectResult.Response, sc)
+			scanVerdict := ScanResponseInjection(redirectResult.Response, sc)
 			wc := scanner.DLPWarnContextFromCtx(inputScanCtx)
 			if wc.Transport == "" {
 				wc.Transport = transportMCPHTTP
@@ -897,6 +897,32 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			}
 			httpWarnCtx := scanner.WithDLPWarnContext(inputScanCtx, wc)
 			dlpResult := sc.ScanTextForDLP(httpWarnCtx, string(redirectResult.Response))
+			finalResponseVerdict := scanVerdict
+			finalResponseVerdict.DLPMatches = append(finalResponseVerdict.DLPMatches, dlpResult.Matches...)
+			finalResponseVerdict.Clean = scanVerdict.Clean && dlpResult.Clean
+			responseAction := config.ActionRedirect
+			if !finalResponseVerdict.Clean {
+				responseAction = config.ActionBlock
+			}
+			obs.ObserveResponseVerdict(context.Background(), &capture.ResponseVerdictRecord{
+				Subsurface:        "response_redirect_output",
+				Transport:         opts.Transport,
+				SessionID:         captureSessionID(opts.Transport),
+				SessionIDOriginal: captureSessionIDOriginal(opts.Transport),
+				ConfigHash:        opts.captureConfigHash(),
+				Profile:           opts.captureProfile(),
+				ActionClass:       captureActionClass,
+				Request:           capture.CaptureRequest{RPCID: captureRPCID(verdict.ID)},
+				TransformKind:     capture.TransformRedirectOutput,
+				WirePayload:       redirectResult.Response,
+				RawFindings:       append(responseMatchesToFindings(finalResponseVerdict.Matches, responseAction), dlpMatchesToFindingsWithAction(finalResponseVerdict.DLPMatches, responseAction)...),
+				EffectiveAction:   responseAction,
+				Outcome:           captureOutcome(responseAction, finalResponseVerdict.Clean),
+			})
+			if !finalResponseVerdict.Clean {
+				receiptLayer = mcpReceiptLayerResponse
+				receiptPattern, receiptSeverity = redirectResponseAttribution(finalResponseVerdict)
+			}
 			if !scanVerdict.Clean {
 				_, _ = fmt.Fprintf(logW, "pipelock: input: blocked redirect response (injection detected in handler output)\n")
 				recordAdaptiveSignal(session.SignalBlock)
