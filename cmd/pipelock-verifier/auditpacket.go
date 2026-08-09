@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	auditpacket "github.com/luckyPipewrench/pipelock/sdk/audit-packet"
@@ -27,6 +28,14 @@ const (
 	statusPass    = "pass"
 	statusFail    = "fail"
 	statusSkipped = "skipped"
+)
+
+// Stable values for the lifecycle_assessment field.
+const (
+	lifecycleAssessed          = "assessed"
+	lifecycleNotAssessed       = "not_assessed"
+	lifecycleReasonOffline     = "offline mode skips chain re-verification"
+	lifecycleReasonChainFailed = "chain re-verification did not complete"
 )
 
 // auditPacketOptions holds resolved CLI flags for the audit-packet command.
@@ -86,18 +95,28 @@ and --key (or the packet's own signer_key) must match.`,
 // auditPacketReport is the structured form emitted by --json. Field names are
 // deliberately stable so external CI checks can grep them.
 type auditPacketReport struct {
-	Path        string         `json:"path"`
-	Verdict     string         `json:"verdict"`
-	Trusted     bool           `json:"trusted"`
-	Valid       bool           `json:"valid"`
-	Summary     auditPktDigest `json:"summary"`
-	Posture     posturePeek    `json:"posture"`
-	Run         runPeek        `json:"run"`
-	Errors      []string       `json:"errors,omitempty"`
-	Warnings    []string       `json:"warnings,omitempty"`
-	SchemaCheck string         `json:"schema_check"`
-	ChainCheck  string         `json:"chain_check"`
-	CrossCheck  string         `json:"cross_check"`
+	Path            string              `json:"path"`
+	Verdict         string              `json:"verdict"`
+	Trusted         bool                `json:"trusted"`
+	Valid           bool                `json:"valid"`
+	Summary         auditPktDigest      `json:"summary"`
+	Posture         posturePeek         `json:"posture"`
+	Run             runPeek             `json:"run"`
+	Errors          []string            `json:"errors,omitempty"`
+	Warnings        []string            `json:"warnings,omitempty"`
+	SchemaCheck     string              `json:"schema_check"`
+	ChainCheck      string              `json:"chain_check"`
+	CrossCheck      string              `json:"cross_check"`
+	LifecycleStatus completeness.Status `json:"lifecycle_status,omitempty"`
+	LifecycleReason completeness.Reason `json:"lifecycle_reason,omitempty"`
+	// LifecycleAssessment states whether completeness was evaluated at all, and
+	// is always emitted. An absent LifecycleStatus alone cannot carry this: it
+	// is equally produced by offline mode, by a chain re-verification that
+	// failed before the analysis could run, and by an older report that had no
+	// lifecycle field. A consumer that cannot tell those apart will read the
+	// same silence as a passing lifecycle.
+	LifecycleAssessment       string `json:"lifecycle_assessment"`
+	LifecycleAssessmentReason string `json:"lifecycle_assessment_reason,omitempty"`
 }
 
 type auditPktDigest struct {
@@ -124,10 +143,12 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 	}
 
 	report := auditPacketReport{
-		Path:        packetPath,
-		SchemaCheck: statusSkipped,
-		ChainCheck:  statusSkipped,
-		CrossCheck:  statusSkipped,
+		Path:                      packetPath,
+		SchemaCheck:               statusSkipped,
+		ChainCheck:                statusSkipped,
+		CrossCheck:                statusSkipped,
+		LifecycleAssessment:       lifecycleNotAssessed,
+		LifecycleAssessmentReason: lifecycleReasonChainFailed,
 	}
 
 	rawPacket, err := readVerifierFile(packetPath)
@@ -173,6 +194,7 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 	report.SchemaCheck = statusPass
 
 	if opts.offline {
+		report.LifecycleAssessmentReason = lifecycleReasonOffline
 		report.Valid = trustVerdict(&packet, opts)
 		emitReport(stdout, stderr, report, opts.jsonOutput)
 		if !report.Valid {
@@ -196,6 +218,11 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 		return cliutil.ExitCodeError(cliutil.ExitGeneral, chainErr)
 	}
 	report.ChainCheck = chainStatusLabel(chainResult)
+	lifecycle := completeness.Analyze(chainReceipts, chainResult)
+	report.LifecycleStatus = lifecycle.Status
+	report.LifecycleReason = lifecycle.Reason
+	report.LifecycleAssessment = lifecycleAssessed
+	report.LifecycleAssessmentReason = ""
 
 	if crossErrs := crossCheck(&packet, chainResult, chainReceipts); len(crossErrs) > 0 {
 		report.CrossCheck = statusFail
