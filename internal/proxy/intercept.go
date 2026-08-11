@@ -1344,21 +1344,43 @@ func newInterceptHandler(
 		// request has full body, headers, and URL available for entropy and
 		// fragment analysis. When p is non-nil, resolve CEE objects per-request
 		// so hot-reloads during long-lived CONNECT tunnels use fresh state.
-		ceeCfg := ceeEffectiveConfig(ic.Config.CrossRequestDetection, ic.Config.EnforceEnabled())
-		if ceeCfg.Enabled {
-			ceeET, ceeFB, ceeSM := ic.EntropyTracker, ic.FragmentBuffer, ic.SessionMgr
-			if ic.Proxy != nil {
-				ceeET = ic.Proxy.entropyTrackerPtr.Load()
-				ceeFB = ic.Proxy.fragmentBufferPtr.Load()
-				ceeSM = ic.Proxy.sessionMgrPtr.Load()
+		sessionKey := ceeSessionKey(ic.Agent, ic.ClientIP, ic.ActorAuth)
+		outbound := extractOutboundPayload(r)
+		keys := queryParamKeys(r.URL)
+		var admission ceeAdmission
+		if ic.Proxy != nil {
+			admission = ic.Proxy.admitCurrentCEE(r.Context(), ceeAdmitRequest{
+				SessionKey: sessionKey, Outbound: outbound, KeyPayload: keys, TargetURL: r.URL.String(),
+				Agent: ic.Agent, ClientIP: ic.ClientIP, RequestID: ic.RequestID, IncludeFragments: true,
+			})
+			// A missing live snapshot is security-relevant only when this
+			// tunnel's last coherent config required CEE. Lightweight proxy
+			// contexts used by callers with CEE disabled have no CEE runtime
+			// to resolve and should retain the disabled behavior.
+			staleCEE := ceeEffectiveConfig(ic.Config.CrossRequestDetection, ic.Config.EnforceEnabled())
+			if !admission.Resolved && staleCEE.Enabled {
+				writeBlockedError(w,
+					blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
+					"blocked: live cross-request policy unavailable", http.StatusForbidden)
+				return
 			}
+		} else {
+			ceeCfg := ceeEffectiveConfig(ic.Config.CrossRequestDetection, ic.Config.EnforceEnabled())
+			if ceeCfg.Enabled {
+				admission = ceeAdmission{
+					Result: ceeAdmit(r.Context(), sessionKey, outbound, keys, r.URL.String(), ic.Agent, ic.ClientIP, ic.RequestID,
+						ceeCfg, ic.EntropyTracker, ic.FragmentBuffer, ic.Scanner, ic.Logger, ic.Metrics),
+					Config:         ceeCfg,
+					AdaptiveConfig: ic.Config.AdaptiveEnforcement,
+					Sessions:       ic.SessionMgr,
+					PolicyHash:     ic.Config.CanonicalPolicyHash(),
+					Active:         true,
+				}
+			}
+		}
 
-			sessionKey := ceeSessionKey(ic.Agent, ic.ClientIP, ic.ActorAuth)
-			outbound := extractOutboundPayload(r)
-			keys := queryParamKeys(r.URL)
-
-			ceeRes := ceeAdmit(r.Context(), sessionKey, outbound, keys, r.URL.String(), ic.Agent, ic.ClientIP, ic.RequestID,
-				ceeCfg, ceeET, ceeFB, ic.Scanner, ic.Logger, ic.Metrics)
+		if admission.Active {
+			ceeRes := admission.Result
 
 			// Capture observer: record intercept CEE verdict for policy replay.
 			if ic.Proxy != nil {
@@ -1375,7 +1397,7 @@ func newInterceptHandler(
 					SessionID:         captureSessionKey(ic.Agent, ic.ClientIP),
 					SessionIDOriginal: captureSessionKeyOriginal(ic.Agent, ic.ClientIP),
 					RequestID:         ic.RequestID,
-					ConfigHash:        ic.Config.CanonicalPolicyHash(),
+					ConfigHash:        admission.PolicyHash,
 					Agent:             ic.Agent,
 					Profile:           ic.Profile,
 					ActionClass:       captureHTTPActionClass(r.Method),
@@ -1389,23 +1411,24 @@ func newInterceptHandler(
 			}
 
 			ceeRec, ceeBlockAll := ceeRecordSignalsAndBlockAll(ceeSignalParams{
-				Result: ceeRes, Sessions: ceeSM, SessionKey: sessionKey,
-				AdaptiveCfg: &ic.Config.AdaptiveEnforcement, Logger: ic.Logger, Metrics: ic.Metrics,
+				Result: ceeRes, Sessions: admission.Sessions, SessionKey: sessionKey,
+				AdaptiveCfg: &admission.AdaptiveConfig, Logger: ic.Logger, Metrics: ic.Metrics,
 				ClientIP: ic.ClientIP, RequestID: ic.RequestID,
 			})
 
 			if ceeRes.Blocked {
 				ic.Metrics.RecordTLSRequestBlocked("cross_request")
 				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
-					ActionID:  actionID,
-					Verdict:   config.ActionBlock,
-					Layer:     "cross_request",
-					Pattern:   ceeRes.Reason,
-					Transport: "intercept",
-					Method:    r.Method,
-					Target:    targetURL,
-					RequestID: ic.RequestID,
-					Agent:     ic.Agent,
+					ActionID:   actionID,
+					Verdict:    config.ActionBlock,
+					Layer:      "cross_request",
+					Pattern:    ceeRes.Reason,
+					Transport:  "intercept",
+					Method:     r.Method,
+					Target:     targetURL,
+					RequestID:  ic.RequestID,
+					Agent:      ic.Agent,
+					PolicyHash: admission.PolicyHash,
 				}))
 				writeBlockedError(w,
 					blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
@@ -1421,15 +1444,16 @@ func newInterceptHandler(
 				recordAdaptiveUpgrade(ic.Logger, ic.Metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: ic.ClientIP, RequestID: ic.RequestID})
 				ic.Metrics.RecordTLSRequestBlocked(adaptiveSessionDeny)
 				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
-					ActionID:  actionID,
-					Verdict:   config.ActionBlock,
-					Layer:     adaptiveSessionDeny,
-					Pattern:   "session escalation level " + session.EscalationLabel(level),
-					Transport: "intercept",
-					Method:    r.Method,
-					Target:    targetURL,
-					RequestID: ic.RequestID,
-					Agent:     ic.Agent,
+					ActionID:   actionID,
+					Verdict:    config.ActionBlock,
+					Layer:      adaptiveSessionDeny,
+					Pattern:    "session escalation level " + session.EscalationLabel(level),
+					Transport:  "intercept",
+					Method:     r.Method,
+					Target:     targetURL,
+					RequestID:  ic.RequestID,
+					Agent:      ic.Agent,
+					PolicyHash: admission.PolicyHash,
 				}))
 				writeBlockedError(w,
 					blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny),

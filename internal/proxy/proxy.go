@@ -366,7 +366,10 @@ type Proxy struct {
 	server               *http.Server
 	agentServers         []*http.Server // per-agent listeners (managed by CLI)
 	startTime            time.Time
-	reloadMu             sync.RWMutex // serializes Reload and coherent request-time runtime snapshots
+	reloadSerialMu       sync.Mutex   // serializes staging by concurrent Reload calls
+	reloadMu             sync.RWMutex // serializes publication and coherent request-time runtime snapshots
+	ceeAdmissionLocked   func()       // test hook: called while a CEE admission owns reloadMu.RLock
+	reloadLocked         func()       // test hook: called after Reload owns reloadMu.Lock
 	approver             *hitl.Approver
 	a2aCardBaseline      *mcp.CardBaseline // Agent Card drift detection across requests
 	captureObs           capture.CaptureObserver
@@ -1307,9 +1310,11 @@ type receiptEmitterStage struct {
 
 // buildReceiptEmitter stages the receipt emitter lifecycle transition for
 // cfg WITHOUT publishing anything to p.receiptEmitterPtr or
-// p.receiptKeyPath. Must be called under reloadMu from Reload, which
-// publishes the returned stage atomically after all other reload
-// preconditions succeed.
+// p.receiptKeyPath. Reload serializes staging, durably opens a new emitter's
+// evidence window, then publishes it under reloadMu after every fallible
+// precondition has succeeded. A crash between the open and publication leaves
+// an empty, valid evidence window; no action can be attributed to an emitter
+// before its open is durable.
 //
 // Return value semantics:
 //
@@ -1647,8 +1652,8 @@ func (p *Proxy) PrepareRequestPolicyBody(r *http.Request, in *requestPolicyInput
 // Only config values read per-request (mode, enforce, user-agent, blocklists,
 // DLP patterns, response scanning, etc.) take effect immediately.
 func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
-	p.reloadMu.Lock()
-	defer p.reloadMu.Unlock()
+	p.reloadSerialMu.Lock()
+	defer p.reloadSerialMu.Unlock()
 
 	oldCfg := p.cfgPtr.Load()
 
@@ -1784,6 +1789,26 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 			}
 		}
 	}
+	if cfg.FlightRecorder.SigningKeyPath != "" && p.recorder != nil && !receiptStage.reuseExisting && receiptStage.emitter != nil {
+		if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
+			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+				fmt.Errorf("session_open receipt emit failed, keeping old config: %w", err))
+			sc.Close()
+			if newEd != nil {
+				newEd.Close()
+			}
+			return false
+		}
+	}
+
+	// Staging above may load keys and build evidence components. Keep that I/O
+	// off the request snapshot lock; only publication and in-place state changes
+	// need to exclude CEE admissions.
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+	if p.reloadLocked != nil {
+		p.reloadLocked()
+	}
 
 	// Publish both emitters now that staging has fully succeeded. The
 	// atomic.Pointer swaps are individually atomic; between them, a
@@ -1812,21 +1837,17 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		// its run window is recorded.
 		if receiptStage.reuseExisting {
 			receiptStage.emitter.UpdateConfigHash(cfg.Hash())
-		} else if receiptStage.emitter != nil {
-			if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
-				p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
-					fmt.Errorf("session_open receipt emit failed, keeping old config: %w", err))
-				sc.Close()
-				if newEd != nil {
-					newEd.Close()
-				}
-				return false
-			}
 		}
 		p.receiptEmitterPtr.Store(receiptStage.emitter)
 		p.v2EmitterPtr.Store(receiptStage.v2)
 		p.receiptKeyPath = receiptStage.keyPath
 	}
+
+	// Apply enabled CEE components before publishing their config. A stricter
+	// budget therefore cannot briefly run with the old, more permissive limit.
+	// Components being disabled stay live until after config publication below,
+	// so an old config can never observe a nil tracker and bypass its policy.
+	p.prepareCEE(&cfg.CrossRequestDetection)
 
 	// When redaction is being disabled, publish the config before clearing the
 	// legacy matcher mirror. Enabling keeps the opposite order: runtime first,
@@ -1859,6 +1880,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.cfgPtr.Store(cfg)
 		p.contractLoaderPtr.Store(contractLoader)
 	}
+	p.disableCEE(&cfg.CrossRequestDetection)
 	if p.wd != nil {
 		p.wd.BeatConfig()
 		p.installScannerHeartbeat(sc)
@@ -1900,23 +1922,154 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		}
 	}
 
-	// Toggle CEE components on config change. Build new components before
-	// swapping to avoid a nil window where concurrent requests bypass CEE.
-	// Entropy/fragment data is lost on reload, which is acceptable for short
-	// sliding windows (typically 5 min).
-	newET, newFB := p.buildCEE(&cfg.CrossRequestDetection)
-	if oldET := p.entropyTrackerPtr.Swap(newET); oldET != nil {
-		oldET.Close()
-	}
-	if oldFB := p.fragmentBufferPtr.Swap(newFB); oldFB != nil {
-		oldFB.Close()
-	}
 	p.updateCEEStats()
 
 	// Receipt emitter hash is updated by the receipt emitter publish above.
 	// Same-key reloads reuse the live v1/v2 emitters to avoid stale-pointer
 	// chain forks; signer rotations still create a new segment.
 	return true
+}
+
+// prepareCEE updates enabled components in place, preserving their session
+// history across a reload. It is called before config publication.
+func (p *Proxy) prepareCEE(ceeCfg *config.CrossRequestDetection) {
+	if ceeCfg.Enabled && ceeCfg.EntropyBudget.Enabled {
+		if et := p.entropyTrackerPtr.Load(); et != nil {
+			et.UpdateConfig(ceeCfg.EntropyBudget.BitsPerWindow, ceeCfg.EntropyBudget.WindowMinutes*60)
+		} else {
+			p.entropyTrackerPtr.Store(scanner.NewEntropyTracker(
+				ceeCfg.EntropyBudget.BitsPerWindow,
+				ceeCfg.EntropyBudget.WindowMinutes*60,
+			))
+		}
+	}
+
+	if ceeCfg.Enabled && ceeCfg.FragmentReassembly.Enabled {
+		if fb := p.fragmentBufferPtr.Load(); fb != nil {
+			fb.UpdateConfig(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.WindowMinutes*60)
+		} else {
+			p.fragmentBufferPtr.Store(scanner.NewFragmentBuffer(
+				ceeCfg.FragmentReassembly.MaxBufferBytes,
+				maxCEESessions,
+				ceeCfg.FragmentReassembly.WindowMinutes*60,
+			))
+		}
+	}
+}
+
+// disableCEE removes components only after their disabled config is live.
+func (p *Proxy) disableCEE(ceeCfg *config.CrossRequestDetection) {
+	if !ceeCfg.Enabled || !ceeCfg.EntropyBudget.Enabled {
+		if old := p.entropyTrackerPtr.Swap(nil); old != nil {
+			old.Close()
+		}
+	}
+	if !ceeCfg.Enabled || !ceeCfg.FragmentReassembly.Enabled {
+		if old := p.fragmentBufferPtr.Swap(nil); old != nil {
+			old.Close()
+		}
+	}
+}
+
+type ceeAdmission struct {
+	Result         ceeResult
+	Config         config.CrossRequestDetection
+	AdaptiveConfig config.AdaptiveEnforcement
+	Sessions       *SessionManager
+	PolicyHash     string
+	Resolved       bool
+	Active         bool
+}
+
+type ceeEntropySnapshot struct {
+	Exceeded       bool
+	Usage          float64
+	Budget         float64
+	Config         config.CrossRequestDetection
+	AdaptiveConfig config.AdaptiveEnforcement
+	Sessions       *SessionManager
+	Recorder       session.Recorder
+	Active         bool
+}
+
+type ceeAdmitRequest struct {
+	SessionKey       string
+	Outbound         []byte
+	KeyPayload       []byte
+	TargetURL        string
+	Agent            string
+	ClientIP         string
+	RequestID        string
+	IncludeFragments bool
+}
+
+// admitCurrentCEE keeps the CEE policy snapshot and its mutable tracking
+// state under the reload lock. A request that started before a reload uses the
+// old pair; one that enters this gate afterward uses the new pair. In
+// particular, an old action can never observe a newly relaxed budget/window,
+// scanner, adaptive policy, session manager, or evidence policy hash.
+func (p *Proxy) admitCurrentCEE(ctx context.Context, req ceeAdmitRequest) ceeAdmission {
+	p.reloadMu.RLock()
+	defer p.reloadMu.RUnlock()
+	if p.ceeAdmissionLocked != nil {
+		p.ceeAdmissionLocked()
+	}
+
+	cfg := p.cfgPtr.Load()
+	if cfg == nil {
+		return ceeAdmission{}
+	}
+	ceeCfg := ceeEffectiveConfig(cfg.CrossRequestDetection, cfg.EnforceEnabled())
+	if !ceeCfg.Enabled {
+		return ceeAdmission{Config: ceeCfg, Resolved: true}
+	}
+	fb := p.fragmentBufferPtr.Load()
+	if !req.IncludeFragments {
+		fb = nil
+	}
+	return ceeAdmission{
+		Result: ceeAdmit(ctx, req.SessionKey, req.Outbound, req.KeyPayload, req.TargetURL, req.Agent, req.ClientIP, req.RequestID,
+			ceeCfg, p.entropyTrackerPtr.Load(), fb, p.scannerPtr.Load(), p.logger, p.metrics),
+		Config:         ceeCfg,
+		AdaptiveConfig: cfg.AdaptiveEnforcement,
+		Sessions:       p.sessionMgrPtr.Load(),
+		PolicyHash:     cfg.CanonicalPolicyHash(),
+		Resolved:       true,
+		Active:         true,
+	}
+}
+
+// currentCEEEntropy snapshots an existing entropy result with the policy that
+// governed it. CONNECT does not add hostname data to CEE, but it must still
+// enforce a prior session's accumulated budget without mixing reload versions.
+func (p *Proxy) currentCEEEntropy(sessionKey string) ceeEntropySnapshot {
+	p.reloadMu.RLock()
+	defer p.reloadMu.RUnlock()
+	cfg := p.cfgPtr.Load()
+	if cfg == nil {
+		return ceeEntropySnapshot{}
+	}
+	ceeCfg := ceeEffectiveConfig(cfg.CrossRequestDetection, cfg.EnforceEnabled())
+	et := p.entropyTrackerPtr.Load()
+	if !ceeCfg.Enabled || !ceeCfg.EntropyBudget.Enabled || et == nil {
+		return ceeEntropySnapshot{Config: ceeCfg}
+	}
+	usage, budget := et.CurrentUsage(sessionKey), et.Budget()
+	sessions := p.sessionMgrPtr.Load()
+	var recorder session.Recorder
+	if sessions != nil {
+		recorder = sessions.GetOrCreate(sessionKey)
+	}
+	return ceeEntropySnapshot{
+		Exceeded:       usage >= budget,
+		Usage:          usage,
+		Budget:         budget,
+		Config:         ceeCfg,
+		AdaptiveConfig: cfg.AdaptiveEnforcement,
+		Sessions:       sessions,
+		Recorder:       recorder,
+		Active:         true,
+	}
 }
 
 func (p *Proxy) installScannerHeartbeat(sc *scanner.Scanner) {
@@ -1972,7 +2125,7 @@ func (p *Proxy) ShutdownAgentServers() {
 }
 
 // buildCEE creates entropy tracker and fragment buffer based on the config.
-// Returns nil for disabled components. Called from setupCEE and Reload.
+// Returns nil for disabled components. Called from setupCEE during startup.
 func (p *Proxy) buildCEE(ceeCfg *config.CrossRequestDetection) (*scanner.EntropyTracker, *scanner.FragmentBuffer) {
 	var et *scanner.EntropyTracker
 	var fb *scanner.FragmentBuffer
@@ -4220,14 +4373,14 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// CEE pre-forward admission: check cross-request entropy and fragment
 	// reassembly before the outbound request leaves the proxy. Fetch is
 	// GET-only so the outbound data is the target URL path and query values.
-	ceeCfg := ceeEffectiveConfig(cfg.CrossRequestDetection, cfg.EnforceEnabled())
-	if ceeCfg.Enabled {
+	admission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
+		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: urlPayload(parsed),
+		KeyPayload: queryParamKeys(parsed), TargetURL: displayURL, Agent: agent, ClientIP: clientIP,
+		RequestID: requestID, IncludeFragments: true,
+	})
+	if admission.Active {
+		ceeRes := admission.Result
 		sessionKey := ceeSessionKey(agent, clientIP, id.Auth)
-		outbound := urlPayload(parsed)
-		keys := queryParamKeys(parsed)
-
-		ceeRes := ceeAdmit(r.Context(), sessionKey, outbound, keys, displayURL, agent, clientIP, requestID,
-			ceeCfg, p.entropyTrackerPtr.Load(), p.fragmentBufferPtr.Load(), sc, log, p.metrics)
 
 		// Capture observer: record CEE verdict for policy replay.
 		ceeFindings := ceeResultToFindings(ceeRes)
@@ -4243,7 +4396,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			SessionID:         captureSessionKey(agent, clientIP),
 			SessionIDOriginal: captureSessionKeyOriginal(agent, clientIP),
 			RequestID:         requestID,
-			ConfigHash:        cfg.CanonicalPolicyHash(),
+			ConfigHash:        admission.PolicyHash,
 			Agent:             agent,
 			Profile:           id.Profile,
 			ActionClass:       captureHTTPActionClass(http.MethodGet),
@@ -4257,10 +4410,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 		var ceeRec session.Recorder
 		var ceeBlockAll bool
-		if sm := p.sessionMgrPtr.Load(); sm != nil {
+		if sm := admission.Sessions; sm != nil {
 			ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
 				Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
-				AdaptiveCfg: &cfg.AdaptiveEnforcement, Logger: log, Metrics: p.metrics,
+				AdaptiveCfg: &admission.AdaptiveConfig, Logger: log, Metrics: p.metrics,
 				ClientIP: clientIP, RequestID: requestID,
 			})
 		}
@@ -4275,6 +4428,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				ActionID:            receipt.NewActionID(),
 				Verdict:             config.ActionBlock,
 				Layer:               "cross_request",
+				PolicyHash:          admission.PolicyHash,
 				Pattern:             ceeRes.Reason,
 				Transport:           "fetch",
 				Method:              http.MethodGet,

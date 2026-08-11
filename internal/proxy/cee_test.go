@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -1082,6 +1083,237 @@ func TestReload_CEETeardownAndRebuild(t *testing.T) {
 	stats = getCEEStats()
 	if !stats.EntropyTrackerActive || !stats.FragmentBufferActive {
 		t.Error("expected both CEE components active after re-enabling")
+	}
+}
+
+func TestReload_CEEPreservesStateAndAppliesLimits(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 8
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 12
+	cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+
+	sc := scanner.MustNew(cfg)
+	p, err := New(cfg, audit.NewNop(), sc, metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	tracker := p.EntropyTrackerPtr().Load()
+	buffer := p.FragmentBufferPtr().Load()
+	tracker.Record("session", []byte("abc"))
+	buffer.Append("session", []byte("first-"))
+
+	unrelated := cfg.Clone()
+	unrelated.KillSwitch.Message = "preserve CEE history"
+	if ok := p.Reload(unrelated, scanner.MustNew(unrelated)); !ok {
+		t.Fatal("unrelated reload failed")
+	}
+	if p.EntropyTrackerPtr().Load() != tracker || p.FragmentBufferPtr().Load() != buffer {
+		t.Fatal("unrelated reload replaced CEE state")
+	}
+	tracker.Record("session", []byte("abc"))
+	if !tracker.BudgetExceeded("session") {
+		t.Fatal("unrelated reload cleared entropy history")
+	}
+
+	tuned := unrelated.Clone()
+	tuned.CrossRequestDetection.EntropyBudget.BitsPerWindow = 6
+	tuned.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 8
+	if ok := p.Reload(tuned, scanner.MustNew(tuned)); !ok {
+		t.Fatal("CEE limit reload failed")
+	}
+	if p.EntropyTrackerPtr().Load() != tracker || p.FragmentBufferPtr().Load() != buffer {
+		t.Fatal("CEE limit reload replaced state")
+	}
+	if got := tracker.Budget(); got != 6 {
+		t.Fatalf("entropy budget after reload = %v, want 6", got)
+	}
+	buffer.Append("session", []byte("second"))
+	if got := buffer.TotalBufferBytes(); got > 8 {
+		t.Fatalf("fragment buffer retained %d bytes after limit reload, want at most 8", got)
+	}
+}
+
+func TestReload_CEEAdmissionSnapshotsPolicyAndStateTogether(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionBlock
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	admissionLocked := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	p.ceeAdmissionLocked = func() {
+		close(admissionLocked)
+		<-releaseAdmission
+	}
+	t.Cleanup(func() { p.ceeAdmissionLocked = nil })
+	admissionDone := make(chan ceeAdmission, 1)
+	go func() {
+		admissionDone <- p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+			SessionKey: "session", Outbound: []byte("abc"), TargetURL: "https://api.vendor.example",
+			ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+		})
+	}()
+	<-admissionLocked
+
+	// The production admission now owns the read snapshot. A reload cannot
+	// publish its permissive generation until that admission releases it.
+	permissive := cfg.Clone()
+	permissive.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1000
+	reloadLocked := make(chan struct{})
+	p.reloadLocked = func() { close(reloadLocked) }
+	t.Cleanup(func() { p.reloadLocked = nil })
+	reloadDone := make(chan bool, 1)
+	permissiveScanner := scanner.MustNew(permissive)
+	go func() {
+		reloadDone <- p.Reload(permissive, permissiveScanner)
+	}()
+	select {
+	case <-reloadLocked:
+		t.Fatal("permissive reload completed while old CEE snapshot was active")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseAdmission)
+
+	admission := <-admissionDone
+	if !admission.Active || !admission.Result.Blocked || admission.Config.EntropyBudget.BitsPerWindow != 1 {
+		t.Fatalf("old CEE snapshot = %+v", admission)
+	}
+	select {
+	case ok := <-reloadDone:
+		if !ok {
+			t.Fatal("permissive reload failed")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("permissive reload remained wedged after the admission released its snapshot")
+	}
+	p.ceeAdmissionLocked = nil
+	admission = p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		SessionKey: "session", Outbound: []byte(""), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !admission.Active || admission.Result.Blocked || admission.Config.EntropyBudget.BitsPerWindow != 1000 {
+		t.Fatalf("new CEE snapshot = %+v", admission)
+	}
+}
+
+func TestReload_CEEAdmissionUsesLiveScannerAndMetadata(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	cfg.CrossRequestDetection.FragmentReassembly.WindowMinutes = 5
+	cfg.AdaptiveEnforcement.Enabled = true
+	cfg.AdaptiveEnforcement.EscalationThreshold = 100
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	const payload = "reload_secret_"
+	before := p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		SessionKey: "session", Outbound: []byte(payload), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !before.Active || before.Result.FragmentHit {
+		t.Fatalf("pre-reload admission = %+v, want no custom-pattern match", before)
+	}
+
+	reloaded := cfg.Clone()
+	reloaded.DLP.Patterns = append(reloaded.DLP.Patterns, config.DLPPattern{
+		Name:     "Reload Canary",
+		Regex:    `reload_secret_[a-z]+`,
+		Severity: "high",
+	})
+	reloaded.AdaptiveEnforcement.EscalationThreshold = 1
+	newScanner := scanner.MustNew(reloaded)
+	if !p.Reload(reloaded, newScanner) {
+		newScanner.Close()
+		t.Fatal("scanner policy reload failed")
+	}
+
+	after := p.admitCurrentCEE(t.Context(), ceeAdmitRequest{
+		SessionKey: "session", Outbound: []byte("canary"), TargetURL: "https://api.vendor.example",
+		ClientIP: "127.0.0.1", RequestID: "req", IncludeFragments: true,
+	})
+	if !after.Active || !after.Result.Blocked || !after.Result.FragmentHit {
+		t.Fatalf("post-reload admission = %+v, want live scanner to block retained canary", after)
+	}
+	if after.PolicyHash != reloaded.CanonicalPolicyHash() || after.AdaptiveConfig.EscalationThreshold != 1 {
+		t.Fatalf("post-reload metadata = hash:%q threshold:%v", after.PolicyHash, after.AdaptiveConfig.EscalationThreshold)
+	}
+}
+
+func TestCurrentCEEEntropySnapshotsAdaptiveGeneration(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1
+	cfg.CrossRequestDetection.EntropyBudget.WindowMinutes = 5
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionWarn
+	cfg.SessionProfiling.Enabled = true
+	cfg.AdaptiveEnforcement.Enabled = true
+	cfg.AdaptiveEnforcement.EscalationThreshold = 100
+
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	const sessionKey = "connect-session"
+	p.entropyTrackerPtr.Load().Record(sessionKey, []byte("high-entropy-payload-abcdefghijklmnop"))
+
+	reloaded := cfg.Clone()
+	reloaded.AdaptiveEnforcement.EscalationThreshold = 1
+	newScanner := scanner.MustNew(reloaded)
+	if !p.Reload(reloaded, newScanner) {
+		newScanner.Close()
+		t.Fatal("adaptive policy reload failed")
+	}
+
+	snapshot := p.currentCEEEntropy(sessionKey)
+	if !snapshot.Active || !snapshot.Exceeded {
+		t.Fatalf("entropy snapshot = %+v, want active exceeded state", snapshot)
+	}
+	if snapshot.AdaptiveConfig.EscalationThreshold != 1 {
+		t.Fatalf("adaptive threshold = %v, want live threshold 1", snapshot.AdaptiveConfig.EscalationThreshold)
+	}
+	if snapshot.Sessions == nil || snapshot.Sessions != p.sessionMgrPtr.Load() {
+		t.Fatal("entropy snapshot did not retain the live session manager")
+	}
+	if snapshot.Recorder == nil || snapshot.Recorder != snapshot.Sessions.GetOrCreate(sessionKey) {
+		t.Fatal("entropy snapshot did not retain the live session recorder")
+	}
+	postRec, postAdaptive := connectPostCEEAdaptiveState(snapshot, nil, config.AdaptiveEnforcement{})
+	if postRec != snapshot.Recorder || postAdaptive.EscalationThreshold != 1 {
+		t.Fatalf("post-CEE state = recorder:%p threshold:%v, want snapshot recorder and threshold 1", postRec, postAdaptive.EscalationThreshold)
+	}
+	fallbackRec := snapshot.Sessions.GetOrCreate("fallback")
+	fallbackCfg := config.AdaptiveEnforcement{Enabled: true, EscalationThreshold: 77}
+	postRec, postAdaptive = connectPostCEEAdaptiveState(ceeEntropySnapshot{}, fallbackRec, fallbackCfg)
+	if postRec != fallbackRec || postAdaptive.EscalationThreshold != 77 {
+		t.Fatalf("inactive post-CEE state = recorder:%p threshold:%v, want fallback", postRec, postAdaptive.EscalationThreshold)
 	}
 }
 

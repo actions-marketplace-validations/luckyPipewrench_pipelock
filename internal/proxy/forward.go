@@ -437,36 +437,35 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// was exhausting the entropy budget and triggering adaptive escalation
 	// to block_all, permanently locking out legitimate agents.
 	// DLP, SSRF, and per-request entropy checks still run on the hostname.
-	if ceeCfg := ceeEffectiveConfig(cfg.CrossRequestDetection, cfg.EnforceEnabled()); ceeCfg.Enabled {
+	ceeEntropy := p.currentCEEEntropy(ceeSessionKey(agent, clientIP, id.Auth))
+	postCEERec, postCEEAdaptive := connectPostCEEAdaptiveState(ceeEntropy, connectRec, cfg.AdaptiveEnforcement)
+	if ceeEntropy.Active {
 		sessionKey := ceeSessionKey(agent, clientIP, id.Auth)
-		if et := p.entropyTrackerPtr.Load(); et != nil && ceeCfg.EntropyBudget.Enabled {
+		if ceeEntropy.Exceeded {
 			// Skip: CONNECT hostname is NOT recorded to entropy budget.
 			// Only query values, request bodies, and MCP args contribute.
-			if et.BudgetExceeded(sessionKey) {
-				hasFinding = true
-				p.metrics.RecordCrossRequestEntropyExceeded()
-				detail := fmt.Sprintf("entropy budget exceeded: %.0f/%.0f bits",
-					et.CurrentUsage(sessionKey), et.Budget())
-				if sm := p.sessionMgrPtr.Load(); sm != nil && cfg.AdaptiveEnforcement.Enabled {
-					ceeRecordSignals(ceeResult{EntropyHit: true}, sm, sessionKey,
-						cfg.AdaptiveEnforcement.EscalationThreshold, p.logger, p.metrics, clientIP, requestID)
-				}
-				ceeAction := ceeCfg.EntropyBudget.Action
-				originalCEEAction := ceeAction
-				ceeAction = decide.UpgradeAction(ceeAction, sr.Level, &cfg.AdaptiveEnforcement)
-				if ceeAction != originalCEEAction {
-					recordAdaptiveUpgrade(p.logger, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sr.Level), FromAction: originalCEEAction, ToAction: ceeAction, Scanner: "cross_request_entropy", ClientIP: clientIP, RequestID: requestID})
-				}
-				if ceeAction == config.ActionBlock {
-					p.logger.LogBlocked(targetCtx, "cross_request_entropy", detail)
-					p.metrics.RecordTunnelBlocked(agentLabel)
-					writeBlockedError(w,
-						blockInfoFor(blockreason.CrossRequestDeny, "cross_request_entropy"),
-						"CONNECT blocked: cross-request entropy budget exceeded", http.StatusForbidden)
-					return
-				}
-				p.logger.LogAnomaly(targetCtx, "cross_request_entropy", detail, 0)
+			hasFinding = true
+			p.metrics.RecordCrossRequestEntropyExceeded()
+			detail := fmt.Sprintf("entropy budget exceeded: %.0f/%.0f bits", ceeEntropy.Usage, ceeEntropy.Budget)
+			if sm := ceeEntropy.Sessions; sm != nil && ceeEntropy.AdaptiveConfig.Enabled {
+				ceeRecordSignals(ceeResult{EntropyHit: true}, sm, sessionKey,
+					ceeEntropy.AdaptiveConfig.EscalationThreshold, p.logger, p.metrics, clientIP, requestID)
 			}
+			ceeAction := ceeEntropy.Config.EntropyBudget.Action
+			originalCEEAction := ceeAction
+			ceeAction = decide.UpgradeAction(ceeAction, sr.Level, &ceeEntropy.AdaptiveConfig)
+			if ceeAction != originalCEEAction {
+				recordAdaptiveUpgrade(p.logger, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sr.Level), FromAction: originalCEEAction, ToAction: ceeAction, Scanner: "cross_request_entropy", ClientIP: clientIP, RequestID: requestID})
+			}
+			if ceeAction == config.ActionBlock {
+				p.logger.LogBlocked(targetCtx, "cross_request_entropy", detail)
+				p.metrics.RecordTunnelBlocked(agentLabel)
+				writeBlockedError(w,
+					blockInfoFor(blockreason.CrossRequestDeny, "cross_request_entropy"),
+					"CONNECT blocked: cross-request entropy budget exceeded", http.StatusForbidden)
+				return
+			}
+			p.logger.LogAnomaly(targetCtx, "cross_request_entropy", detail, 0)
 		}
 	}
 
@@ -474,10 +473,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// CEE block above may fire ceeRecordSignals without blocking (e.g. entropy
 	// budget exceeded but action=warn), pushing the session to a block_all level.
 	// Use the live recorder for an up-to-date escalation level.
-	if cfg.AdaptiveEnforcement.Enabled {
-		if connectRec != nil {
-			level := connectRec.EscalationLevel()
-			if decide.UpgradeAction("", level, &cfg.AdaptiveEnforcement) == config.ActionBlock {
+	if postCEEAdaptive.Enabled {
+		if postCEERec != nil {
+			level := postCEERec.EscalationLevel()
+			if decide.UpgradeAction("", level, &postCEEAdaptive) == config.ActionBlock {
 				recordAdaptiveUpgrade(p.logger, p.metrics, adaptiveUpgrade{SessionKey: connectSessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
 				emitConnectSessionDenyReceipt()
 				p.metrics.RecordTunnelBlocked(agentLabel)
@@ -834,6 +833,13 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// are streaming: bytes are tracked after close and enforced on the next
 	// admission check, not mid-stream (can't un-send tunnel data).
 	_ = resolved.Budget.RecordBytes(totalBytes)
+}
+
+func connectPostCEEAdaptiveState(snapshot ceeEntropySnapshot, fallback session.Recorder, fallbackCfg config.AdaptiveEnforcement) (session.Recorder, config.AdaptiveEnforcement) {
+	if snapshot.Active {
+		return snapshot.Recorder, snapshot.AdaptiveConfig
+	}
+	return fallback, fallbackCfg
 }
 
 // handleForwardHTTP handles forward proxy requests with absolute URIs
@@ -1688,14 +1694,14 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// CEE pre-forward admission: check cross-request entropy and fragment
 	// reassembly before the outbound request leaves. Forward proxy has
 	// URL path, query params, and request body as outbound data.
-	ceeCfg := ceeEffectiveConfig(cfg.CrossRequestDetection, cfg.EnforceEnabled())
-	if ceeCfg.Enabled {
+	ceeAdmission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
+		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: extractOutboundPayload(r),
+		KeyPayload: queryParamKeys(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
+		RequestID: requestID, IncludeFragments: true,
+	})
+	if ceeAdmission.Active {
+		ceeRes := ceeAdmission.Result
 		sessionKey := ceeSessionKey(agent, clientIP, id.Auth)
-		outbound := extractOutboundPayload(r)
-		keys := queryParamKeys(r.URL)
-
-		ceeRes := ceeAdmit(r.Context(), sessionKey, outbound, keys, targetURL, agent, clientIP, requestID,
-			ceeCfg, p.entropyTrackerPtr.Load(), p.fragmentBufferPtr.Load(), sc, p.logger, p.metrics)
 
 		// Capture observer: record forward CEE verdict for policy replay.
 		ceeFindings := ceeResultToFindings(ceeRes)
@@ -1711,7 +1717,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			SessionID:         captureSessionKey(agent, clientIP),
 			SessionIDOriginal: captureSessionKeyOriginal(agent, clientIP),
 			RequestID:         requestID,
-			ConfigHash:        cfg.CanonicalPolicyHash(),
+			ConfigHash:        ceeAdmission.PolicyHash,
 			Agent:             agent,
 			Profile:           id.Profile,
 			ActionClass:       captureHTTPActionClass(r.Method),
@@ -1729,10 +1735,10 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 		var ceeRec session.Recorder
 		var ceeBlockAll bool
-		if sm := p.sessionMgrPtr.Load(); sm != nil {
+		if sm := ceeAdmission.Sessions; sm != nil {
 			ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
 				Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
-				AdaptiveCfg: &cfg.AdaptiveEnforcement, Logger: p.logger, Metrics: p.metrics,
+				AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: p.logger, Metrics: p.metrics,
 				ClientIP: clientIP, RequestID: requestID,
 			})
 		}

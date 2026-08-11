@@ -140,7 +140,31 @@ func (et *EntropyTracker) BudgetExceeded(sessionKey string) bool {
 
 // Budget returns the configured entropy budget in bits per window.
 func (et *EntropyTracker) Budget() float64 {
+	et.mu.Lock()
+	defer et.mu.Unlock()
 	return et.budget
+}
+
+// UpdateConfig applies a new entropy budget and window without discarding
+// in-progress session state. Entries outside the new window are pruned before
+// the new limits become observable, so a shorter window cannot keep stale
+// traffic alive and a lower budget takes effect immediately.
+func (et *EntropyTracker) UpdateConfig(budgetBits float64, windowSecs int) {
+	if budgetBits <= 0 {
+		budgetBits = 1
+	}
+	if windowSecs <= 0 {
+		windowSecs = 1
+	}
+
+	et.mu.Lock()
+	defer et.mu.Unlock()
+
+	et.budget = budgetBits
+	et.windowSecs = windowSecs
+	now := time.Now()
+	et.cleanupLocked(now)
+	et.lastCleanup = now
 }
 
 // Delete removes all entropy tracking state for the given session key.
@@ -150,9 +174,15 @@ func (et *EntropyTracker) Delete(key string) {
 	delete(et.sessions, key)
 }
 
-// Close is retained for scanner lifecycle symmetry. EntropyTracker owns no
-// background resources, so closing it is intentionally a no-op.
-func (et *EntropyTracker) Close() {}
+// Close retires all tracked entropy state. It is safe to call more than once.
+func (et *EntropyTracker) Close() {
+	if et == nil {
+		return
+	}
+	et.mu.Lock()
+	defer et.mu.Unlock()
+	et.sessions = make(map[string]*entropySession)
+}
 
 // currentUsageLocked sums entropy bits within the sliding window.
 // Caller must hold et.mu.

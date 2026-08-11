@@ -974,34 +974,20 @@ Key-free evidence capture:
 				chainMatcher = chains.New(&cfg.ToolChainDetection)
 			}
 
+			// Create the MCP metrics registry independently of session profiling so
+			// transport, CEE, and denial-of-wallet counters share the served registry.
+			mcpMetrics := metrics.New()
+
 			// Build CEE deps when cross-request detection is enabled.
 			var cee *mcp.CEEDeps
 			if cfg.CrossRequestDetection.Enabled {
-				m := metrics.New()
-				ceeCfg := cfg.CrossRequestDetection
-				cee = &mcp.CEEDeps{Config: &ceeCfg, Metrics: m}
-				if ceeCfg.EntropyBudget.Enabled {
-					cee.Tracker = scanner.NewEntropyTracker(
-						ceeCfg.EntropyBudget.BitsPerWindow,
-						ceeCfg.EntropyBudget.WindowMinutes*60, // minutes to seconds
-					)
-				}
-				if ceeCfg.FragmentReassembly.Enabled {
-					cee.Buffer = scanner.NewFragmentBuffer(
-						ceeCfg.FragmentReassembly.MaxBufferBytes,
-						10000, // 10K max sessions, matching proxy constant
-						ceeCfg.FragmentReassembly.WindowMinutes*60,
-					)
-				}
+				cee = mcp.NewCEEDeps(cfg.CrossRequestDetection, mcpMetrics)
 			}
 
-			// Create the MCP metrics registry independently of session profiling so
-			// transport and denial-of-wallet counters remain available in Free-tier
-			// configurations. The session store remains optional.
+			// The session store remains optional.
 			var store session.Store
 			var baselineChecker session.BaselineChecker
 			var adaptiveCfg *config.AdaptiveEnforcement
-			mcpMetrics := metrics.New()
 			if cfg.AdaptiveEnforcement.Enabled {
 				adaptiveCfg = &cfg.AdaptiveEnforcement
 			}
