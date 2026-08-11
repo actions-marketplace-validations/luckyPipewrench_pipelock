@@ -6,6 +6,7 @@ package gitprotect
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -23,13 +24,154 @@ import (
 // nothing. Match on what runs, reached through the parsed job.
 
 type workflowStep struct {
-	Name string `yaml:"name"`
-	Uses string `yaml:"uses"`
-	If   string `yaml:"if"`
-	Run  string `yaml:"run"`
+	Name string            `yaml:"name"`
+	Uses string            `yaml:"uses"`
+	If   string            `yaml:"if"`
+	Run  string            `yaml:"run"`
+	Env  map[string]string `yaml:"env"`
 	// ContinueOnError is any-typed because YAML admits several shapes here:
 	// omitted, null, blank, a bool, or a `${{ }}` expression string.
 	ContinueOnError any `yaml:"continue-on-error"`
+}
+
+// TestTrustedScanSelectsDiffEndpointsForEveryTrigger pins both event shapes
+// accepted by the workflow. Pull-request-only fields are empty on a push, so
+// using them unconditionally makes the main-branch gate fail before scanning.
+// The explicit endpoint guards also keep an absent, zero, or unavailable ref
+// from degrading into an empty or ambiguous scan.
+func TestTrustedScanSelectsDiffEndpointsForEveryTrigger(t *testing.T) {
+	t.Parallel()
+
+	var steps []workflowStep
+	for _, step := range runStepsContaining(securityScanSteps(t), "generate-trusted-diff.sh") {
+		if step.Name == "Scan the diff" {
+			steps = append(steps, step)
+		}
+	}
+	if len(steps) != 1 {
+		t.Fatalf("got %d unconditional diff-generation steps, want exactly 1", len(steps))
+	}
+
+	step := steps[0]
+	if strings.TrimSpace(step.If) != "" {
+		t.Fatalf("scan step is conditional (if: %q); the endpoint gate must run for every job invocation", step.If)
+	}
+	if got, want := step.Env["BASE_SHA"], "${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}"; got != want {
+		t.Fatalf("BASE_SHA expression = %q, want %q", got, want)
+	}
+	if got, want := step.Env["HEAD_SHA"], "${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}"; got != want {
+		t.Fatalf("HEAD_SHA expression = %q, want %q", got, want)
+	}
+	for _, exactGuard := range []string{
+		`if [[ -z "${BASE_SHA}" || -z "${HEAD_SHA}" || "${BASE_SHA}" == "${zero_sha}" || "${HEAD_SHA}" == "${zero_sha}" ]]; then`,
+		`git rev-parse --verify --quiet "${BASE_SHA}^{commit}" >/dev/null || {`,
+		`git rev-parse --verify --quiet "${HEAD_SHA}^{commit}" >/dev/null || {`,
+	} {
+		if !strings.Contains(step.Run, exactGuard) {
+			t.Fatalf("scan step lacks exact fail-closed endpoint guard %q", exactGuard)
+		}
+	}
+
+	repo, runnerTemp, baseSHA, headSHA := trustedScanTestRepo(t)
+	scanScriptPath := filepath.Join(runnerTemp, "scan-step.sh")
+	if err := os.WriteFile(scanScriptPath, []byte(step.Run), 0o600); err != nil {
+		t.Fatalf("write scan-step fixture: %v", err)
+	}
+	zeroSHA := strings.Repeat("0", 40)
+	for _, tc := range []struct {
+		name             string
+		baseSHA          string
+		headSHA          string
+		wantPass         bool
+		wantRanGenerator bool
+		wantRanScan      bool
+	}{
+		{name: "valid endpoints", baseSHA: baseSHA, headSHA: headSHA, wantPass: true, wantRanGenerator: true, wantRanScan: true},
+		{name: "empty base", baseSHA: "", headSHA: headSHA},
+		{name: "empty head", baseSHA: baseSHA, headSHA: ""},
+		{name: "zero base", baseSHA: zeroSHA, headSHA: headSHA},
+		{name: "zero head", baseSHA: baseSHA, headSHA: zeroSHA},
+		{name: "unavailable base", baseSHA: strings.Repeat("a", 40), headSHA: headSHA},
+		{name: "unavailable head", baseSHA: baseSHA, headSHA: strings.Repeat("b", 40)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, marker := range []string{"generator-ran", "scanner-ran", "pr.diff"} {
+				_ = os.Remove(filepath.Join(runnerTemp, marker))
+			}
+			// #nosec G204 -- the script path names this test's temporary copy of the checked-in workflow step.
+			cmd := exec.CommandContext(t.Context(), "bash", scanScriptPath)
+			cmd.Dir = repo
+			cmd.Env = append(os.Environ(), "RUNNER_TEMP="+runnerTemp, "BASE_SHA="+tc.baseSHA, "HEAD_SHA="+tc.headSHA)
+			output, err := cmd.CombinedOutput()
+			if tc.wantPass && err != nil {
+				t.Fatalf("scan step rejected valid endpoints: %v\n%s", err, output)
+			}
+			if !tc.wantPass && err == nil {
+				t.Fatalf("scan step accepted invalid endpoints; output:\n%s", output)
+			}
+			_, generatorErr := os.Stat(filepath.Join(runnerTemp, "generator-ran"))
+			if got := generatorErr == nil; got != tc.wantRanGenerator {
+				t.Fatalf("generator execution = %t, want %t; output:\n%s", got, tc.wantRanGenerator, output)
+			}
+			_, scanErr := os.Stat(filepath.Join(runnerTemp, "scanner-ran"))
+			if got := scanErr == nil; got != tc.wantRanScan {
+				t.Fatalf("scanner execution = %t, want %t; output:\n%s", got, tc.wantRanScan, output)
+			}
+		})
+	}
+}
+
+func trustedScanTestRepo(t *testing.T) (repo, runnerTemp, baseSHA, headSHA string) {
+	t.Helper()
+	repo = t.TempDir()
+	runnerTemp = t.TempDir()
+	runTrustedScanGitCommand(t, repo, "init", "--quiet")
+	runTrustedScanGitCommand(t, repo, "config", "user.email", "test@example.invalid")
+	runTrustedScanGitCommand(t, repo, "config", "user.name", "Pipelock Test")
+	tracked := filepath.Join(repo, "tracked.txt")
+	if err := os.WriteFile(tracked, []byte("base\n"), 0o600); err != nil {
+		t.Fatalf("write base fixture: %v", err)
+	}
+	runTrustedScanGitCommand(t, repo, "add", "tracked.txt")
+	runTrustedScanGitCommand(t, repo, "commit", "--quiet", "-m", "base")
+	baseSHA = strings.TrimSpace(runTrustedScanGitCommand(t, repo, "rev-parse", "HEAD"))
+	if err := os.WriteFile(tracked, []byte("head\n"), 0o600); err != nil {
+		t.Fatalf("write head fixture: %v", err)
+	}
+	runTrustedScanGitCommand(t, repo, "add", "tracked.txt")
+	runTrustedScanGitCommand(t, repo, "commit", "--quiet", "-m", "head")
+	headSHA = strings.TrimSpace(runTrustedScanGitCommand(t, repo, "rev-parse", "HEAD"))
+
+	scriptDir := filepath.Join(runnerTemp, "trusted-main", "scripts")
+	if err := os.MkdirAll(scriptDir, 0o750); err != nil {
+		t.Fatalf("create trusted script directory: %v", err)
+	}
+	generator := "#!/usr/bin/env bash\nset -euo pipefail\ntouch \"${RUNNER_TEMP}/generator-ran\"\ngit diff --binary \"$1\" \"$2\" > \"$3\"\n"
+	if err := os.WriteFile(filepath.Join(scriptDir, "generate-trusted-diff.sh"), []byte(generator), 0o600); err != nil {
+		t.Fatalf("write fake diff generator: %v", err)
+	}
+	scanner := "#!/usr/bin/env bash\nset -euo pipefail\ncat >/dev/null\ntouch \"${RUNNER_TEMP}/scanner-ran\"\n"
+	scannerPath := filepath.Join(runnerTemp, "pipelock")
+	if err := os.WriteFile(scannerPath, []byte(scanner), 0o600); err != nil {
+		t.Fatalf("write fake scanner: %v", err)
+	}
+	// #nosec G302 -- this temporary test fixture must be executable as the workflow scanner binary.
+	if err := os.Chmod(scannerPath, 0o700); err != nil {
+		t.Fatalf("make fake scanner executable: %v", err)
+	}
+	return repo, runnerTemp, baseSHA, headSHA
+}
+
+func runTrustedScanGitCommand(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	// #nosec G204 -- arguments are fixed Git fixture commands supplied by this test.
+	cmd := exec.CommandContext(t.Context(), "git", args...)
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
 }
 
 type workflowJob struct {
