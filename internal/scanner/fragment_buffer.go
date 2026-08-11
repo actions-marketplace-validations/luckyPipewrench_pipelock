@@ -197,6 +197,39 @@ func (fb *FragmentBuffer) TotalBufferBytes() int {
 	return total
 }
 
+// UpdateConfig applies new fragment limits without discarding fragments that
+// remain valid under them. It removes expired data first, then retains each
+// session's newest suffix within the new byte cap. This lets a reload tighten
+// limits immediately without creating a fresh split-secret window.
+func (fb *FragmentBuffer) UpdateConfig(maxBytesPerSession, windowSecs int) {
+	if maxBytesPerSession <= 0 {
+		maxBytesPerSession = 1
+	}
+	if windowSecs <= 0 {
+		windowSecs = 1
+	}
+
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+
+	fb.maxBytes = maxBytesPerSession
+	fb.windowSecs = windowSecs
+	now := time.Now()
+	fb.cleanupLocked(now)
+	for _, sb := range fb.sessions {
+		for sb.totalBytes > fb.maxBytes && len(sb.fragments) > 1 {
+			sb.totalBytes -= len(sb.fragments[0].data)
+			sb.fragments = sb.fragments[1:]
+		}
+		if sb.totalBytes > fb.maxBytes && len(sb.fragments) == 1 {
+			last := &sb.fragments[0]
+			last.data = last.data[len(last.data)-fb.maxBytes:]
+			sb.totalBytes = fb.maxBytes
+		}
+	}
+	fb.lastCleanup = now
+}
+
 // Delete removes all fragment state for the given session key.
 func (fb *FragmentBuffer) Delete(key string) {
 	fb.mu.Lock()
@@ -204,9 +237,15 @@ func (fb *FragmentBuffer) Delete(key string) {
 	delete(fb.sessions, key)
 }
 
-// Close is retained for scanner lifecycle symmetry. FragmentBuffer owns no
-// background resources, so closing it is intentionally a no-op.
-func (fb *FragmentBuffer) Close() {}
+// Close retires all buffered fragments. It is safe to call more than once.
+func (fb *FragmentBuffer) Close() {
+	if fb == nil {
+		return
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.sessions = make(map[string]*sessionBuffer)
+}
 
 // concatenateFragments builds a single byte slice from non-expired session
 // fragments. Filters by windowSecs so scans never include stale data, even

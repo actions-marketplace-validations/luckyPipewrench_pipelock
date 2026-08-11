@@ -6,12 +6,140 @@ package mcp
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
+
+func TestCEEDepsReconfigure_SerializesPolicyAndStateSnapshots(t *testing.T) {
+	strict := config.CrossRequestDetection{
+		Enabled: true,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1,
+			WindowMinutes: 5,
+			Action:        config.ActionBlock,
+		},
+	}
+	cee := NewCEEDeps(strict, metrics.New())
+	oldTracker, _, _, oldCfg, release := cee.snapshot()
+	if oldTracker == nil || oldCfg.EntropyBudget.BitsPerWindow != 1 {
+		t.Fatalf("old CEE snapshot = tracker:%p cfg:%+v", oldTracker, oldCfg)
+	}
+	oldTracker.Record(testMCPSessionKey, []byte("abc"))
+	if !oldTracker.BudgetExceeded(testMCPSessionKey) {
+		t.Fatal("strict snapshot did not enforce its own budget")
+	}
+
+	permissive := strict
+	permissive.EntropyBudget.BitsPerWindow = 1000
+	done := make(chan struct{})
+	go func() {
+		cee.Reconfigure(permissive, metrics.New())
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("permissive reload acquired its write lock while an old policy snapshot was active")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	release()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reload remained wedged after the in-flight CEE check completed")
+	}
+
+	newTracker, _, _, newCfg, newRelease := cee.snapshot()
+	defer newRelease()
+	if newTracker != oldTracker {
+		t.Fatal("reload discarded entropy history instead of reusing the tracker")
+	}
+	if newCfg.EntropyBudget.BitsPerWindow != 1000 {
+		t.Fatalf("new policy budget = %v, want 1000", newCfg.EntropyBudget.BitsPerWindow)
+	}
+	if newTracker.BudgetExceeded(testMCPSessionKey) {
+		t.Fatal("new permissive snapshot retained the old strict limit")
+	}
+}
+
+func TestCEEDepsReconfigure_RetiresAndRecreatesComponents(t *testing.T) {
+	cfg := config.CrossRequestDetection{
+		Enabled: true,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 32,
+			WindowMinutes: 5,
+		},
+	}
+	cee := NewCEEDeps(cfg, metrics.New())
+	oldTracker, oldBuffer := cee.Components()
+	if oldTracker == nil || oldBuffer != nil {
+		t.Fatalf("initial components = tracker:%p buffer:%p", oldTracker, oldBuffer)
+	}
+	oldTracker.Record(testMCPSessionKey, []byte("secret state"))
+
+	cfg.EntropyBudget.Enabled = false
+	cfg.FragmentReassembly.Enabled = true
+	cfg.FragmentReassembly.MaxBufferBytes = 128
+	cfg.FragmentReassembly.WindowMinutes = 5
+	cee.Reconfigure(cfg, metrics.New())
+	tracker, oldBuffer := cee.Components()
+	if tracker != nil || oldBuffer == nil {
+		t.Fatalf("fragment-only components = tracker:%p buffer:%p", tracker, oldBuffer)
+	}
+	if got := oldTracker.CurrentUsage(testMCPSessionKey); got != 0 {
+		t.Fatalf("retired tracker retained %.1f bits", got)
+	}
+	oldBuffer.Append(testMCPSessionKey, []byte("split-secret"))
+
+	cfg.EntropyBudget.Enabled = true
+	cfg.FragmentReassembly.Enabled = false
+	cee.Reconfigure(cfg, metrics.New())
+	tracker, buffer := cee.Components()
+	if tracker == nil || tracker == oldTracker || buffer != nil {
+		t.Fatalf("entropy-only components = tracker:%p old:%p buffer:%p", tracker, oldTracker, buffer)
+	}
+	if got := oldBuffer.TotalBufferBytes(); got != 0 {
+		t.Fatalf("retired fragment buffer retained %d bytes", got)
+	}
+}
+
+func TestCEEDepsReconfigure_PreservesHistoryAndAppliesStricterPolicy(t *testing.T) {
+	cfg := config.CrossRequestDetection{
+		Enabled: true,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled: true, BitsPerWindow: 1000, WindowMinutes: 5, Action: config.ActionBlock,
+		},
+	}
+	cee := NewCEEDeps(cfg, metrics.New())
+	tracker, _ := cee.Components()
+	tracker.Record(testMCPSessionKey, []byte("recorded-before-reload"))
+
+	cee.Reconfigure(cfg, metrics.New())
+	unchanged, _ := cee.Components()
+	if unchanged != tracker || unchanged.CurrentUsage(testMCPSessionKey) == 0 {
+		t.Fatal("unrelated reload discarded the active entropy tracker or its history")
+	}
+
+	cfg.EntropyBudget.BitsPerWindow = 1
+	cee.Reconfigure(cfg, metrics.New())
+	strict, _ := cee.Components()
+	if strict != tracker || !strict.BudgetExceeded(testMCPSessionKey) {
+		t.Fatal("stricter reload did not apply to retained entropy history")
+	}
+
+	cfg.Enabled = false
+	cee.Reconfigure(cfg, metrics.New())
+	retired, buffer := cee.Components()
+	if retired != nil || buffer != nil || tracker.CurrentUsage(testMCPSessionKey) != 0 {
+		t.Fatal("disabled reload retained active or buffered CEE state")
+	}
+}
 
 const (
 	testMCPSessionKey = "session-001"

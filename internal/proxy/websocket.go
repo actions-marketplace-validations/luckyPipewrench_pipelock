@@ -2114,26 +2114,21 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 		// Entropy tracking applies to all frame types (text + binary) since
 		// binary frames can carry high-entropy exfiltrated data. Fragment
 		// buffering only applies to text frames (DLP patterns match text).
-		if ceeCfg := ceeEffectiveConfig(r.cfg.CrossRequestDetection, r.cfg.EnforceEnabled()); ceeCfg.Enabled {
-			isText := frag.Opcode == ws.OpText || hdr.OpCode == ws.OpText
+		ceeAdmission := r.proxy.admitCurrentCEE(ctx, ceeAdmitRequest{
+			SessionKey: ceeSessionKey(r.agent, r.clientIP, r.actorAuth), Outbound: msg,
+			TargetURL: r.targetURL, Agent: r.agent, ClientIP: r.clientIP, RequestID: r.requestID,
+			IncludeFragments: frag.Opcode == ws.OpText || hdr.OpCode == ws.OpText,
+		})
+		if ceeAdmission.Active {
+			ceeRes := ceeAdmission.Result
 			sessionKey := ceeSessionKey(r.agent, r.clientIP, r.actorAuth)
-
-			// Pass fragment buffer only for text frames; binary content
-			// doesn't match DLP text patterns.
-			var fb *scanner.FragmentBuffer
-			if isText {
-				fb = r.proxy.fragmentBufferPtr.Load()
-			}
-
-			ceeRes := ceeAdmit(ctx, sessionKey, msg, nil, r.targetURL, r.agent, r.clientIP, r.requestID,
-				ceeCfg, r.proxy.entropyTrackerPtr.Load(), fb, r.scanner, r.proxy.logger, r.proxy.metrics)
 
 			var ceeRec session.Recorder
 			var ceeBlockAll bool
-			if sm := r.proxy.sessionMgrPtr.Load(); sm != nil {
+			if sm := ceeAdmission.Sessions; sm != nil {
 				ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
 					Result: ceeRes, Sessions: sm, SessionKey: sessionKey,
-					AdaptiveCfg: &r.cfg.AdaptiveEnforcement, Logger: r.proxy.logger, Metrics: r.proxy.metrics,
+					AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: r.proxy.logger, Metrics: r.proxy.metrics,
 					ClientIP: r.clientIP, RequestID: r.requestID,
 				})
 			}
@@ -2142,15 +2137,16 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 				log.LogWSBlocked(r.targetURL, audit.DirectionClientToServer, "cross_request", ceeRes.Reason, r.clientIP, r.requestID)
 				r.proxy.metrics.RecordWSScanHit("cross_request")
 				_ = r.emitReceipt(receipt.EmitOpts{
-					ActionID:  receipt.NewActionID(),
-					Verdict:   config.ActionBlock,
-					Layer:     "cross_request",
-					Pattern:   ceeRes.Reason,
-					Transport: TransportWS,
-					Method:    "WS",
-					Target:    r.targetURL,
-					RequestID: r.requestID,
-					Agent:     r.agent,
+					ActionID:   receipt.NewActionID(),
+					Verdict:    config.ActionBlock,
+					Layer:      "cross_request",
+					PolicyHash: ceeAdmission.PolicyHash,
+					Pattern:    ceeRes.Reason,
+					Transport:  TransportWS,
+					Method:     "WS",
+					Target:     r.targetURL,
+					RequestID:  r.requestID,
+					Agent:      r.agent,
 				})
 				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, "cross-request exfiltration detected")
@@ -2166,15 +2162,16 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 				recordAdaptiveUpgrade(log, r.proxy.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: r.clientIP, RequestID: r.requestID})
 				r.terminalOnce.Do(func() {
 					_ = r.emitReceipt(receipt.EmitOpts{
-						ActionID:  receipt.NewActionID(),
-						Verdict:   config.ActionBlock,
-						Layer:     adaptiveSessionDeny,
-						Pattern:   "session escalation",
-						Transport: TransportWS,
-						Method:    "WS",
-						Target:    r.targetURL,
-						RequestID: r.requestID,
-						Agent:     r.agent,
+						ActionID:   receipt.NewActionID(),
+						Verdict:    config.ActionBlock,
+						Layer:      adaptiveSessionDeny,
+						Pattern:    "session escalation",
+						Transport:  TransportWS,
+						Method:     "WS",
+						Target:     r.targetURL,
+						RequestID:  r.requestID,
+						Agent:      r.agent,
+						PolicyHash: ceeAdmission.PolicyHash,
 					})
 				})
 				plwsutil.WriteCloseFrame(r.clientConn, ws.StatusPolicyViolation, adaptiveBlockedReason)
