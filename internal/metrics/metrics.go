@@ -20,6 +20,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/collectors"
 )
 
+// DoWAgentDefault is the reserved denial-of-wallet agent label for events
+// without a configured agent identity. It never collapses into _other.
+const DoWAgentDefault = "_default"
+
 // Metrics collects Prometheus counters and histograms for the fetch proxy.
 type Metrics struct {
 	registry *prometheus.Registry
@@ -27,6 +31,7 @@ type Metrics struct {
 	// Proxy / tunnel / SNI / reverse proxy (proxy.go).
 	requestsTotal           *prometheus.CounterVec
 	scannerHits             *prometheus.CounterVec
+	denialOfWalletEvents    *prometheus.CounterVec
 	requestLatency          prometheus.Histogram
 	tunnelsTotal            *prometheus.CounterVec
 	tunnelDuration          prometheus.Histogram
@@ -192,6 +197,7 @@ type Metrics struct {
 	sessionAnomalyCount    int64
 	sessionEscalationCount int64
 	agentStats             map[string]*agentCounters
+	denialOfWalletAgents   map[string]struct{}
 	degradedRuleBundles    []string
 
 	// Cross-request exfiltration stats callback (for JSON /stats endpoint).
@@ -224,6 +230,7 @@ func New() *Metrics {
 		topScannerHits:              make(map[string]int64),
 		topAnomalyTypes:             make(map[string]int64),
 		agentStats:                  make(map[string]*agentCounters),
+		denialOfWalletAgents:        map[string]struct{}{DoWAgentDefault: {}},
 		receiptEmitFailureCounts:    make(map[string]int64),
 		requiredReceiptBlocks:       make(map[string]int64),
 		evidenceSequenceGapCounts:   make(map[string]int64),
