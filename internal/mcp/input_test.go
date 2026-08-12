@@ -913,6 +913,72 @@ func TestForwardScannedInput_CleanRequestsForwarded(t *testing.T) {
 	}
 }
 
+func TestForwardScannedInput_ClientResponseDoesNotAuthorizeServerResponse(t *testing.T) {
+	sc := testInputScanner(t)
+	tracker := NewRequestTracker()
+	tracker.Track(json.RawMessage(`1`))
+	clientResponse := `{"jsonrpc":"2.0","id":89,"result":{"content":[{"type":"text","text":"client reply"}]}}` + "\n"
+
+	var serverIn bytes.Buffer
+	var inputLog bytes.Buffer
+	blockedCh := make(chan BlockedRequest, 1)
+	ForwardScannedInput(
+		transport.NewStdioReader(strings.NewReader(clientResponse)),
+		transport.NewStdioWriter(&serverIn),
+		&inputLog,
+		config.ActionBlock,
+		config.ActionBlock,
+		blockedCh,
+		nil,
+		tracker,
+		testOpts(sc),
+	)
+	if !strings.Contains(serverIn.String(), `"id":89`) {
+		t.Fatalf("client response was not forwarded: %q", serverIn.String())
+	}
+
+	unsolicited := `{"jsonrpc":"2.0","id":89,"result":{"content":[{"type":"text","text":"unsolicited"}]}}` + "\n"
+	var clientOut bytes.Buffer
+	var responseLog bytes.Buffer
+	_, err := ForwardScanned(
+		transport.NewStdioReader(strings.NewReader(unsolicited)),
+		transport.NewStdioWriter(&clientOut),
+		&responseLog,
+		tracker,
+		testOpts(sc),
+	)
+	if err != nil {
+		t.Fatalf("ForwardScanned: %v", err)
+	}
+	if !strings.Contains(responseLog.String(), "confused deputy") || !strings.Contains(clientOut.String(), "unsolicited response ID") {
+		t.Fatalf("missing confused-deputy refusal: log=%q output=%q", responseLog.String(), clientOut.String())
+	}
+	if strings.Contains(clientOut.String(), `"text":"unsolicited"`) {
+		t.Fatalf("unsolicited server response reached client: %q", clientOut.String())
+	}
+}
+
+func TestIsTrackableRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  string
+		id   json.RawMessage
+		want bool
+	}{
+		{name: "request", msg: `{"jsonrpc":"2.0","id":1,"method":"tools/list"}`, id: json.RawMessage(`1`), want: true},
+		{name: "notification", msg: `{"jsonrpc":"2.0","method":"notifications/initialized"}`, id: nil, want: false},
+		{name: "null ID notification", msg: `{"jsonrpc":"2.0","id":null,"method":"notifications/progress"}`, id: json.RawMessage(`null`), want: false},
+		{name: "client response", msg: `{"jsonrpc":"2.0","id":2,"result":{}}`, id: json.RawMessage(`2`), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isTrackableRequest([]byte(tt.msg), tt.id); got != tt.want {
+				t.Fatalf("isTrackableRequest() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestForwardScannedInput_BlockedRequestSendsID(t *testing.T) {
 	sc := testInputScanner(t)
 	dirty := makeRequest(42, "tools/call", map[string]string{
