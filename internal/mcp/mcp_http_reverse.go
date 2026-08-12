@@ -36,6 +36,8 @@ import (
 
 const listenerProxyAuthorization = "Proxy-Authorization"
 
+const listenerUnboundStateDegradationReason = "MCP HTTP listener request has no valid Pipelock-issued session state; stateful controls are unavailable"
+
 const (
 	listenerAuthorization   = "Authorization"
 	listenerLastEventID     = "Last-Event-ID"
@@ -460,9 +462,9 @@ func RunHTTPListenerProxy(
 			}
 		}
 		if requireStateToken && !stateBound {
-			// An unbound client still receives stateless content scanning and its
-			// resulting evidence. It never enters a state partition selected by
-			// client-controlled routing data.
+			// An unbound client receives stateless content and tool-poison scanning,
+			// plus its resulting evidence. It never enters a state partition
+			// selected by client-controlled routing data.
 			clientState = listenerClients.newUnboundState()
 			clientStateKey = clientState.key
 			defer listenerClients.discardUnboundState(clientState)
@@ -1063,6 +1065,26 @@ func RunHTTPListenerProxy(
 		}
 		if stateBound {
 			bindStateRequestContext()
+		}
+		if requireStateToken && !stateBound {
+			// Emitting per request lets any reachable client amplify one
+			// request into one log line and one audit record. Aggregate
+			// instead: the first degraded request reports immediately, later
+			// ones are counted, and each report carries the count since the
+			// previous one so the evidence survives the throttle.
+			if degraded, report := listenerClients.degradationReporter.observe(); report {
+				detail := fmt.Sprintf("%s (degraded_requests_since_last_report=%d)",
+					listenerUnboundStateDegradationReason, degraded)
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: %s\n", detail)
+				if requestBaseOpts.AuditLogger != nil {
+					requestBaseOpts.AuditLogger.LogAnomaly(
+						mustMCPAuditContext(requestBaseOpts.AuditLogger, "MCP", "http-listener"),
+						"",
+						detail,
+						0,
+					)
+				}
+			}
 		}
 
 		// Kill switch: deny all requests when active.
@@ -1792,11 +1814,23 @@ func listenerRequiresStateToken(opts MCPProxyOpts) bool {
 
 // listenerStatelessRequestOpts strips every control whose decision depends on
 // a retained client state partition. It is used only while a listener request
-// lacks a valid Pipelock-issued token. Stateless scanner, A2A, policy,
-// redaction, contract, and receipt checks remain active and run before the
-// request receives its token-required verdict.
+// lacks a valid Pipelock-issued token. Stateless scanner, tool-poison, A2A,
+// policy, redaction, contract, and receipt checks remain active. Tool drift
+// remains unavailable because no baseline is retained or fabricated.
 func listenerStatelessRequestOpts(opts MCPProxyOpts) MCPProxyOpts {
-	opts.ToolCfg = nil
+	if toolCfg := opts.toolCfg(); toolCfg != nil {
+		// Preserve response-only tool-poison matching and the explicit
+		// no-baseline binding decision without supplying a baseline that a
+		// tokenless request could mutate or reuse.
+		opts.ToolCfg = &tools.ToolScanConfig{
+			Action:                  toolCfg.Action,
+			BindingUnknownAction:    toolCfg.BindingUnknownAction,
+			BindingNoBaselineAction: toolCfg.BindingNoBaselineAction,
+			ExtraPoison:             toolCfg.ExtraPoison,
+		}
+	} else {
+		opts.ToolCfg = nil
+	}
 	opts.ToolCfgFn = nil
 	opts.Baseline = nil
 	opts.BaselineFn = nil
