@@ -320,3 +320,94 @@ func TestIssue_ExportFileShape(t *testing.T) {
 		t.Fatal("export missing payload or signature")
 	}
 }
+
+// TestIssue_ExportNamingKey_Refused drives the guard through the real command so
+// the CLI wiring is exercised, not only the helper. Writing an issuance export
+// over the signing key destroys it, so the command must refuse before signing.
+func TestIssue_ExportNamingKey_Refused(t *testing.T) {
+	dir := t.TempDir()
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	keyPath := filepath.Join(dir, licensePrivKeyFile)
+	if err := signing.SavePrivateKey(priv, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		flag string
+	}{
+		{name: "export", flag: "--export"},
+		{name: "ledger", flag: "--ledger"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{
+				"--key", keyPath,
+				"--email", "ops@vendor.example",
+				"--features", "agents",
+				"--expires", time.Now().Add(24 * time.Hour).Format(time.DateOnly),
+				"--break-glass",
+				tc.flag, keyPath,
+			}
+			if tc.flag == "--ledger" {
+				args = append(args, "--export", filepath.Join(dir, "export.json"))
+			}
+			out, err := runIssue(t, args...)
+			if err == nil {
+				t.Fatalf("expected refusal when %s names the signing key:\n%s", tc.flag, out)
+			}
+			if !strings.Contains(err.Error(), "must not name the signing key") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			after, err := os.ReadFile(filepath.Clean(keyPath))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("signing key was modified despite the refusal")
+			}
+		})
+	}
+}
+
+// TestAppendLedger_RefusesOpenedAliasOfProtectedFile covers the window between
+// the pathname checks and the open. A writable ledger directory lets the path be
+// swapped for a link to the signing key after validation, so the writer
+// re-verifies what it actually opened before appending.
+func TestAppendLedger_RefusesOpenedAliasOfProtectedFile(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, licensePrivKeyFile)
+	if err := os.WriteFile(keyPath, []byte("key-material"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A hard link is the swap an attacker performs: the pathname is not a
+	// symlink, so a pre-open Lstat check passes, yet it opens the key.
+	ledgerPath := filepath.Join(dir, "licenses.jsonl")
+	if err := os.Link(keyPath, ledgerPath); err != nil {
+		t.Skipf("hard links unsupported here: %v", err)
+	}
+
+	lic := license.License{ID: "lic_test", Email: "ops@vendor.example"}
+	err = appendLedger(ledgerPath, lic, "token", map[string]string{"the signing key": keyPath})
+	if err == nil {
+		t.Fatal("appendLedger appended to a file that is the signing key")
+	}
+	if !strings.Contains(err.Error(), "the signing key") {
+		t.Fatalf("error = %v, want the protected input named", err)
+	}
+	after, err := os.ReadFile(filepath.Clean(keyPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatal("signing key was modified despite the refusal")
+	}
+}
