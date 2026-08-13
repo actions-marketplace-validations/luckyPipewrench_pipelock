@@ -227,10 +227,12 @@ probe() {
     # Relocating them keeps the block booted; skipping it would hollow out cover.
     # Input dirs such as rules_dir and learn_lock.store_dir are deliberately
     # excluded: replacing them with an empty directory could conceal a refusal.
+    # The bare file key is logging.file; all other file-path schema keys use a
+    # distinct *_file name, so it cannot accidentally rewrite an input path.
     local run_cfg="$WORK/run-$total.yaml"
     sed -E "s@^([[:space:]]*(dir|profile_dir|bundle_cache_dir|durable_audit_queue_dir|quarantine_dir|capture_dir):[[:space:]])(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#]([^#]*[^[:space:]#])?)([[:space:]]*#.*)?\$@\1\"$WORK/d$total\"\5@" \
         "$snippet" \
-    | sed -E "s@^([[:space:]]*(spool_file|cursor_file):[[:space:]])(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#]([^#]*[^[:space:]#])?)([[:space:]]*#.*)?\$@\1\"$WORK/d$total/\2\"\5@" \
+    | sed -E "s@^([[:space:]]*(spool_file|cursor_file|file):[[:space:]])(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#]([^#]*[^[:space:]#])?)([[:space:]]*#.*)?\$@\1\"$WORK/d$total/\2\"\5@" \
         >"$run_cfg"
     mkdir -p "$WORK/d$total"
 
@@ -254,8 +256,17 @@ probe() {
             "$run_cfg" >"$commitment_cfg"
         mv "$commitment_cfg" "$run_cfg"
         local commitment_out="$WORK/commitment-init-$total.txt"
+        local lifecycle_cfg="$KEYRING_WORK/commitment-lifecycle-$total.yaml"
+        local lifecycle_log="$KEYRING_WORK/commitment-lifecycle-$total.jsonl"
+        printf '%s\n' \
+            'mode: balanced' \
+            'logging:' \
+            '  output: file' \
+            "  file: $lifecycle_log" \
+            'evidence_provenance:' \
+            "  commitment_keyring_path: $commitment_path" >"$lifecycle_cfg"
         if ! HOME="$PROBE_HOME" "$BIN" commitment-key initialize \
-            --keyring "$commitment_path" >"$commitment_out" 2>&1; then
+            --config "$lifecycle_cfg" >"$commitment_out" 2>&1; then
             echo "config-examples: could not fixture a commitment keyring for $label" >&2
             grep -vE '^[[:space:]]*$' "$commitment_out" | tail -3 >&2
             exit 1
