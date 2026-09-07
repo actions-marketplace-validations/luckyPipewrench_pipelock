@@ -93,6 +93,7 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 		cfg.FlightRecorder.Enabled = true
 		cfg.Defer.Enabled = true
 		cfg.Rules.TrustEmbeddedKeys = true
+		cfg.Rules.AllowUnversionedBundleLoad = true
 		return
 	}
 
@@ -138,6 +139,7 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 
 	rules, _ := raw["rules"].(map[string]interface{})
 	setBoolDefault(rules, "trust_embedded_keys", &cfg.Rules.TrustEmbeddedKeys)
+	setBoolDefault(rules, "allow_unversioned_bundle_load", &cfg.Rules.AllowUnversionedBundleLoad)
 
 	// A2A scanning: detection booleans default to true (full scanning when enabled).
 	a2a, _ := raw["a2a_scanning"].(map[string]interface{})
@@ -287,6 +289,7 @@ func (c *Config) ApplyDefaults() {
 		c.DLP.Patterns,
 		Defaults().DLP.Patterns,
 	)
+	markBuiltInCredentialURLWhitespaceGrammar(c.DLP.Patterns)
 	c.Suppress = mergeDefaultSuppressions(c.Suppress, defaultProviderKeySuppressions())
 	// Always default OnParseError (fail-closed) regardless of enabled state,
 	// since validation checks it unconditionally.
@@ -589,6 +592,9 @@ func (c *Config) ApplyDefaults() {
 	if c.RequestBodyScanning.MaxBodyBytes == 0 {
 		c.RequestBodyScanning.MaxBodyBytes = 5 * 1024 * 1024 // 5MB default
 	}
+	if c.ReverseProxy.MaxInflightScanBytes == 0 {
+		c.ReverseProxy.MaxInflightScanBytes = DefaultReverseProxyMaxInflightScanBytes
+	}
 	if c.RequestBodyScanning.Enabled || c.RequestBodyScanning.ContentEntropyEnabled {
 		if c.RequestBodyScanning.ContentEntropyAction == "" {
 			c.RequestBodyScanning.ContentEntropyAction = ActionWarn
@@ -857,6 +863,28 @@ func mergeDLPPatterns(includeDefaults *bool, user, defaults []DLPPattern) []DLPP
 	}
 	merged = append(merged, user...)
 	return merged
+}
+
+// markBuiltInCredentialURLWhitespaceGrammar restores built-in runtime
+// provenance for shipped preset YAML, which serializes DLPPattern without its
+// runtime-only marker. Only an exact copy of the canonical built-in definition
+// receives the marker; operators cannot configure it through YAML.
+func markBuiltInCredentialURLWhitespaceGrammar(patterns []DLPPattern) {
+	for _, pattern := range defaultDLPPatternSet {
+		if !pattern.CredentialURLWhitespaceGrammar {
+			continue
+		}
+		for i := range patterns {
+			candidate := &patterns[i]
+			candidate.CredentialURLWhitespaceGrammar = candidate.Bundle == "" &&
+				candidate.Name == pattern.Name &&
+				candidate.Regex == pattern.Regex &&
+				candidate.Severity == pattern.Severity &&
+				candidate.Validator == pattern.Validator &&
+				sameStrings(candidate.ExemptDomains, pattern.ExemptDomains)
+		}
+		return
+	}
 }
 
 func mergeDefaultSuppressions(user, defaults []SuppressEntry) []SuppressEntry {

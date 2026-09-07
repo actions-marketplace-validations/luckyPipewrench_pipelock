@@ -40,6 +40,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"golang.org/x/time/rate"
 )
 
 // ServerOpts carries the CLI-flag surface and I/O bindings for a runtime
@@ -98,10 +99,19 @@ type ServerOpts struct {
 type Server struct {
 	opts ServerOpts
 
-	runtimeMode       config.RuntimeMode
-	hasMCPListen      bool
-	apiOnSeparatePort bool
-	hasApprover       bool
+	runtimeMode        config.RuntimeMode
+	hasMCPListen       bool
+	apiOnSeparatePort  bool
+	hasApprover        bool
+	containmentManaged bool
+	metricsDisabled    bool
+	// containmentMetricsDenied is set when a containment reload presents an
+	// invalid metrics listener or policy. The bound listener stays up, but its handler
+	// denies every request until a valid policy is reloaded.
+	containmentMetricsDenied atomic.Bool
+	// containmentMetricsDenyLog bounds attacker-driven audit volume from the
+	// unauthenticated observability listener.
+	containmentMetricsDenyLog *rate.Limiter
 
 	cfg          *config.Config
 	bundleResult *rules.LoadResult
@@ -320,8 +330,10 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	}
 
 	s := &Server{
-		opts:         opts,
-		hasMCPListen: hasMCPListen,
+		opts:                      opts,
+		hasMCPListen:              hasMCPListen,
+		containmentManaged:        containmentManagedRuntime(),
+		containmentMetricsDenyLog: rate.NewLimiter(rate.Every(time.Second), 5),
 	}
 	s.mcpListenerBearerToken = mcpAuthToken
 	if cfg.EvidenceProvenance.CommitmentKeyringPath != "" {
@@ -377,8 +389,12 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	logger.SetEmitter(emitter)
 	s.emitter = emitter
 	s.emitSinks = append([]emit.Sink(nil), emitSinks...)
-	emitLicenseExpiryWarning(cfg, logger, sentryClient, opts.Stderr)
-
+	if s.containmentManaged {
+		if containmentErr := validateContainmentMetricsConfig(cfg); containmentErr != nil {
+			s.metricsDisabled = true
+			s.reportContainmentMetricsDrift(cfg, "startup", containmentErr)
+		}
+	}
 	runtimeMode := config.RuntimeForward
 	if hasMCPListen {
 		runtimeMode = config.RuntimeForwardWithMCPListener
@@ -430,8 +446,11 @@ func NewServer(opts ServerOpts) (*Server, error) {
 			return nil, err
 		}
 		cfg.LicenseID = lic.ID
+		cfg.LicenseIssuedAt = lic.IssuedAt
 		cfg.LicenseExpiresAt = lic.ExpiresAt
+		cfg.LicenseTier = lic.Tier
 	}
+	emitLicenseExpiryWarning(cfg, logger, sentryClient, opts.Stderr)
 	if err := s.initConductorApplyAndAudit(cfg, m); err != nil {
 		s.cleanup()
 		return nil, err
@@ -542,7 +561,12 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		runFlightRecorderExpiryOnce(rec, opts.Stderr, opts.expiry())
 		s.recorder = rec
 		proxyOpts = append(proxyOpts, proxy.WithRecorder(rec))
-		postureBinding, bindErr := posturebinding.LoadRuntime()
+		postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
+			ReceiptSigningEnabled:      cfg.FlightRecorder.SigningKeyPath != "",
+			RequireContainmentEvidence: cfg.FlightRecorder.RequireContainmentEvidence,
+			PinnedPostureSignerKey:     cfg.FlightRecorder.PostureSignerPublicKey,
+			Stderr:                     opts.Stderr,
+		})
 		if bindErr != nil {
 			s.cleanup()
 			return nil, fmt.Errorf("loading posture binding: %w", bindErr)
@@ -558,14 +582,15 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		// effective policy should produce identical envelope ph
 		// regardless of YAML formatting.
 		s.receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
-			Recorder:         rec,
-			PrivKey:          recPrivKey,
-			ConfigHash:       cfg.Hash(),
-			Principal:        "local",
-			Actor:            "pipelock",
-			Metrics:          m,
-			PostureBinding:   postureBinding,
-			HeartbeatSeconds: cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+			Recorder:            rec,
+			PrivKey:             recPrivKey,
+			ConfigHash:          cfg.Hash(),
+			Principal:           "local",
+			Actor:               "pipelock",
+			Metrics:             m,
+			PostureBinding:      postureResult.Binding,
+			PostureAvailability: string(postureResult.Availability),
+			HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
 		})
 		if s.receiptEmitter != nil {
 			// Loud, one-time startup signal when the chain could not be
@@ -656,6 +681,14 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		})
 		proxyOpts = append(proxyOpts, proxy.WithEnvelopeEmitter(s.envelopeEmitter))
 		_, _ = fmt.Fprintf(opts.Stderr, "  Envelope: enabled (mediation envelopes injected)\n")
+	}
+
+	// A containment refusal has to reach the proxy's own routes too. Skipping
+	// the dedicated listener alone leaves /metrics and /stats served on the
+	// proxy port whenever metrics_listen is empty, which is the address the
+	// contained agent can reach, while startup reports metrics disabled.
+	if s.metricsDisabled {
+		proxyOpts = append(proxyOpts, proxy.WithMetricsSuppressed())
 	}
 
 	p, pErr := proxy.New(cfg, logger, sc, m, proxyOpts...)

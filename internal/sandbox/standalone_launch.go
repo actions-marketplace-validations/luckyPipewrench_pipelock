@@ -20,6 +20,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // standaloneProxyConnectionConfig controls how one accepted bridge connection
@@ -46,7 +48,7 @@ type standaloneProxyConnectionConfig struct {
 // but is not kernel-enforced (cooperative, not mandatory).
 //
 // Returns when the agent command exits.
-func LaunchStandalone(cfg StandaloneLaunchConfig) error {
+func LaunchStandalone(cfg StandaloneLaunchConfig) (returnErr error) {
 	if runtime.GOOS != osLinux {
 		return fmt.Errorf("%w: sandbox requires Linux", ErrUnavailable)
 	}
@@ -134,6 +136,11 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	if cfg.Strict && cfg.BestEffort {
 		return fmt.Errorf("sandbox: strict and best_effort are mutually exclusive")
 	}
+	if cfg.BestEffort {
+		if _, err := validateBestEffortOverride(cfg.BestEffortReason, cfg.BestEffortExpiry, time.Now()); err != nil {
+			return err
+		}
+	}
 
 	// Probe namespace support before forking.
 	// Only CLONE_NEWUSER is probed because CLONE_NEWNET requires CLONE_NEWUSER
@@ -198,6 +205,17 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 			_ = guardStatusWriter.Close()
 		}()
 	}
+	var readinessReader, readinessWriter *os.File
+	if hasNamespaces {
+		readinessReader, readinessWriter, err = os.Pipe()
+		if err != nil {
+			return fmt.Errorf("creating standalone parent-hardening pipe: %w", err)
+		}
+		defer func() {
+			_ = readinessReader.Close()
+			_ = readinessWriter.Close()
+		}()
+	}
 
 	var developerPipe *developerEnvironmentPipe
 	if cfg.UseDeveloperEnvironment {
@@ -215,7 +233,17 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 	if guardStatusWriter != nil {
 		guardStatusFD = 2 + len(cmd.ExtraFiles)
 	}
-	cmd.Env = standaloneInitControlEnv(cfg, socketPath, coverageEnv, policyJSON, hasNamespaces, guardDeclarationJSON, guardStatusFD)
+	readinessFD := 0
+	if readinessReader != nil {
+		cmd.ExtraFiles = append(cmd.ExtraFiles, readinessReader)
+		readinessFD = 2 + len(cmd.ExtraFiles)
+	}
+	cmd.Env = standaloneInitControlEnv(standaloneInitControlOptions{
+		Config: cfg, SocketPath: socketPath, CoverageEnv: coverageEnv,
+		PolicyJSON: policyJSON, HasNamespaces: hasNamespaces,
+		GuardDeclarationJSON: guardDeclarationJSON, GuardStatusFD: guardStatusFD,
+		ReadinessFD: readinessFD,
+	})
 
 	if hasNamespaces {
 		cloneFlags := uintptr(syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET)
@@ -252,10 +280,53 @@ func LaunchStandalone(cfg StandaloneLaunchConfig) error {
 		}
 	}
 
+	var restoreParent func() error
+	if !hasNamespaces {
+		restoreParent, err = hardenStandaloneParent()
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if restoreErr := restoreParent(); returnErr == nil && restoreErr != nil {
+				returnErr = restoreErr
+			}
+		}()
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("starting sandbox child: %w", err)
 	}
 	cleanupChildState := standaloneChildCleanup(cmd.Process.Pid, cfg.Strict, proxyServer.stop, ReapOrphans)
+	failStartedChild := func(err error) error {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		cleanupChildState()
+		return err
+	}
+	if readinessReader != nil {
+		if err := readinessReader.Close(); err != nil {
+			return failStartedChild(fmt.Errorf("closing standalone readiness reader: %w", err))
+		}
+		restoreParent, err = hardenStandaloneParent()
+		if err != nil {
+			return failStartedChild(err)
+		}
+		defer func() {
+			if restoreErr := restoreParent(); returnErr == nil && restoreErr != nil {
+				returnErr = restoreErr
+			}
+		}()
+		if n, writeErr := readinessWriter.Write([]byte{1}); writeErr != nil || n != 1 {
+			if writeErr == nil {
+				writeErr = io.ErrShortWrite
+			}
+			return failStartedChild(fmt.Errorf("releasing standalone target after parent hardening: %w", writeErr))
+		}
+		if err := readinessWriter.Close(); err != nil {
+			return failStartedChild(fmt.Errorf("closing standalone readiness writer: %w", err))
+		}
+	}
+	// Register cleanup after the dumpability restore so LIFO execution kills
+	// the sandbox process group before the parent becomes inspectable again.
 	defer cleanupChildState()
 	if guardStatusWriter != nil {
 		if err := guardStatusWriter.Close(); err != nil {
@@ -355,15 +426,27 @@ func readGuardExecutionProof(r io.Reader) ([]byte, error) {
 // standaloneInitControlEnv is the complete re-exec environment. In
 // developer-environment mode it carries only a fixed descriptor number, never
 // a developer-supplied value.
-func standaloneInitControlEnv(cfg StandaloneLaunchConfig, socketPath string, coverageEnv []string, policyJSON string, hasNamespaces bool, guardDeclarationJSON []byte, guardStatusFD int) []string {
+type standaloneInitControlOptions struct {
+	Config               StandaloneLaunchConfig
+	SocketPath           string
+	CoverageEnv          []string
+	PolicyJSON           string
+	HasNamespaces        bool
+	GuardDeclarationJSON []byte
+	GuardStatusFD        int
+	ReadinessFD          int
+}
+
+func standaloneInitControlEnv(opts standaloneInitControlOptions) []string {
+	cfg := opts.Config
 	commandJSON, _ := json.Marshal(cfg.Command)
 	env := []string{
 		standaloneInitEnv + "=1",
 		"__PIPELOCK_SANDBOX_WORKSPACE=" + cfg.Workspace,
 		standaloneCommandJSONEnv + "=" + string(commandJSON),
-		sandboxSocketEnv + "=" + socketPath,
+		sandboxSocketEnv + "=" + opts.SocketPath,
 	}
-	env = append(env, subprocessCoverageControlEnv(coverageEnv)...)
+	env = append(env, subprocessCoverageControlEnv(opts.CoverageEnv)...)
 	if cfg.Strict {
 		env = append(env, strictEnvKey+"=1")
 	}
@@ -373,19 +456,42 @@ func standaloneInitControlEnv(cfg StandaloneLaunchConfig, socketPath string, cov
 	if cfg.UseDeveloperEnvironment {
 		env = append(env, developerEnvironmentControlEnv+"="+strconv.Itoa(developerEnvironmentFD))
 	}
-	env = append(env, "__PIPELOCK_SANDBOX_POLICY="+policyJSON)
-	if !hasNamespaces {
+	env = append(env, "__PIPELOCK_SANDBOX_POLICY="+opts.PolicyJSON)
+	if !opts.HasNamespaces {
 		env = append(env, noNetNSEnvKey+"=1")
+	}
+	if opts.ReadinessFD > 0 {
+		env = append(env, sandboxReadinessFDEnv+"="+strconv.Itoa(opts.ReadinessFD))
 	}
 	if cfg.GuardDeclaration != nil {
 		env = append(env,
-			standaloneGuardDeclarationEnv+"="+string(guardDeclarationJSON),
+			standaloneGuardDeclarationEnv+"="+string(opts.GuardDeclarationJSON),
 			standaloneGuardProfileEnv+"="+cfg.GuardProfile,
 			standaloneGuardPolicyHashEnv+"="+cfg.GuardPolicyHash,
-			guardStatusControlEnv+"="+strconv.Itoa(guardStatusFD),
+			guardStatusControlEnv+"="+strconv.Itoa(opts.GuardStatusFD),
 		)
 	}
 	return env
+}
+
+func hardenStandaloneParent() (func() error, error) {
+	previous, err := unix.PrctlRetInt(unix.PR_GET_DUMPABLE, 0, 0, 0, 0)
+	if err != nil {
+		return nil, fmt.Errorf("reading standalone parent dumpability: %w", err)
+	}
+	if err := unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0); err != nil {
+		return nil, fmt.Errorf("hardening standalone parent: %w", err)
+	}
+	if err := recordParentHardeningForTest(); err != nil {
+		_ = unix.Prctl(unix.PR_SET_DUMPABLE, uintptr(previous), 0, 0, 0)
+		return nil, fmt.Errorf("recording standalone parent hardening: %w", err)
+	}
+	return func() error {
+		if err := unix.Prctl(unix.PR_SET_DUMPABLE, uintptr(previous), 0, 0, 0); err != nil {
+			return fmt.Errorf("restoring standalone parent dumpability: %w", err)
+		}
+		return nil
+	}, nil
 }
 
 // newStandaloneControlDir creates the per-invocation control directory that
@@ -430,7 +536,40 @@ func newStandaloneControlDir() (retDir string, retErr error) {
 	if int(stat.Uid) != os.Geteuid() {
 		return "", fmt.Errorf("sandbox control dir %s is owned by uid %d, not this process (uid %d)", sandboxDir, stat.Uid, os.Geteuid())
 	}
+	if err := checkSocketPathLength(ProxySocketPath(sandboxDir)); err != nil {
+		return "", err
+	}
 	return sandboxDir, nil
+}
+
+// maxUnixSocketPath is the usable length of sockaddr_un.sun_path.
+//
+// The kernel struct reserves 108 bytes on Linux and 104 on Darwin, including
+// the terminating NUL, so 103 is the longest path that is safe on both. The
+// limit is a fixed-size C array rather than anything configurable, which is why
+// this is a constant and not a knob.
+const maxUnixSocketPath = 103
+
+// checkSocketPathLength refuses a control socket path the kernel cannot bind.
+//
+// The path is derived from TMPDIR, and bind() answers an over-long one with
+// EINVAL, which surfaces as "invalid argument" naming neither the length nor
+// the variable that caused it. An operator on a host with a long TMPDIR -- a
+// container whose temp lives under an overlay storage path, for instance --
+// would see the sandbox fail to start with nothing to act on.
+//
+// Checked at directory creation rather than at bind so it fails before any
+// listener, child process or proxy has been set up, and so the message can name
+// the fix.
+func checkSocketPathLength(path string) error {
+	if len(path) <= maxUnixSocketPath {
+		return nil
+	}
+	return fmt.Errorf(
+		"sandbox control socket path is %d bytes, over the %d-byte kernel limit: %s; "+
+			"set TMPDIR to a shorter directory",
+		len(path), maxUnixSocketPath, path,
+	)
 }
 
 type standaloneProxyServer struct {

@@ -52,6 +52,9 @@ type DeferredRequest struct {
 	ResolverProfileName string
 	ArgDigest           string
 	Arguments           string
+	authorityRef        string
+	authorityCarrierErr error
+	authorityFrame      MCPFrame
 }
 
 // scanHTTPInput checks a single input message for DLP/injection/policy/CEE.
@@ -72,7 +75,7 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 	// scrub on the stdio path at internal/mcp/input.go:213. The stdio
 	// strip runs unconditionally on every inbound line; the HTTP listener
 	// now matches.
-	msg = stripInboundMCPMeta(msg)
+	msg, authorityRef, authorityCarrierErr := extractInboundMCPAuthority(msg)
 
 	sc := opts.scanner()
 	inputCfg := opts.inputCfg()
@@ -126,6 +129,23 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 		emitActionID := actionID
 		emitTarget := toolName
 		emitVerdict := receiptVerdict
+		if requireReceipts && result.Blocked == nil && isRequiredReceiptMetadataMethod(mcpMethod) {
+			// initialize and tools/list are ordinary mediated handshake actions.
+			// They do not carry a tool name or an envelope, but strict evidence
+			// still needs an action identity before the HTTP bridge forwards them.
+			if emitActionID == "" {
+				emitActionID = receipt.NewActionID()
+			}
+			if emitTarget == "" {
+				emitTarget = mcpMethod
+			}
+			if emitVerdict == "" {
+				emitVerdict = config.ActionAllow
+				if isRequiredReceiptHandshakeNotification(mcpMethod, frame.ID) {
+					emitVerdict = config.ActionForward
+				}
+			}
+		}
 		if IsA2AMethod(mcpMethod) {
 			if emitActionID == "" {
 				switch {
@@ -190,7 +210,7 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				IsNotification: isRPCNotification(frame.ID),
 				LogMessage:     "receipt emission failed",
 				ErrorCode:      -32007,
-				ErrorMessage:   "pipelock: receipt emission failed",
+				ErrorMessage:   requiredReceiptFailureMessage(err),
 				ErrorData:      mcpBlockReasonData(blockreason.ReceiptEmissionFailed),
 			}
 			return
@@ -222,7 +242,34 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			if receiptContractGate != nil {
 				outcomeReceipt = mcpWithContractReceipt(outcomeReceipt, *receiptContractGate)
 			}
-			result.Outcome = TrackedRequestOutcome{Receipt: outcomeReceipt}
+			result.Outcome = TrackedRequestOutcome{Receipt: outcomeReceipt, Method: mcpMethod}
+		}
+	}()
+	// Registered after the receipt finalizer so it runs first. A failed
+	// authority check clears pending allow evidence and replaces the forward
+	// result before the caller can perform any upstream write.
+	defer func() {
+		if opts.AuthorityVerifier == nil || result.Blocked != nil {
+			return
+		}
+		if result.Deferred != nil {
+			result.Deferred.authorityRef = authorityRef
+			result.Deferred.authorityCarrierErr = authorityCarrierErr
+			result.Deferred.authorityFrame = frame
+			return
+		}
+		if err := authorizeMCP(opts.warnContext(), authorityRef, authorityCarrierErr, frame, opts); err != nil {
+			result.Blocked = authorityBlockedRequest(frame)
+			result.Deferred = nil
+			result.Outcome = TrackedRequestOutcome{}
+			receiptVerdict = config.ActionBlock
+			receiptLayer, receiptPattern, receiptSeverity = authorityReceiptAttribution()
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
 		}
 	}()
 
@@ -404,8 +451,8 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				Authority:   decision.Authority.String(),
 				Decision:    decision.Result.Decision.String(),
 				Reason:      decision.Result.Reason,
-				SourceURL:   decision.Risk.LastExternalURL,
-				SourceKind:  decision.Risk.LastExternalKind,
+				SourceURL:   decision.Risk.SecurityOriginURL(),
+				SourceKind:  decision.Risk.SecurityOriginKind(),
 			},
 		)
 	}
@@ -633,7 +680,12 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			return result
 		}
 		// Cross-request exfiltration check on clean outbound messages.
-		ceeKey := ceeSessionKeyMCP("", sessionKey)
+		// The MCP session key is the CEE key verbatim. It is issued by the
+		// transport, not supplied by the caller, so there is no self-declared
+		// agent name to namespace by. Namespacing CEE state by a
+		// caller-controlled name would let a client rotate that name to
+		// partition a secret across buckets and evade accumulation.
+		ceeKey := sessionKey
 		if reason := ceeRecordMCP(ceeRecordMCPOptions{
 			sessionKey:     ceeKey,
 			entropyPayload: msg,
@@ -792,7 +844,10 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			}
 		}
 	}
-	if effectiveAction == config.ActionDefer && actionID == "" && IsA2AMethod(verdict.Method) {
+	// Deferral stores its correlation ID before the receipt finalizer runs.
+	// Metadata must share that ID with the deferred receipt and its resolution.
+	if effectiveAction == config.ActionDefer && actionID == "" &&
+		(IsA2AMethod(verdict.Method) || (requireReceipts && isRequiredReceiptMetadataMethod(verdict.Method))) {
 		actionID = receipt.NewActionID()
 	}
 
@@ -1092,7 +1147,12 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			recordAdaptiveSignal(session.SignalNearMiss)
 		}
 		// Cross-request exfiltration check even in warn mode.
-		ceeKey := ceeSessionKeyMCP("", sessionKey)
+		// The MCP session key is the CEE key verbatim. It is issued by the
+		// transport, not supplied by the caller, so there is no self-declared
+		// agent name to namespace by. Namespacing CEE state by a
+		// caller-controlled name would let a client rotate that name to
+		// partition a secret across buckets and evade accumulation.
+		ceeKey := sessionKey
 		if reason := ceeRecordMCP(ceeRecordMCPOptions{
 			sessionKey:     ceeKey,
 			entropyPayload: msg,

@@ -8,6 +8,7 @@ package runtime
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -23,6 +25,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/applycache"
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor/auditbatcher"
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/controlplane"
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/policysync"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
@@ -32,16 +35,46 @@ import (
 const conductorStatusResponseBytes = 64 * 1024
 
 type conductorPolicyStatusReporter struct {
-	client   policysync.HTTPDoer
-	endpoint string
-	cfg      config.Conductor
-	identity conductorEnrollmentMarker
-	cache    *applycache.Cache
+	client            policysync.HTTPDoer
+	endpoint          string
+	heartbeatEndpoint string
+	cfg               config.Conductor
+	cache             *applycache.Cache
+	// markerPath is the follower's local enrollment marker, and identity is
+	// resolved from it lazily rather than once at construction.
+	//
+	// The poller that owns this reporter is built early in server startup, while
+	// auto-enrolment writes the marker much later in the same startup. Resolving
+	// at construction therefore found no marker on the one run that enrols, and
+	// the reporter stayed nil for that whole process: a freshly enrolled follower
+	// reported no runtime status until someone restarted it, which left fleet
+	// status blind and made every publish need the admin-only skew override.
+	// Measured before this change: zero posts across 35 poll cycles and a
+	// successful bundle apply, then one post immediately after a restart.
+	//
+	// Resolution stays fail-closed. No marker means no report, exactly as before,
+	// so the follower can never publish status while it is not enrolled.
+	markerPath string
+	identity   atomic.Pointer[conductorEnrollmentMarker]
 	// latest holds the most recent StatusEvent so the audit producer's
 	// applied-state provider (invoked asynchronously off recorder-entry
 	// observation) can read the same poll/apply outcome the unsigned status POST
 	// reports, without coupling the producer to the poller.
 	latest atomic.Pointer[policysync.StatusEvent]
+	// heartbeatConfig is installed only after capability negotiation confirms
+	// the conductor understands recorder-independent signed state. Atomic
+	// publication keeps policy polling and startup wiring race-free.
+	heartbeatConfig atomic.Pointer[conductorHeartbeatConfig]
+	heartbeatSeq    atomic.Uint64
+	heartbeatMu     sync.Mutex
+	// afterHeartbeatSnapshot is a deterministic concurrency-test seam. It is
+	// nil in production and runs while heartbeatMu is held.
+	afterHeartbeatSnapshot func()
+}
+
+type conductorHeartbeatConfig struct {
+	signerKeyID string
+	privateKey  ed25519.PrivateKey
 }
 
 func newConductorPolicyStatusReporter(cfg *config.Config, client policysync.HTTPDoer, cache *applycache.Cache) (*conductorPolicyStatusReporter, error) {
@@ -51,29 +84,54 @@ func newConductorPolicyStatusReporter(cfg *config.Config, client policysync.HTTP
 	if client == nil {
 		return nil, errors.New("conductor runtime status reporter HTTP client required")
 	}
-	marker, ok, err := readConductorEnrollmentMarker(filepath.Join(cfg.Conductor.BundleCacheDir, conductorEnrolledStateFileName), cfg.Conductor)
-	if err != nil {
-		// Runtime status is best-effort telemetry; a bad marker must not block
-		// the core policy bundle poller from starting.
-		return nil, nil
-	}
-	if !ok {
-		return nil, nil
-	}
+	markerPath := filepath.Join(cfg.Conductor.BundleCacheDir, conductorEnrolledStateFileName)
 	endpoint, err := conductorStatusEndpoint(cfg.Conductor.ConductorURL)
 	if err != nil {
 		return nil, err
 	}
-	return &conductorPolicyStatusReporter{
-		client:   client,
-		endpoint: endpoint,
-		cfg:      cfg.Conductor,
-		identity: marker,
-		cache:    cache,
-	}, nil
+	heartbeatEndpoint, err := conductorEndpoint(cfg.Conductor.ConductorURL, controlplane.AppliedStateHeartbeatPath)
+	if err != nil {
+		return nil, err
+	}
+	r := &conductorPolicyStatusReporter{
+		client:            client,
+		endpoint:          endpoint,
+		heartbeatEndpoint: heartbeatEndpoint,
+		cfg:               cfg.Conductor,
+		cache:             cache,
+		markerPath:        markerPath,
+	}
+	// Resolve now when the marker already exists, so an already-enrolled follower
+	// behaves exactly as before and never pays a lookup on its first report.
+	r.resolveIdentity()
+	return r, nil
+}
+
+// resolveIdentity returns the enrollment identity, reading the marker on first
+// use and caching it. A missing or unreadable marker returns false, which keeps
+// the reporter silent rather than reporting under an identity it cannot prove.
+// Runtime status is best-effort telemetry, so a bad marker must never fail the
+// poll it rides along with.
+func (r *conductorPolicyStatusReporter) resolveIdentity() (conductorEnrollmentMarker, bool) {
+	if r == nil {
+		return conductorEnrollmentMarker{}, false
+	}
+	if cached := r.identity.Load(); cached != nil {
+		return *cached, true
+	}
+	marker, ok, err := readConductorEnrollmentMarker(r.markerPath, r.cfg)
+	if err != nil || !ok {
+		return conductorEnrollmentMarker{}, false
+	}
+	r.identity.Store(&marker)
+	return marker, true
 }
 
 func conductorStatusEndpoint(rawBaseURL string) (string, error) {
+	return conductorEndpoint(rawBaseURL, controlplane.FollowerRuntimeStatusPath)
+}
+
+func conductorEndpoint(rawBaseURL, path string) (string, error) {
 	u, err := url.Parse(rawBaseURL)
 	if err != nil {
 		return "", fmt.Errorf("parse conductor status base URL: %w", err)
@@ -87,7 +145,7 @@ func conductorStatusEndpoint(rawBaseURL string) (string, error) {
 	if u.Path != "" && u.Path != "/" {
 		return "", fmt.Errorf("conductor status base URL must not include a path component")
 	}
-	u.Path = controlplane.FollowerRuntimeStatusPath
+	u.Path = path
 	u.RawPath = ""
 	return u.String(), nil
 }
@@ -101,7 +159,15 @@ func (r *conductorPolicyStatusReporter) ReportPolicyStatus(ctx context.Context, 
 	// the same event.
 	evCopy := ev
 	r.latest.Store(&evCopy)
-	status := r.status(ev)
+	// The applied-state provider above works without an identity, so latest is
+	// stored first and unconditionally. The POST below cannot be: without a
+	// resolved enrollment identity there is nothing to report under, so stay
+	// silent until the marker appears rather than posting an unattributed status.
+	identity, ok := r.resolveIdentity()
+	if !ok {
+		return nil
+	}
+	status := r.status(ev, identity)
 	body, err := json.Marshal(struct {
 		Status controlplane.FollowerRuntimeStatus `json:"status"`
 	}{Status: status})
@@ -123,16 +189,97 @@ func (r *conductorPolicyStatusReporter) ReportPolicyStatus(ctx context.Context, 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("conductor runtime status rejected HTTP %d: %s", resp.StatusCode, statusSnippet(respBody))
 	}
+	_ = r.reportAppliedStateHeartbeat(ctx, ev)
 	return nil
 }
 
-func (r *conductorPolicyStatusReporter) status(ev policysync.StatusEvent) controlplane.FollowerRuntimeStatus {
+func (r *conductorPolicyStatusReporter) configureAppliedStateHeartbeat(enabled bool, signerKeyID string, privateKey ed25519.PrivateKey) {
+	if r == nil {
+		return
+	}
+	if !enabled || len(privateKey) != ed25519.PrivateKeySize || strings.TrimSpace(signerKeyID) == "" {
+		r.heartbeatConfig.Store(nil)
+		return
+	}
+	r.heartbeatConfig.Store(&conductorHeartbeatConfig{
+		signerKeyID: signerKeyID,
+		privateKey:  append(ed25519.PrivateKey(nil), privateKey...),
+	})
+}
+
+func (r *conductorPolicyStatusReporter) reportAppliedStateHeartbeat(ctx context.Context, ev policysync.StatusEvent) error {
+	r.heartbeatMu.Lock()
+	defer r.heartbeatMu.Unlock()
+	return r.reportAppliedStateHeartbeatLocked(ctx, ev)
+}
+
+func (r *conductorPolicyStatusReporter) reportAppliedStateHeartbeatLocked(ctx context.Context, ev policysync.StatusEvent) error {
+	cfg := r.heartbeatConfig.Load()
+	if cfg == nil {
+		return nil
+	}
+	now := time.Now().UTC()
+	state := r.buildAppliedState(ev)
+	// The signed heartbeat is evidence produced now. ObservedAt and
+	// ProvenanceAt therefore advance together even when the underlying bundle
+	// has not changed; the bundle/apply timestamps remain unchanged.
+	state.ObservedAt = now
+	state.ProvenanceAt = now
+	heartbeat := conductor.AppliedStateHeartbeat{
+		SchemaVersion: conductor.SchemaVersion,
+		HeartbeatID:   fmt.Sprintf("state-%020d-%06d", now.UnixNano(), r.heartbeatSeq.Add(1)),
+		OrgID:         r.cfg.OrgID,
+		FleetID:       r.cfg.FleetID,
+		InstanceID:    r.cfg.InstanceID,
+		EmittedAt:     now,
+		AppliedState:  state,
+	}
+	signed, err := auditbatcher.SignAppliedStateHeartbeat(heartbeat, cfg.signerKeyID, cfg.privateKey)
+	if err != nil {
+		return fmt.Errorf("sign conductor applied-state heartbeat: %w", err)
+	}
+	body, err := json.Marshal(signed)
+	if err != nil {
+		return fmt.Errorf("marshal conductor applied-state heartbeat: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.heartbeatEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build conductor applied-state heartbeat request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("post conductor applied-state heartbeat: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, conductorStatusResponseBytes))
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("conductor applied-state heartbeat rejected HTTP %d: %s", resp.StatusCode, statusSnippet(respBody))
+	}
+	return nil
+}
+
+func (r *conductorPolicyStatusReporter) reportCurrentAppliedStateHeartbeat(ctx context.Context) error {
+	r.heartbeatMu.Lock()
+	defer r.heartbeatMu.Unlock()
+	latest := r.latest.Load()
+	if r.afterHeartbeatSnapshot != nil {
+		r.afterHeartbeatSnapshot()
+	}
+	if latest == nil {
+		return nil
+	}
+	return r.reportAppliedStateHeartbeatLocked(ctx, *latest)
+}
+
+func (r *conductorPolicyStatusReporter) status(ev policysync.StatusEvent, identity conductorEnrollmentMarker) controlplane.FollowerRuntimeStatus {
 	applied := r.buildAppliedState(ev)
 	return controlplane.FollowerRuntimeStatus{
 		OrgID:                          r.cfg.OrgID,
 		FleetID:                        r.cfg.FleetID,
 		InstanceID:                     r.cfg.InstanceID,
-		Environment:                    r.identity.Environment,
+		Environment:                    identity.Environment,
 		PipelockVersion:                applied.PipelockVersion,
 		GitCommit:                      applied.GitCommit,
 		BuildDate:                      applied.BuildDate,

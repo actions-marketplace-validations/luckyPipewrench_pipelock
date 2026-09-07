@@ -6,10 +6,13 @@ How Pipelock's runtime security controls map to the [EU AI Act (Regulation 2024/
 
 **Disclaimer:** This document maps Pipelock's security features to EU AI Act requirements for informational purposes. It does not constitute legal advice or guarantee regulatory compliance. Organizations should consult qualified legal counsel for compliance obligations specific to their AI systems.
 
-**Last reviewed:** July 2026 against v3.3.0. This mapping describes current
+**Last reviewed:** August 2026 against v3.4.0. This mapping describes current
 behavior; see [CHANGELOG.md](../../CHANGELOG.md) for release history.
 
 Recent control additions reviewed:
+
+- Art. 12 / 15: v3.4 distinguishes policy findings from incomplete scan results and blocks unscanned oversized reverse-proxy media bodies.
+- Art. 13 / 14: v3.4 removes configuration fields that had no runtime consumer, reducing the chance that an operator mistakes inert configuration for enforcement.
 
 - Art. 12: block-reason receipts, scan API tool-call findings, and file_sentry skip visibility improve operator records for mediated decisions and uninspected local files.
 - Art. 13: `request_policy_deny` block reasons and explicit scan-cap failure behavior make denial causes more transparent to operators and agent clients.
@@ -158,7 +161,7 @@ These require other tools or organizational processes:
 | EU database registration | Art. 71 | Administrative requirement |
 | Incident reporting timelines | Art. 73 | Audit logs provide incident data; reporting process is organizational |
 | Bias and fairness evaluation | Art. 10(2) | Pipelock applies rules uniformly but doesn't evaluate model fairness |
-| Full process isolation for the agent runtime | Art. 15(4) | Pipelock ships best-effort sandbox primitives (Landlock, seccomp, network namespace isolation on Linux) but full process isolation for the agent itself depends on OS/container support and deployment policy. For a stricter agent-runtime sandbox see [srt](https://github.com/anthropic-experimental/sandbox-runtime) or [agentsh](https://github.com/canyonroad/agentsh). |
+| Full process isolation for the agent runtime | Art. 15(4) | Pipelock ships best-effort sandbox primitives (Landlock and network namespace isolation on Linux, plus seccomp on `linux/amd64`) but full process isolation for the agent itself depends on OS/container support and deployment policy. For a stricter agent-runtime sandbox see [srt](https://github.com/anthropic-experimental/sandbox-runtime) or [agentsh](https://github.com/canyonroad/agentsh). |
 
 ---
 
@@ -191,7 +194,7 @@ How Pipelock maps to NIST AI Risk Management Framework functions, with EU AI Act
 | NIST Subcategory | Description | Pipelock Feature | EU AI Act |
 |-----------------|-------------|-----------------|-----------|
 | MEASURE 1.1 | Metrics selected and documented | Prometheus: `pipelock_requests_total`, `pipelock_scanner_hits_total`, `pipelock_request_duration_seconds` | Art. 12 |
-| MEASURE 2.5 | System demonstrated valid and reliable | CI: 6 required checks (test, lint, build, govulncheck, CodeQL, pipelock self-scan), CodeQL analysis, full test suite with race detector (see [README](../../README.md#testing)) | Art. 15 |
+| MEASURE 2.5 | System demonstrated valid and reliable | CI: eight required contexts (security scan; Go 1.25 and 1.26 aggregates; macOS test; lint; build with Helm as a transitive prerequisite; govulncheck on default and enterprise graphs; CodeQL), plus race-tested OSS and enterprise matrices (see [README](../../README.md#testing)) | Art. 15 |
 | MEASURE 2.6 | Evaluated for misuse and abuse | Scanning layers target misuse: DLP catches exfiltration, SSRF catches internal probing, injection detection catches hijacking | Art. 9, 15 |
 | MEASURE 2.7 | Security and resilience evaluated | Security audit completed (26 of 32 items fixed); DNS rebinding protection; fail-closed architecture | Art. 15 |
 | MEASURE 3.1 | Risks tracked on ongoing basis | Prometheus real-time tracking; zerolog persistent timeline; both queryable and alertable | Art. 12 |

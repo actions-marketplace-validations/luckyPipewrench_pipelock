@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -71,44 +72,75 @@ func TestScanner_BeginUse_FailsAfterClose(t *testing.T) {
 // invoked its release func. Without the WaitGroup drain, a future
 // destructive Close would race with mid-scan callers.
 func TestScanner_Close_BlocksUntilDrain(t *testing.T) {
-	cfg := config.Defaults()
-	cfg.Internal = nil
-	sc := scanner.MustNew(cfg)
+	synctest.Test(t, func(t *testing.T) {
+		cfg := config.Defaults()
+		cfg.Internal = nil
+		sc := scanner.MustNew(cfg)
 
-	release, ok := sc.BeginUse()
-	if !ok {
-		t.Fatal("BeginUse on fresh scanner returned ok=false")
-	}
+		// Two in-flight users let the test prove Close remains blocked after a
+		// partial drain. synctest.Wait returns only when Close and its drain
+		// goroutine are durably blocked, so each check follows a processed
+		// WaitGroup state transition rather than an opportunity window.
+		releaseFirst, ok := sc.BeginUse()
+		if !ok {
+			t.Fatal("BeginUse on fresh scanner returned ok=false")
+		}
+		firstReleased := false
+		defer func() {
+			if !firstReleased {
+				releaseFirst()
+			}
+		}()
 
-	// Start Close in a goroutine. It must block on the in-flight user.
-	closeReturned := make(chan struct{})
-	go func() {
-		sc.Close()
-		close(closeReturned)
-	}()
+		releaseSecond, ok := sc.BeginUse()
+		if !ok {
+			t.Fatal("second BeginUse on fresh scanner returned ok=false")
+		}
+		secondReleased := false
+		defer func() {
+			if !secondReleased {
+				releaseSecond()
+			}
+		}()
 
-	// Allow the goroutine to publish closed=true and start the drain.
-	select {
-	case <-closeReturned:
-		t.Fatal("Close returned before in-flight release was invoked")
-	case <-time.After(50 * time.Millisecond):
-	}
+		closeReturned := make(chan struct{})
+		go func() {
+			sc.Close()
+			close(closeReturned)
+		}()
 
-	// Once closed=true is published, BeginUse must reject newcomers.
-	if !sc.Closed() {
-		t.Fatal("Close goroutine did not publish closed=true within 50ms")
-	}
-	if release2, ok2 := sc.BeginUse(); ok2 {
-		t.Error("BeginUse succeeded while Close was draining")
-		release2()
-	}
+		synctest.Wait()
+		if !sc.Closed() {
+			t.Fatal("Close did not publish closed=true before draining")
+		}
+		if release, began := sc.BeginUse(); began {
+			t.Error("BeginUse succeeded while Close was draining")
+			release()
+		}
+		select {
+		case <-closeReturned:
+			t.Fatal("Close returned with two users still in flight")
+		default:
+		}
 
-	release()
-	select {
-	case <-closeReturned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Close did not return after in-flight release was invoked")
-	}
+		releaseFirst()
+		firstReleased = true
+		synctest.Wait()
+		select {
+		case <-closeReturned:
+			t.Fatal("Close returned after a partial drain, with one user still in flight")
+		default:
+		}
+
+		releaseSecond()
+		secondReleased = true
+		synctest.Wait()
+		select {
+		case <-closeReturned:
+		default:
+			t.Fatal("Close did not return after the final in-flight release")
+		}
+	})
 }
 
 // TestScanner_Close_DrainTimeoutDefersTeardown verifies that a hung

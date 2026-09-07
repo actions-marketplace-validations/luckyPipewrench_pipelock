@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -29,8 +30,11 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract"
 	"github.com/luckyPipewrench/pipelock/internal/contract/runtime/contractruntimetest"
+	"github.com/luckyPipewrench/pipelock/internal/filesentry"
 	mcptools "github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/posture"
+	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
@@ -1305,6 +1309,122 @@ func TestServer_StartArmsFileSentry(t *testing.T) {
 	}
 }
 
+func TestServer_StartReturnsFileSentryRuntimeFailure(t *testing.T) {
+	wantErr := errors.New("watch backend failed")
+	watcher := newGatedFileSentryWatcher(wantErr)
+	installGatedFileSentryWatcher(t, watcher)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background()) }()
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start")
+	}
+	waitForServerOutput(t, buf, "  Health:")
+	close(watcher.release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("Start error = %v, want file sentry runtime failure wrapping %v", err, wantErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after file sentry runtime failure")
+	}
+}
+
+func TestServer_StartKeepsCleanCancellationNilWithFileSentry(t *testing.T) {
+	watcher := newGatedFileSentryWatcher(errors.New("must not be returned after clean cancellation"))
+	installGatedFileSentryWatcher(t, watcher)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+
+	done := make(chan error, 1)
+	go func() { done <- s.Start(context.Background()) }()
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start")
+	}
+	waitForServerOutput(t, buf, "  Health:")
+	if err := s.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start error after clean Shutdown = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after Shutdown")
+	}
+}
+
+func TestServer_StartRejectsFileSentryBlockWithoutSubprocessChild(t *testing.T) {
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"file_sentry:",
+		"  enabled: true",
+		"  action: block",
+		"  watch_paths:",
+		"    - " + strconv.Quote(t.TempDir()),
+		"",
+	}, "\n"))
+	s, buf := newTestServer(t, func(o *ServerOpts) {
+		o.ConfigFile = cfgPath
+		o.Listen = serverTestEphemeralListen
+		o.ListenChanged = true
+	})
+	// The refusal must happen before any watcher exists: a constructed watcher
+	// would already be reading the filesystem for a block mode that cannot act.
+	oldNew := newFileSentryWatcher
+	newFileSentryWatcher = func(*config.FileSentry, filesentry.DLPScanner, filesentry.Lineage, func(error)) (filesentry.Watcher, error) {
+		t.Error("file sentry watcher constructed despite the block-mode refusal")
+		return nil, errors.New("test: watcher must not be constructed")
+	}
+	t.Cleanup(func() { newFileSentryWatcher = oldNew })
+
+	err := s.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start accepted file_sentry.action: block without a subprocess child")
+	}
+	for _, want := range []string{"file_sentry.action", "subprocess MCP mode", "pipelock mcp proxy -- COMMAND"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Start error = %q, want substring %q", err, want)
+		}
+	}
+	if buf.contains("file sentry watching") {
+		t.Fatalf("Start armed file sentry despite refusal:\n%s", buf.String())
+	}
+}
+
 // TestServer_StartReportsArmedWatchCount asserts the file-sentry startup line
 // reports the count of paths that actually ARMED, not the configured count,
 // when a non-required watch path fails to install. Reporting the
@@ -1602,6 +1722,22 @@ func TestRuntimeMCPBuilders(t *testing.T) {
 	if toolCfg.BindingUnknownAction != config.ActionBlock || toolCfg.BindingNoBaselineAction != config.ActionWarn {
 		t.Fatalf("tool binding actions = %q/%q, want block/warn", toolCfg.BindingUnknownAction, toolCfg.BindingNoBaselineAction)
 	}
+	// server_lifecycle calls this builder again after reload. A detect_drift
+	// false->true change must retain prior hashes until a signed reset is
+	// consumed, rather than silently accepting a new baseline.
+	if drifted, _ := baseline.CheckAndUpdate("approved", "hash-before-disable"); drifted {
+		t.Fatal("initial tool baseline unexpectedly drifted")
+	}
+	cfg.MCPToolScanning.DetectDrift = false
+	_ = buildMCPToolCfg(cfg, extra, baseline)
+	cfg.MCPToolScanning.DetectDrift = true
+	_ = buildMCPToolCfg(cfg, extra, baseline)
+	if got := baseline.DriftEpoch(); got != 0 {
+		t.Fatalf("server reload reset tool baseline epoch to %d without authority", got)
+	}
+	if drifted, previous, _ := baseline.CheckAndUpdatePromote("approved", "hash-after-reload", false, false); !drifted || previous != "hash-before-disable" {
+		t.Fatalf("server reload discarded trusted baseline: drifted=%v previous=%q", drifted, previous)
+	}
 	if chain := buildMCPChainMatcher(cfg, metrics.New()); chain == nil {
 		t.Fatal("expected chain matcher when tool chain detection is enabled")
 	}
@@ -1612,6 +1748,39 @@ func TestRuntimeMCPBuilders(t *testing.T) {
 	tracker, buffer := cee.Components()
 	if tracker == nil || buffer == nil {
 		t.Fatalf("CEE deps = %+v, want tracker and buffer", cee)
+	}
+}
+
+func TestBuildMCPToolCfgWiresListenerResetAuthority(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate reset authority key: %v", err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "reset-authority.pub")
+	if err := signing.SavePublicKey(publicKey, keyPath); err != nil {
+		t.Fatalf("write reset authority key: %v", err)
+	}
+
+	cfg := config.Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = config.ActionBlock
+	cfg.MCPToolScanning.ListenerDriftResetFile = filepath.Join(t.TempDir(), "drift-reset")
+	cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = keyPath
+	cfg.MCPToolScanning.ListenerDriftResetTarget = "mcp://listener-reset-test"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate listener reset authority: %v", err)
+	}
+	replacementKey, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generate replacement reset authority key: %v", err)
+	}
+	if err := signing.SavePublicKey(replacementKey, keyPath); err != nil {
+		t.Fatalf("replace reset authority key after validation: %v", err)
+	}
+	baseline := mcptools.NewToolBaseline()
+	toolCfg := buildMCPToolCfg(cfg, nil, baseline)
+	if toolCfg == nil || toolCfg.Baseline != baseline || !bytes.Equal(toolCfg.ListenerDriftResetAuthorityPublicKey, publicKey) || toolCfg.ListenerDriftResetTarget != cfg.MCPToolScanning.ListenerDriftResetTarget {
+		t.Fatalf("listener reset authority tool config = %+v", toolCfg)
 	}
 }
 
@@ -1752,6 +1921,107 @@ func TestServer_Reload_StrictRejectsDowngrade(t *testing.T) {
 	}
 }
 
+func TestServer_Reload_TrustedDomainExpansionReportsRefusalAndPreservesLiveConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		required bool
+		widen    func(*config.Config)
+		field    string
+		wantErr  string
+	}{
+		{
+			name:    "global trusted domains",
+			mode:    config.ModeStrict,
+			widen:   func(cfg *config.Config) { cfg.TrustedDomains = []string{"internal.example"} },
+			field:   "trusted_domains",
+			wantErr: "strict mode",
+		},
+		{
+			name: "agent trusted domains",
+			mode: config.ModeStrict,
+			widen: func(cfg *config.Config) {
+				cfg.Agents = map[string]config.AgentProfile{"build": {TrustedDomains: []string{"internal.example"}}}
+			},
+			field:   "agents.build.trusted_domains",
+			wantErr: "strict mode",
+		},
+		{
+			name:    "SSRF IP allowlist",
+			mode:    config.ModeStrict,
+			widen:   func(cfg *config.Config) { cfg.SSRF.IPAllowlist = []string{"10.0.0.0/8"} },
+			field:   "ssrf.ip_allowlist",
+			wantErr: "strict mode",
+		},
+		{
+			name:     "required receipts with global trusted domains",
+			mode:     config.ModeBalanced,
+			required: true,
+			widen:    func(cfg *config.Config) { cfg.TrustedDomains = []string{"internal.example"} },
+			field:    "trusted_domains",
+			wantErr:  "flight_recorder.require_receipts",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, buf := newTestServer(t, func(o *ServerOpts) {
+				o.Mode = tc.mode
+				o.ModeChanged = true
+			})
+			oldCfg := s.proxy.CurrentConfig()
+			oldCfg.FlightRecorder.RequireReceipts = tc.required
+			candidate := oldCfg.Clone()
+			tc.widen(candidate)
+			s.lastReloadAt = time.Time{} // exercise the rejection, not fsnotify/SIGHUP deduplication
+
+			if err := s.Reload(candidate); err == nil {
+				t.Fatal("trusted-domain expansion reload succeeded")
+			} else if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("reload error = %q, want %q", err, tc.wantErr)
+			}
+			for _, want := range []string{
+				"WARNING: config reload: " + tc.field,
+				"WARNING: config reload rejected: " + tc.field + " cannot widen trust at runtime",
+				"previous configuration remains active",
+				"restart Pipelock",
+			} {
+				if !buf.contains(want) {
+					t.Fatalf("stderr missing %q:\n%s", want, buf.String())
+				}
+			}
+			if got := s.proxy.CurrentConfig(); got != oldCfg {
+				t.Fatal("trusted-domain expansion changed the live configuration")
+			}
+		})
+	}
+}
+
+func TestServer_Reload_BalancedAndAuditAcceptTrustedDomainExpansion(t *testing.T) {
+	for _, mode := range []string{config.ModeBalanced, config.ModeAudit} {
+		t.Run(mode, func(t *testing.T) {
+			s, buf := newTestServer(t, func(o *ServerOpts) {
+				o.Mode = mode
+				o.ModeChanged = true
+			})
+			candidate := s.proxy.CurrentConfig().Clone()
+			candidate.TrustedDomains = []string{"internal.example"}
+			s.lastReloadAt = time.Time{} // exercise the reload, not fsnotify/SIGHUP deduplication
+
+			if err := s.Reload(candidate); err != nil {
+				t.Fatalf("ordinary trusted-domain expansion reload: %v", err)
+			}
+			if got := s.proxy.CurrentConfig().TrustedDomains; !reflect.DeepEqual(got, candidate.TrustedDomains) {
+				t.Fatalf("live trusted_domains = %v, want %v", got, candidate.TrustedDomains)
+			}
+			if !buf.contains("WARNING: config reload: trusted_domains") {
+				t.Fatalf("accepted reload did not report trust expansion:\n%s", buf.String())
+			}
+			if buf.contains("config reload rejected") {
+				t.Fatalf("accepted reload reported a refusal:\n%s", buf.String())
+			}
+		})
+	}
+}
+
 func TestServer_ReloadRejectsNilConfig(t *testing.T) {
 	s, _ := newTestServer(t, nil)
 	oldCfg := s.proxy.CurrentConfig()
@@ -1762,6 +2032,39 @@ func TestServer_ReloadRejectsNilConfig(t *testing.T) {
 	}
 	if live := s.proxy.CurrentConfig(); live != oldCfg {
 		t.Fatal("rejected nil reload changed the live config")
+	}
+}
+
+// A reload that asks for file_sentry block on the server listener is rejected
+// atomically: nothing else in that reload lands either, so a policy rollout
+// cannot report success while the enforcement it asked for never arrived.
+func TestServer_ReloadRejectsFileSentryBlockWithoutSubprocessChild(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+	oldCfg := s.proxy.CurrentConfig()
+
+	newCfg := oldCfg.Clone()
+	newCfg.FileSentry.Enabled = true
+	newCfg.FileSentry.Action = config.ActionBlock
+	newCfg.FileSentry.WatchPaths = []config.WatchPath{{Path: t.TempDir()}}
+	newCfg.DLP.Patterns = append(newCfg.DLP.Patterns, config.DLPPattern{Name: "reload-secret", Regex: `RELOAD_SECRET_[A-Z]+`, Severity: config.SeverityCritical})
+
+	err := s.Reload(newCfg)
+	if err == nil {
+		t.Fatal("Reload accepted file_sentry.action: block without a subprocess child")
+	}
+	for _, want := range []string{"rejected", "file_sentry.action", "subprocess MCP mode", "pipelock mcp proxy -- COMMAND"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Reload error = %q, want substring %q", err, want)
+		}
+	}
+	live := s.proxy.CurrentConfig()
+	if live != oldCfg {
+		t.Fatal("rejected reload swapped the live config")
+	}
+	for _, p := range live.DLP.Patterns {
+		if p.Name == "reload-secret" {
+			t.Fatal("rejected reload still applied the DLP change riding alongside it")
+		}
 	}
 }
 
@@ -2533,7 +2836,23 @@ func TestServer_Reload_SerializesBundleGateWithRuntimeMirrorRefresh(t *testing.T
 
 	firstPaused := make(chan struct{})
 	releaseFirst := make(chan struct{})
+	var reloads sync.WaitGroup
 	var hookCalls atomic.Int32
+	secondAtLock := make(chan struct{})
+	secondAcquiredLock := make(chan struct{})
+	var lockAttempts atomic.Int32
+	var lockAcquisitions atomic.Int32
+	restoreLockHook := setReloadLockHookForTest(func(acquired bool) {
+		if acquired {
+			if lockAcquisitions.Add(1) == 2 {
+				close(secondAcquiredLock)
+			}
+			return
+		}
+		if lockAttempts.Add(1) == 2 {
+			close(secondAtLock)
+		}
+	})
 	restoreHook := setReloadAfterProxySwapHookForTest(func(*Server) {
 		if hookCalls.Add(1) != 1 {
 			return
@@ -2541,11 +2860,23 @@ func TestServer_Reload_SerializesBundleGateWithRuntimeMirrorRefresh(t *testing.T
 		close(firstPaused)
 		<-releaseFirst
 	})
-	defer restoreHook()
+	defer func() {
+		select {
+		case <-releaseFirst:
+		default:
+			close(releaseFirst)
+		}
+		reloads.Wait()
+		restoreHook()
+		restoreLockHook()
+	}()
 
 	firstDone := make(chan error, 1)
+	firstConfig := loadServerTestReloadConfig(t, "first-clean-tool-poison")
+	reloads.Add(1)
 	go func() {
-		firstDone <- s.Reload(loadServerTestReloadConfig(t, "first-clean-tool-poison"))
+		defer reloads.Done()
+		firstDone <- s.Reload(firstConfig)
 	}()
 
 	<-firstPaused
@@ -2554,17 +2885,39 @@ func TestServer_Reload_SerializesBundleGateWithRuntimeMirrorRefresh(t *testing.T
 	}
 
 	secondDone := make(chan error, 1)
-	go func() {
-		secondDone <- s.Reload(loadServerTestReloadConfig(t, "second-should-not-activate"))
-	}()
+	secondConfig := loadServerTestReloadConfig(t, "second-should-not-activate")
+	secondReload := func() {
+		defer reloads.Done()
+		secondDone <- s.Reload(secondConfig)
+	}
+	reloads.Add(1)
+	go secondReload()
 
+	testwait.For(t, 5*time.Second, func() bool {
+		select {
+		case <-secondAtLock:
+			return true
+		default:
+			return false
+		}
+	}, "second reload to reach reloadMu")
 	select {
+	case <-secondAcquiredLock:
+		t.Fatal("second reload acquired reloadMu while first reload still held it")
 	case err := <-secondDone:
-		t.Fatalf("second reload completed before first reload refreshed runtime mirrors: %v", err)
-	case <-time.After(100 * time.Millisecond):
+		t.Fatalf("second reload completed before acquiring reloadMu: %v", err)
+	default:
 	}
 
 	close(releaseFirst)
+	testwait.For(t, 5*time.Second, func() bool {
+		select {
+		case <-secondAcquiredLock:
+			return true
+		default:
+			return false
+		}
+	}, "second reload to acquire released reloadMu")
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first clean reload: %v", err)
 	}
@@ -2747,7 +3100,7 @@ func TestFilterAllowedRuleBundleCoverageWarningsKeepsLocalResponseWeakening(t *t
 }
 
 // TestServer_StartupPartialStandardBundleKeepsResponseFallback proves the
-// per-surface fix (AF-81 / CodeRabbit): a standard bundle that provides ONLY
+// per-surface fix from review: a standard bundle that provides ONLY
 // DLP patterns must NOT empty the response-scanning surface. Before the fix a
 // single "standard bundle loaded" flag stripped the compiled response fallback
 // and left response scanning empty (a fail-open detection loss).
@@ -2932,7 +3285,7 @@ func TestServer_Reload_StrictRejectsSuppressWidening(t *testing.T) {
 	buf.reset()
 	newCfg := oldCfg.Clone()
 	newCfg.Suppress = append(newCfg.Suppress, config.SuppressEntry{
-		Rule:   "Prompt Injection",
+		Rule:   "New Instructions",
 		Path:   "*",
 		Reason: "review repro",
 	})
@@ -2952,6 +3305,33 @@ func TestServer_Reload_StrictRejectsSuppressWidening(t *testing.T) {
 	}
 	if !buf.contains("suppress") {
 		t.Fatalf("stderr missing suppress widening warning:\n%s", buf.String())
+	}
+}
+
+func TestServer_ReloadRejectsCoreFloorSuppressAndPreservesRuntime(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+	oldCfg := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+
+	newCfg := oldCfg.Clone()
+	newCfg.Suppress = append(newCfg.Suppress, config.SuppressEntry{
+		Rule:   "AWS Access ID",
+		Path:   "*",
+		Reason: "injected after validation",
+	})
+
+	err := s.Reload(newCfg)
+	if err == nil {
+		t.Fatal("Reload accepted core floor suppression")
+	}
+	if !strings.Contains(err.Error(), "core floor patterns cannot be suppressed") {
+		t.Fatalf("Reload error = %q, want core floor rejection", err)
+	}
+	if s.proxy.CurrentConfig() != oldCfg {
+		t.Fatal("live config changed after rejected core floor suppression")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("live scanner changed after rejected core floor suppression")
 	}
 }
 
@@ -3221,6 +3601,205 @@ func TestServer_Reload_IgnoresFlightRecorderHeartbeatIntervalChange(t *testing.T
 	}
 	if !buf.contains("flight_recorder settings changed") {
 		t.Fatalf("stderr missing flight_recorder restart-only warning:\n%s", buf.String())
+	}
+}
+
+func newContainmentEvidenceReloadServer(t *testing.T, require bool) (*Server, *syncBuffer) {
+	t.Helper()
+	dir := t.TempDir()
+	_, receiptKey, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatalf("GenerateKeyPair receipt: %v", err)
+	}
+	receiptKeyPath := filepath.Join(dir, "receipt.key")
+	if err := signing.SavePrivateKey(receiptKey, receiptKeyPath); err != nil {
+		t.Fatalf("SavePrivateKey receipt: %v", err)
+	}
+	posturePublicKey, postureKey, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey posture: %v", err)
+	}
+	capsule, err := posture.Emit(config.Defaults(), posture.Options{
+		SigningKey: postureKey,
+		Containment: &posture.ContainmentEvidence{
+			Mode:                     posture.ContainmentModeKernelNFTOwnerMatch,
+			BoundaryVerified:         true,
+			ProbeRefusedDirectEgress: true,
+			KernelRuleHash:           strings.Repeat("a", 64),
+			TargetUID:                "966",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Emit posture capsule: %v", err)
+	}
+	proof, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal posture capsule: %v", err)
+	}
+	proofPath := filepath.Join(dir, "proof.json")
+	if err := os.WriteFile(proofPath, proof, 0o600); err != nil {
+		t.Fatalf("Write posture capsule: %v", err)
+	}
+	t.Setenv(posturebinding.RuntimeProofEnv, proofPath)
+
+	cfgPath := writeServerTestConfig(t, strings.Join([]string{
+		"mode: balanced",
+		"flight_recorder:",
+		"  enabled: true",
+		"  dir: " + strconv.Quote(filepath.Join(dir, "receipts")),
+		"  signing_key_path: " + strconv.Quote(receiptKeyPath),
+		"  posture_signer_key: " + strconv.Quote(hex.EncodeToString(posturePublicKey)),
+		"  require_containment_evidence: " + strconv.FormatBool(require),
+		"",
+	}, "\n"))
+	return newTestServer(t, func(opts *ServerOpts) { opts.ConfigFile = cfgPath })
+}
+
+func TestNewServer_RequiredContainmentEvidenceFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		proofKind string
+	}{
+		{name: "missing proof", proofKind: "missing"},
+		{name: "different signer", proofKind: "different-signer"},
+		{name: "no containment evidence", proofKind: "no-containment"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			_, receiptKey, err := signing.GenerateKeyPair()
+			if err != nil {
+				t.Fatalf("GenerateKeyPair receipt: %v", err)
+			}
+			receiptKeyPath := filepath.Join(dir, "receipt.key")
+			if err := signing.SavePrivateKey(receiptKey, receiptKeyPath); err != nil {
+				t.Fatalf("SavePrivateKey receipt: %v", err)
+			}
+
+			posturePublicKey, postureKey, err := ed25519.GenerateKey(nil)
+			if err != nil {
+				t.Fatalf("GenerateKey posture: %v", err)
+			}
+			proofPath := filepath.Join(dir, "proof.json")
+			if tc.proofKind != "missing" {
+				proofKey := postureKey
+				containment := (*posture.ContainmentEvidence)(nil)
+				if tc.proofKind == "different-signer" {
+					_, proofKey, err = ed25519.GenerateKey(nil)
+					if err != nil {
+						t.Fatalf("GenerateKey mismatched posture: %v", err)
+					}
+					containment = &posture.ContainmentEvidence{
+						Mode:                     posture.ContainmentModeKernelNFTOwnerMatch,
+						BoundaryVerified:         true,
+						ProbeRefusedDirectEgress: true,
+						KernelRuleHash:           strings.Repeat("a", 64),
+						TargetUID:                "966",
+					}
+				}
+				capsule, emitErr := posture.Emit(config.Defaults(), posture.Options{
+					SigningKey:  proofKey,
+					Containment: containment,
+				})
+				if emitErr != nil {
+					t.Fatalf("Emit posture capsule: %v", emitErr)
+				}
+				proof, marshalErr := json.Marshal(capsule)
+				if marshalErr != nil {
+					t.Fatalf("Marshal posture capsule: %v", marshalErr)
+				}
+				if err := os.WriteFile(proofPath, proof, 0o600); err != nil {
+					t.Fatalf("Write posture capsule: %v", err)
+				}
+			}
+			t.Setenv(posturebinding.RuntimeProofEnv, proofPath)
+
+			cfgPath := writeServerTestConfig(t, strings.Join([]string{
+				"mode: balanced",
+				"flight_recorder:",
+				"  enabled: true",
+				"  dir: " + strconv.Quote(filepath.Join(dir, "receipts")),
+				"  signing_key_path: " + strconv.Quote(receiptKeyPath),
+				"  posture_signer_key: " + strconv.Quote(hex.EncodeToString(posturePublicKey)),
+				"  require_containment_evidence: true",
+				"",
+			}, "\n"))
+			buf := &syncBuffer{}
+			s, err := NewServer(ServerOpts{
+				ConfigFile:                        cfgPath,
+				Stdout:                            buf,
+				Stderr:                            buf,
+				allowEphemeralListenersForTesting: true,
+			})
+			if s != nil {
+				s.cleanup()
+				t.Fatal("NewServer returned a server for invalid containment evidence")
+			}
+			if err == nil || !strings.Contains(err.Error(), "loading posture binding") {
+				t.Fatalf("NewServer error = %v, want fail-closed posture binding error", err)
+			}
+		})
+	}
+}
+
+func TestServer_Reload_ContainmentEvidenceRequirementIsRestartOnly(t *testing.T) {
+	s, buf := newContainmentEvidenceReloadServer(t, true)
+	oldLive := s.proxy.CurrentConfig()
+	if !oldLive.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("server did not start with required containment evidence")
+	}
+
+	changed := oldLive.Clone()
+	changed.FlightRecorder.RequireContainmentEvidence = false
+	if err := s.Reload(changed); err != nil {
+		t.Fatalf("Reload changed requirement: %v", err)
+	}
+	live := s.proxy.CurrentConfig()
+	if !live.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("containment evidence requirement was removed by reload")
+	}
+	s.stateMu.RLock()
+	runtimeRequire := s.cfg.FlightRecorder.RequireContainmentEvidence
+	s.stateMu.RUnlock()
+	if !runtimeRequire {
+		t.Fatal("server runtime state applied the restart-only containment evidence change")
+	}
+	if !buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("stderr missing restart-only requirement warning:\n%s", buf.String())
+	}
+
+	buf.reset()
+	if err := s.Reload(live.Clone()); err != nil {
+		t.Fatalf("Reload unchanged requirement: %v", err)
+	}
+	if buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("unchanged requirement produced a restart-only warning:\n%s", buf.String())
+	}
+}
+
+func TestServer_Reload_ContainmentEvidenceRequirementEnableIsRestartOnly(t *testing.T) {
+	s, buf := newContainmentEvidenceReloadServer(t, false)
+	oldLive := s.proxy.CurrentConfig()
+	if oldLive.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("server unexpectedly started with required containment evidence")
+	}
+
+	changed := oldLive.Clone()
+	changed.FlightRecorder.RequireContainmentEvidence = true
+	if err := s.Reload(changed); err != nil {
+		t.Fatalf("Reload enabled requirement: %v", err)
+	}
+	live := s.proxy.CurrentConfig()
+	if live.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("reload silently enabled containment evidence requirement without a restart")
+	}
+	s.stateMu.RLock()
+	runtimeRequire := s.cfg.FlightRecorder.RequireContainmentEvidence
+	s.stateMu.RUnlock()
+	if runtimeRequire {
+		t.Fatal("server runtime state applied the restart-only containment evidence change")
+	}
+	if !buf.contains("flight_recorder.require_containment_evidence changed") {
+		t.Fatalf("stderr missing restart-only requirement warning:\n%s", buf.String())
 	}
 }
 
@@ -3500,7 +4079,7 @@ func TestServer_Reload_PreservesRestartOnlyFields(t *testing.T) {
 	newCfg.FlightRecorder.SigningKeyPath = "/tmp/new-signing-key"
 	newCfg.FlightRecorder.RequireReceipts = true
 	newCfg.Conductor.ConductorURL = "https://boss-new.example"
-	newCfg.FileSentry.Action = config.ActionBlock // file_sentry is restart-only; this change must be ignored
+	newCfg.FileSentry.Enabled = false // file_sentry is restart-only; this change must be ignored
 	newCfg.DashboardSnapshot.Path = "/tmp/new-runtime-snapshot.json"
 	newCfg.DashboardSnapshot.Interval = "2s"
 	newCfg.ReverseProxy.Listen = "127.0.0.1:28084"

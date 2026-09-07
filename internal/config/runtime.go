@@ -254,6 +254,12 @@ func (c *Config) Clone() *Config {
 	if c.LicenseIntermediateCert != nil {
 		clone.LicenseIntermediateCert = append([]byte(nil), c.LicenseIntermediateCert...)
 	}
+	if c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey != nil {
+		clone.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey...)
+	}
+	if c.FlightRecorder.PostureSignerPublicKey != nil {
+		clone.FlightRecorder.PostureSignerPublicKey = append([]byte(nil), c.FlightRecorder.PostureSignerPublicKey...)
+	}
 
 	clone.DLP.Patterns = cloneDLPPatterns(c.DLP.Patterns)
 	clone.ResponseScanning.Patterns = cloneResponseScanPatterns(c.ResponseScanning.Patterns)
@@ -272,8 +278,22 @@ func (c *Config) Clone() *Config {
 	if c.ResponseScanning.UnscannablePassthrough != nil {
 		clone.ResponseScanning.UnscannablePassthrough = cloneUnscannablePassthrough(c.ResponseScanning.UnscannablePassthrough)
 	}
+	if c.ResponseScanning.AuthenticatedArtifacts != nil {
+		clone.ResponseScanning.AuthenticatedArtifacts = append([]AuthenticatedArtifactEntry(nil), c.ResponseScanning.AuthenticatedArtifacts...)
+	}
+	if c.RequestBodyScanning.ContentEntropyWarnRoutes != nil {
+		clone.RequestBodyScanning.ContentEntropyWarnRoutes = cloneRequestBodyEntropyWarnRoutes(c.RequestBodyScanning.ContentEntropyWarnRoutes)
+	}
+	if c.RequestBodyScanning.SigV4CredentialRoutes != nil {
+		clone.RequestBodyScanning.SigV4CredentialRoutes = cloneRequestBodySigV4CredentialRoutes(c.RequestBodyScanning.SigV4CredentialRoutes)
+	}
 	if c.Taint.TrustedMCPServers != nil {
 		clone.Taint.TrustedMCPServers = append([]string(nil), c.Taint.TrustedMCPServers...)
+	}
+	if c.Containment.MetricsExposure != nil {
+		exposure := *c.Containment.MetricsExposure
+		exposure.AllowedSourceCIDRs = append([]string(nil), c.Containment.MetricsExposure.AllowedSourceCIDRs...)
+		clone.Containment.MetricsExposure = &exposure
 	}
 	clone.MCPToolPolicy.Rules = cloneToolPolicyRules(c.MCPToolPolicy.Rules)
 	// Deep-copy the follower audience-labels map so a runtime caller that
@@ -289,6 +309,15 @@ func (c *Config) Clone() *Config {
 	}
 
 	return &clone
+}
+
+func cloneRequestBodySigV4CredentialRoutes(entries []RequestBodySigV4CredentialRoute) []RequestBodySigV4CredentialRoute {
+	out := append([]RequestBodySigV4CredentialRoute(nil), entries...)
+	for i := range out {
+		out[i].ContentTypes = append([]string(nil), out[i].ContentTypes...)
+		out[i].Methods = append([]string(nil), out[i].Methods...)
+	}
+	return out
 }
 
 // cloneDLPPatterns returns a deep copy of src. Each pattern's ExemptDomains
@@ -323,6 +352,15 @@ func cloneUnscannablePassthrough(src []UnscannablePassthroughEntry) []Unscannabl
 		if src[i].ContentTypes != nil {
 			dst[i].ContentTypes = append([]string(nil), src[i].ContentTypes...)
 		}
+	}
+	return dst
+}
+
+func cloneRequestBodyEntropyWarnRoutes(src []RequestBodyEntropyWarnRoute) []RequestBodyEntropyWarnRoute {
+	dst := append([]RequestBodyEntropyWarnRoute(nil), src...)
+	for i := range src {
+		dst[i].ContentTypes = append([]string(nil), src[i].ContentTypes...)
+		dst[i].Methods = append([]string(nil), src[i].Methods...)
 	}
 	return dst
 }

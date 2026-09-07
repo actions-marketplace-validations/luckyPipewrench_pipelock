@@ -31,6 +31,7 @@ import (
 
 	readability "github.com/go-shiori/go-readability"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/certgen"
@@ -65,6 +66,7 @@ const (
 	ctxKeyClientIP contextKey = iota
 	ctxKeyRequestID
 	ctxKeyAgent
+	ctxKeyAgentAuth    // provenance grade for ctxKeyAgent (envelope.ActorAuth)
 	ctxKeyAgentConfig  // per-agent resolved config for redirect scanning
 	ctxKeyAgentScanner // per-agent resolved scanner for redirect scanning
 	ctxKeyAgentContractLoader
@@ -105,6 +107,10 @@ const (
 	// tracker. httputil.ReverseProxy completes through callbacks, so ServeHTTP
 	// owns final emission while callbacks only record status/bytes/reason.
 	ctxKeyReverseOutcome
+	// ctxKeyReverseResponseReceipt carries the response header state across
+	// httputil.ReverseProxy's ModifyResponse boundary. Buffered response blocks
+	// replace the upstream response after an admission receipt was exposed.
+	ctxKeyReverseResponseReceipt
 
 	// ctxKeyEnvelopeEmitter snapshots the fetch/forward envelope emitter
 	// decision, including an explicit nil when signing was off at
@@ -120,6 +126,14 @@ const (
 	// the transport that originated the request rather than the
 	// hardcoded default. See Info 2 on the envelope-signing review.
 	ctxKeyRedirectTransport
+	// ctxKeyRedirectSessionRecorder carries the exact admission-time session
+	// recorder into CheckRedirect so policy is re-evaluated against the same
+	// identity and state on every hop.
+	ctxKeyRedirectSessionRecorder
+	// ctxKeyEntropyWarnRoute binds a request-body entropy warning exception to
+	// its exact admitted HTTPS destination. CheckRedirect refuses a replay to
+	// any other route because 307/308 preserve the already-scanned body.
+	ctxKeyEntropyWarnRoute
 
 	// ctxKeySSRFDialScanSnapshot carries the DNS answers from an allowed
 	// scanner SSRF pass into the later dial-time re-resolution. The safe
@@ -177,6 +191,8 @@ type blockedRequestError struct {
 	layer  string
 	reason string
 	detail string
+	target string
+	taint  *taintDecision
 }
 
 func (e *blockedRequestError) Error() string {
@@ -219,6 +235,12 @@ func newRedirectBlockedRequest(originLayer, reason string) *blockedRequestError 
 		layer = "redirect"
 	}
 	return newBlockedRequestError(layer, fullReason, fullReason)
+}
+
+func newRedirectTaintBlockedRequest(decision taintDecision, reason string) *blockedRequestError {
+	blockedErr := newRedirectBlockedRequest("taint_policy", reason)
+	blockedErr.taint = &decision
+	return blockedErr
 }
 
 func newEnvelopeBlockedRequest(err error) *blockedRequestError {
@@ -264,6 +286,19 @@ func redirectBlockedInfo(blockedErr *blockedRequestError) blockreason.Info {
 		layer = blockedErr.layer
 	}
 	return blockInfoFor(blockreason.RedirectScanDenied, layer)
+}
+
+// redirectReceiptTarget keeps redirect-denial receipts tied to the URL that
+// was actually refused. The admitted request remains available through the
+// request ID and prior audit events; recording it as the blocked target would
+// make a redirected denial look like a denial of the original destination.
+// The fallback preserves a useful target for legacy typed errors that did not
+// originate in CheckRedirect.
+func redirectReceiptTarget(blockedErr *blockedRequestError, fallback string) string {
+	if blockedErr != nil && blockedErr.target != "" {
+		return blockedErr.target
+	}
+	return fallback
 }
 
 // Regex patterns for extracting content from HTML hiding spots that
@@ -314,26 +349,74 @@ func requestMeta(r *http.Request) (clientIP, requestID string) {
 	return
 }
 
-func newHTTPAuditContext(logger *audit.Logger, method, targetURL, clientIP, requestID, agent string) audit.LogContext {
-	ctx, err := audit.NewHTTPLogContext(method, targetURL, clientIP, requestID, agent)
-	if err != nil {
-		if logger != nil {
-			logger.LogError(audit.NewMethodLogContext(method), err)
-		}
-		return audit.NewMethodLogContext(method)
-	}
-	return ctx
+// httpAuditEvent carries the descriptive fields of an HTTP-shaped audit event.
+//
+// These are grouped so newHTTPAuditContext stays inside the project's
+// six-parameter limit. The request context deliberately stays a separate
+// positional parameter rather than joining the struct: it is what carries the
+// agent label's provenance grade, and a struct field is easy to leave unset,
+// which is exactly the failure that shipped an ungraded first version of this
+// change.
+type httpAuditEvent struct {
+	Method    string
+	TargetURL string
+	ClientIP  string
+	RequestID string
+	Agent     string
 }
 
-func newConnectAuditContext(logger *audit.Logger, target, clientIP, requestID, agent string) audit.LogContext {
+// newHTTPAuditContext builds an audit context for an HTTP-shaped event.
+//
+// reqCtx is REQUIRED and carries the agent label's provenance grade. It is a
+// mandatory parameter rather than an optional With-style call because an
+// optional carrier is a carrier that gets forgotten: the first version of this
+// change added a request-aware helper beside this one and wired zero call
+// sites, so every event reported its grade as unknown and the SIEM identity
+// fields were withheld even from infrastructure-bound deployments. Pass the
+// request context where one exists; pass context.Background() only where none
+// genuinely does, which yields the fail-closed unknown grade explicitly.
+func newHTTPAuditContext(reqCtx context.Context, logger *audit.Logger, ev httpAuditEvent) audit.LogContext {
+	grade := agentAuthFromContext(reqCtx)
+	ctx, err := audit.NewHTTPLogContext(ev.Method, ev.TargetURL, ev.ClientIP, ev.RequestID, ev.Agent)
+	if err != nil {
+		// Build the fallback once and grade it before logging. Logging an
+		// ungraded fallback and returning a graded one would make the error
+		// event itself the only record claiming unknown provenance.
+		fallback := audit.NewMethodLogContext(ev.Method).WithActorAuth(grade)
+		if logger != nil {
+			logger.LogError(fallback, err)
+		}
+		return fallback
+	}
+	return ctx.WithActorAuth(grade)
+}
+
+// agentAuthFromContext returns the provenance grade recorded alongside the
+// agent name. A request that never carried a grade yields ActorAuthUnknown,
+// which every downstream identity surface treats as untrusted.
+func agentAuthFromContext(ctx context.Context) string {
+	if auth, ok := ctx.Value(ctxKeyAgentAuth).(string); ok && auth != "" {
+		return auth
+	}
+	return string(envelope.ActorAuthUnknown)
+}
+
+// newConnectAuditContext builds an audit context for a CONNECT event.
+//
+// reqCtx is REQUIRED for the same reason it is on newHTTPAuditContext: the
+// grade has to ride the context or every CONNECT event silently reports
+// unknown provenance.
+func newConnectAuditContext(reqCtx context.Context, logger *audit.Logger, target, clientIP, requestID, agent string) audit.LogContext {
+	grade := agentAuthFromContext(reqCtx)
 	ctx, err := audit.NewConnectLogContext(target, clientIP, requestID, agent)
 	if err != nil {
+		fallback := audit.NewMethodLogContext(http.MethodConnect).WithActorAuth(grade)
 		if logger != nil {
-			logger.LogError(audit.NewMethodLogContext(http.MethodConnect), err)
+			logger.LogError(fallback, err)
 		}
-		return audit.NewMethodLogContext(http.MethodConnect)
+		return fallback
 	}
-	return ctx
+	return ctx.WithActorAuth(grade)
 }
 
 // Version is set at build time via ldflags.
@@ -355,6 +438,7 @@ type Proxy struct {
 	redactMatcherPtr     atomic.Pointer[redact.Matcher]         // nil when redaction disabled
 	reqPolicyPtr         atomic.Pointer[reqpolicy.Matcher]      // nil when request_policy disabled
 	contractLoaderPtr    atomic.Pointer[contractruntime.Loader] // nil when learn_lock is disabled
+	authorityVerifier    authority.Verifier                     // nil preserves pre-authority forwarding behavior
 	logger               *audit.Logger
 	metrics              *metrics.Metrics
 	ks                   *killswitch.Controller
@@ -383,7 +467,20 @@ type Proxy struct {
 	shieldEngine         *shield.Engine                        // browser shield HTML/JS rewriter (nil = not initialized)
 	frozenTools          *FrozenToolRegistry                   // frozen tool inventories for airlock hard tier
 	wd                   *health.Watchdog                      // wedge-detection watchdog (nil = disabled)
+	metricsSuppressed    bool                                  // never publish /metrics or /stats on this listener
 	probeInflight        atomic.Bool                           // singleflight guard for scannerProbe (prevents goroutine leak when scanner wedges)
+	metricsTargetPtr     atomic.Pointer[metricsDialTarget]     // resolved metrics listener; rebuilt when MetricsListen changes
+	lookupMetricsHost    func(context.Context, string) ([]string, error)
+	// responseBodyLimit is an internal test seam. Production leaves it zero
+	// and uses fetch_proxy.max_response_mb.
+	responseBodyLimit int64
+}
+
+func (p *Proxy) responseScanBodyLimit(cfg *config.Config) int64 {
+	if p != nil && p.responseBodyLimit > 0 {
+		return p.responseBodyLimit
+	}
+	return int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
 }
 
 // Option configures optional Proxy behavior.
@@ -450,6 +547,13 @@ func WithContractLoader(loader *contractruntime.Loader) Option {
 	return func(p *Proxy) { p.contractLoaderPtr.Store(loader) }
 }
 
+// WithAuthorityVerifier installs the external-grant verifier used by every
+// forwarding surface. A nil verifier preserves existing behavior while still
+// consuming the reserved carrier so grants never leak upstream.
+func WithAuthorityVerifier(verifier authority.Verifier) Option {
+	return func(p *Proxy) { p.authorityVerifier = verifier }
+}
+
 // WithEnvelopeEmitter sets the mediation envelope emitter. When non-nil, the
 // proxy injects signed mediation envelopes into proxied requests. Pass nil to
 // disable (default).
@@ -466,6 +570,22 @@ func WithHealthWatchdog(wd *health.Watchdog) Option {
 	return func(p *Proxy) { p.wd = wd }
 }
 
+// WithMetricsSuppressed stops the proxy publishing /metrics and /stats on its
+// own listener.
+//
+// The proxy serves those two routes itself only when metrics_listen is empty,
+// which normally means "no dedicated port, so use this one". A contained
+// runtime that refuses an unsafe metrics configuration reaches the same empty
+// value by a different route, and there the fallback is exactly wrong: the
+// proxy port is the one the contained agent can reach, so falling back hands
+// the agent the endpoints the refusal was meant to withhold.
+//
+// The caller decides, because only the caller knows which of those two
+// situations produced the empty value.
+func WithMetricsSuppressed() Option {
+	return func(p *Proxy) { p.metricsSuppressed = true }
+}
+
 // FetchResponse is the JSON response returned by the /fetch endpoint.
 type FetchResponse struct {
 	URL         string `json:"url"`
@@ -479,7 +599,11 @@ type FetchResponse struct {
 	BlockReason string `json:"block_reason,omitempty"`
 	Hint        string `json:"hint,omitempty"`
 	Layer       string `json:"layer,omitempty"`
+	// ShieldRewrite is the client-visible summary for a Browser Shield body rewrite.
+	ShieldRewrite string `json:"shield_rewrite,omitempty"`
 }
+
+const shieldRewriteHeader = "X-Pipelock-Shield-Rewrite"
 
 const (
 	adaptiveEnforcementLayer = "adaptive_enforcement"
@@ -505,6 +629,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	}
 	p.cfgPtr.Store(cfg)
 	p.scannerPtr.Store(sc)
+	p.refreshMetricsDialTarget(cfg.MetricsListen)
 
 	if p.currentContractLoader() == nil {
 		loader, loaderErr := buildContractLoader(cfg)
@@ -647,12 +772,17 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	p.client = &http.Client{
 		Transport: transport,
 		Timeout:   time.Duration(cfg.FetchProxy.TimeoutSeconds) * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		CheckRedirect: func(req *http.Request, via []*http.Request) (retErr error) {
 			if len(via) >= 5 {
 				return fmt.Errorf("too many redirects (max 5)")
 			}
 			originalURL := via[0].URL.String()
 			redirectURL := req.URL.String()
+			defer func() {
+				if blockedErr, ok := blockedRequestErrorFrom(retErr); ok && blockedErr.target == "" {
+					blockedErr.target = redirectURL
+				}
+			}()
 			clientIP, _ := req.Context().Value(ctxKeyClientIP).(string)
 			requestID, _ := req.Context().Value(ctxKeyRequestID).(string)
 			agentName, _ := req.Context().Value(ctxKeyAgent).(string)
@@ -669,6 +799,19 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			currentScanner, _ := req.Context().Value(ctxKeyAgentScanner).(*scanner.Scanner)
 			if currentScanner == nil {
 				currentScanner = p.scannerPtr.Load()
+			}
+			if redirectReplaysBodyToNewAuthority(req, via) {
+				return newRedirectBlockedRequest(scannerLabelBodyDLP, "redirect replay changes destination authority")
+			}
+			if admitted, ok := req.Context().Value(ctxKeyEntropyWarnRoute).(*BodyEntropyWarnRouteMatch); ok && admitted != nil {
+				matched := matchBodyEntropyWarnRoute(BodyScanRequest{
+					Scheme: req.URL.Scheme, Method: req.Method, ContentType: req.Header.Get(headerContentType),
+					Host: req.URL.Hostname(), EntropyRoutePath: req.URL.EscapedPath(), ContentEntropyAction: config.ActionBlock,
+					ContentEntropyWarnRoutes: currentCfg.RequestBodyScanning.ContentEntropyWarnRoutes,
+				}, time.Now().UTC())
+				if matched == nil || *matched != *admitted {
+					return newRedirectBlockedRequest(scannerLabelBodyEntropy, "redirect replay left the admitted entropy warning route")
+				}
 			}
 			redirectWarnCtx := scanner.DLPWarnContextFromCtx(req.Context())
 			redirectWarnCtx.Method = req.Method
@@ -694,7 +837,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			result := currentScanner.Scan(redirectScanCtx, redirectURL)
 			*req = *req.WithContext(withAllowedSSRFDialScanSnapshot(redirectScanCtx, currentScanner, req.URL.Hostname(), effectiveURLPort(req.URL), result))
 			if !result.Allowed {
-				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
 				if currentCfg.EnforceEnabled() {
 					// Preserve the originating scanner label (SSRF,
 					// DLP, blocklist, …) in the typed block error so
@@ -708,6 +851,44 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				logger.LogAnomaly(actx, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), result.Score)
 			}
 			scannerMatched := !result.Allowed
+
+			// A 307/308 redirect preserves the original method and body. A
+			// git-receive-pack POST therefore remains a push on the redirected
+			// target, which must satisfy the same repository allowlist as the
+			// admitted request.
+			if gitPush := evaluateGitPushAllowlist(currentCfg.GitProtection, req.Method, req.URL); gitPush.Block {
+				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
+				logger.LogBlocked(actx, "git_protection", "redirect from "+originalURL+" blocked: "+gitPush.Reason)
+				return newRedirectBlockedRequest("git_protection", gitPush.Reason)
+			}
+			redirectRec, _ := req.Context().Value(ctxKeyRedirectSessionRecorder).(session.Recorder)
+			redirectTaint := evaluateHTTPTaint(currentCfg, redirectRec, req.Method, req.URL)
+			if redirectTaint.Result.Decision == session.PolicyAsk || redirectTaint.Result.Decision == session.PolicyBlock {
+				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
+				logger.LogTaintDecision(actx, audit.TaintDecision{
+					TaintLevel: redirectTaint.Risk.Level.String(), ActionClass: redirectTaint.ActionClass.String(),
+					Sensitivity: redirectTaint.Sensitivity.String(), Authority: redirectTaint.Authority.String(),
+					Decision: redirectTaint.Result.Decision.String(), Reason: redirectTaint.Result.Reason,
+					SourceURL: redirectTaint.Risk.SecurityOriginURL(), SourceKind: redirectTaint.Risk.SecurityOriginKind(),
+				})
+			}
+			switch redirectTaint.Result.Decision {
+			case session.PolicyBlock:
+				return newRedirectTaintBlockedRequest(redirectTaint, redirectTaint.Result.Reason)
+			case session.PolicyAsk:
+				approved, blockReason := p.resolveTaintAsk(agentName, redirectURL, req.Method, redirectTaint.Result.Reason)
+				if !approved {
+					return newRedirectTaintBlockedRequest(redirectTaint, blockReason)
+				}
+			}
+			if redirectSess, ok := redirectRec.(*SessionState); ok && redirectSess != nil {
+				tier := airlockTierForScope(redirectSess, adaptiveScopeForHost(req.URL.Hostname()))
+				if allowed, reason := ClassifyAction(tier, req.Method, redirectTransport, false); !allowed {
+					logger.LogAirlockDeny(redirectSess.key, tier, redirectTransport, req.Method, clientIP, requestID)
+					p.metrics.RecordAirlockDenial(tier, redirectTransport, req.Method)
+					return newRedirectBlockedRequest("airlock", reason)
+				}
+			}
 
 			// request_policy runs before the contract gate so a contract
 			// allow can never suppress an operation-policy block.
@@ -723,7 +904,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				Target:      redirectURL,
 				RequestID:   requestID,
 				Agent:       agentName,
-				AuditCtx:    newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName),
+				AuditCtx:    newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName}),
 				Emit: func(opts receipt.EmitOpts) error {
 					return p.emitRequestPolicyReceipt(withReceiptPolicyHash(opts, currentCfg.CanonicalPolicyHash()))
 				},
@@ -746,7 +927,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				Transport:       redirectTransport,
 			})
 			if gateErr != nil {
-				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
 				logger.LogBlocked(actx, blockLayerContract, "redirect from "+originalURL+" blocked: "+gateErr.Error())
 				return newRedirectBlockedRequest(blockLayerContract, "contract evaluation failed")
 			}
@@ -755,7 +936,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				if reason == "" {
 					reason = gate.WinningSource
 				}
-				actx := newHTTPAuditContext(logger, req.Method, redirectURL, clientIP, requestID, agentName)
+				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
 				logger.LogBlocked(actx, blockLayerContract, "redirect from "+originalURL+" blocked: "+reason)
 				return newRedirectBlockedRequest(blockLayerContract, reason)
 			}
@@ -777,6 +958,22 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 	p.tlsTransport = newTLSInterceptTransport(p.ssrfSafeDialContext, m.RecordTLSHandshake, nil)
 
 	return p, nil
+}
+
+// redirectReplaysBodyToNewAuthority reports whether net/http is about to
+// replay a request body (the 307/308 path) to a different authority. Body DLP
+// suppressions are destination-scoped, so retaining the first-hop decision on
+// a changed authority would fail open. Re-evaluation can replace this guard
+// when redirect-time body scanning is implemented.
+func redirectReplaysBodyToNewAuthority(req *http.Request, via []*http.Request) bool {
+	if req == nil || req.URL == nil || req.GetBody == nil || len(via) == 0 {
+		return false
+	}
+	previous := via[len(via)-1]
+	if previous == nil || previous.URL == nil {
+		return false
+	}
+	return !strings.EqualFold(req.URL.Host, previous.URL.Host)
 }
 
 // refreshEnvelopeForRedirect rebuilds the Pipelock-Mediation header
@@ -828,7 +1025,7 @@ func (p *Proxy) refreshEnvelopeForRedirect(req *http.Request, via []*http.Reques
 	clientIP, _ := req.Context().Value(ctxKeyClientIP).(string)
 	requestID, _ := req.Context().Value(ctxKeyRequestID).(string)
 	agentName, _ := req.Context().Value(ctxKeyAgent).(string)
-	actx := newHTTPAuditContext(p.logger, req.Method, req.URL.String(), clientIP, requestID, agentName)
+	actx := newHTTPAuditContext(req.Context(), p.logger, httpAuditEvent{Method: req.Method, TargetURL: req.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: agentName})
 
 	// 1. Parse the ORIGINAL envelope. Identity fields (Actor,
 	//    ActorAuth, ReceiptID, Taint, TaskID, RequiresReauth)
@@ -1047,6 +1244,19 @@ func (p *Proxy) recordDecision(verdict, layer, pattern, transport, requestID str
 // operator reconstructing the enforcement decision after a missing-receipt
 // incident can correlate the audit log entry to the action that was
 // supposed to be attested.
+// emitRecordedReceipt reports whether a receipt for opts was actually
+// recorded. A nil emitter is a legitimate no-op for enforcement, but it never
+// counts as recorded: a caller-facing X-Pipelock-Receipt set from an
+// allocated-but-unrecorded id would be false evidence, so block writers use
+// this and fail toward silence.
+func (p *Proxy) emitRecordedReceipt(opts receipt.EmitOpts) bool {
+	if cfg := p.cfgPtr.Load(); cfg != nil {
+		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+	}
+	e := p.receiptEmitterPtr.Load()
+	return e != nil && p.emitReceiptWithEmitter(opts, e) == nil
+}
+
 func (p *Proxy) emitReceipt(opts receipt.EmitOpts) error {
 	if cfg := p.cfgPtr.Load(); cfg != nil {
 		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
@@ -1373,19 +1583,25 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 		}, nil
 	}
 
-	postureBinding, bindErr := posturebinding.LoadRuntime()
+	postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      keyPath != "",
+		RequireContainmentEvidence: cfg.FlightRecorder.RequireContainmentEvidence,
+		PinnedPostureSignerKey:     cfg.FlightRecorder.PostureSignerPublicKey,
+		Stderr:                     os.Stderr,
+	})
 	if bindErr != nil {
 		return receiptEmitterStage{}, fmt.Errorf("loading posture binding: %w", bindErr)
 	}
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
-		Recorder:         p.recorder,
-		PrivKey:          privKey,
-		ConfigHash:       cfg.Hash(),
-		Principal:        "local",
-		Actor:            "pipelock",
-		Metrics:          p.metrics,
-		PostureBinding:   postureBinding,
-		HeartbeatSeconds: cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+		Recorder:            p.recorder,
+		PrivKey:             privKey,
+		ConfigHash:          cfg.Hash(),
+		Principal:           "local",
+		Actor:               "pipelock",
+		Metrics:             p.metrics,
+		PostureBinding:      postureResult.Binding,
+		PostureAvailability: string(postureResult.Availability),
+		HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
 	})
 	if emitter != nil {
 		if initErr := emitter.InitError(); initErr != nil {
@@ -1560,6 +1776,15 @@ func (p *Proxy) ScannerPtr() *atomic.Pointer[scanner.Scanner] {
 	return &p.scannerPtr
 }
 
+// BindReverseProxyIdentity makes a reverse-proxy handler resolve identities
+// from the same edition snapshot as the main proxy, including enterprise
+// source CIDR bindings across reloads.
+func (p *Proxy) BindReverseProxyIdentity(handler *ReverseProxyHandler) {
+	if handler != nil {
+		handler.setEditionPtr(&p.editionPtr)
+	}
+}
+
 // SessionMgrPtr returns the atomic pointer to the session manager.
 // Used by run.go to construct the session API handler for the dedicated port.
 func (p *Proxy) SessionMgrPtr() *atomic.Pointer[SessionManager] {
@@ -1710,6 +1935,15 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		}
 		return false
 	}
+	receiptStagePublished := receiptStage.reuseExisting || receiptStage.emitter == nil
+	defer func() {
+		if receiptStagePublished {
+			return
+		}
+		if err := receiptStage.emitter.AbortNativeAEL(); err != nil {
+			p.logger.LogError(audit.NewMethodLogContext("RELOAD"), fmt.Errorf("close unpublished native AEL emitter: %w", err))
+		}
+	}()
 	contractLoader, contractErr := buildContractLoader(cfg)
 	if contractErr != nil {
 		p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
@@ -1789,18 +2023,6 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 			}
 		}
 	}
-	if cfg.FlightRecorder.SigningKeyPath != "" && p.recorder != nil && !receiptStage.reuseExisting && receiptStage.emitter != nil {
-		if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
-			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
-				fmt.Errorf("session_open receipt emit failed, keeping old config: %w", err))
-			sc.Close()
-			if newEd != nil {
-				newEd.Close()
-			}
-			return false
-		}
-	}
-
 	// Staging above may load keys and build evidence components. Keep that I/O
 	// off the request snapshot lock; only publication and in-place state changes
 	// need to exclude CEE admissions.
@@ -1808,6 +2030,42 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	defer p.reloadMu.Unlock()
 	if p.reloadLocked != nil {
 		p.reloadLocked()
+	}
+
+	// A signer rotation gives native AEL a new key-scoped run. Close the old
+	// run while admissions are excluded and before publishing any new runtime
+	// state, so every replaced emitter has an explicit terminal record. The
+	// replacement open is persisted only after this close succeeds, so aborting
+	// here cannot leave the current receipt chain behind a staged record.
+	currentReceiptEmitter := p.receiptEmitterPtr.Load()
+	if current := currentReceiptEmitter; current != nil && !receiptStage.reuseExisting && current != receiptStage.emitter {
+		if err := current.RetireNativeAEL(); err != nil {
+			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+				fmt.Errorf("native AEL rotation close failed, keeping old config: %w", err))
+			sc.Close()
+			if newEd != nil {
+				newEd.Close()
+			}
+			return false
+		}
+	}
+	if cfg.FlightRecorder.SigningKeyPath != "" && p.recorder != nil && !receiptStage.reuseExisting && receiptStage.emitter != nil {
+		if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
+			// The old AEL run is already terminal. If the replacement receipt was
+			// written before its paired AEL open failed, the old emitter's chain
+			// head is stale. Brick it explicitly so no later request can fork the
+			// signed receipt chain while the reload remains uncommitted.
+			if currentReceiptEmitter != nil {
+				currentReceiptEmitter.MarkUnhealthy(err)
+			}
+			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+				fmt.Errorf("session_open receipt emit failed, keeping old config fail-closed: %w", err))
+			sc.Close()
+			if newEd != nil {
+				newEd.Close()
+			}
+			return false
+		}
 	}
 
 	// Publish both emitters now that staging has fully succeeded. The
@@ -1841,6 +2099,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.receiptEmitterPtr.Store(receiptStage.emitter)
 		p.v2EmitterPtr.Store(receiptStage.v2)
 		p.receiptKeyPath = receiptStage.keyPath
+		receiptStagePublished = true
 	}
 
 	// Apply enabled CEE components before publishing their config. A stricter
@@ -1880,6 +2139,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.cfgPtr.Store(cfg)
 		p.contractLoaderPtr.Store(contractLoader)
 	}
+	p.refreshMetricsDialTarget(cfg.MetricsListen)
 	p.disableCEE(&cfg.CrossRequestDetection)
 	if p.wd != nil {
 		p.wd.BeatConfig()
@@ -1996,6 +2256,7 @@ type ceeAdmitRequest struct {
 	SessionKey       string
 	Outbound         []byte
 	KeyPayload       []byte
+	PathPayload      *ceePathPayload
 	TargetURL        string
 	Agent            string
 	ClientIP         string
@@ -2028,8 +2289,13 @@ func (p *Proxy) admitCurrentCEE(ctx context.Context, req ceeAdmitRequest) ceeAdm
 		fb = nil
 	}
 	return ceeAdmission{
-		Result: ceeAdmit(ctx, req.SessionKey, req.Outbound, req.KeyPayload, req.TargetURL, req.Agent, req.ClientIP, req.RequestID,
-			ceeCfg, p.entropyTrackerPtr.Load(), fb, p.scannerPtr.Load(), p.logger, p.metrics),
+		Result: ceeAdmit(ctx, ceeAdmitOptions{
+			SessionKey: req.SessionKey, Outbound: req.Outbound, KeyPayload: req.KeyPayload,
+			PathPayload: req.PathPayload, TargetURL: req.TargetURL, Agent: req.Agent,
+			ClientIP: req.ClientIP, RequestID: req.RequestID, Config: ceeCfg,
+			Entropy: p.entropyTrackerPtr.Load(), Fragments: fb, Scanner: p.scannerPtr.Load(),
+			Logger: p.logger, Metrics: p.metrics,
+		}),
 		Config:         ceeCfg,
 		AdaptiveConfig: cfg.AdaptiveEnforcement,
 		Sessions:       p.sessionMgrPtr.Load(),
@@ -2461,6 +2727,8 @@ func inboundEnvelopeFailurePattern(err error) string {
 		switch code {
 		case envelope.VerificationFailureReplay:
 			return "inbound_verify_replay"
+		case envelope.VerificationFailureReplayCapacity:
+			return "inbound_verify_replay_capacity"
 		case envelope.VerificationFailureExpired:
 			return "inbound_verify_expired"
 		case envelope.VerificationFailureNotTrusted:
@@ -2662,6 +2930,7 @@ type sessionActivityOptions struct {
 	Scope      string
 	RequestID  string
 	UserAgent  string
+	ActorAuth  envelope.ActorAuth
 	Result     scanner.Result
 	Config     *config.Config
 	Logger     *audit.Logger
@@ -2706,10 +2975,14 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 
 	anomalies := sess.RecordRequest(hostname, &cfg.SessionProfiling)
 
-	// IP-level domain tracking: catches header rotation attacks where the
-	// agent identity changes per request but the source IP stays the same.
-	ipAnomalies := sm.RecordIPDomain(clientIP, hostname, &cfg.SessionProfiling)
-	anomalies = append(anomalies, ipAnomalies...)
+	// IP-level domain tracking exists to catch header rotation of a
+	// request-controlled agent name. Bound and config-default identities
+	// are not request-controlled, so writing them into the shared IP
+	// bucket only poisons co-located sessions on the same address.
+	if !opts.ActorAuth.TrustedForIdentity() {
+		ipAnomalies := sm.RecordIPDomain(clientIP, hostname, &cfg.SessionProfiling)
+		anomalies = append(anomalies, ipAnomalies...)
+	}
 
 	if baselineResult := sm.CheckBaselineFailClosed(baselineAgentKeyForSessionKey(key), sess); baselineResult != nil {
 		detail := baselineDecisionDetail(baselineResult)
@@ -2804,7 +3077,8 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 	}
 
 	if cfg.AdaptiveEnforcement.Enabled && !result.IsAdaptiveNeutral() && !isAdaptiveExempt(hostname, cfg.AdaptiveEnforcement.ExemptDomains) {
-		cooperativeBurst := cfg.AdaptiveEnforcement.CooperativeToolDownweight && isCooperativeToolBurstUserAgent(userAgent)
+		cooperativeBurst := (cfg.AdaptiveEnforcement.CooperativeToolDownweight && isCooperativeToolBurstUserAgent(userAgent)) ||
+			opts.ActorAuth.TrustedForIdentity()
 		for _, a := range anomalies {
 			sig, ok := signalForSessionAnomaly(a.Type, cooperativeBurst)
 			if !ok || a.Score <= 0 {
@@ -3087,28 +3361,31 @@ func (p *Proxy) applyShield(body []byte, contentType, hostname string, respHeade
 		return body, nil, false
 	}
 
-	// Max shield bytes: enforce oversize action. Only runs for content the
-	// shield would rewrite (HTML/JS/SVG) per the gate above.
-	if cfg.BrowserShield.MaxShieldBytes > 0 && len(body) > cfg.BrowserShield.MaxShieldBytes {
+	// Max shield bytes: enforce oversize action. A size-exempt response already
+	// admitted to the bounded whole-buffer path can reuse that path's larger
+	// ceiling. Over-cap bodies retain the inflight reservation until this work
+	// finishes; under-cap bodies remain bounded by the normal scan ceiling.
+	shieldMaxBytes := shieldMaxBytesForResponse(cfg, hostname, transport)
+	if shieldMaxBytes > 0 && len(body) > shieldMaxBytes {
 		p.metrics.RecordShieldSkipped("oversize")
 		switch cfg.BrowserShield.OversizeAction {
 		case config.ShieldOversizeScanHead:
 			p.metrics.RecordShieldOversizeScanHead(transport)
 			// Rewrite only the head; append the unshielded tail so the full
 			// response body is returned intact.
-			head, summary := p.runShieldPipelineResult(body[:cfg.BrowserShield.MaxShieldBytes], contentType, respHeaders, &cfg.BrowserShield, p.metrics, actx, clientIP, requestID, transport)
+			head, summary := p.runShieldPipelineResult(body[:shieldMaxBytes], contentType, respHeaders, &cfg.BrowserShield, p.metrics, actx, clientIP, requestID, transport)
 			if summary != nil {
 				summary.BodyBytes = len(body)
-				summary.ScannedBytes = cfg.BrowserShield.MaxShieldBytes
+				summary.ScannedBytes = shieldMaxBytes
 				summary.Partial = true
 				p.recordShieldIntervention(summary, cfg, hostname, actx, clientIP, requestID, transport, parentActionID)
 			}
-			return append(head, body[cfg.BrowserShield.MaxShieldBytes:]...), summary, false
+			return append(head, body[shieldMaxBytes:]...), summary, false
 		case config.ShieldOversizeWarn:
-			p.logger.LogAnomaly(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds max_shield_bytes %d", len(body), cfg.BrowserShield.MaxShieldBytes), 0)
+			p.logger.LogAnomaly(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds shield ceiling %d", len(body), shieldMaxBytes), 0)
 			return body, nil, false
 		default: // block: fail-closed, return 403
-			p.logger.LogBlocked(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds max_shield_bytes %d (action: block)", len(body), cfg.BrowserShield.MaxShieldBytes))
+			p.logger.LogBlocked(actx, "shield_oversize", shieldOversizeBlockReason(hostname, len(body), shieldMaxBytes))
 			return nil, nil, true
 		}
 	}
@@ -3215,6 +3492,104 @@ func shieldSummaryFromResult(result shield.Result) *receipt.ShieldSummary {
 		SVGExternalReferences:   result.SVGXlinkExternalHits,
 		SVGHiddenText:           result.SVGHiddenTextHits,
 		SVGAnimationInjections:  result.SVGAnimationInjectionHits,
+	}
+}
+
+// shieldRewriteHeaderValue renders the bounded, client-visible summary for a
+// rewritten Browser Shield response. Extension includes an injected extension
+// defense shim; trap includes SVG active-content removals, which are the
+// shield's SVG-specific trap class.
+func shieldRewriteHeaderValue(summary *receipt.ShieldSummary) string {
+	if summary == nil {
+		return ""
+	}
+	extension := summary.ExtensionProbes
+	if summary.FingerprintShimInjected {
+		extension++
+	}
+	trap := summary.AgentTraps + summary.SVGForeignObjects + summary.SVGEventHandlers + summary.SVGExternalReferences + summary.SVGHiddenText + summary.SVGAnimationInjections
+	parts := make([]string, 0, 3)
+	if extension > 0 {
+		parts = append(parts, "extension="+strconv.Itoa(extension))
+	}
+	if summary.TrackingBeacons > 0 {
+		parts = append(parts, "tracking="+strconv.Itoa(summary.TrackingBeacons))
+	}
+	if trap > 0 {
+		parts = append(parts, "trap="+strconv.Itoa(trap))
+	}
+	return strings.Join(parts, ",")
+}
+
+// setShieldRewriteHeader makes the marker authoritative: a transport boundary
+// first removes any upstream value, then restores only a locally computed
+// Browser Shield summary. It is deliberately nil-safe because an upstream
+// response may have no header map.
+// stripUpstreamShieldRewriteMarker removes every upstream-supplied copy of the
+// marker from a response before any local value is applied: the header, the
+// trailer map, and the marker's name in the announced Trailer list. The reverse
+// proxy relays upstream trailers after the body, so a forged marker there would
+// otherwise survive the header strip.
+func stripUpstreamShieldRewriteMarker(resp *http.Response) {
+	if resp == nil {
+		return
+	}
+	if resp.Header != nil {
+		resp.Header.Del(shieldRewriteHeader)
+		if announced := resp.Header.Values("Trailer"); len(announced) > 0 {
+			kept := make([]string, 0, len(announced))
+			for _, value := range announced {
+				var names []string
+				for _, name := range strings.Split(value, ",") {
+					name = strings.TrimSpace(name)
+					if name == "" || strings.EqualFold(name, shieldRewriteHeader) {
+						continue
+					}
+					names = append(names, name)
+				}
+				if len(names) > 0 {
+					kept = append(kept, strings.Join(names, ", "))
+				}
+			}
+			resp.Header.Del("Trailer")
+			for _, value := range kept {
+				resp.Header.Add("Trailer", value)
+			}
+		}
+	}
+	if resp.Trailer != nil {
+		resp.Trailer.Del(shieldRewriteHeader)
+	}
+	// The transport fills resp.Trailer only once the body reaches EOF, and the
+	// reverse proxy copies trailers after the body, so the delete above runs
+	// too early for a real trailer. Wrap the body to delete again at EOF.
+	if resp.Body != nil {
+		resp.Body = &shieldTrailerStrippingBody{ReadCloser: resp.Body, resp: resp}
+	}
+}
+
+// shieldTrailerStrippingBody removes the marker from the response trailer map
+// the moment the body is exhausted, before any relay reads the trailers.
+type shieldTrailerStrippingBody struct {
+	io.ReadCloser
+	resp *http.Response
+}
+
+func (b *shieldTrailerStrippingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil && b.resp.Trailer != nil {
+		b.resp.Trailer.Del(shieldRewriteHeader)
+	}
+	return n, err
+}
+
+func setShieldRewriteHeader(headers http.Header, summary *receipt.ShieldSummary) {
+	if headers == nil {
+		return
+	}
+	headers.Del(shieldRewriteHeader)
+	if value := shieldRewriteHeaderValue(summary); value != "" {
+		headers.Set(shieldRewriteHeader, value)
 	}
 }
 
@@ -3490,6 +3865,242 @@ func blockIfNonOverridableSSRFTarget(ctx context.Context, host string, ip net.IP
 	return nil
 }
 
+// metricsHostnameLookupTimeout bounds the one lookup used to resolve a
+// hostname MetricsListen value. The result is cached for that listen
+// string so the hot dial path never blocks on DNS.
+const metricsHostnameLookupTimeout = time.Second
+
+var errMetricsHostnameNoIPs = errors.New("hostname resolved to no IP addresses")
+
+// errMetricsTargetUnpublished marks a dial reaching the guard before the
+// resolved metrics target was published, or after the published one stopped
+// matching the configured listener. The dial path does not resolve, so this
+// state is reported as unverifiable rather than treated as permission.
+var errMetricsTargetUnpublished = errors.New("metrics listener target not published for the configured listen address")
+
+// metricsDialTarget is the resolved metrics listener compared against each
+// dial. It is published at config load, at reload, and when the listener
+// reports the address it actually bound; it is never built on the dial path.
+// There is no TTL: the metrics socket is bound once for a given listen string,
+// and re-resolving on a timer would stop blocking the bound address if DNS
+// later moved.
+//
+// bound records that this snapshot came from a real listener bind rather than
+// from parsing the configured string. That distinction is load-bearing when the
+// configured port is 0, because the configured form carries no port at all and
+// rebuilding from it would discard the only value that can match a dial.
+type metricsDialTarget struct {
+	listen      string
+	port        uint16
+	unspecified bool
+	ips         []net.IP
+	resolveErr  error
+	bound       bool
+}
+
+func configuredMetricsBlockDetail(host, port string) string {
+	return fmt.Sprintf("SSRF blocked: %s:%s is the configured metrics listener", host, port)
+}
+
+func unverifiedMetricsBlockDetail(host, port, kind string, err error) string {
+	return fmt.Sprintf("SSRF blocked: cannot verify whether %s:%s reaches the %s metrics listener: %v", host, port, kind, err)
+}
+
+func (p *Proxy) metricsHostLookup() func(context.Context, string) ([]string, error) {
+	if p != nil && p.lookupMetricsHost != nil {
+		return p.lookupMetricsHost
+	}
+	return net.DefaultResolver.LookupHost
+}
+
+func (p *Proxy) refreshMetricsDialTarget(listen string) {
+	if p == nil {
+		return
+	}
+	if listen == "" {
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	// A reload that leaves metrics_listen unchanged must not replace a target
+	// that came from a real bind. With a configured port of 0 the rebuilt
+	// target carries port 0, the dial guard treats port 0 as nothing to match,
+	// and an unrelated reload would silently reopen the metrics listener to
+	// every mediated transport. The listener is only rebound when the address
+	// changes, and that path publishes its own target.
+	if cached := p.metricsTargetPtr.Load(); cached != nil && cached.bound && cached.listen == listen {
+		return
+	}
+	p.metricsTargetPtr.Store(p.buildMetricsDialTarget(listen))
+}
+
+// UpdateMetricsDialTargetFromBoundAddr replaces a hostname-derived metrics
+// target with the numeric address the metrics listener actually bound. The
+// listener resolves a hostname independently from config load, so retaining
+// the earlier lookup could leave the dial guard comparing against a stale IP.
+func (p *Proxy) UpdateMetricsDialTargetFromBoundAddr(addr string) {
+	if p == nil {
+		return
+	}
+	cfg := p.CurrentConfig()
+	if cfg == nil || cfg.MetricsListen == "" {
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	target := p.buildMetricsDialTarget(addr)
+	if target == nil {
+		_, configuredPort, configuredErr := net.SplitHostPort(cfg.MetricsListen)
+		port, portErr := strconv.Atoi(configuredPort)
+		if configuredErr == nil && portErr == nil && port > 0 && port <= 65535 {
+			p.metricsTargetPtr.Store(&metricsDialTarget{
+				listen:     cfg.MetricsListen,
+				port:       uint16(port),
+				resolveErr: fmt.Errorf("parse bound metrics listener %q", addr),
+				bound:      true,
+			})
+			return
+		}
+		p.metricsTargetPtr.Store(nil)
+		return
+	}
+	target.listen = cfg.MetricsListen
+	target.bound = true
+	p.metricsTargetPtr.Store(target)
+}
+
+// cachedMetricsDialTarget returns the published snapshot for listen. It never
+// builds one, because building resolves a hostname and this runs on the dial
+// path for every mediated request: doing that work here would block the request
+// for up to the lookup timeout, and concurrent misses would each repeat it,
+// which is a denial-of-service shape rather than a guard. A snapshot that is
+// missing or belongs to a different listen string means the published state is
+// stale, so the target reports itself unverifiable and the guard blocks, which
+// matches how an unresolvable hostname is already handled.
+func (p *Proxy) cachedMetricsDialTarget(listen string) *metricsDialTarget {
+	if cached := p.metricsTargetPtr.Load(); cached != nil && cached.listen == listen {
+		return cached
+	}
+	_, configuredPort, splitErr := net.SplitHostPort(listen)
+	if splitErr != nil {
+		return nil
+	}
+	port, portErr := strconv.Atoi(configuredPort)
+	if portErr != nil || port < 1 || port > 65535 {
+		return nil
+	}
+	return &metricsDialTarget{
+		listen:     listen,
+		port:       uint16(port),
+		resolveErr: errMetricsTargetUnpublished,
+	}
+}
+
+func (p *Proxy) buildMetricsDialTarget(listen string) *metricsDialTarget {
+	metricsHost, metricsPort, err := net.SplitHostPort(listen)
+	if err != nil {
+		return nil
+	}
+	wantPort, wantErr := strconv.Atoi(metricsPort)
+	target := &metricsDialTarget{listen: listen}
+	if wantErr != nil || wantPort < 1 || wantPort > 65535 {
+		return target
+	}
+	target.port = uint16(wantPort)
+	metricsIP := net.ParseIP(metricsHost)
+	if strings.TrimSpace(metricsHost) == "" || (metricsIP != nil && metricsIP.IsUnspecified()) {
+		target.unspecified = true
+		return target
+	}
+	if metricsIP != nil {
+		if v4 := metricsIP.To4(); v4 != nil {
+			metricsIP = v4
+		}
+		target.ips = []net.IP{metricsIP}
+		return target
+	}
+	lookupCtx, cancel := context.WithTimeout(context.Background(), metricsHostnameLookupTimeout)
+	defer cancel()
+	addrs, lookupErr := p.metricsHostLookup()(lookupCtx, metricsHost)
+	if lookupErr != nil {
+		target.resolveErr = lookupErr
+		return target
+	}
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			continue
+		}
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		target.ips = append(target.ips, ip)
+	}
+	if len(target.ips) == 0 {
+		target.resolveErr = errMetricsHostnameNoIPs
+	}
+	return target
+}
+
+// blockIfConfiguredMetricsTarget keeps the contained agent from using a broad
+// SSRF exception to query the proxy's own metrics listener. This check belongs
+// in the dial path, before trusted-domain, IP-allowlist, and grant exceptions,
+// because every mediated transport that can reach an address converges here.
+func (p *Proxy) blockIfConfiguredMetricsTarget(ctx context.Context, host, port string, ip net.IP) error {
+	cfg := p.CurrentConfig()
+	if cfg == nil || cfg.MetricsListen == "" {
+		return nil
+	}
+	target := p.cachedMetricsDialTarget(cfg.MetricsListen)
+	if target == nil {
+		return nil
+	}
+	gotPort, gotErr := strconv.ParseUint(port, 10, 16)
+	if gotErr != nil || target.port == 0 || target.port != uint16(gotPort) || ip == nil {
+		return nil
+	}
+	if target.unspecified {
+		local, localErr := isLocalInterfaceIP(ip)
+		if localErr != nil {
+			return newSSRFDialBlockError(ctx, host, ip, unverifiedMetricsBlockDetail(host, port, "wildcard", localErr))
+		}
+		if !local {
+			return nil
+		}
+		return newSSRFDialBlockError(ctx, host, ip, configuredMetricsBlockDetail(host, port))
+	}
+	if target.resolveErr != nil {
+		return newSSRFDialBlockError(ctx, host, ip, unverifiedMetricsBlockDetail(host, port, "hostname", target.resolveErr))
+	}
+	for _, metricsIP := range target.ips {
+		if metricsIP.Equal(ip) {
+			return newSSRFDialBlockError(ctx, host, ip, configuredMetricsBlockDetail(host, port))
+		}
+	}
+	return nil
+}
+
+func isLocalInterfaceIP(ip net.IP) (bool, error) {
+	if ip.IsLoopback() {
+		return true, nil
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false, fmt.Errorf("list local interface addresses: %w", err)
+	}
+	for _, addr := range addrs {
+		var localIP net.IP
+		switch value := addr.(type) {
+		case *net.IPNet:
+			localIP = value.IP
+		case *net.IPAddr:
+			localIP = value.IP
+		}
+		if localIP != nil && localIP.Equal(ip) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	currentSc, _ := ctx.Value(ctxKeyAgentScanner).(*scanner.Scanner)
 	if currentSc == nil {
@@ -3513,6 +4124,9 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 		// consistent with the DNS resolution path below.
 		if v4 := ip.To4(); v4 != nil {
 			ip = v4
+		}
+		if err := p.blockIfConfiguredMetricsTarget(ctx, host, port, ip); err != nil {
+			return nil, err
 		}
 		if err := blockIfNonOverridableSSRFTarget(ctx, host, ip); err != nil {
 			return nil, err
@@ -3544,6 +4158,9 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 		// Normalize IPv4-mapped IPv6 (::ffff:x.x.x.x) to 4-byte form.
 		if v4 := ip.To4(); v4 != nil {
 			ip = v4
+		}
+		if err := p.blockIfConfiguredMetricsTarget(ctx, host, port, ip); err != nil {
+			return nil, err
 		}
 		if err := blockIfNonOverridableSSRFTarget(ctx, host, ip); err != nil {
 			return nil, err
@@ -3582,12 +4199,15 @@ func (p *Proxy) buildHandler(mux *http.ServeMux) http.Handler {
 					// so emit a forward receipt here to keep the
 					// audit chain unbroken.
 					requestID, _ := r.Context().Value(ctxKeyRequestID).(string)
-					_ = p.emitReceipt(forwardKillSwitchReceiptOpts(
-						receipt.NewActionID(),
+					actionID := receipt.NewActionID()
+					if p.emitRecordedReceipt(forwardKillSwitchReceiptOpts(
+						actionID,
 						requestID,
 						r.Method,
 						r.URL.String(),
-					))
+					)) {
+						blockreason.SetRecordedReceipt(w.Header(), actionID)
+					}
 					writeBlockedError(w,
 						blockInfoFor(blockreason.KillSwitchActive, "kill_switch"),
 						"blocked: kill_switch_active", http.StatusForbidden)
@@ -3658,8 +4278,11 @@ func (p *Proxy) buildMux() *http.ServeMux {
 	mux.HandleFunc("/ws", p.handleWebSocket)
 	mux.HandleFunc("/health", p.handleHealth)
 	mux.HandleFunc(envelope.WellKnownPath, p.handleEnvelopeDirectory)
-	// Register metrics/stats only when NOT running on a separate port.
-	if cfg.MetricsListen == "" {
+	// Register metrics/stats only when NOT running on a separate port, and
+	// never when the caller suppressed them. An empty metrics_listen means
+	// "serve them here" for an ordinary deployment and "refuse to serve them
+	// at all" for a contained one; see WithMetricsSuppressed.
+	if cfg.MetricsListen == "" && !p.metricsSuppressed {
 		mux.Handle("/metrics", p.metrics.PrometheusHandler())
 		mux.HandleFunc("/stats", p.metrics.StatsHandler())
 	}
@@ -3800,8 +4423,10 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 	}()
 
 	// Warn if listen address exposes metrics/stats to the network.
-	// Skip when metrics_listen is set - metrics are on a separate port.
-	if cfg.MetricsListen == "" {
+	// Skip when metrics_listen is set - metrics are on a separate port - and
+	// when they are suppressed, since then this listener serves neither route
+	// and the warning would name an exposure that does not exist.
+	if cfg.MetricsListen == "" && !p.metricsSuppressed {
 		if host, _, splitErr := net.SplitHostPort(listenAddr); splitErr == nil {
 			ip := net.ParseIP(host)
 			if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && !ip.IsLoopback()) {
@@ -3847,8 +4472,17 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if agent == "" {
 		agent = agentAnonymous
 	}
+	// Carry the provenance grade on the request from the moment identity is
+	// resolved. Every audit context below derives from r.Context(), so setting
+	// it only at fetch time would report "unknown" for each event on the way.
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyAgentAuth, string(id.Auth)))
 	emitFetchReceipt := func(opts receipt.EmitOpts) {
-		_ = p.emitReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
+		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		if e := p.receiptEmitterPtr.Load(); e != nil && p.emitReceiptWithEmitter(opts, e) == nil {
+			if opts.Verdict == config.ActionBlock {
+				blockreason.SetRecordedReceipt(w.Header(), opts.ActionID)
+			}
+		}
 	}
 	if err := p.verifyInboundEnvelope(r, cfg); err != nil {
 		pattern := inboundEnvelopeFailurePattern(err)
@@ -3884,6 +4518,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
@@ -3952,7 +4587,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// internally decodes for matching, but targetURL retains partial decoding
 	// from Go's query parsing. Operators should see the final resolved URL.
 	displayURL := scanner.IterativeDecode(targetURL)
-	actx := newHTTPAuditContext(p.logger, http.MethodGet, displayURL, clientIP, requestID, agent)
+	actx := newHTTPAuditContext(r.Context(), p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent})
 
 	// Scan URL through all scanners
 	scanCtx := scanner.WithDLPWarnContext(r.Context(), scanner.DLPWarnContext{
@@ -3997,6 +4632,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		Hostname:   parsed.Hostname(),
 		RequestID:  requestID,
 		UserAgent:  r.UserAgent(),
+		ActorAuth:  id.Auth,
 		Result:     result,
 		Config:     cfg,
 		Logger:     log,
@@ -4009,7 +4645,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// RecordClean at the end when no finding was detected.
 	var fetchRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
-		fetchRec = sm.GetOrCreate(sessionKeyFor(agent, clientIP))
+		fetchRec = sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, id.Auth))
 	}
 	fetchTaint := evaluateHTTPTaint(cfg, fetchRec, http.MethodGet, parsed)
 
@@ -4379,7 +5015,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// GET-only so the outbound data is the target URL path and query values.
 	admission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
 		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: urlPayload(parsed),
-		KeyPayload: queryParamKeys(parsed), TargetURL: displayURL, Agent: agent, ClientIP: clientIP,
+		KeyPayload: queryParamKeys(parsed), PathPayload: pathSegments(parsed), TargetURL: displayURL, Agent: agent, ClientIP: clientIP,
 		RequestID: requestID, IncludeFragments: true,
 	})
 	if admission.Active {
@@ -4582,6 +5218,44 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ActionRead),
+		Destination: targetURL,
+	}, actx, TransportFetch); err != nil {
+		const reason = "authority verification failed"
+		p.recordDecision(config.ActionBlock, blockLayerAuthority, reason, TransportFetch, requestID)
+		emitFetchReceipt(receipt.EmitOpts{
+			ActionID:            actionID,
+			Verdict:             config.ActionBlock,
+			Layer:               blockLayerAuthority,
+			Pattern:             reason,
+			Transport:           TransportFetch,
+			Method:              http.MethodGet,
+			Target:              displayURL,
+			RequestID:           requestID,
+			Agent:               agent,
+			SessionTaintLevel:   fetchTaint.Risk.Level.String(),
+			SessionContaminated: fetchTaint.Risk.Contaminated,
+			RecentTaintSources:  fetchTaint.Risk.Sources,
+			SessionTaskID:       fetchTaint.Task.CurrentTaskID,
+			SessionTaskLabel:    fetchTaint.Task.CurrentTaskLabel,
+			AuthorityKind:       fetchTaint.Authority.String(),
+			TaintDecision:       fetchTaint.Result.Decision.String(),
+			TaintDecisionReason: fetchTaint.Result.Reason,
+			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
+		})
+		p.metrics.RecordBlocked(parsed.Hostname(), blockLayerAuthority, time.Since(start), agentLabel)
+		writeBlockedJSON(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			http.StatusForbidden, FetchResponse{
+				URL:         displayURL,
+				Agent:       agent,
+				Blocked:     true,
+				BlockReason: "authority verification failed",
+			})
+		return
+	}
 
 	// Fetch the URL - attach clientIP/requestID/agent and resolved agent
 	// config/scanner to context for redirect logging and per-agent redirect enforcement.
@@ -4592,6 +5266,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, parsed.Hostname(), effectiveURLPort(parsed), result)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -4705,6 +5380,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				})
 			return
 		}
+		blockreason.SetRecordedReceipt(w.Header(), fetchAllowReceipt.ActionID)
 	}
 	outcomeStatus := "unknown"
 	outcomeBytes := int64(-1)
@@ -4755,6 +5431,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
+			redirectTaint := fetchTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			resp := FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -4771,15 +5451,24 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				resp.Hint = "Request was redirected to a different origin. Cross-origin redirects are blocked to prevent open redirect attacks."
 			}
 			emitFetchReceipt(receipt.EmitOpts{
-				ActionID:  actionID,
-				Verdict:   config.ActionBlock,
-				Layer:     blockedErr.layer,
-				Pattern:   blockedErr.reason,
-				Transport: "fetch",
-				Method:    http.MethodGet,
-				Target:    displayURL,
-				RequestID: requestID,
-				Agent:     agent,
+				ActionID:            actionID,
+				Verdict:             config.ActionBlock,
+				Layer:               blockedErr.layer,
+				Pattern:             blockedErr.reason,
+				Transport:           "fetch",
+				Method:              http.MethodGet,
+				Target:              redirectReceiptTarget(blockedErr, displayURL),
+				RequestID:           requestID,
+				Agent:               agent,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
 				redirectBlockedInfo(blockedErr),
@@ -4808,12 +5497,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// binary garbage, bypassing both. Forward proxy already runs the same
 	// guard in forward.go; this completes parity on the fetch surface.
 	if hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
-		log.LogBlocked(actx, "response_scan", "compressed response cannot be scanned")
-		p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
+		log.LogBlocked(actx, responseScanLayer, "compressed response cannot be scanned")
+		p.metrics.RecordBlocked(parsed.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
 			Verdict:   config.ActionBlock,
-			Layer:     "response_scan",
+			Layer:     responseScanLayer,
 			Pattern:   "compressed_response",
 			Transport: "fetch",
 			Method:    http.MethodGet,
@@ -4822,7 +5511,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.CompressedResponse, "response_scan"),
+			blockInfoFor(blockreason.CompressedResponse, responseScanLayer),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -4842,7 +5531,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Limit response body size: use the tighter of max_response_mb and the
 	// remaining per-agent byte budget, so oversized responses are blocked
 	// at read time rather than after the full body has been consumed.
-	configMaxBytes := int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
+	configMaxBytes := p.responseScanBodyLimit(cfg)
 	maxBytes := configMaxBytes
 	remaining := resolved.Budget.RemainingBytes()
 	if remaining >= 0 && remaining < maxBytes {
@@ -4931,14 +5620,17 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Use the final response origin (after redirects), not the original request
 	// URL. An exempt origin that 302s to a non-exempt host must still be shielded.
 	shieldHost := resp.Request.URL.Hostname()
-	body, _, shieldBlocked := p.applyShield(body, contentType, shieldHost, resp.Header, cfg, actx, clientIP, requestID, TransportFetch, actionID)
+	shieldBodyLen := len(body)
+	shieldMaxBytes := shieldMaxBytesForResponse(cfg, shieldHost, TransportFetch)
+	body, shieldSummary, shieldBlocked := p.applyShield(body, contentType, shieldHost, resp.Header, cfg, actx, clientIP, requestID, TransportFetch, actionID)
 	if shieldBlocked {
+		reason := shieldOversizeBlockReason(shieldHost, shieldBodyLen, shieldMaxBytes)
 		p.metrics.RecordBlocked(parsed.Hostname(), "shield_oversize", time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
 			Verdict:   config.ActionBlock,
 			Layer:     "shield_oversize",
-			Pattern:   "response body exceeds browser shield size limit",
+			Pattern:   reason,
 			Transport: "fetch",
 			Method:    http.MethodGet,
 			Target:    displayURL,
@@ -4949,7 +5641,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
 			http.StatusForbidden, FetchResponse{
 				URL: displayURL, Agent: agent, Blocked: true,
-				BlockReason: "response body exceeds browser shield size limit",
+				BlockReason: reason,
 			})
 		outcomeStatus = strconv.Itoa(http.StatusForbidden)
 		outcomeBytes = int64(len(body))
@@ -4996,6 +5688,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if mediaVerdict.StripResult != nil && mediaVerdict.StripResult.Changed() {
 		body = mediaVerdict.Body
 	}
+	scanAsHTML := isHTML && !scanner.IsVerifiedImageResponseBody(body)
 	content := string(body)
 
 	// Extract text from HTML hiding spots (comments, script/style bodies)
@@ -5011,18 +5704,41 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		p.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportFetch)
 	}
 	var hiddenInjectionFound bool
-	if sc.ResponseScanningEnabled() && isHTML {
+	if sc.ResponseScanningEnabled() && scanAsHTML {
 		hidden := extractHiddenContent(content)
 		if hidden != "" {
 			rawResult := sc.ScanResponseWithSuppress(r.Context(), hidden, finalResponseURL, cfg.Suppress)
 			recordSuppressedResponseScanExempts(p.metrics, rawResult.SuppressedMatches, TransportFetch)
+			recordDroppedResponseScanMatches(p.metrics, log, actx, rawResult.SuppressedMatches, TransportFetch)
 			// Use live escalation level so mid-request CEE escalations are reflected.
 			// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
-			blocked, _, found := p.filterAndActOnResponseScan(w, rawResult, content, displayURL, agent, clientIP, requestID, actionID, sc, cfg, log, recEscalationLevel(fetchRec), responseScanExempt)
+			blocked, _, found, scanFailed := p.filterAndActOnResponseScan(responseScanContext{
+				requestContext: r.Context(),
+				writer:         w,
+				result:         rawResult,
+				content:        content,
+				displayURL:     displayURL,
+				agent:          agent,
+				clientIP:       clientIP,
+				requestID:      requestID,
+				actionID:       actionID,
+				scanner:        sc,
+				config:         cfg,
+				logger:         log,
+				sessionLevel:   recEscalationLevel(fetchRec),
+				exempt:         responseScanExempt,
+			})
 			if blocked {
-				outcomeStatus = strconv.Itoa(http.StatusForbidden)
+				outcomeLayer := responseScanLayer
+				outcomeCode := http.StatusForbidden
+				if scanFailed {
+					outcomeLayer = "response_scan_error"
+					outcomeCode = http.StatusServiceUnavailable
+				}
+				p.metrics.RecordBlocked(parsed.Hostname(), outcomeLayer, time.Since(start), agentLabel)
+				outcomeStatus = strconv.Itoa(outcomeCode)
 				outcomeBytes = int64(len(body))
-				outcomeReason = "response_scan"
+				outcomeReason = outcomeLayer
 				return
 			}
 			if found {
@@ -5035,7 +5751,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	// Use go-readability for HTML content extraction.
 	readabilityOK := false
-	if isHTML {
+	if scanAsHTML {
 		article, err := readability.FromReader(strings.NewReader(content), parsed)
 		if err != nil {
 			log.LogAnomaly(actx, "", fmt.Sprintf("readability extraction failed: %v", err), 0.3)
@@ -5054,12 +5770,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if hiddenInjectionFound && !readabilityOK {
 		responsePromptHit = true
 		reason := "hidden injection detected and readability extraction failed (fail-closed)"
-		log.LogBlocked(actx, "response_scan", reason)
-		p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
+		log.LogBlocked(actx, responseScanLayer, reason)
+		p.metrics.RecordBlocked(parsed.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
 			Verdict:   config.ActionBlock,
-			Layer:     "response_scan",
+			Layer:     responseScanLayer,
 			Pattern:   reason,
 			Transport: "fetch",
 			Method:    http.MethodGet,
@@ -5073,7 +5789,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 		outcomeStatus = strconv.Itoa(http.StatusForbidden)
 		outcomeBytes = int64(len(body))
-		outcomeReason = "response_scan"
+		outcomeReason = responseScanLayer
 		return
 	}
 
@@ -5081,9 +5797,15 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Exempt domains are still scanned for visibility (findings logged as warn)
 	// but adaptive scoring is skipped and actions are not upgraded.
 	if sc.ResponseScanningEnabled() {
-		scanResult := sc.ScanResponseWithSuppress(r.Context(), content, finalResponseURL, cfg.Suppress)
+		var scanResult scanner.ResponseScanResult
+		if scanAsHTML {
+			scanResult = sc.ScanResponseWithSuppress(r.Context(), content, finalResponseURL, cfg.Suppress)
+		} else {
+			scanResult = sc.ScanResponseBodyWithSuppress(r.Context(), []byte(content), finalResponseURL, cfg.Suppress)
+		}
 		recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportFetch)
-		if !scanResult.Clean {
+		recordDroppedResponseScanMatches(p.metrics, log, actx, scanResult.SuppressedMatches, TransportFetch)
+		if !scanResult.Clean && !scanResult.Failed() {
 			responsePromptHit = true
 		}
 
@@ -5094,6 +5816,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		}
 		if scanResult.Clean {
 			respAction = config.ActionAllow
+		} else if scanResult.Failed() {
+			// An incomplete scan is a fail-closed runtime error, not a
+			// response-scanning match. Keep replay/capture from presenting it
+			// as a warn/allow verdict.
+			respAction = config.ActionBlock
 		}
 		p.captureObs.ObserveResponseVerdict(r.Context(), &capture.ResponseVerdictRecord{
 			Subsurface:        "response_fetch",
@@ -5115,15 +5842,36 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 		// Use live escalation level so mid-request CEE escalations are reflected.
 		// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
-		blocked, newContent, found := p.filterAndActOnResponseScan(w, scanResult, content, displayURL, agent, clientIP, requestID, actionID, sc, cfg, log, recEscalationLevel(fetchRec), responseScanExempt)
+		blocked, newContent, found, scanFailed := p.filterAndActOnResponseScan(responseScanContext{
+			requestContext: r.Context(),
+			writer:         w,
+			result:         scanResult,
+			content:        content,
+			displayURL:     displayURL,
+			agent:          agent,
+			clientIP:       clientIP,
+			requestID:      requestID,
+			actionID:       actionID,
+			scanner:        sc,
+			config:         cfg,
+			logger:         log,
+			sessionLevel:   recEscalationLevel(fetchRec),
+			exempt:         responseScanExempt,
+		})
 		if found {
 			hasFinding = true
 		}
 		if blocked {
-			p.metrics.RecordBlocked(parsed.Hostname(), "response_scan", time.Since(start), agentLabel)
-			outcomeStatus = strconv.Itoa(http.StatusForbidden)
+			outcomeLayer := responseScanLayer
+			outcomeCode := http.StatusForbidden
+			if scanFailed {
+				outcomeLayer = "response_scan_error"
+				outcomeCode = http.StatusServiceUnavailable
+			}
+			p.metrics.RecordBlocked(parsed.Hostname(), outcomeLayer, time.Since(start), agentLabel)
+			outcomeStatus = strconv.Itoa(outcomeCode)
 			outcomeBytes = int64(len(body))
-			outcomeReason = "response_scan"
+			outcomeReason = outcomeLayer
 			return
 		}
 		content = newContent
@@ -5164,14 +5912,17 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	log.LogAllowed(actx, resp.StatusCode, len(body), duration)
 
+	shieldRewrite := shieldRewriteHeaderValue(shieldSummary)
+	setShieldRewriteHeader(w.Header(), shieldSummary)
 	writeJSON(w, http.StatusOK, FetchResponse{
-		URL:         displayURL,
-		Agent:       agent,
-		StatusCode:  resp.StatusCode,
-		ContentType: contentType,
-		Title:       title,
-		Content:     content,
-		Blocked:     false,
+		URL:           displayURL,
+		Agent:         agent,
+		StatusCode:    resp.StatusCode,
+		ContentType:   contentType,
+		Title:         title,
+		Content:       content,
+		Blocked:       false,
+		ShieldRewrite: shieldRewrite,
 	})
 	outcomeStatus = strconv.Itoa(resp.StatusCode)
 	outcomeBytes = int64(len(body))
@@ -5184,6 +5935,38 @@ func recordSuppressedResponseScanExempts(m *metrics.Metrics, matches []scanner.R
 	}
 }
 
+// recordDroppedResponseScanMatches records only pattern metadata for findings
+// deliberately suppressed by policy. It is observational: nil dependencies are
+// accepted and the response verdict has already been decided by the caller.
+func recordDroppedResponseScanMatches(m *metrics.Metrics, log *audit.Logger, actx audit.LogContext, matches []scanner.ResponseMatch, surface string) {
+	for _, match := range matches {
+		if log != nil {
+			log.LogResponseScanSuppressed(actx, match.PatternName, surface, "suppressed")
+		}
+		m.RecordResponseSuppressedMatch(match.PatternName, surface, "suppressed")
+	}
+}
+
+// responseScanContext groups the fetch response state used to enforce a scan result.
+// Keep both keyed literals complete: omitted fields compile as zero values, and some
+// zero values are valid runtime state.
+type responseScanContext struct {
+	requestContext context.Context
+	writer         http.ResponseWriter
+	result         scanner.ResponseScanResult
+	content        string
+	displayURL     string
+	agent          string
+	clientIP       string
+	requestID      string
+	actionID       string
+	scanner        *scanner.Scanner
+	config         *config.Config
+	logger         *audit.Logger
+	sessionLevel   int
+	exempt         bool
+}
+
 // filterAndActOnResponseScan applies suppression filtering and the configured
 // response scanning action to a scan result. Returns blocked=true if the
 // request was blocked (HTTP response already written), the output content
@@ -5192,23 +5975,44 @@ func recordSuppressedResponseScanExempts(m *metrics.Metrics, matches []scanner.R
 // exempt indicates the domain was in exempt_domains: findings are logged as
 // warn but adaptive scoring is skipped and UpgradeAction is not applied.
 // This preserves operator visibility without triggering escalation death spirals.
-func (p *Proxy) filterAndActOnResponseScan(
-	w http.ResponseWriter,
-	result scanner.ResponseScanResult,
-	content, displayURL, agent, clientIP, requestID, actionID string,
-	sc *scanner.Scanner,
-	cfg *config.Config,
-	log *audit.Logger,
-	sessionLevel int,
-	exempt bool,
-) (blocked bool, out string, found bool) {
+func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool, out string, found, scanFailed bool) {
+	reqCtx := in.requestContext
+	w := in.writer
+	result := in.result
+	content := in.content
+	displayURL := in.displayURL
+	agent := in.agent
+	clientIP := in.clientIP
+	requestID := in.requestID
+	actionID := in.actionID
+	sc := in.scanner
+	cfg := in.config
+	log := in.logger
+	sessionLevel := in.sessionLevel
+	exempt := in.exempt
+
 	out = content
 	emitResponseReceipt := func(opts receipt.EmitOpts) {
-		_ = p.emitReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
+		if p.emitRecordedReceipt(opts) {
+			blockreason.SetRecordedReceipt(w.Header(), opts.ActionID)
+		}
 	}
 
 	if result.Clean {
-		return false, out, false
+		return false, out, false, false
+	}
+	if result.Failed() {
+		reason := "response scan failed: " + result.ScanError
+		log.LogError(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), fmt.Errorf("%s", reason))
+		emitResponseReceipt(receipt.EmitOpts{
+			ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+			Transport: "fetch", Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
+		})
+		writeBlockedJSON(w,
+			blockInfoFor(blockreason.ParseError, "response_scan_error"),
+			http.StatusServiceUnavailable,
+			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
+		return true, "", false, true
 	}
 
 	patternNames := make([]string, len(result.Matches))
@@ -5231,7 +6035,10 @@ func (p *Proxy) filterAndActOnResponseScan(
 	}
 	if action != originalAction {
 		sessionKey := sessionKeyFor(agent, clientIP)
-		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionLevel), FromAction: originalAction, ToAction: action, Scanner: "response_scan", ClientIP: clientIP, RequestID: requestID})
+		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionLevel), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: clientIP, RequestID: requestID})
+	}
+	if action == config.ActionStrip && result.TransformedContent == "" {
+		action = config.ActionBlock
 	}
 
 	// recordResponseSignal records an adaptive enforcement signal for the
@@ -5263,11 +6070,11 @@ func (p *Proxy) filterAndActOnResponseScan(
 	case config.ActionBlock:
 		recordResponseSignal(session.SignalBlock)
 		reason := fmt.Sprintf("response contains prompt injection: %s", strings.Join(patternNames, ", "))
-		log.LogBlocked(newHTTPAuditContext(p.logger, http.MethodGet, displayURL, clientIP, requestID, agent), "response_scan", reason)
+		log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), responseScanLayer, reason)
 		emitResponseReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
 			Verdict:   config.ActionBlock,
-			Layer:     "response_scan",
+			Layer:     responseScanLayer,
 			Pattern:   reason,
 			Transport: "fetch",
 			Method:    http.MethodGet,
@@ -5276,19 +6083,19 @@ func (p *Proxy) filterAndActOnResponseScan(
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.PromptInjection, "response_scan"),
+			blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 			http.StatusForbidden,
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-		return true, "", true
+		return true, "", true, false
 	case config.ActionAsk:
 		if p.approver == nil {
 			recordResponseSignal(session.SignalBlock)
 			reason := fmt.Sprintf("response contains prompt injection: %s (no HITL approver)", strings.Join(patternNames, ", "))
-			log.LogBlocked(newHTTPAuditContext(p.logger, http.MethodGet, displayURL, clientIP, requestID, agent), "response_scan", reason)
+			log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), responseScanLayer, reason)
 			emitResponseReceipt(receipt.EmitOpts{
 				ActionID:  actionID,
 				Verdict:   config.ActionBlock,
-				Layer:     "response_scan",
+				Layer:     responseScanLayer,
 				Pattern:   reason,
 				Transport: "fetch",
 				Method:    http.MethodGet,
@@ -5297,10 +6104,10 @@ func (p *Proxy) filterAndActOnResponseScan(
 				Agent:     agent,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.PromptInjection, "response_scan"),
+				blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 				http.StatusForbidden,
 				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-			return true, "", true
+			return true, "", true, false
 		}
 		preview := content
 		if len(preview) > 200 {
@@ -5315,18 +6122,32 @@ func (p *Proxy) filterAndActOnResponseScan(
 		})
 		switch d {
 		case hitl.DecisionAllow:
-			log.LogResponseScan(newHTTPAuditContext(log, http.MethodGet, displayURL, clientIP, requestID, agent), "ask:allow", len(result.Matches), patternNames, bundleRules)
+			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:allow", len(result.Matches), patternNames, bundleRules)
 		case hitl.DecisionStrip:
+			if result.TransformedContent == "" {
+				recordResponseSignal(session.SignalBlock)
+				reason := fmt.Sprintf("response contains prompt injection: %s (strip failed)", strings.Join(patternNames, ", "))
+				log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), responseScanLayer, reason)
+				emitResponseReceipt(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: responseScanLayer, Pattern: reason,
+					Transport: "fetch", Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
+				})
+				writeBlockedJSON(w,
+					blockInfoFor(blockreason.PromptInjection, responseScanLayer),
+					http.StatusForbidden,
+					FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
+				return true, "", true, false
+			}
 			out = result.TransformedContent
-			log.LogResponseScan(newHTTPAuditContext(log, http.MethodGet, displayURL, clientIP, requestID, agent), "ask:strip", len(result.Matches), patternNames, bundleRules)
+			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:strip", len(result.Matches), patternNames, bundleRules)
 		default:
 			recordResponseSignal(session.SignalBlock)
 			reason := fmt.Sprintf("response blocked by operator: %s", strings.Join(patternNames, ", "))
-			log.LogBlocked(newHTTPAuditContext(p.logger, http.MethodGet, displayURL, clientIP, requestID, agent), "response_scan", reason)
+			log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), responseScanLayer, reason)
 			emitResponseReceipt(receipt.EmitOpts{
 				ActionID:  actionID,
 				Verdict:   config.ActionBlock,
-				Layer:     "response_scan",
+				Layer:     responseScanLayer,
 				Pattern:   reason,
 				Transport: "fetch",
 				Method:    http.MethodGet,
@@ -5335,23 +6156,23 @@ func (p *Proxy) filterAndActOnResponseScan(
 				Agent:     agent,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.PromptInjection, "response_scan"),
+				blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 				http.StatusForbidden,
 				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-			return true, "", true
+			return true, "", true, false
 		}
 	case config.ActionStrip:
 		recordResponseSignal(session.SignalStrip)
 		out = result.TransformedContent
-		log.LogResponseScan(newHTTPAuditContext(log, http.MethodGet, displayURL, clientIP, requestID, agent), config.ActionStrip, len(result.Matches), patternNames, bundleRules)
+		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), config.ActionStrip, len(result.Matches), patternNames, bundleRules)
 	case config.ActionWarn:
 		recordResponseSignal(session.SignalNearMiss)
-		log.LogResponseScan(newHTTPAuditContext(log, http.MethodGet, displayURL, clientIP, requestID, agent), config.ActionWarn, len(result.Matches), patternNames, bundleRules)
+		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), config.ActionWarn, len(result.Matches), patternNames, bundleRules)
 	default:
 		recordResponseSignal(session.SignalNearMiss)
-		log.LogResponseScan(newHTTPAuditContext(log, http.MethodGet, displayURL, clientIP, requestID, agent), action, len(result.Matches), patternNames, bundleRules)
+		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), action, len(result.Matches), patternNames, bundleRules)
 	}
-	return false, out, true
+	return false, out, true, false
 }
 
 // stripFetchControlChars removes C0 control characters (0x00-0x1F) and DEL

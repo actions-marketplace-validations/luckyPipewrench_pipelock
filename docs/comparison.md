@@ -37,9 +37,9 @@ The matrix below compares Pipelock to earlier-generation tools (AIP, agentsh, sr
 
 | Feature | Pipelock | AIP | agentsh | srt |
 |---------|----------|-----|---------|-----|
-| **Layer** | Application firewall + process containment (HTTP + MCP + WebSocket + Landlock + seccomp + netns) | MCP proxy | Kernel (seccomp/eBPF/FUSE) | OS sandbox |
+| **Layer** | Application firewall + process containment (HTTP + MCP + WebSocket + Landlock + netns, plus seccomp on linux/amd64) | MCP proxy | Kernel (seccomp/eBPF/FUSE) | OS sandbox |
 | **Language** | Go | Go | Go | TypeScript |
-| **Binary** | Single, ~22MB | Single | Single + kernel modules | npm package |
+| **Binary** | Single, ~36MB | Single | Single + kernel modules | npm package |
 | **Domain allowlist** | Yes | Yes (MCP-level) | Yes (LLM proxy) | Yes |
 | **DLP (secret detection)** | Regex + entropy + env scan + BIP-39 seed phrases | Regex (per-argument) | Regex (LLM proxy) | No |
 | **Crypto secret detection** | Yes (BIP-39, WIF, xprv, ETH hex) | No | No | No |
@@ -56,7 +56,7 @@ The matrix below compares Pipelock to earlier-generation tools (AIP, agentsh, sr
 | **Prometheus metrics** | Yes | No | No | No |
 | **Multi-agent support** | Agent ID header + per-agent logs | Per-agent config | Per-session | No |
 | **Network isolation** | Yes (network namespaces in sandbox mode, deployment-enforced otherwise) | No | Kernel-level | sandbox-exec / bubblewrap |
-| **Syscall filtering** | Yes (seccomp BPF in sandbox mode) | No | Yes (seccomp) | Yes (sandbox-exec) |
+| **Syscall filtering** | Yes (seccomp BPF in sandbox mode, linux/amd64 only) | No | Yes (seccomp) | Yes (sandbox-exec) |
 | **Filesystem sandboxing** | Yes (Landlock LSM in sandbox mode) | No | Yes (FUSE) | Yes (bubblewrap) |
 | **Config format** | YAML + presets | YAML (agent.yaml) | CLI flags | Code |
 | **Hot-reload** | Yes (fsnotify + SIGHUP) | No | No | No |

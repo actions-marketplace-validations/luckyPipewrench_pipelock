@@ -99,6 +99,8 @@ Install steps run in order; each one is idempotent. If any step fails, every pre
 12. Write per-tool proxy + CA config (`git` / `npm` / `pip` / `cargo`) into the agent home.
 13. Write the wrapper inventory, then install the sudoers entry that lets the operator user invoke `plk-launch` as `pipelock-agent` without a password prompt.
 
+Newly installed `pipelock.service` units support `sudo systemctl reload pipelock`, which sends SIGHUP to reload the config. This command confirms signal delivery; check `sudo journalctl -u pipelock` for the reload result. Existing units without an `ExecReload` entry require a direct SIGHUP or a restart. A rejected trust expansion leaves the active policy unchanged and requires `sudo systemctl restart pipelock` to take effect.
+
 Exit codes:
 
 - **0** — all steps applied (or already in place).
@@ -123,10 +125,12 @@ Upgrade performs a containment-aware binary update in one fail-closed command. I
 
 The sequence is:
 
-1. Download and verify the candidate release by invoking the **deployed** binary's `pipelock update --yes` (Ed25519 manifest + checksums + optional cosign), which replaces the binary only after those checks pass.
-2. Re-pin the SHA-256 integrity hash against the newly deployed binary at `/etc/pipelock/integrity/binary-pin.sha256`.
-3. Restart the `pipelock.service` systemd unit and wait for readiness.
-4. Run `contain verify` and require exit 0, which means every probe passed.
+1. Validate the managed config with the integrity-pinned deployed binary and require containment-safe metrics before any binary or service change.
+2. Download and verify the candidate release by invoking the **deployed** binary's `pipelock update --yes` (Ed25519 manifest + checksums + optional cosign), which replaces the binary only after those checks pass.
+3. Re-pin the SHA-256 integrity hash against the newly deployed binary at `/etc/pipelock/integrity/binary-pin.sha256`.
+4. Add the containment marker to `/etc/systemd/system/pipelock.service` if it is absent, so a host installed before the containment runtime guard existed gains that protection on upgrade rather than only on reinstall. This edits one `Environment=` line inside `[Service]` and leaves the rest of the unit alone; it is a no-op on a unit that already carries the marker.
+5. Restart the `pipelock.service` systemd unit and wait for readiness.
+6. Run `contain verify` and repeat the managed-config check. Exit 0 means every probe passed.
    A failing probe exits 1 and a skipped or inconclusive probe exits 2, so
    both roll the upgrade back.
 
@@ -155,7 +159,7 @@ Exit codes:
 
 ## `pipelock contain verify`
 
-Verify is read-only. It walks 12 probes in order and prints pass / fail / skip /
+Verify is read-only. It walks 13 probes in order and prints pass / fail / skip /
 unknown per probe. It does not require root.
 
 ```bash
@@ -176,6 +180,38 @@ pipelock contain verify
 | 10 | `binary_integrity_pin` | The installed pipelock binary hash matches `/etc/pipelock/integrity/binary-pin.sha256`. |
 | 11 | `cc_launch_allow_list_enforced` | `plk-launch` rejects tools that are not in the registered allow-list. |
 | 12 | `listed_tool_targets_resolvable` | Every entry in `tools.list` resolves to an executable absolute path in the agent user's PATH. |
+| 13 | `managed_config_metrics` | The managed config keeps metrics on a dedicated numeric loopback port or verifies a current, source-scoped remote metrics exception. It skips only when the config file is missing or permission is denied, and reports unknown for any other read failure. |
+
+### Managed metrics invariant
+
+Containment keeps `metrics_listen` on a numeric loopback address and a port other than the agent-accessible proxy port by default. Keep the key present. Removing it registers `/metrics` and `/stats` on the proxy listener, where the contained agent can reach them.
+
+Repair the managed config with a dedicated loopback listener such as:
+
+```yaml
+metrics_listen: 127.0.0.1:9091
+```
+
+Choose another unused non-proxy port if `9091` is unavailable. Do not delete `metrics_listen` to disable metrics.
+
+When a Prometheus server must scrape from another host, declare a short-lived exception with the listener's assigned numeric address and the exact source CIDRs that may scrape it. `allow_full_metrics` is deliberately explicit because `/metrics` contains live enforcement data. `owner` and `reason` record who accepted that exposure and why. `expires_at` uses RFC3339 and must remain in the future.
+
+```yaml
+metrics_listen: 192.0.2.20:9091
+
+containment:
+  metrics_exposure:
+    allow_full_metrics: true
+    allowed_source_cidrs:
+      - 192.0.2.42/32
+    owner: observability
+    reason: Prometheus scrape from the monitoring host
+    expires_at: 2026-12-01T00:00:00Z
+```
+
+Replace the documentation addresses with addresses assigned to the host and scraper. Wildcard and hostname binds are rejected. An absent, malformed, or expired exception denies remote metrics requests, and probe 13 fails. `/metrics` returns 403 to every source outside `allowed_source_cidrs`. `/stats` remains loopback-only because it includes blocked domains and scanner categories.
+
+The proxy also refuses to dial its configured metrics address and port. An `ssrf.ip_allowlist`, trusted domain, or grant cannot reopen this path through the agent's permitted proxy connection.
 
 The nftables probes fail closed when attribution is ambiguous. A regular
 lookalike chain, a table-wide listing that happens to contain matching-looking
@@ -215,7 +251,7 @@ The contract has four parts:
 
 3. **Known-good wrappers** on the agent PATH: `pipelock-curl`, `pipelock-python`, `pipelock-node`. Each forces the full contract before exec'ing the real tool, so it is proxy- and CA-correct even when the caller's environment is incomplete (for example, a bare `sudo -u pipelock-agent <cmd>` that inherits no proxy env).
 
-4. **Per-tool config files** written into the agent home (`~/.gitconfig`, `~/.npmrc`, `~/.config/pip/pip.conf`, `~/.cargo/config.toml`). These tools read their own config regardless of environment, so config-driven invocations are proxy-correct on every exec path.
+4. **Per-tool config files** written into the agent home (`~/.gitconfig`, `~/.npmrc`, `~/.config/pip/pip.conf`, `~/.cargo/config.toml`). These tools read their own config regardless of environment, so config-driven invocations are proxy-correct on every exec path. The managed `.npmrc` sets `ignore-scripts=true`, and the runtime environment sets `npm_config_ignore_scripts=1`, so an untrusted project `.npmrc` cannot re-enable `package.json` lifecycle scripts during dependency installation on the contained runtime path. This is an install default, not an execution boundary: a caller can deliberately unset the environment variable or pass a command-line override, and a bare non-login npm invocation outside `plk-launch` does not inherit the runtime environment. Packages that compile or download native components during install will need an explicit override. For a known dependency, run that install as `npm install --ignore-scripts=false`; the command-line override applies only to that npm command, and the containment boundary still applies. Existing installations receive this contract after `pipelock contain install` is rerun; `contain upgrade` updates the binary but does not rewrite agent tool configuration.
 
 A login-shell script at `/etc/profile.d/pipelock-contain.sh` exports the same matrix so an interactive `sudo -iu pipelock-agent` session inherits it too. Because `/etc/profile.d` is sourced by all login shells, the script returns immediately for every user except `pipelock-agent`.
 

@@ -8,6 +8,7 @@ package sandbox
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	guardruntime "github.com/luckyPipewrench/pipelock/internal/guard"
+	"github.com/luckyPipewrench/pipelock/internal/testposture"
 )
 
 // Landlock tests use subprocess execution because Landlock restrictions are
@@ -32,6 +34,12 @@ const landlockTestEnv = "__SANDBOX_LANDLOCK_TEST"
 // exits in well under a second; this prevents a wedged child or grandchild from
 // consuming the whole package timeout.
 const landlockChildTimeout = 60 * time.Second
+
+var (
+	mcpEnvironProofBinaryPath  string
+	mcpEnvironProofBuildOutput []byte
+	errMCPEnvironProofBuild    error
+)
 
 func TestMain(m *testing.M) {
 	if guardruntime.IsExecMode() {
@@ -55,7 +63,52 @@ func TestMain(m *testing.M) {
 		runLandlockTestChild(op)
 		return
 	}
-	os.Exit(m.Run())
+
+	// Isolate the pipelock processes these tests spawn from the host's
+	// containment posture state. They inherit this process's environment, so
+	// pinning the proof path here reaches the child, which is where the read
+	// actually happens.
+	//
+	// The pin goes after the re-exec entry points above and before m.Run: a
+	// child that re-enters this binary as an init or exec helper must not take
+	// this path, and no ordinary test may run without it.
+	//
+	// Same cause as the runtime and proxy packages: without an override the
+	// child reads an absolute path under /var/lib/pipelock, which is absent on
+	// a clean runner and unreadable once `pipelock contain install` has created
+	// it 0o750 owned by pipelock-proxy. The child then fails to start and the
+	// test reports a sandbox failure that has nothing to do with sandboxing.
+	posturePin, err := testposture.PinAbsent()
+	if err != nil {
+		// PinAbsent creates its temporary directory before it pins, and returns
+		// the cleanup either way, so exiting without calling it leaks that
+		// directory and can leave a partial environment override behind.
+		posturePin()
+		fmt.Fprintf(os.Stderr, "pinning posture proof: %v\n", err)
+		os.Exit(1)
+	}
+
+	var proofBuildDir string
+	if runtime.GOARCH == "amd64" && os.Getenv("PIPELOCK_MCP_ENVIRON_PROOF_HELPER") == "" {
+		proofBuildDir, errMCPEnvironProofBuild = os.MkdirTemp("", "pipelock-mcp-environ-proof-")
+		if errMCPEnvironProofBuild == nil {
+			errMCPEnvironProofBuild = os.Chmod(proofBuildDir, 0o750) // #nosec G302 -- directory mode follows repository policy
+		}
+		if errMCPEnvironProofBuild == nil {
+			mcpEnvironProofBinaryPath = filepath.Join(proofBuildDir, "pipelock-mcp-environ-proof")
+			buildCtx, cancelBuild := context.WithTimeout(context.Background(), 2*time.Minute)
+			cmd := exec.CommandContext(buildCtx, "go", "build", "-tags=mcp_hardening_test", "-o", mcpEnvironProofBinaryPath, "./cmd/pipelock/") // #nosec G204 G702 -- fixed repository build for the integration proof
+			cmd.Dir = filepath.Join("..", "..")
+			mcpEnvironProofBuildOutput, errMCPEnvironProofBuild = cmd.CombinedOutput()
+			cancelBuild()
+		}
+	}
+	code := m.Run()
+	posturePin()
+	if proofBuildDir != "" {
+		_ = os.RemoveAll(proofBuildDir)
+	}
+	os.Exit(code)
 }
 
 // runLandlockTestChild is executed in the sandboxed child process.

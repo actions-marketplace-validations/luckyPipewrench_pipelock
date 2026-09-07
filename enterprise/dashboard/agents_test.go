@@ -142,12 +142,13 @@ func TestHandler_AgentsRendersGroups(t *testing.T) {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 	body := rec.Body.String()
-	if !strings.Contains(body, "Agent evidence") {
-		t.Fatal("body should contain the agents page heading")
+	// Assert the CLAIM, not the page title. The page keeps its navigational
+	// name; what had to change is the identity claim it made about a v1 label.
+	if !strings.Contains(body, "Identity not established by v1 receipts") {
+		t.Fatal("roster must state that a v1 receipt does not establish identity")
 	}
-	// The designed header carries the honest what-this-proves lead, not a bare title.
-	if !strings.Contains(body, "produced signed receipts in the configured evidence source") {
-		t.Fatal("body should contain the honest agents-page intent lead")
+	if !strings.Contains(body, "recorded labels rather than proven identities") {
+		t.Fatal("roster lead must describe the values as recorded labels")
 	}
 	if !strings.Contains(body, "with loaded evidence") {
 		t.Fatal("body should contain the agent-count summary line")
@@ -168,6 +169,37 @@ func TestHandler_AgentsRendersGroups(t *testing.T) {
 	}
 }
 
+func TestHandler_AgentsDescribesGroupsAsRecordedLabels(t *testing.T) {
+	t.Parallel()
+
+	dir, trusted := writeTrustedHandlerSession(t)
+	handler := New(Options{
+		TrustedOuterAuth: true,
+		ReceiptDir:       dir,
+		TrustedKeys:      trusted,
+		HasFeature:       allowAgentsFeature,
+	})
+
+	for _, path := range []string{"/agents", "/evidence"} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
+			context.Background(), http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want %d; body=%s", path, rec.Code, http.StatusOK, rec.Body.String())
+		}
+
+		body := rec.Body.String()
+		for _, want := range []string{
+			"Identity not established by v1 receipts",
+			"Recorded label",
+		} {
+			if !strings.Contains(body, want) {
+				t.Fatalf("%s body missing %q: %s", path, want, body)
+			}
+		}
+	}
+}
+
 func TestHandler_AgentsEmptyStateExplainsReceiptSource(t *testing.T) {
 	t.Parallel()
 
@@ -184,8 +216,9 @@ func TestHandler_AgentsEmptyStateExplainsReceiptSource(t *testing.T) {
 	}
 	body := rec.Body.String()
 	for _, want := range []string{
-		"The roster proves which agents have loaded receipt sessions",
-		"No agents or receipts are loaded",
+		"The roster lists labels recorded on loaded receipts",
+		"Identity not established by v1 receipts",
+		"No labels or receipts are loaded",
 		"--receipt-dir",
 	} {
 		if !strings.Contains(body, want) {
@@ -295,7 +328,10 @@ func TestHandler_Investigator(t *testing.T) {
 	dir := t.TempDir()
 	pub, priv := generateDashboardKey(t)
 	keyHex := hex.EncodeToString(pub)
-	writeReceiptsToDir(t, dir, buildDashboardChain(t, priv, 3))
+	receipts := buildDashboardChain(t, priv, 3)
+	writeReceiptsToDir(t, dir, receipts)
+	firstPath := "/session/" + testSessionID + "/receipt/" + receipts[0].ActionRecord.ActionID
+	lastPath := "/session/" + testSessionID + "/receipt/" + receipts[2].ActionRecord.ActionID
 	trusted := map[string]TrustedKey{keyHex: {Source: trustedKeySource}}
 
 	handler := New(Options{
@@ -305,10 +341,10 @@ func TestHandler_Investigator(t *testing.T) {
 		HasFeature:       allowAgentsFeature,
 	})
 
-	t.Run("found_seq_0", func(t *testing.T) {
+	t.Run("found_action_id", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/0", nil))
+			context.Background(), http.MethodGet, firstPath, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 		}
@@ -321,25 +357,25 @@ func TestHandler_Investigator(t *testing.T) {
 		}
 	})
 
-	t.Run("found_seq_2", func(t *testing.T) {
+	t.Run("found_second_action_id", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/2", nil))
+			context.Background(), http.MethodGet, lastPath, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
 		}
 	})
 
-	t.Run("not_found_seq", func(t *testing.T) {
+	t.Run("not_found_action_id", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/999", nil))
+			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/missing-action-id", nil))
 		if rec.Code != http.StatusNotFound {
 			t.Fatalf("status = %d, want %d", rec.Code, http.StatusNotFound)
 		}
 	})
 
-	t.Run("bad_seq_format", func(t *testing.T) {
+	t.Run("unknown_action_id", func(t *testing.T) {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
 			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/abc", nil))
@@ -350,9 +386,7 @@ func TestHandler_Investigator(t *testing.T) {
 
 	t.Run("malformed_receipt_paths_404", func(t *testing.T) {
 		paths := []string{
-			"/session/" + testSessionID + "/receipt/-1",
-			"/session/" + testSessionID + "/receipt/18446744073709551616",
-			"/session/" + testSessionID + "/receipt/0/extra",
+			"/session/" + testSessionID + "/receipt/" + receipts[0].ActionRecord.ActionID + "/extra",
 			"/session/" + testSessionID + "/receipt/%2f0",
 			"/session/" + testSessionID + "/receipt/%2e%2e",
 		}
@@ -415,6 +449,7 @@ func TestHandler_InvestigatorHostileEvidenceEscaped(t *testing.T) {
 		t.Fatalf("signAlteredReceipt: %v", err)
 	}
 	writeReceiptsToDir(t, dir, []receipt.Receipt{resigned})
+	receiptPath := "/session/" + testSessionID + "/receipt/" + resigned.ActionRecord.ActionID
 
 	t.Run("raw_view_escapes", func(t *testing.T) {
 		handler := New(Options{
@@ -426,7 +461,7 @@ func TestHandler_InvestigatorHostileEvidenceEscaped(t *testing.T) {
 		})
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/0", nil))
+			context.Background(), http.MethodGet, receiptPath, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 		}
@@ -456,7 +491,7 @@ func TestHandler_InvestigatorHostileEvidenceEscaped(t *testing.T) {
 		})
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-			context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/0", nil))
+			context.Background(), http.MethodGet, receiptPath, nil))
 		if rec.Code != http.StatusOK {
 			t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 		}
@@ -519,6 +554,7 @@ func TestHandler_InvestigatorMetadataRedactsRawExplanationFields(t *testing.T) {
 		t.Fatalf("signAlteredReceipt: %v", err)
 	}
 	writeReceiptsToDir(t, dir, []receipt.Receipt{resigned})
+	receiptPath := "/session/" + testSessionID + "/receipt/" + resigned.ActionRecord.ActionID
 
 	handler := New(Options{
 		TrustedOuterAuth: true,
@@ -529,7 +565,7 @@ func TestHandler_InvestigatorMetadataRedactsRawExplanationFields(t *testing.T) {
 	})
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, httptest.NewRequestWithContext(
-		context.Background(), http.MethodGet, "/session/"+testSessionID+"/receipt/0", nil))
+		context.Background(), http.MethodGet, receiptPath, nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
@@ -758,7 +794,8 @@ func TestReadModel_ReceiptDetail(t *testing.T) {
 	dir := t.TempDir()
 	pub, priv := generateDashboardKey(t)
 	keyHex := hex.EncodeToString(pub)
-	writeReceiptsToDir(t, dir, buildDashboardChain(t, priv, 3))
+	receipts := buildDashboardChain(t, priv, 3)
+	writeReceiptsToDir(t, dir, receipts)
 
 	model := NewReadModel(Options{
 		ReceiptDir:  dir,
@@ -766,7 +803,7 @@ func TestReadModel_ReceiptDetail(t *testing.T) {
 	})
 
 	t.Run("found", func(t *testing.T) {
-		exp, found, err := model.ReceiptDetail(testSessionID, 1)
+		exp, found, err := model.ReceiptDetail(testSessionID, receipts[1].ActionRecord.ActionID)
 		if err != nil {
 			t.Fatalf("ReceiptDetail: %v", err)
 		}
@@ -782,12 +819,45 @@ func TestReadModel_ReceiptDetail(t *testing.T) {
 	})
 
 	t.Run("not_found", func(t *testing.T) {
-		_, found, err := model.ReceiptDetail(testSessionID, 999)
+		_, found, err := model.ReceiptDetail(testSessionID, "missing-action-id")
 		if err != nil {
 			t.Fatalf("ReceiptDetail: %v", err)
 		}
 		if found {
 			t.Fatal("expected receipt to not be found")
+		}
+	})
+
+	t.Run("not_found_in_truncated_view", func(t *testing.T) {
+		limited := NewReadModel(Options{ReceiptDir: dir, ReceiptReadLimit: 1})
+		_, found, err := limited.ReceiptDetail(testSessionID, "missing-action-id")
+		if found || !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+			t.Fatalf("ReceiptDetail truncated result = found %v, err %v", found, err)
+		}
+	})
+
+	t.Run("independent_chains_with_same_seq_select_by_action_id", func(t *testing.T) {
+		collisionDir := t.TempDir()
+		first := signDashboardReceipt(t, priv, 0, receipt.GenesisHash, time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC))
+		second := signDashboardReceipt(t, priv, 0, receipt.GenesisHash, time.Date(2026, 7, 3, 12, 1, 0, 0, time.UTC))
+		second.ActionRecord.Verdict = "block"
+		var err error
+		second, err = receipt.Sign(second.ActionRecord, priv)
+		if err != nil {
+			t.Fatalf("Sign(second): %v", err)
+		}
+		writeReceiptsToDir(t, collisionDir, []receipt.Receipt{first, second})
+
+		collisionModel := NewReadModel(Options{ReceiptDir: collisionDir})
+		exp, found, err := collisionModel.ReceiptDetail(testSessionID, second.ActionRecord.ActionID)
+		if err != nil {
+			t.Fatalf("ReceiptDetail: %v", err)
+		}
+		if !found {
+			t.Fatal("expected second chain receipt to be found")
+		}
+		if exp.Verdict.Detail != "block" {
+			t.Fatalf("Verdict.Detail = %q, want block from second independent chain", exp.Verdict.Detail)
 		}
 	})
 }

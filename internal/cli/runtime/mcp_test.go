@@ -57,6 +57,93 @@ const (
 	mcpProxyCancelGrace = 5 * time.Second
 )
 
+func TestMCPProxyCmdRejectsMixedBestEffortProvenance(t *testing.T) {
+	futureExpiry := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	for _, tt := range []struct {
+		name     string
+		config   string
+		flagArgs []string
+	}{
+		{
+			name:     "command line override with configuration expiry",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--sandbox-best-effort", "--sandbox-best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "command line override with configuration reason",
+			config:   "sandbox:\n  best_effort: false\n  best_effort_reason: configuration reason\n  best_effort_expiry: 2h\n",
+			flagArgs: []string{"--sandbox-best-effort", "--sandbox-best-effort-expiry", "1h"},
+		},
+		{
+			name:     "configuration override with command line reason",
+			config:   "sandbox:\n  enabled: true\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--sandbox-best-effort-reason", "command line reason"},
+		},
+		{
+			name:     "configuration override with command line expiry",
+			config:   "sandbox:\n  enabled: true\n  best_effort: true\n  best_effort_reason: configuration reason\n  best_effort_expiry: " + futureExpiry + "\n",
+			flagArgs: []string{"--sandbox-best-effort-expiry", "1h"},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+			if err := os.WriteFile(configPath, []byte(tt.config), 0o600); err != nil {
+				t.Fatalf("write config: %v", err)
+			}
+			cmd := McpCmd()
+			cmd.SilenceUsage = true
+			args := append([]string{"proxy", "--config", configPath}, tt.flagArgs...)
+			args = append(args, "--", "/bin/true")
+			cmd.SetArgs(args)
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "command-line") || !strings.Contains(err.Error(), "configuration") {
+				t.Fatalf("McpCmd(%v) error = %v, want command-line/configuration refusal", args, err)
+			}
+		})
+	}
+}
+
+func TestMCPProxyCmdRejectsInvalidBestEffortOverrideBeforeReporting(t *testing.T) {
+	cmd := McpCmd()
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{
+		"proxy",
+		"--sandbox-best-effort",
+		"--sandbox-best-effort-reason", "test override",
+		"--sandbox-best-effort-expiry", "0s",
+		"--", "/bin/true",
+	})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("McpCmd() error = %v, want expired override refusal", err)
+	}
+	if strings.Contains(out.String(), "best-effort expiry bounds launch admission") {
+		t.Fatalf("McpCmd() reported launch admission before refusing the override: %s", out.String())
+	}
+}
+
+func TestMCPProxyCmdRejectsStrictBestEffortTogetherBeforeMetadataValidation(t *testing.T) {
+	cmd := McpCmd()
+	cmd.SilenceUsage = true
+	cmd.SetArgs([]string{"proxy", "--sandbox-strict", "--sandbox-best-effort", "--", "/bin/true"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("McpCmd() error = %v, want strict/best-effort mutual exclusion", err)
+	}
+}
+
 func TestSafeWriter(t *testing.T) {
 	var buf bytes.Buffer
 	sw := &safeWriter{w: &buf}
@@ -136,6 +223,111 @@ func TestMcpProxyCmd_FileSentryBestEffortRejectsInitializationFailure(t *testing
 	_, stderr, err := runMCPProxyCommand(t, configPath)
 	if err == nil || !strings.Contains(err.Error(), "file sentry init failed") {
 		t.Fatalf("mcp proxy error = %v, want initialization failure; stderr:\n%s", err, stderr)
+	}
+}
+
+func TestMcpProxyCmd_ReturnsFileSentryRuntimeFailure(t *testing.T) {
+	wantErr := errors.New("watch backend failed")
+	watcher := newGatedFileSentryWatcher(wantErr)
+	installGatedFileSentryWatcher(t, watcher)
+	configPath := writeMCPFileSentryConfig(t, false, t.TempDir())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inputR, inputW := io.Pipe()
+	defer func() { _ = inputR.Close() }()
+	defer func() { _ = inputW.Close() }()
+	cmd := McpCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetContext(ctx)
+	cmd.SetIn(inputR)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{
+		"proxy",
+		"--config", configPath,
+		"--env", "PIPELOCK_TEST_MCP_HELPER=1",
+		"--",
+		os.Args[0],
+		"-test.run=TestMCPRuntimeHelperProcess$",
+	})
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start after MCP child launch")
+	}
+	close(watcher.release)
+	if err := inputW.Close(); err != nil {
+		t.Fatalf("close MCP input: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("mcp proxy error = %v, want file sentry runtime failure wrapping %v\nstderr:\n%s", err, wantErr, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mcp proxy did not return after file sentry runtime failure")
+	}
+}
+
+func TestMcpProxyCmd_KeepsCleanCancellationNilWithFileSentry(t *testing.T) {
+	watcher := newGatedFileSentryWatcher(errors.New("must not be returned after clean cancellation"))
+	installGatedFileSentryWatcher(t, watcher)
+	configPath := writeMCPFileSentryConfig(t, false, t.TempDir())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	inputR, inputW := io.Pipe()
+	defer func() { _ = inputR.Close() }()
+	defer func() { _ = inputW.Close() }()
+	cmd := McpCmd()
+	var stdout, stderr bytes.Buffer
+	cmd.SetContext(ctx)
+	cmd.SetIn(inputR)
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{
+		"proxy",
+		"--config", configPath,
+		"--env", "PIPELOCK_TEST_MCP_HELPER=1",
+		"--",
+		os.Args[0],
+		"-test.run=TestMCPRuntimeHelperProcess$",
+	})
+	done := make(chan error, 1)
+	go func() { done <- cmd.Execute() }()
+
+	select {
+	case <-watcher.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file sentry watcher did not start after MCP child launch")
+	}
+	cancel()
+	if err := inputW.Close(); err != nil {
+		t.Fatalf("close MCP input: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("mcp proxy error after clean cancellation = %v, want nil\nstderr:\n%s", err, stderr.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("mcp proxy did not return after clean cancellation")
+	}
+}
+
+func TestMcpProxyCmd_KeepsNaturalChildExitNilWithFileSentry(t *testing.T) {
+	watcher := newGatedFileSentryWatcher(errors.New("must not be returned after natural child exit"))
+	installGatedFileSentryWatcher(t, watcher)
+	configPath := writeMCPFileSentryConfig(t, false, t.TempDir())
+
+	_, stderr, err := runMCPProxyCommand(t, configPath)
+	if err != nil {
+		t.Fatalf("mcp proxy error after natural child exit = %v, want nil\nstderr:\n%s", err, stderr)
 	}
 }
 
@@ -305,6 +497,33 @@ func TestBuildDeferManagerAndSurfaceValidation(t *testing.T) {
 	cfg.MCPToolPolicy.Rules = []config.ToolPolicyRule{{Name: "hold", Action: config.ActionDefer}}
 	if !mcpToolPolicyUsesDefer(cfg.MCPToolPolicy) {
 		t.Fatal("mcpToolPolicyUsesDefer did not detect rule-level defer")
+	}
+}
+
+func TestDeferredJournalCannotWriteDuringEvidenceCeremony(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.Defaults()
+	cfg.Defer.Enabled = true
+	cfg.FlightRecorder.Dir = dir
+	manager := buildDeferManager(cfg, io.Discard)
+	lock, err := recorder.AcquireEvidenceCeremonyLock(dir)
+	if err != nil {
+		t.Skipf("evidence ceremony lock unavailable: %v", err)
+	}
+	defer func() { _ = lock.Close() }()
+	err = manager.Hold(deferred.HeldAction{
+		DeferID:   "locked",
+		ActionID:  "locked",
+		Target:    "tool",
+		SizeBytes: 1,
+		Authority: deferred.AuthoritySnapshot{SessionID: "s1", SessionIDOriginal: "s1"},
+		Resolve:   func(deferred.Resolution) {},
+	})
+	if err == nil || !strings.Contains(err.Error(), "locking recorder against receipt ceremonies") {
+		t.Fatalf("Hold error = %v, want ceremony lock failure", err)
+	}
+	if _, err := os.Stat(manager.JournalPath()); !os.IsNotExist(err) {
+		t.Fatalf("deferred journal write ran during ceremony: %v", err)
 	}
 }
 
@@ -1908,5 +2127,30 @@ func TestReadHeaderFile_Strict(t *testing.T) {
 	}
 	if hdrs.Get("X-Group") != "ok" {
 		t.Errorf("X-Group = %q, want ok", hdrs.Get("X-Group"))
+	}
+}
+
+func TestMCPProxyCmdRejectsBestEffortFlagsInRemoteModes(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+	}{
+		{name: "upstream with best-effort", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort"}},
+		{name: "upstream with expiry only", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort-expiry", "1h"}},
+		{name: "listen with best-effort metadata", args: []string{"--listen", "127.0.0.1:0", "--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort", "--sandbox-best-effort-reason", "x", "--sandbox-best-effort-expiry", "1h"}},
+		{name: "upstream with reason only", args: []string{"--upstream", "https://mcp.vendor.example/", "--sandbox-best-effort-reason", "x"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := McpCmd()
+			cmd.SilenceUsage = true
+			cmd.SetArgs(append([]string{"proxy"}, tt.args...))
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			err := cmd.Execute()
+			if err == nil || !strings.Contains(err.Error(), "cannot sandbox a remote server") {
+				t.Fatalf("mcp proxy %v error = %v, want remote-mode sandbox refusal", tt.args, err)
+			}
+		})
 	}
 }

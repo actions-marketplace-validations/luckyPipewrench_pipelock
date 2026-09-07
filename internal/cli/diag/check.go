@@ -37,6 +37,7 @@ Examples:
   pipelock check --config pipelock.yaml
   pipelock check --config pipelock.yaml --url https://example.com
   pipelock check --url https://pastebin.com/raw/abc123`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Load and validate config
 			var cfg *config.Config
@@ -75,6 +76,9 @@ Examples:
 				bundleResult := rules.MergeIntoConfig(cfg, cliutil.Version)
 				for _, e := range bundleResult.Errors {
 					cmd.PrintErrf("pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+				}
+				for _, w := range bundleResult.Warnings {
+					cmd.PrintErrf("pipelock: %s\n", w)
 				}
 				sc, err := scanner.New(cfg)
 				if err != nil {

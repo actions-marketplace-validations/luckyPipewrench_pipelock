@@ -34,9 +34,19 @@ import (
 // "proxy kept the previous config" fail-safe path when proxy.Reload aborts its
 // internal swap. Silent no-ops (dedup, restart-only field changes) return nil.
 func (s *Server) Reload(newCfg *config.Config) (err error) {
+	fireReloadLockHook(false)
 	s.reloadMu.Lock()
+	fireReloadLockHook(true)
 	defer s.reloadMu.Unlock()
+	return s.reloadLocked(newCfg)
+}
 
+// reloadLocked applies a validated runtime configuration while reloadMu is
+// held by the caller. Keeping the activation body behind this seam lets
+// Conductor preserve follower-local state from the current live config under
+// the same lock, so a concurrent operator reload cannot be overwritten by a
+// stale pre-apply snapshot.
+func (s *Server) reloadLocked(newCfg *config.Config) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			ReloadPanicHandler(r, s.sentry, s.logger, s.opts.ConfigFile)
@@ -56,6 +66,28 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
 		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
 		return rejectErr
+	}
+	if validationErr := newCfg.ValidateSuppressions(); validationErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", validationErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	// Startup refuses block on this listener, so a reload that asks for it is
+	// requesting enforcement this runtime cannot provide. Reject the whole
+	// reload atomically and record it through the reload audit path; applying
+	// the rest while quietly keeping the old file sentry settings would report a
+	// policy rollout as successful when its enforcement never arrived.
+	if fileSentryErr := validateServerFileSentry(newCfg); fileSentryErr != nil {
+		rejectErr := fmt.Errorf("rejected: invalid config reload: %w", fileSentryErr)
+		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
+		return rejectErr
+	}
+	if s.containmentManaged {
+		if containmentErr := validateContainmentMetricsConfig(newCfg); containmentErr != nil {
+			s.containmentMetricsDenied.Store(true)
+			s.reportContainmentMetricsDrift(newCfg, "reload", containmentErr)
+			return fmt.Errorf("rejected: invalid containment metrics configuration: %w", containmentErr)
+		}
 	}
 
 	oldCfg := s.proxy.CurrentConfig()
@@ -97,6 +129,24 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: metrics_listen changed from %q to %q — requires restart, ignoring\n",
 				oldCfg.MetricsListen, newCfg.MetricsListen)
 			newCfg.MetricsListen = oldCfg.MetricsListen
+			if s.containmentManaged {
+				newCfg.Containment.MetricsExposure = oldCfg.Containment.MetricsExposure
+			}
+		}
+		// Emit sinks own live workers, queues, network connections and, for the
+		// durable forwarder, exclusive spool/cursor locks. Replacing them after
+		// the proxy publishes a candidate can make Reload return an error after
+		// the candidate policy and kill-switch state are already live. Replacing
+		// them before publication is not generally safe either: a same-state
+		// forwarder must close the old worker before the replacement can acquire
+		// its lock. Keep the whole coupled block restart-only so a successful
+		// reload has one honest effective configuration and the live audit path
+		// is never torn down by a candidate that may fail.
+		if !reflect.DeepEqual(oldCfg.Emit, newCfg.Emit) {
+			attemptedHash := newCfg.Emit.Fingerprint()
+			_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: emit settings changed — live sink workers require restart, ignoring")
+			s.logger.LogConfigReload("ignored", "emit settings restart-only", attemptedHash)
+			newCfg.Emit = oldCfg.Emit
 		}
 		// Block scan_api listener setting changes via reload. The Scan
 		// API server binds at startup and cannot rebind or reconfigure
@@ -143,7 +193,8 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		// changes would leave the live config disagreeing with the running
 		// recorder. require_receipts is the exception: it changes only whether
 		// an emit failure escalates an otherwise-allowed request to a block, so
-		// it is safe and intentionally reloadable.
+		// it is safe and intentionally reloadable. Containment evidence is read
+		// while the emitter starts, so its requirement remains restart-only.
 		//
 		// This also keeps Conductor policy-bundle apply working: a signed bundle
 		// carries enforcement-only config (flight_recorder is not an allowlisted
@@ -157,7 +208,9 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		oldFR.EvidenceHealth.MaxAnchorLag = newFR.EvidenceHealth.MaxAnchorLag
 		oldFR.Anchor = newFR.Anchor
 		if !reflect.DeepEqual(oldFR, newFR) {
-			if oldCfg.FlightRecorder.SigningKeyPath != newCfg.FlightRecorder.SigningKeyPath {
+			if oldCfg.FlightRecorder.RequireContainmentEvidence != newCfg.FlightRecorder.RequireContainmentEvidence {
+				_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reload: flight_recorder.require_containment_evidence changed, but posture evidence is checked when signed receipts start. Ignoring the change until restart.")
+			} else if oldCfg.FlightRecorder.SigningKeyPath != newCfg.FlightRecorder.SigningKeyPath {
 				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: flight_recorder.signing_key_path changed from %q to %q — receipt chain cannot rotate at runtime, ignoring (restart required)\n",
 					oldCfg.FlightRecorder.SigningKeyPath, newCfg.FlightRecorder.SigningKeyPath)
 			} else if !boolPtrEqual(oldCfg.FlightRecorder.EvidenceHealth.Enabled, newCfg.FlightRecorder.EvidenceHealth.Enabled) {
@@ -348,11 +401,12 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 			// analogue of the agents preserve path above.
 			_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload: new license inputs could not be verified; Conductor fleet entitlement unchanged, follower stays running — requires restart for license re-verification\n")
 		}
-		// Carry forward runtime-derived license expiry.
-		// LicenseExpiresAt is set by EnforceLicenseGate at startup,
-		// not parsed from YAML. Always preserve the old value until
-		// restart.
+		// Carry forward runtime-derived license warning metadata. These claims
+		// are set after token verification at startup, not parsed from YAML.
+		// Always preserve the old values until restart.
 		newCfg.LicenseExpiresAt = oldCfg.LicenseExpiresAt
+		newCfg.LicenseIssuedAt = oldCfg.LicenseIssuedAt
+		newCfg.LicenseTier = oldCfg.LicenseTier
 		newCfg.LicenseID = oldCfg.LicenseID
 		newCfg.LicenseCRLExpiresAt = oldCfg.LicenseCRLExpiresAt
 		newCfg.LicenseCRLSHA256 = oldCfg.LicenseCRLSHA256
@@ -446,6 +500,11 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 		// keep forwarding under a warning-only weakening reload.
 		if reason := reloadDowngradeRejectReason(oldCfg, newCfg, warnings); reason != "" {
 			rejectErr := fmt.Errorf("rejected: security downgrade from %s", reason)
+			if fields := trustExpansionReloadFields(warnings); len(fields) > 0 {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %s cannot widen trust at runtime; previous configuration remains active; restart Pipelock to apply this change\n", strings.Join(fields, ", "))
+			} else {
+				_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload rejected: %v; previous configuration remains active\n", rejectErr)
+			}
 			s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), rejectErr)
 			return rejectErr
 		}
@@ -483,6 +542,9 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 	if !s.proxy.Reload(newCfg, newSc) {
 		return errors.New("reload failed: proxy kept previous config")
 	}
+	if s.containmentManaged {
+		s.containmentMetricsDenied.Store(false)
+	}
 	fireReloadAfterProxySwapHook(s)
 	s.refreshRuntimeState(oldCfg, newCfg, reloadBundleResult, s.proxy.ScannerPtr().Load())
 	publishDegradedRuleBundleMetrics(s.metrics, newCfg)
@@ -491,42 +553,6 @@ func (s *Server) Reload(newCfg *config.Config) (err error) {
 			fmt.Errorf("TLS cert cache reload failed: %w", reloadErr))
 	}
 	s.killswitch.Reload(newCfg)
-
-	// Reload emit sinks: activate the replacement before publication. A
-	// forwarder sharing a spool or cursor requires the old worker to close first
-	// so the two can never race durable state; if the replacement then fails,
-	// the runtime reports
-	// a degraded reload and keeps the unswapped sink set (with that one forwarder
-	// closed) rather than claiming success.
-	newSinks, sinkErr := BuildEmitSinks(newCfg, s.metrics)
-	if sinkErr != nil {
-		reloadErr := fmt.Errorf("emit sink rebuild failed; previous sinks retained: %w", sinkErr)
-		_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload degraded: %v\n", reloadErr)
-		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), reloadErr)
-		s.logger.LogConfigReload("failed", reloadErr.Error(), newCfg.Hash())
-		return reloadErr
-	}
-	preclosed, activationErr := activateReplacementEmitSinks(s.emitSinks, newSinks)
-	if activationErr != nil {
-		for _, sink := range newSinks {
-			_ = sink.Close()
-		}
-		reloadErr := fmt.Errorf("emit sink activation failed; previous sink set not swapped: %w", activationErr)
-		_, _ = fmt.Fprintf(s.opts.Stderr, "WARNING: config reload degraded: %v\n", reloadErr)
-		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), reloadErr)
-		s.logger.LogConfigReload("failed", reloadErr.Error(), newCfg.Hash())
-		return reloadErr
-	}
-	retiredSinks := s.emitter.ReloadSinks(newSinks)
-	finalizeRetiredSinks := newRetiredSinkFinalizer(s.emitter, retiredSinks, preclosed, func(closeErr error) {
-		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile),
-			fmt.Errorf("closing old emit sink: %w", closeErr))
-	})
-	// Install cleanup immediately after publication. Any later panic still
-	// drains and finalizes exactly this generation before Reload returns.
-	defer finalizeRetiredSinks()
-	s.emitSinks = append([]emit.Sink(nil), newSinks...)
-	finalizeRetiredSinks()
 
 	if needsHITLApprover(newCfg) && !s.hasApprover {
 		_, _ = fmt.Fprintln(s.opts.Stderr, "WARNING: config reloaded to HITL ask mode but approver was not initialized at startup; detections will be blocked")
@@ -732,6 +758,13 @@ func requiredModeTeardowns(oldCfg, newCfg *config.Config) []string {
 	tornDown("mcp_binary_integrity.require_signature",
 		oldCfg.MCPBinaryIntegrity.Enabled && oldCfg.MCPBinaryIntegrity.RequireSignature,
 		newCfg.MCPBinaryIntegrity.Enabled && newCfg.MCPBinaryIntegrity.RequireSignature)
+	// Listener state tokens are optional in balanced and audit modes for
+	// compatibility, but a strict-mode listener that was requiring one cannot
+	// silently stop doing so. Session binding is the parent that makes the
+	// setting effective, so turning that parent off is a teardown too.
+	tornDown("mcp_session_binding.listener_require_state_token",
+		oldCfg.Mode == config.ModeStrict && oldCfg.MCPSessionBinding.Enabled && oldCfg.MCPSessionBinding.RequiresListenerStateToken(),
+		newCfg.MCPSessionBinding.Enabled && newCfg.MCPSessionBinding.RequiresListenerStateToken())
 	tornDown("mediation_envelope.verify_inbound.enabled",
 		oldCfg.MediationEnvelope.VerifyInbound.Enabled, newCfg.MediationEnvelope.VerifyInbound.Enabled)
 	// sni_require_tls refuses to splice an opaque CONNECT tunnel when the
@@ -1004,6 +1037,19 @@ func reloadWarningIsAdvisory(w config.ReloadWarning) bool {
 	default:
 		return false
 	}
+}
+
+// trustExpansionReloadFields identifies trust fields for a rejected reload's
+// diagnostic. It does not decide whether a reload is accepted.
+func trustExpansionReloadFields(warnings []config.ReloadWarning) []string {
+	fields := make([]string, 0, len(warnings))
+	for _, w := range warnings {
+		if w.Field == "trusted_domains" || w.Field == "ssrf.ip_allowlist" ||
+			(strings.HasPrefix(w.Field, "agents.") && strings.HasSuffix(w.Field, ".trusted_domains")) {
+			fields = append(fields, w.Field)
+		}
+	}
+	return fields
 }
 
 func hasNamedAgentProfiles(agents map[string]config.AgentProfile) bool {

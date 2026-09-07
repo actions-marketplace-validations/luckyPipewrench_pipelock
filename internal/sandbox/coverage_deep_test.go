@@ -47,9 +47,11 @@ func TestPrepareSandboxCmd_ReadsExePath(t *testing.T) {
 	workspace := t.TempDir()
 
 	cmd, err := PrepareSandboxCmd(LaunchConfig{
-		Command:    []string{echoCmd, testStr},
-		Workspace:  workspace,
-		BestEffort: true,
+		Command:          []string{echoCmd, testStr},
+		Workspace:        workspace,
+		BestEffort:       true,
+		BestEffortReason: "test override",
+		BestEffortExpiry: "1h",
 	})
 	if err != nil {
 		t.Fatalf("PrepareSandboxCmd: %v", err)
@@ -71,9 +73,11 @@ func TestPrepareSandboxCmd_SetsProcessGroup(t *testing.T) {
 	workspace := t.TempDir()
 
 	cmd, err := PrepareSandboxCmd(LaunchConfig{
-		Command:    []string{echoCmd, testStr},
-		Workspace:  workspace,
-		BestEffort: true,
+		Command:          []string{echoCmd, testStr},
+		Workspace:        workspace,
+		BestEffort:       true,
+		BestEffortReason: "test override",
+		BestEffortExpiry: "1h",
 	})
 	if err != nil {
 		t.Fatalf("PrepareSandboxCmd: %v", err)
@@ -96,12 +100,14 @@ func TestPrepareSandboxCmd_SetsIOStreams(t *testing.T) {
 	var stdin bytes.Buffer
 	var stdout, stderr bytes.Buffer
 	cmd, err := PrepareSandboxCmd(LaunchConfig{
-		Command:    []string{echoCmd, testStr},
-		Workspace:  workspace,
-		BestEffort: true,
-		Stdin:      &stdin,
-		Stdout:     &stdout,
-		Stderr:     &stderr,
+		Command:          []string{echoCmd, testStr},
+		Workspace:        workspace,
+		BestEffort:       true,
+		BestEffortReason: "test override",
+		BestEffortExpiry: "1h",
+		Stdin:            &stdin,
+		Stdout:           &stdout,
+		Stderr:           &stderr,
 	})
 	if err != nil {
 		t.Fatalf("PrepareSandboxCmd: %v", err)
@@ -329,25 +335,6 @@ func TestValidatePolicy_AllowDirEvalSymlinksRejectsMissing(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "does not exist") {
 		t.Errorf("non-existent allow_read dir err = %v, want rejected missing path", err)
 	}
-}
-
-// ---------------------------------------------------------------------------
-// buildSeccompFilter: verify filter properties.
-// ---------------------------------------------------------------------------
-
-func TestBuildSeccompFilter_BestEffortAndStrict(t *testing.T) {
-	bestEffort := buildSeccompFilter(false)
-	strict := buildSeccompFilter(true)
-
-	const minInstructions = 4
-	if len(bestEffort) < minInstructions {
-		t.Errorf("best-effort filter too short: %d instructions", len(bestEffort))
-	}
-	if len(strict) < minInstructions {
-		t.Errorf("strict filter too short: %d instructions", len(strict))
-	}
-
-	t.Logf("best-effort: %d instructions, strict: %d instructions", len(bestEffort), len(strict))
 }
 
 // ---------------------------------------------------------------------------
@@ -745,88 +732,6 @@ func TestLayerNameConstants(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// seccomp conditionals: verify instruction counts.
-// ---------------------------------------------------------------------------
-
-func TestSeccompConditionals_InstructionCounts(t *testing.T) {
-	cloneInsns := cloneConditional()
-	clone3Strict := clone3Conditional(true)
-	clone3BestEff := clone3Conditional(false)
-	socketInsns := socketConditional()
-	personalityInsns := personalityConditional()
-
-	tests := []struct {
-		name  string
-		count int
-		got   int
-	}{
-		{name: "clone", count: 5, got: len(cloneInsns)},
-		{name: "clone3_strict", count: 2, got: len(clone3Strict)},
-		{name: "clone3_besteff", count: 2, got: len(clone3BestEff)},
-		{name: "socket", count: 5, got: len(socketInsns)},
-		{name: "personality", count: 9, got: len(personalityInsns)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.got != tt.count {
-				t.Errorf("%s: got %d instructions, want %d", tt.name, tt.got, tt.count)
-			}
-		})
-	}
-}
-
-// ---------------------------------------------------------------------------
-// allowedSyscalls / killSyscalls / denySyscalls: no dups, no overlap.
-// ---------------------------------------------------------------------------
-
-func TestSyscallLists_NoDuplicates(t *testing.T) {
-	lists := map[string][]uint32{
-		"allowed": allowedSyscalls(),
-		"kill":    killSyscalls(),
-		"deny":    denySyscalls(),
-	}
-
-	for name, list := range lists {
-		t.Run(name, func(t *testing.T) {
-			if len(list) == 0 {
-				t.Errorf("%s syscall list is empty", name)
-			}
-			seen := make(map[uint32]bool, len(list))
-			for _, nr := range list {
-				if seen[nr] {
-					t.Errorf("%s: duplicate syscall number %d", name, nr)
-				}
-				seen[nr] = true
-			}
-		})
-	}
-}
-
-func TestSyscallLists_NoOverlap(t *testing.T) {
-	allow := make(map[uint32]bool)
-	for _, nr := range allowedSyscalls() {
-		allow[nr] = true
-	}
-	kill := make(map[uint32]bool)
-
-	for _, nr := range killSyscalls() {
-		if allow[nr] {
-			t.Errorf("syscall %d is in both allowed and kill lists", nr)
-		}
-		kill[nr] = true
-	}
-	for _, nr := range denySyscalls() {
-		if allow[nr] {
-			t.Errorf("syscall %d is in both allowed and deny lists", nr)
-		}
-		if kill[nr] {
-			t.Errorf("syscall %d is in both kill and deny lists", nr)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
 // loopbackUp: verify direct call (will fail without CAP_NET_ADMIN).
 // ---------------------------------------------------------------------------
 
@@ -1088,9 +993,11 @@ func TestLaunchStandalone_BestEffortMode(t *testing.T) {
 	workspace := t.TempDir()
 
 	err := LaunchStandalone(StandaloneLaunchConfig{
-		Command:    []string{"true"},
-		Workspace:  workspace,
-		BestEffort: true,
+		Command:          []string{"true"},
+		Workspace:        workspace,
+		BestEffort:       true,
+		BestEffortReason: "test override",
+		BestEffortExpiry: "1h",
 	})
 	if err != nil {
 		t.Fatalf("LaunchStandalone best-effort: %v", err)
@@ -1276,11 +1183,35 @@ func TestPreflight_ValidBestEffort(t *testing.T) {
 	if result.Workspace != workspace {
 		t.Errorf("workspace = %q, want %q", result.Workspace, workspace)
 	}
-	if result.Mode != "best-effort" {
-		t.Errorf("mode = %q, want best-effort", result.Mode)
+	if result.Mode != "required" {
+		t.Errorf("mode = %q, want required", result.Mode)
 	}
 	if len(result.Layers) != 3 {
 		t.Errorf("expected 3 layers, got %d", len(result.Layers))
+	}
+	// The loop this replaces would have passed if Landlock were absent from
+	// the result entirely, because it only inspected layers that were present.
+	// Assert each flag by name, and assert the two that must stay optional as
+	// well, so a change that made everything required would also be caught.
+	required := map[LayerName]bool{}
+	for _, layer := range result.Layers {
+		required[layer.Name] = layer.Required
+	}
+	landlock, ok := required[LayerLandlock]
+	if !ok {
+		t.Fatalf("preflight result has no %s layer at all, so its required flag proves nothing", LayerLandlock)
+	}
+	if !landlock {
+		t.Errorf("normal sandbox preflight did not mark %s required", LayerLandlock)
+	}
+	for _, optional := range []LayerName{LayerNetNS, LayerSeccomp} {
+		flag, present := required[optional]
+		if !present {
+			t.Fatalf("preflight result has no %s layer", optional)
+		}
+		if flag {
+			t.Errorf("non-strict preflight marked %s required; only Landlock is mandatory outside strict mode", optional)
+		}
 	}
 }
 
@@ -1339,13 +1270,13 @@ func TestPreflight_InvalidPolicy(t *testing.T) {
 
 func TestPreflight_AllLayersAvailable(t *testing.T) {
 	workspace := t.TempDir()
-	caps := Detect()
-
-	if caps.LandlockABI <= 0 || !caps.UserNamespaces || !caps.Seccomp {
-		t.Skip("not all layers available on this system")
-	}
-
 	result := Preflight(workspace, []string{echoCmd}, nil, false)
+	requireExpectedPreflightLayers(t, result.Layers)
+	for _, layer := range result.Layers {
+		if !layer.Available {
+			t.Skipf("layer %s unavailable on this system: %s", layer.Name, layer.Reason)
+		}
+	}
 	if result.Status != StatusReady {
 		t.Errorf("status = %q, want %q with all layers available", result.Status, StatusReady)
 	}
@@ -1353,15 +1284,37 @@ func TestPreflight_AllLayersAvailable(t *testing.T) {
 
 func TestPreflight_StrictAllAvailable(t *testing.T) {
 	workspace := t.TempDir()
-	caps := Detect()
-
-	if caps.LandlockABI <= 0 || !caps.UserNamespaces || !caps.Seccomp {
-		t.Skip("not all layers available on this system")
-	}
-
 	result := Preflight(workspace, []string{echoCmd}, nil, true)
+	requireExpectedPreflightLayers(t, result.Layers)
+	for _, layer := range result.Layers {
+		if !layer.Available {
+			t.Skipf("layer %s unavailable on this system: %s", layer.Name, layer.Reason)
+		}
+	}
 	if result.Status != StatusReady {
 		t.Errorf("strict with all layers: status = %q, want %q", result.Status, StatusReady)
+	}
+}
+
+func requireExpectedPreflightLayers(t *testing.T, layers []LayerProbe) {
+	t.Helper()
+
+	expected := map[LayerName]struct{}{
+		LayerLandlock: {},
+		LayerNetNS:    {},
+		LayerSeccomp:  {},
+	}
+	if len(layers) != len(expected) {
+		t.Fatalf("preflight layers = %d, want %d", len(layers), len(expected))
+	}
+	for _, layer := range layers {
+		if _, ok := expected[layer.Name]; !ok {
+			t.Fatalf("unexpected or duplicate preflight layer %q", layer.Name)
+		}
+		delete(expected, layer.Name)
+	}
+	if len(expected) != 0 {
+		t.Fatalf("preflight omitted layers: %#v", expected)
 	}
 }
 
@@ -1375,9 +1328,18 @@ func TestPreflight_PrivateShm(t *testing.T) {
 		t.Error("best-effort should not have private SHM")
 	}
 
-	caps := Detect()
-	if caps.UserNamespaces && !strict.PrivateShm {
-		t.Error("strict with user namespaces should have private SHM")
+	var netNS *LayerProbe
+	for i := range strict.Layers {
+		if strict.Layers[i].Name == LayerNetNS {
+			netNS = &strict.Layers[i]
+			break
+		}
+	}
+	if netNS == nil {
+		t.Fatal("strict preflight omitted network namespace layer")
+	}
+	if strict.PrivateShm != netNS.Available {
+		t.Errorf("strict private SHM = %v, want network namespace availability %v", strict.PrivateShm, netNS.Available)
 	}
 }
 
@@ -1499,49 +1461,6 @@ func TestBuildRules_AllSlicesFilled(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// BPF helpers: verify instruction codes.
-// ---------------------------------------------------------------------------
-
-func TestBPFHelpers(t *testing.T) {
-	t.Run("bpfLoad", func(t *testing.T) {
-		insn := bpfLoad(42)
-		if insn.K != 42 {
-			t.Errorf("K = %d, want 42", insn.K)
-		}
-	})
-
-	t.Run("bpfJumpEq", func(t *testing.T) {
-		insn := bpfJumpEq(100, 2, 3)
-		if insn.K != 100 {
-			t.Errorf("K = %d, want 100", insn.K)
-		}
-		if insn.Jt != 2 {
-			t.Errorf("Jt = %d, want 2", insn.Jt)
-		}
-		if insn.Jf != 3 {
-			t.Errorf("Jf = %d, want 3", insn.Jf)
-		}
-	})
-
-	t.Run("bpfRet", func(t *testing.T) {
-		insn := bpfRet(0x7FFF0001)
-		if insn.K != 0x7FFF0001 {
-			t.Errorf("K = %d, want %d", insn.K, 0x7FFF0001)
-		}
-	})
-
-	t.Run("bpfJumpSet", func(t *testing.T) {
-		insn := bpfJumpSet(0xFF, 1, 0)
-		if insn.K != 0xFF {
-			t.Errorf("K = %d, want 255", insn.K)
-		}
-		if insn.Jt != 1 {
-			t.Errorf("Jt = %d, want 1", insn.Jt)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
 // Rlimit constants: verify values.
 // ---------------------------------------------------------------------------
 
@@ -1551,7 +1470,8 @@ func TestRlimitConstants(t *testing.T) {
 		got  uint64
 		want uint64
 	}{
-		{name: "nproc", got: rlimitNProc, want: 1024},
+		{name: "nproc", got: rlimitNProc, want: 4096},
+		{name: "nproc headroom", got: rlimitNProcHeadroom, want: 1024},
 		{name: "nofile", got: rlimitNoFile, want: 4096},
 		{name: "fsize", got: rlimitFSize, want: 1 << 30},
 		{name: "core", got: rlimitCore, want: 0},

@@ -47,6 +47,8 @@ type serveOptions struct {
 	conductorID           string
 	followerTrustDomain   string
 	publisherTokenFile    string
+	publisherOrgID        string
+	publisherFleetID      string
 	auditorTokenFile      string
 	adminTokenFile        string
 	auditorOrgID          string
@@ -153,12 +155,14 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVar(&opts.conductorID, "conductor-id", opts.conductorID, "Conductor ID advertised in capabilities")
 	cmd.Flags().StringVar(&opts.followerTrustDomain, "follower-trust-domain", opts.followerTrustDomain, "SPIFFE trust domain for follower mTLS identities")
 	cmd.Flags().StringVar(&opts.publisherTokenFile, "publisher-token-file", "", "file containing bearer token required for policy publish requests")
+	cmd.Flags().StringVar(&opts.publisherOrgID, "publisher-org", "", "org scope for the publisher bearer token on policy publish requests (required)")
+	cmd.Flags().StringVar(&opts.publisherFleetID, "publisher-fleet", "", "optional fleet scope for the publisher bearer token on policy publish requests")
 	cmd.Flags().StringVar(&opts.auditorTokenFile, "auditor-token-file", "", "file containing bearer token required for audit metadata query requests")
 	cmd.Flags().StringVar(&opts.adminTokenFile, "admin-token-file", "", "file containing bearer token required for Conductor admin requests")
 	cmd.Flags().StringVar(&opts.auditorOrgID, "auditor-org", "", "org scope for the auditor bearer token on audit/follower read requests (required)")
 	cmd.Flags().StringVar(&opts.auditorFleetID, "auditor-fleet", "", "optional fleet scope for the auditor bearer token on audit/follower read requests")
-	cmd.Flags().StringVar(&opts.adminOrgID, "admin-org", "", "org scope for the admin bearer token on audit/follower read requests (required)")
-	cmd.Flags().StringVar(&opts.adminFleetID, "admin-fleet", "", "optional fleet scope for the admin bearer token on audit/follower read requests")
+	cmd.Flags().StringVar(&opts.adminOrgID, "admin-org", "", "org scope for every admin bearer request (required)")
+	cmd.Flags().StringVar(&opts.adminFleetID, "admin-fleet", "", "optional fleet scope for every admin bearer request")
 	cmd.Flags().DurationVar(&opts.auditRetention, "audit-retention", 0, "duration to keep SQLite audit evidence; older batches are pruned at startup (0 = keep forever)")
 	cmd.Flags().StringArrayVar(&opts.trustedAuditKeys, "trusted-audit-key", nil,
 		"trusted audit signing key as comma-separated kv pairs: 'id=ID,(inline=HEX_OR_VERSIONED_PUBLIC_KEY|file=/path),org=ORG[,fleet=FLEET][,instance=INSTANCE]'; "+
@@ -304,6 +308,9 @@ func buildServeHandler(ctx context.Context, opts serveOptions) (*serveHandler, h
 	if strings.TrimSpace(opts.auditorOrgID) == "" {
 		return nil, nil, nil, errors.New("--auditor-org is required")
 	}
+	if strings.TrimSpace(opts.publisherOrgID) == "" {
+		return nil, nil, nil, errors.New("--publisher-org is required")
+	}
 	if strings.TrimSpace(opts.adminOrgID) == "" {
 		return nil, nil, nil, errors.New("--admin-org is required")
 	}
@@ -328,15 +335,17 @@ func buildServeHandler(ctx context.Context, opts serveOptions) (*serveHandler, h
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	adminAuthorizer, err := controlplane.ScopedBearerAdminAuthorizer([]controlplane.ScopedBearerCredential{{
-		Token: adminToken,
-		Role:  controlplane.RoleAdmin,
+	adminAuthenticator, err := controlplane.ScopedBearerAdminAuthenticator([]controlplane.ScopedBearerCredential{{
+		Token:   adminToken,
+		Role:    controlplane.RoleAdmin,
+		OrgID:   opts.adminOrgID,
+		FleetID: opts.adminFleetID,
 	}})
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	publishAuthorizer, err := controlplane.ScopedBearerBundleAuthorizer([]controlplane.ScopedBearerCredential{
-		{Token: publisherToken, Role: controlplane.RolePublisher},
+		{Token: publisherToken, Role: controlplane.RolePublisher, OrgID: opts.publisherOrgID, FleetID: opts.publisherFleetID},
 		{Token: adminToken, Role: controlplane.RolePublisher, OrgID: opts.adminOrgID, FleetID: opts.adminFleetID},
 	})
 	if err != nil {
@@ -346,7 +355,8 @@ func buildServeHandler(ctx context.Context, opts serveOptions) (*serveHandler, h
 		if err := publisherAuthorizer(r); err == nil {
 			return nil
 		}
-		return adminAuthorizer(r)
+		_, err := adminAuthenticator(r)
+		return err
 	}
 	identity, err := controlplane.MTLSFollowerIdentityResolver(opts.followerTrustDomain)
 	if err != nil {
@@ -402,13 +412,17 @@ func buildServeHandler(ctx context.Context, opts serveOptions) (*serveHandler, h
 		FollowerIdentity:   identity,
 		AuthorizePublisher: publishRequestAuthorizer,
 		AuthorizeBundle:    publishAuthorizer,
-		AuthorizeFleetSkewOverride: func(r *http.Request, _ conductorcore.PolicyBundle, _ string) error {
-			return adminAuthorizer(r)
+		AuthorizeFleetSkewOverride: func(r *http.Request, bundle conductorcore.PolicyBundle, _ string) error {
+			admin, authErr := adminAuthenticator(r)
+			if authErr != nil || !admin.Allows(bundle.OrgID, bundle.FleetID) {
+				return controlplane.ErrPublisherForbidden
+			}
+			return nil
 		},
 		AuthorizeAuditQuery:   auditQueryAuthorizer,
 		AuthorizeFollowers:    followerListAuthorizer,
 		AuthorizeStream:       streamStatusAuthorizer,
-		AuthorizeAdmin:        adminAuthorizer,
+		AuthenticateAdmin:     adminAuthenticator,
 		AuditSink:             auditStore,
 		AuditKeys:             controlplane.CompositeAuditKeyResolver(enrollments, auditKeys),
 		Enrollments:           enrollments,

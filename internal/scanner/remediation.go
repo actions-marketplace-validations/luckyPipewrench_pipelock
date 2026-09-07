@@ -68,16 +68,16 @@ const (
 )
 
 const (
-	bodyDLPOperatorKnob        = "Request body DLP matched. For false positives, add a top-level suppress: entry with rule: set to the matched rule name and path: scoped to the request path."
-	bodyEntropyOperatorKnob    = "If this destination is trusted to receive opaque body or WebSocket-frame content, add only that host to `request_body_scanning.content_entropy_exclusions`; for a WebSocket-only endpoint, prefer `websocket_proxy.content_entropy_exclusions`. `trusted_domains` is broader because it also affects SSRF trust."
-	bodyEntropyOperatorBroader = "Raising `request_body_scanning.content_entropy_threshold` or setting `request_body_scanning.content_entropy_action: warn` affects opaque body/frame entropy for every destination; prefer a per-host exclusion first."
+	bodyDLPOperatorKnob        = "Request body DLP matched. For a non-core false positive, add a top-level `suppress:` entry with `rule:` set to the matched rule name and `path:` scoped to the request path. Core DLP matches cannot be suppressed; fix the core pattern's precision."
+	bodyEntropyOperatorKnob    = "For a known HTTPS upload endpoint, prefer an exact, expiring `request_body_scanning.content_entropy_warn_routes` entry so the finding remains visible. For a WebSocket-only endpoint, use `websocket_proxy.content_entropy_exclusions`."
+	bodyEntropyOperatorBroader = "Host-wide `request_body_scanning.content_entropy_exclusions`, `trusted_domains`, a higher entropy threshold, or a global warn action affect more traffic than one exact route; use them only when that broader scope is intended."
 	denialOfWalletOperatorKnob = "Correct the denial-of-wallet condition named by the reason. `runaway expansion` and alternating `cycle detected` use fixed detector thresholds and have no per-detector limit knob. " +
 		"To audit instead of block, set the matched `agents._default.budget.dow_action` (or `agents.<name>.budget.dow_action`) to `warn`; this changes enforcement for every denial-of-wallet finding."
 	denialOfWalletToolCallsOperatorKnob = "Raise `agents._default.budget.max_tool_calls_per_session` (or the matched `agents.<name>.budget.max_tool_calls_per_session`) if the DoW subject's per-window tool-call budget is intentionally higher."
 	denialOfWalletWallClockOperatorKnob = "Raise `agents._default.budget.max_wall_clock_minutes` (or the matched `agents.<name>.budget.max_wall_clock_minutes`) if the DoW subject's per-window active time is intentionally longer-lived."
 	denialOfWalletRetriesOperatorKnob   = "Raise `agents._default.budget.max_retries_per_tool` (or the matched `agents.<name>.budget.max_retries_per_tool`) if repeated identical calls are expected."
-	responseScanOperatorKnob            = "For a false-positive response finding, add a top-level `suppress:` entry with `rule:` set to the event's matched pattern and `path:` scoped to the exact request path. `response_scanning.exempt_domains` is broader: it disables injection scanning for every response from that host."
-	headerDLPOperatorKnob               = "For a false-positive header finding, add a top-level `suppress:` entry with `rule:` set to the matched DLP pattern and `path:` scoped to the exact request path. Header scanning calls this suppression list before enforcing the finding."
+	responseScanOperatorKnob            = "For a non-core false-positive response finding, add a top-level `suppress:` entry with `rule:` set to the event's matched pattern and `path:` scoped to the exact request path. Core response floor matches cannot be suppressed; fix the core pattern's precision. `response_scanning.exempt_domains` is broader: it disables injection scanning for every response from that host."
+	headerDLPOperatorKnob               = "For a non-core false-positive header finding, add a top-level `suppress:` entry with `rule:` set to the matched DLP pattern and `path:` scoped to the exact request path. Core DLP matches cannot be suppressed; fix the core pattern's precision."
 	bodyPromptInjectionOperatorKnob     = "Correct the outbound request body. The only destination carve-out this hard-block path consults is `response_scanning.exempt_domains`; adding a host there also disables injection scanning for every inbound response from that host, so it is a broad trust decision rather than a single-finding suppression."
 	addressProtectionOperatorKnob       = "After independently verifying the intended destination, add the exact address to `address_protection.allowed_addresses` (or the matched `agents.<name>.allowed_addresses`). Do not weaken similarity thresholds to approve one address."
 	chainDetectionOperatorKnob          = "If the event's named chain is expected, set that exact key under `tool_chain_detection.pattern_overrides` to `warn`; for a custom pattern, narrow its `sequence` or `action`. This changes only that named pattern."
@@ -99,7 +99,7 @@ const (
 	responseSizeOperatorKnob            = "Raise only the exact transport response ceiling named in the reason. A `response_scanning.size_exempt_domains` entry is not a universal override: fetch-handler response-size blocks do not consult it."
 	shieldOversizeOperatorKnob          = "Raise `browser_shield.max_shield_bytes` for the expected response size, or add only the trusted host to `browser_shield.exempt_domains`. Changing `browser_shield.oversize_action` to `warn` or `scan_head` permits incompletely shielded content and is broader."
 	contractOperatorKnob                = "Correct the action to match the active contract, or inspect and ratify a narrowly updated contract through the contract operator workflow. Disabling contract enforcement or broadening the manifest without review is not a safe remediation."
-	sseStreamOperatorKnob               = "For a false-positive SSE finding, add a top-level `suppress:` entry for the matched response rule and exact path. For event-size failures, raise `response_scanning.sse_streaming.max_event_bytes`; changing its action to `warn` affects every SSE finding."
+	sseStreamOperatorKnob               = "For a non-core false-positive SSE finding, add a top-level `suppress:` entry for the matched response rule and exact path. Core response floor matches cannot be suppressed; fix the core pattern's precision. For event-size failures, raise `response_scanning.sse_streaming.max_event_bytes`; changing its action to `warn` affects every SSE finding."
 	unscannableOperatorKnob             = "Remove or narrow the matching `response_scanning.unscannable_passthrough` entry to restore fail-closed scanning, or make the upstream response scannable. This event records an explicit full-content visibility gap; do not broaden the entry."
 	a2aScanOperatorKnob                 = "Correct the flagged A2A content. There is no per-finding suppression, and `a2a_scanning.action` is not a universal override: malformed/uninspectable payloads and hostname-exfiltration findings hard-block without consulting it."
 	a2aCardSignatureOperatorKnob        = "Sign the Agent Card with a key whose exact origin is authorized by `a2a_scanning.trusted_agent_card_keys`, or add the verified signer/origin pair there. Disabling signed-card requirements trusts every unsigned card and is broader."
@@ -258,7 +258,7 @@ var remediationGuidance = map[string]RemediationGuidance{
 		AgentReason:  "Request blocked: the URL scheme is not permitted.",
 	},
 	ScannerCoreResponse: {
-		OperatorKnob: "Core response scanning cannot be disabled wholesale, even when `response_scanning.enabled` is false. For a proven false positive, `ScanResponseWithSuppress` does consult the top-level `suppress:` list: match the exact core pattern name and scope `path:` to the affected response path.",
+		OperatorKnob: "Core response scanning is an immutable safety floor and cannot be suppressed or disabled by config. If this is a genuine false positive, the pattern itself must be tightened in a release; there is no per-pattern config carve-out.",
 		Immutable:    true,
 		AgentReason:  "Response blocked: a prompt-injection pattern was detected.",
 	},
@@ -364,7 +364,47 @@ func OperatorHintFor(label string) string {
 // entropy, while ScannerDenialOfWallet distinguishes budget-limit reasons.
 // Every other label falls through to the label-keyed table. This is the single
 // place that disambiguation lives, so explain, audit, and future consumers agree.
-func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
+// stripNestedURLReasonPrefix removes the "nested URL in query parameter %q: "
+// prefix so guidance routes on the INNER scanner reason. The parameter key is
+// attacker-chosen, and the SSRF routing below matches substrings such as
+// "metadata"; without this, a request naming its parameter "metadata" would be
+// explained with the immutable cloud-metadata guidance no matter what the
+// nested destination actually was.
+func stripNestedURLReasonPrefix(reason string) string {
+	open := nestedURLReasonPrefix + " \""
+	if !strings.HasPrefix(reason, open) {
+		return reason
+	}
+	rest := reason[len(open):]
+	// The key is %q-quoted, so the terminating quote is the first one not
+	// preceded by an odd number of backslashes.
+	for i := 0; i < len(rest); i++ {
+		if rest[i] != '"' {
+			continue
+		}
+		slashes := 0
+		for j := i - 1; j >= 0 && rest[j] == '\\'; j-- {
+			slashes++
+		}
+		if slashes%2 == 1 {
+			continue
+		}
+		if strings.HasPrefix(rest[i:], "\": ") {
+			return rest[i+3:]
+		}
+		return reason
+	}
+	return reason
+}
+
+func GuidanceForResult(label, reason string) (g RemediationGuidance, ok bool) {
+	nested := reason
+	reason = stripNestedURLReasonPrefix(reason)
+	defer func() {
+		if ok {
+			g = annotateNestedURLGuidance(g, label, nested, reason)
+		}
+	}()
 	// Some transports retain historical audit labels for the same enforcing
 	// family. Normalize them before reason routing so alternate labels cannot
 	// drift to a less accurate hint.
@@ -598,6 +638,15 @@ func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
 	// knobs that cannot exempt these targets. Route those reason-specific SSRF
 	// blocks to the non-overridable guidance regardless of which SSRF label
 	// carried them.
+	// A nested-destination timeout is an availability condition wearing an SSRF
+	// label. Route it before the SSRF knobs below, which would otherwise offer
+	// ssrf.ip_allowlist and trusted_domains for a block no allowlist can lift.
+	if strings.Contains(reason, nestedURLBudgetReason) {
+		return RemediationGuidance{
+			OperatorKnob: nestedURLBudgetOperatorKnob,
+			AgentReason:  nestedURLBudgetAgentReason,
+		}, true
+	}
 	if label == ScannerSSRF || label == ScannerSSRFMetadata || label == ScannerCoreSSRF {
 		if strings.Contains(reason, "metadata") {
 			return RemediationGuidance{
@@ -615,6 +664,39 @@ func GuidanceForResult(label, reason string) (RemediationGuidance, bool) {
 		}
 	}
 	return GuidanceFor(label)
+}
+
+// nestedURLBudgetReason is the substring that identifies a nested-destination
+// resolution timeout. Guidance for it must never name an allowlist: no allowlist
+// entry makes a resolver answer faster, and naming one teaches an operator that
+// policy changed when nothing did.
+const nestedURLBudgetReason = "shared resolution budget"
+
+const nestedURLBudgetOperatorKnob = "Nested query destinations could not be resolved within the shared resolution budget, so the request was refused with a destination left unverified. This is resolver availability, not detection: check resolver health and latency for the hostnames named in the request. To stop evaluating query-parameter destinations entirely, set `fetch_proxy.monitoring.scan_nested_urls` to false."
+
+const nestedURLBudgetAgentReason = "a destination named inside this request could not be verified in time"
+
+func annotateNestedURLGuidance(g RemediationGuidance, label, reason, stripped string) RemediationGuidance {
+	// A resolution timeout already carries its own guidance and must not be
+	// annotated with the destination-knob sentence: no allowlist lifts a timeout.
+	// Test the STRIPPED reason, never the raw one. The raw reason still carries
+	// the query key, which the client chooses, so matching on it let a parameter
+	// named after the budget suppress the sentence on a genuine destination block.
+	if strings.Contains(strings.ToLower(stripped), strings.ToLower(nestedURLBudgetReason)) {
+		return g
+	}
+	if !strings.Contains(strings.ToLower(reason), "nested url in query parameter") {
+		return g
+	}
+	nestedKnob := " Nested query destinations are evaluated because `fetch_proxy.monitoring.scan_nested_urls` is enabled (nil/true). Set it false only for an endpoint whose contract legitimately carries private or blocklisted URLs in query strings."
+	switch label {
+	case ScannerSSRF, ScannerCoreSSRF:
+		if !g.Immutable {
+			nestedKnob += " The nested host consults `ssrf.ip_allowlist`, `trusted_domains`, and `dns.host_overrides` because it reuses the same destination checks as the outer host."
+		}
+	}
+	g.OperatorKnob += nestedKnob
+	return g
 }
 
 // OperatorHintForResult is OperatorHintFor with Reason-based disambiguation. Use

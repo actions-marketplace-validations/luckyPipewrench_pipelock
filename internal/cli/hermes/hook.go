@@ -108,6 +108,7 @@ Exit code is 0 when the command completes successfully; the decision JSON
 drives Hermes-side behaviour.`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		Args:          cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			ctx, cancel := context.WithTimeout(cmd.Context(), timeout)
 			defer cancel()
@@ -161,6 +162,9 @@ func runHook(ctx context.Context, cmd *cobra.Command, configFile string) error {
 			result := rules.MergeIntoConfig(c, cliutil.Version)
 			for _, e := range result.Errors {
 				_, _ = fmt.Fprintf(stderr, "pipelock hermes hook: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range result.Warnings {
+				_, _ = fmt.Fprintf(stderr, "pipelock hermes hook: warning: %s\n", w)
 			}
 		},
 	}, stderr, "hermes hook")
@@ -278,7 +282,11 @@ func scanCombined(ctx context.Context, sc *scanner.Scanner, text, surface string
 		}
 	}
 
-	if resp := sc.ScanResponse(ctx, text); !resp.Clean && len(resp.Matches) > 0 {
+	resp := sc.ScanResponse(ctx, text)
+	if resp.Failed() {
+		return blockDecision(fmt.Sprintf("pipelock scan failed on %s: %s", surface, resp.ScanError))
+	}
+	if !resp.Clean && len(resp.Matches) > 0 {
 		first := resp.Matches[0]
 		return blockDecision(fmt.Sprintf("pipelock injection match on %s: %s",
 			surface, first.PatternName))

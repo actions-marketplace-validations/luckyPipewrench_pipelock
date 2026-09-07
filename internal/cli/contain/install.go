@@ -21,6 +21,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
 // installOpts collects the flag-derived state for runInstall. Mirrored as
@@ -35,6 +36,14 @@ type installOpts struct {
 }
 
 var containUsernamePattern = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// Test seams keep the command-level host preflight load-bearing: an
+// unsupported host must fail before an install environment is constructed.
+var (
+	requireContainInstallPrivilege = requireContainPrivilege
+	requireContainInstallHost      = requireContainHost
+	newContainInstallEnv           = defaultInstallEnv
+)
 
 // containToolNameRegex is the shared regex that both plk-launch and the plk
 // meta-wrapper enforce on operator-supplied tool names. Keeping a single
@@ -79,10 +88,15 @@ Exit codes:
 			if err := validatePort(opts.proxyPort); err != nil {
 				return cliutil.ExitCodeError(cliutil.ExitConfig, err)
 			}
-			if !opts.dryRun && os.Geteuid() != 0 {
-				return cliutil.ExitCodeError(cliutil.ExitConfig, errors.New("install must be run as root (use sudo)"))
+			if !opts.dryRun {
+				if err := requireContainInstallPrivilege("install"); err != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+				}
+				if err := requireContainInstallHost(); err != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+				}
 			}
-			env := defaultInstallEnv(cmd.OutOrStdout())
+			env := newContainInstallEnv(cmd.OutOrStdout())
 			if opts.operatorUser != "" {
 				env.operatorUser = opts.operatorUser
 			}
@@ -1426,7 +1440,9 @@ func renderSystemUnit(env *installEnv) string {
 		"Type=simple",
 		"User=" + env.proxyUserName,
 		"Group=" + env.proxyUserName,
+		"Environment=" + config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue,
 		"ExecStart=" + env.pipelockTarget + " run --config " + configPath + " --capture-output " + capturePath,
+		"ExecReload=/bin/kill -HUP $MAINPID",
 		"Restart=on-failure",
 		"RestartSec=5",
 		"",

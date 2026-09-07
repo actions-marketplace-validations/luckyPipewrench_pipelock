@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -207,6 +208,7 @@ func makeProbeEnv(t *testing.T, opts ...func(*probeEnv)) *probeEnv {
 		serviceName:        testService,
 		pinPath:            filepath.Join(t.TempDir(), "binary-pin.sha256"),
 		toolsListPath:      filepath.Join(t.TempDir(), "tools.list"),
+		configPath:         filepath.Join(t.TempDir(), "pipelock.yaml"),
 		pipelockTarget:     defaultPipelockTarget,
 		verifyRunningImage: true,
 		runCmd:             rejectAllRun,
@@ -461,6 +463,92 @@ func TestParseSystemdShow(t *testing.T) {
 	}
 }
 
+func TestProbeManagedConfigMetrics(t *testing.T) {
+	tests := []struct {
+		name       string
+		read       func(string) ([]byte, error)
+		wantStatus string
+		wantDetail string
+	}{
+		{
+			name:       "compliant dedicated loopback listener passes",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 127.0.0.1:9091\n"), nil },
+			wantStatus: statusPass,
+			wantDetail: "keeps metrics off",
+		},
+		{
+			name: "current metrics exposure policy passes",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2099-01-01T00:00:00Z\n"), nil
+			},
+			wantStatus: statusPass,
+			wantDetail: "keeps metrics off",
+		},
+		{
+			name:       "non-loopback listener without exposure policy fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 192.0.2.20:9091\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "requires containment.metrics_exposure",
+		},
+		{
+			name: "malformed metrics exposure policy fails",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2099-01-01T00:00:00Z\n    typo: true\n"), nil
+			},
+			wantStatus: statusFail,
+			wantDetail: "parse containment.metrics_exposure",
+		},
+		{
+			name: "expired metrics exposure policy fails",
+			read: func(string) ([]byte, error) {
+				return []byte("metrics_listen: 192.0.2.20:9091\ncontainment:\n  metrics_exposure:\n    allow_full_metrics: true\n    allowed_source_cidrs: [192.0.2.42/32]\n    owner: observability\n    reason: Prometheus scrape\n    expires_at: 2000-01-01T00:00:00Z\n"), nil
+			},
+			wantStatus: statusFail,
+			wantDetail: "expired at",
+		},
+		{
+			name:       "wildcard listener fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 0.0.0.0:9091\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "unsafe for containment",
+		},
+		{
+			name:       "proxy port fails",
+			read:       func(string) ([]byte, error) { return []byte("metrics_listen: 127.0.0.1:8888\n"), nil },
+			wantStatus: statusFail,
+			wantDetail: "agent-accessible proxy port",
+		},
+		{
+			name:       "missing config skips",
+			read:       func(string) ([]byte, error) { return nil, os.ErrNotExist },
+			wantStatus: statusSkip,
+			wantDetail: "is missing",
+		},
+		{
+			name:       "unreadable config skips",
+			read:       func(string) ([]byte, error) { return nil, os.ErrPermission },
+			wantStatus: statusSkip,
+			wantDetail: "rerun as root",
+		},
+		{
+			name:       "io failure is unknown",
+			read:       func(string) ([]byte, error) { return nil, errors.New("I/O fault") },
+			wantStatus: statusUnknown,
+			wantDetail: "I/O fault",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := makeProbeEnv(t, func(env *probeEnv) { env.readFile = tc.read })
+			status, detail := probeManagedConfigMetrics(t.Context(), env)
+			if status != tc.wantStatus || !strings.Contains(detail, tc.wantDetail) {
+				t.Fatalf("probe = (%q, %q), want (%q, detail containing %q)", status, detail, tc.wantStatus, tc.wantDetail)
+			}
+		})
+	}
+}
+
 // Probe 3: nftables_containment_ruleset --------------------------------------
 
 func TestProbeNFTContainment(t *testing.T) {
@@ -481,6 +569,25 @@ func TestProbeNFTContainment(t *testing.T) {
 		{
 			name:       "happy path",
 			stdout:     goodNFTContainmentOutput,
+			code:       0,
+			wantStatus: statusPass,
+			wantDetail: "skuid drop rule",
+		},
+		{
+			name: "established server reply remains compatible",
+			stdout: `table inet pipelock_containment {
+		chain output_filter {
+			type filter hook output priority filter; policy accept;
+			meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction reply counter packets 3 bytes 180 accept
+			meta skuid 1000 accept
+			meta skuid 988 accept
+			meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+			meta skuid 987 udp dport 53 counter packets 0 bytes 0 drop
+			meta skuid 987 tcp dport 53 counter packets 0 bytes 0 drop
+			meta skuid 987 counter packets 9 bytes 540 drop
+		}
+	}
+`,
 			code:       0,
 			wantStatus: statusPass,
 			wantDetail: "skuid drop rule",
@@ -1039,6 +1146,38 @@ func TestProbeNFTContainment(t *testing.T) {
 	}
 }
 
+func TestLineHasAgentEstablishedReplyAllow(t *testing.T) {
+	tests := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{name: "loopback numeric state", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state 0x2 ct direction reply accept # handle 18`, want: true},
+		{name: "numeric state and direction", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state 0x2 ct direction 1 accept # handle 18`, want: true},
+		{name: "tailnet named state", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`, want: true},
+		{name: "bookkeeping", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction reply counter packets 3 bytes 180 log prefix "reply path " accept`, want: true},
+		{name: "interface index", line: `meta skuid 987 oif 7 ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`, want: true},
+		{name: "missing reply direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established accept`},
+		{name: "original direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction original accept`},
+		{name: "numeric original direction", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state 0x2 ct direction 0 accept`},
+		{name: "new connection", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state new ct direction reply accept`},
+		{name: "state set includes new", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp sport 8642 ct state { established, new } ct direction reply accept`},
+		{name: "destination port", line: `meta skuid 987 oifname "tailscale0" ip saddr 100.100.47.101 tcp dport 8642 ct state established ct direction reply accept`},
+		{name: "missing interface", line: `meta skuid 987 ip saddr 100.100.47.101 tcp sport 8642 ct state established ct direction reply accept`},
+		{name: "wrong uid", line: `meta skuid 986 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state established ct direction reply accept`},
+		{name: "port zero", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 0 ct state established ct direction reply accept`},
+		{name: "IPv6 under IPv4 family", line: `meta skuid 987 oifname "lo" ip daddr ::1 tcp sport 9119 ct state established ct direction reply accept`},
+		{name: "extra verdict", line: `meta skuid 987 oifname "lo" ip daddr 127.0.0.1 tcp sport 9119 ct state established ct direction reply accept return`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := lineHasAgentEstablishedReplyAllow(tt.line, 987); got != tt.want {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFieldsAreNFTBookkeeping(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1096,11 +1235,12 @@ func TestProbeNFTContainment_ChecksPersistenceUnit(t *testing.T) {
 	tests := []struct {
 		name       string
 		unitBody   func(string) string
+		rulesBody  func() string
 		wantStatus string
 		wantDetail string
 	}{
 		{
-			name: "exec start points at managed rules",
+			name: "canonical rules and exec start point at managed rules",
 			unitBody: func(rulesPath string) string {
 				return "[Service]\nExecStart=/usr/sbin/nft -f " + rulesPath + "\n"
 			},
@@ -1123,6 +1263,30 @@ func TestProbeNFTContainment_ChecksPersistenceUnit(t *testing.T) {
 			wantStatus: statusFail,
 			wantDetail: "missing ExecStart",
 		},
+		{
+			name: "stale persisted rules fail despite canonical live rules and matching unit",
+			unitBody: func(rulesPath string) string {
+				return "[Service]\nExecStart=/usr/sbin/nft -f " + rulesPath + "\n"
+			},
+			rulesBody: func() string {
+				return `# Pipelock containment ruleset (managed by pipelock contain install).
+# operator=1000  pipelock-proxy=988  pipelock-agent=987  proxy-port=8888
+table inet pipelock_containment {
+    chain output_filter {
+        type filter hook output priority filter; policy accept;
+
+        meta skuid 1000 accept
+        meta skuid 988 accept
+
+        meta skuid 987 ip daddr 127.0.0.1 tcp dport 8888 accept
+        meta skuid 987 drop
+    }
+}
+`
+			},
+			wantStatus: statusFail,
+			wantDetail: "does not match the canonical containment boundary",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1130,6 +1294,13 @@ func TestProbeNFTContainment_ChecksPersistenceUnit(t *testing.T) {
 			tmp := t.TempDir()
 			unitPath := filepath.Join(tmp, "pipelock-containment-nft.service")
 			rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+			rulesBody := renderNFTRules(1000, 988, 987, 8888, testTable, testChain)
+			if tc.rulesBody != nil {
+				rulesBody = tc.rulesBody()
+			}
+			if err := os.WriteFile(rulesPath, []byte(rulesBody), 0o600); err != nil {
+				t.Fatalf("write persisted rules: %v", err)
+			}
 			if err := os.WriteFile(unitPath, []byte(tc.unitBody(rulesPath)), 0o600); err != nil {
 				t.Fatalf("write persistence unit: %v", err)
 			}
@@ -1151,6 +1322,36 @@ func TestProbeNFTContainment_ChecksPersistenceUnit(t *testing.T) {
 				t.Fatalf("detail: got %q, want substring %q", gotDetail, tc.wantDetail)
 			}
 		})
+	}
+}
+
+func TestProbeNFTContainment_RejectsPersistedOperatorUIDDrift(t *testing.T) {
+	tmp := t.TempDir()
+	rulesPath := filepath.Join(tmp, "50-pipelock-containment.nft")
+	unitPath := filepath.Join(tmp, "pipelock-containment-nft.service")
+	if err := os.WriteFile(rulesPath, []byte(renderNFTRules(98, 988, 987, 8888, testTable, testChain)), 0o600); err != nil {
+		t.Fatalf("write persisted rules: %v", err)
+	}
+	if err := os.WriteFile(unitPath, []byte("[Service]\nExecStart=/usr/sbin/nft -f "+rulesPath+"\n"), 0o600); err != nil {
+		t.Fatalf("write persistence unit: %v", err)
+	}
+	env := makeProbeEnv(t, func(e *probeEnv) {
+		e.operatorUser = testOperatorUser
+		e.lookupUser = containTestLookup
+		e.nftRulesPath = rulesPath
+		e.nftPersistUnitPath = unitPath
+		e.readFile = os.ReadFile
+		e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
+			return renderNFTRules(98, 988, 987, 8888, testTable, testChain), 0, nil
+		}
+	})
+
+	gotStatus, gotDetail := probeNFTContainment(context.Background(), env)
+	if gotStatus != statusFail {
+		t.Fatalf("status: got %q, want fail (detail=%q)", gotStatus, gotDetail)
+	}
+	if !strings.Contains(gotDetail, "does not match current operator uid 1000") {
+		t.Fatalf("detail: got %q, want current operator uid drift", gotDetail)
 	}
 }
 
@@ -2795,10 +2996,10 @@ func TestRunVerify_TextOutput_AllPass(t *testing.T) {
 	if !strings.HasPrefix(out, "pipelock contain verify") {
 		t.Errorf("missing header: %q", out)
 	}
-	if strings.Count(out, "[PASS]") != 12 {
-		t.Errorf("want 12 [PASS] lines, got %d in %q", strings.Count(out, "[PASS]"), out)
+	if strings.Count(out, "[PASS]") != 13 {
+		t.Errorf("want 13 [PASS] lines, got %d in %q", strings.Count(out, "[PASS]"), out)
 	}
-	if !strings.Contains(out, "12 PASS / 0 FAIL / 0 SKIP") {
+	if !strings.Contains(out, "13 PASS / 0 FAIL / 0 SKIP") {
 		t.Errorf("missing aggregate: %q", out)
 	}
 }
@@ -2815,10 +3016,10 @@ func TestRunVerify_JSONOutput_AllPass(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
-	if len(lines) != 13 {
-		t.Fatalf("expected 13 JSON records (12 probes + aggregate), got %d: %q", len(lines), buf.String())
+	if len(lines) != 14 {
+		t.Fatalf("expected 14 JSON records (13 probes + aggregate), got %d: %q", len(lines), buf.String())
 	}
-	for i := 0; i < 12; i++ {
+	for i := 0; i < 13; i++ {
 		var rec probeRecord
 		if err := json.Unmarshal([]byte(lines[i]), &rec); err != nil {
 			t.Fatalf("line %d: parse: %v (line=%q)", i, err, lines[i])
@@ -2831,10 +3032,10 @@ func TestRunVerify_JSONOutput_AllPass(t *testing.T) {
 		}
 	}
 	var agg aggregateRecord
-	if err := json.Unmarshal([]byte(lines[12]), &agg); err != nil {
-		t.Fatalf("aggregate: parse: %v (line=%q)", err, lines[12])
+	if err := json.Unmarshal([]byte(lines[13]), &agg); err != nil {
+		t.Fatalf("aggregate: parse: %v (line=%q)", err, lines[13])
 	}
-	if agg.Aggregate.Pass != 12 || agg.Aggregate.Fail != 0 || agg.Aggregate.Skip != 0 {
+	if agg.Aggregate.Pass != 13 || agg.Aggregate.Fail != 0 || agg.Aggregate.Skip != 0 {
 		t.Errorf("aggregate counts: %+v", agg.Aggregate)
 	}
 	if agg.Aggregate.ExitCode != cliutil.ExitOK {
@@ -2879,7 +3080,7 @@ func TestRunVerify_EnforcementOnlySkipsProxyLiveness(t *testing.T) {
 	if strings.Contains(out, "probe 2:") || strings.Contains(out, "probe 6:") {
 		t.Errorf("liveness probes should be omitted: %q", out)
 	}
-	if !strings.Contains(out, "10 PASS / 0 FAIL / 0 SKIP") {
+	if !strings.Contains(out, "11 PASS / 0 FAIL / 0 SKIP") {
 		t.Errorf("missing enforcement-only aggregate: %q", out)
 	}
 	if !strings.Contains(out, "probe 10: deployed pipelock binary matches TOFU pin; running-service image is not verified") ||
@@ -3095,8 +3296,8 @@ func TestRunVerify_JSONUnknownIsIncomplete(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-	if len(lines) != 13 {
-		t.Fatalf("JSON record count = %d, want 13: %q", len(lines), buf.String())
+	if len(lines) != 14 {
+		t.Fatalf("JSON record count = %d, want 14: %q", len(lines), buf.String())
 	}
 	var canary probeRecord
 	if err := json.Unmarshal([]byte(lines[7]), &canary); err != nil {
@@ -3106,11 +3307,11 @@ func TestRunVerify_JSONUnknownIsIncomplete(t *testing.T) {
 		t.Fatalf("canary record = %+v, want probe 8 unknown", canary)
 	}
 	var agg aggregateRecord
-	if err := json.Unmarshal([]byte(lines[12]), &agg); err != nil {
+	if err := json.Unmarshal([]byte(lines[13]), &agg); err != nil {
 		t.Fatalf("decode aggregate: %v", err)
 	}
-	if agg.Aggregate.Unknown != 1 || agg.Aggregate.Pass != 11 || agg.Aggregate.ExitCode != cliutil.ExitConfig {
-		t.Fatalf("aggregate = %+v, want 11 pass / 1 unknown / exit 2", agg.Aggregate)
+	if agg.Aggregate.Unknown != 1 || agg.Aggregate.Pass != 12 || agg.Aggregate.ExitCode != cliutil.ExitConfig {
+		t.Fatalf("aggregate = %+v, want 12 pass / 1 unknown / exit 2", agg.Aggregate)
 	}
 }
 
@@ -3147,14 +3348,14 @@ func TestRunVerify_MixedOutcomesPreserveWorstResultInTextAndJSON(t *testing.T) {
 				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
 					t.Fatalf("decode aggregate: %v\n%s", err, out)
 				}
-				if agg.Aggregate.Pass != 8 || agg.Aggregate.Fail != 1 ||
+				if agg.Aggregate.Pass != 9 || agg.Aggregate.Fail != 1 ||
 					agg.Aggregate.Skip != 2 || agg.Aggregate.Unknown != 1 ||
 					agg.Aggregate.ExitCode != cliutil.ExitGeneral {
-					t.Fatalf("mixed aggregate = %+v, want 8 pass / 1 fail / 2 skip / 1 unknown / exit 1", agg.Aggregate)
+					t.Fatalf("mixed aggregate = %+v, want 9 pass / 1 fail / 2 skip / 1 unknown / exit 1", agg.Aggregate)
 				}
 				return
 			}
-			if !strings.Contains(out, "8 PASS / 1 FAIL / 2 SKIP / 1 UNKNOWN — exit 1") {
+			if !strings.Contains(out, "9 PASS / 1 FAIL / 2 SKIP / 1 UNKNOWN — exit 1") {
 				t.Fatalf("text lost a mixed outcome or fail precedence:\n%s", out)
 			}
 		})
@@ -3178,9 +3379,9 @@ func TestRunVerify_RecordAndAggregateWriteFailuresFailClosed(t *testing.T) {
 		want             string
 	}{
 		{name: "text probe", successfulWrites: 1, want: "writing probe 1 text"},
-		{name: "text aggregate", successfulWrites: 13, want: "writing verify aggregate"},
+		{name: "text aggregate", successfulWrites: 14, want: "writing verify aggregate"},
 		{name: "JSON probe", jsonOutput: true, want: "encoding probe 1 JSON"},
-		{name: "JSON aggregate", jsonOutput: true, successfulWrites: 12, want: "encoding aggregate JSON"},
+		{name: "JSON aggregate", jsonOutput: true, successfulWrites: 13, want: "encoding aggregate JSON"},
 	}
 
 	for _, tc := range tests {
@@ -3331,6 +3532,12 @@ func TestMutatingSubcommandsRequireRoot(t *testing.T) {
 		{"rollback", nil},
 		{"add-tool", []string{"validname"}},
 		{"ca-refresh", nil},
+		// upgrade and the two workspace subcommands run the same gate and were
+		// absent from this table, so the branch that refuses an unprivileged
+		// mutation was unexercised for three of the seven sites.
+		{"upgrade", nil},
+		{"grant-workspace", []string{"/tmp/pipelock-workspace-gate-probe"}},
+		{"revoke-workspace", []string{"/tmp/pipelock-workspace-gate-probe"}},
 	}
 	root := Cmd()
 	for _, tc := range cases {
@@ -3346,8 +3553,15 @@ func TestMutatingSubcommandsRequireRoot(t *testing.T) {
 			if code := cliutil.ExitCodeOf(err); code != cliutil.ExitConfig {
 				t.Errorf("%s exit code: got %d, want %d (ExitConfig)", tc.subcmd, code, cliutil.ExitConfig)
 			}
-			if !strings.Contains(err.Error(), "must be run as root") {
-				t.Errorf("%s error: got %q, want substring 'must be run as root'", tc.subcmd, err)
+			// The gate refuses for a different reason per platform: Windows
+			// has no containment implementation at all, so it fails on the
+			// platform check before privilege is ever considered.
+			want := "must be run as root"
+			if runtime.GOOS == "windows" {
+				want = "not supported on Windows"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s error: got %q, want substring %q", tc.subcmd, err, want)
 			}
 		})
 	}
@@ -3404,6 +3618,7 @@ func allPassEnv(t *testing.T) *probeEnv {
 	env := makeProbeEnv(t)
 	env.operatorUser = testOperatorUser
 	env.nftRulesPath = filepath.Join(t.TempDir(), "50-pipelock-containment.nft")
+	env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
 
 	// Probe 1: both users present.
 	env.lookupUser = func(name string) (*user.User, error) {
@@ -3462,6 +3677,9 @@ func allPassEnv(t *testing.T) *probeEnv {
 		return defaultRunForAllPass(name, args)
 	}
 	env.readFile = func(path string) ([]byte, error) {
+		if path == env.configPath {
+			return []byte("metrics_listen: 127.0.0.1:9091\n"), nil
+		}
 		if path == env.pinPath {
 			return []byte(allPassHash + "\n"), nil
 		}

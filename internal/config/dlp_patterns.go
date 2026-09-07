@@ -3,18 +3,38 @@
 
 package config
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 //go:generate go run ./gen_dlp_presets.go
+
+// ProviderKeyLeftBoundaryRegex is the raw-text false-positive boundary shared
+// by the shipped Anthropic and OpenAI key patterns. Scanner views that remove
+// separators derive a credential-only matcher by removing this exact prefix;
+// keep it separate from the credential body so that derivation cannot drift.
+const (
+	ProviderKeyLeftBoundaryRegex = `(?:^|[^A-Za-z0-9_-])`
+	AnthropicKeyBodyRegex        = `sk-ant-[a-zA-Z0-9\-_]{20,}`
+	OpenAIKeyBodyRegex           = `sk-proj-[a-zA-Z0-9\-_]{20,}`
+	OpenAIServiceKeyBodyRegex    = `sk-svcacct-[a-zA-Z0-9\-_]{20,}`
+)
 
 // defaultDLPPatternSet is the canonical shipped DLP pattern registry.
 // Defaults, generated presets, and drift tests read from this list instead of
 // carrying separate name/regex/severity copies.
 var defaultDLPPatternSet = []DLPPattern{
 	// Provider API keys
-	{Name: "Anthropic API Key", Regex: `sk-ant-[a-zA-Z0-9\-_]{20,}\b`, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("Anthropic API Key")},
-	{Name: "OpenAI API Key", Regex: `sk-proj-[a-zA-Z0-9\-_]{20,}\b`, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("OpenAI API Key")},
-	{Name: "OpenAI Service Key", Regex: `sk-svcacct-[a-zA-Z0-9\-]{20,}\b`, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("OpenAI Service Key")},
+	// Provider key suffixes are opaque and may contain '-' or '_', so \b is
+	// not a safe boundary. The explicit raw-text delimiter rejects prose words
+	// ending in "sk" (for example, "desk-ant-..."). Scanner views that remove
+	// separators match the credential body without this boundary because their
+	// adjacency is manufactured rather than present in the source text.
+	// Do not add a length floor: these provider formats are opaque.
+	{Name: "Anthropic API Key", Regex: ProviderKeyLeftBoundaryRegex + AnthropicKeyBodyRegex, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("Anthropic API Key")},
+	{Name: "OpenAI API Key", Regex: ProviderKeyLeftBoundaryRegex + OpenAIKeyBodyRegex, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("OpenAI API Key")},
+	{Name: "OpenAI Service Key", Regex: ProviderKeyLeftBoundaryRegex + OpenAIServiceKeyBodyRegex, Severity: SeverityCritical, ExemptDomains: providerKeyExemptDomains("OpenAI Service Key")},
 	// Fireworks API keys use an "fw_" prefix with a 22-character
 	// alphanumeric suffix. Keep the trailing word boundary so longer
 	// opaque base64-ish IDs do not match a 22-character prefix.
@@ -34,9 +54,12 @@ var defaultDLPPatternSet = []DLPPattern{
 	{Name: "Stripe Webhook Secret", Regex: `whsec_[a-zA-Z0-9_\-]{20,}`, Severity: SeverityCritical},
 
 	// Source control tokens
-	// GitHub tokens are base64url-ish after a short "gh?_"/"github_pat_"
-	// prefix. Keep these unanchored so glued-key exfiltration still matches.
-	{Name: "GitHub Token", Regex: `gh[pousr]_[A-Za-z0-9_]{36,}`, Severity: SeverityCritical},
+	// GitHub's classic tokens are base64url-ish after a short "gh?_" prefix.
+	// Stateless server-to-server tokens use ghs_ followed by a JWT and therefore
+	// also contain dots and hyphens. Keep the broader alphabet scoped to ghs_ so
+	// the other short prefixes do not start matching dotted prose.
+	// Source: https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/
+	{Name: "GitHub Token", Regex: `(?:gh[pour]_[A-Za-z0-9_]{36,}|ghs_[A-Za-z0-9.\-_]{36,})`, Severity: SeverityCritical},
 	{Name: "GitHub Fine-Grained PAT", Regex: `github_pat_[a-zA-Z0-9_]{36,}`, Severity: SeverityCritical},
 	// GitLab personal access tokens: "glpat-" prefix, 20+ chars.
 	{Name: "GitLab PAT", Regex: `glpat-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
@@ -93,11 +116,11 @@ var defaultDLPPatternSet = []DLPPattern{
 	// (86 + "==") in an AccountKey= connection-string field. Anchored
 	// on AccountKey= so arbitrary 88-char base64 does not match.
 	{Name: "Azure Storage Account Key", Regex: `AccountKey=[A-Za-z0-9+/]{86}==`, Severity: SeverityCritical},
-	// Azure SAS signature: the sig= parameter is a URL-encoded base64
-	// HMAC-SHA256 (32 bytes -> 44 base64 chars, trailing '=' as %3D).
-	// Anchored on the urlencoded padding; severity "high" reflects the
-	// generality of a "sig=" parameter name.
-	{Name: "Azure SAS Token", Regex: `\bsig=[A-Za-z0-9%]{43,}%3d\b`, Severity: SeverityHigh},
+	// Azure SAS signature: the sig= parameter is a base64 HMAC-SHA256
+	// (32 bytes -> 44 base64 chars). Match both the URI form with encoded
+	// padding and the decoded form read after a carrier is unescaped.
+	// Source: https://learn.microsoft.com/en-us/rest/api/storageservices/create-account-sas
+	{Name: "Azure SAS Token", Regex: `\bsig=(?:[A-Za-z0-9%]{43,}%3d\b|[A-Za-z0-9+/]{43}=)`, Severity: SeverityHigh},
 
 	// Messaging platform tokens
 	{Name: "Slack Token", Regex: `xox[bpras]-[0-9a-zA-Z-]{15,}`, Severity: SeverityCritical},
@@ -257,7 +280,10 @@ var defaultDLPPatternSet = []DLPPattern{
 	// otherwise turn into a spurious match by deleting the value's
 	// natural delimiter: command substitution (token=$(...)),
 	// backticks, and quoted variable refs (password="$VAR").
-	{Name: "Credential in URL", Regex: `(?m)(?:^|[?&;])\s*(?:password|passwd|secret|token|apikey|api_key|api-key)\s*=\s*[A-Za-z0-9_+/=~%.-][^\s&;]{3,}`, Severity: SeverityHigh},
+	// The line-start branch is intentionally strict around '=': spaced source
+	// assignments are not URL credentials. Delimiter-led query parameters keep
+	// whitespace tolerance for decoded and hand-written URLs.
+	{Name: "Credential in URL", Regex: `(?m)(?:^\s*(?:password|passwd|secret|token|apikey|api_key|api-key)=[A-Za-z0-9_+/=~%.-][^\s&;]{3,}|[?&;]\s*(?:password|passwd|secret|token|apikey|api_key|api-key)\s*=\s*[A-Za-z0-9_+/=~%.-][^\s&;]{3,})`, Severity: SeverityHigh, CredentialURLWhitespaceGrammar: true},
 	// Environment variable credential patterns: catches env var dumps
 	// where the secret-bearing keyword is the terminal segment of an
 	// UPPER_CASE name (e.g., AWS_SECRET_ACCESS_KEY=..., STRIPE_SECRET_KEY=...,
@@ -364,12 +390,12 @@ var coreOnlyDLPPatterns = []DLPPattern{
 // safety floor used by the scanner.
 func IsCoreDLPPatternName(name string) bool {
 	for _, coreName := range coreDLPPatternNames {
-		if name == coreName {
+		if strings.EqualFold(name, coreName) {
 			return true
 		}
 	}
 	for _, pattern := range coreOnlyDLPPatterns {
-		if name == pattern.Name {
+		if strings.EqualFold(name, pattern.Name) {
 			return true
 		}
 	}

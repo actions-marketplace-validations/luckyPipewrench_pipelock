@@ -99,6 +99,13 @@ type LiveRunOpts struct {
 	// OrchestratorKeyPath, when non-empty, loads the run's orchestrator
 	// (trust-root) signing key from disk instead of generating an ephemeral one.
 	OrchestratorKeyPath string
+	// SessionPrivateKey, when set, is the short-lived session signer minted by
+	// the broker. It takes precedence over OrchestratorKeyPath. The durable
+	// root private key must not be supplied here.
+	SessionPrivateKey ed25519.PrivateKey
+	// Delegation, when set, is written into the run directory and bound into
+	// the launch manifest before signing.
+	Delegation *OrchestratorDelegation
 	// ModelBaseURL, when non-empty, allowlists the model API host in the lab
 	// proxy so a model-backed agent's chat-completions calls can egress through
 	// it. This is the ONLY real-egress destination the lab proxy permits; the
@@ -126,10 +133,14 @@ type LiveRun struct {
 	// Keys
 	orchestratorPub  ed25519.PublicKey
 	orchestratorPriv ed25519.PrivateKey
-	collectorPub     ed25519.PublicKey
-	collectorPriv    ed25519.PrivateKey
-	pipelockPub      ed25519.PublicKey
-	pipelockPriv     ed25519.PrivateKey
+	// delegationRoot is the durable root that authenticated orchestratorPub when
+	// this run uses delegated signing. It is retained so sealing verifies the
+	// delegation against the root rather than against the delegated signer.
+	delegationRoot ed25519.PublicKey
+	collectorPub   ed25519.PublicKey
+	collectorPriv  ed25519.PrivateKey
+	pipelockPub    ed25519.PublicKey
+	pipelockPriv   ed25519.PrivateKey
 
 	// Infrastructure
 	safeTarget   *SafeTarget
@@ -147,6 +158,7 @@ type LiveRun struct {
 	// Scenario / config
 	scenario    replaycapture.Scenario
 	manifest    LaunchManifest
+	delegation  *OrchestratorDelegation
 	opts        LiveRunOpts
 	evidenceDir string
 	policyHash  string
@@ -281,11 +293,56 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 	}()
 
 	// --- Key generation ---
-	// The orchestrator key is the run's trust root. When a stable key path is
-	// supplied, load it (so the run signs under the published demo key and is
-	// verifiable against PublishedOrchestratorPubKeyHex); otherwise generate an
-	// ephemeral per-run key (the dev default).
-	if opts.OrchestratorKeyPath != "" {
+	// Delegated live sessions sign with a broker-minted session key. A path
+	// loads a durable key for local/legacy runs. Empty means an ephemeral
+	// per-run key (dev default).
+	switch {
+	case opts.Delegation != nil && len(opts.SessionPrivateKey) == 0:
+		// The manifest records the delegation regardless of which signer is
+		// selected, so a delegation without its session key would produce a
+		// run claiming an authorization its actual signer never held.
+		//
+		// Each refusal below assigns the named err before returning, because
+		// the deferred cleanup keys on it; a bare return would skip lr.Close()
+		// and leave this run's context attached to its parent.
+		err = fmt.Errorf("delegation requires the session signing key it authorizes")
+		return nil, err
+	case len(opts.SessionPrivateKey) != 0:
+		if keyErr := signing.ValidatePrivateKeyConsistency(opts.SessionPrivateKey); keyErr != nil {
+			err = fmt.Errorf("session signing key: %w", keyErr)
+			return nil, err
+		}
+		if opts.Delegation == nil {
+			err = fmt.Errorf("session signing key requires a root-signed delegation")
+			return nil, err
+		}
+		// Verify at the signing boundary too. A direct caller reaches this
+		// path without passing through the server's check, and an unverified
+		// delegation would sign a run no published key authorized. Retain the
+		// verified root: the session key signs the manifest, but it must never
+		// be presented as the root that signed the delegation at seal time.
+		resolved, rootErr := trustedDelegationRoot()
+		if rootErr != nil {
+			err = rootErr
+			return nil, err
+		}
+		// Copy and size-check BEFORE verifying, then use only the copy. The
+		// resolver hands back a slice this function does not own, so verifying
+		// the caller's slice and retaining a copy taken afterwards would let the
+		// bytes that were authenticated differ from the bytes kept for sealing
+		// and for the trust root stamped into the downloaded archive.
+		// Size is checked downstream by delegation verification, which owns that
+		// error contract; duplicating it here would only give the same refusal
+		// two different messages.
+		root := append(ed25519.PublicKey(nil), resolved...)
+		if delErr := verifySessionDelegationWithRoot(root, opts.SessionPrivateKey, *opts.Delegation, opts.RunNonce); delErr != nil {
+			err = fmt.Errorf("session delegation: %w", delErr)
+			return nil, err
+		}
+		lr.orchestratorPriv = opts.SessionPrivateKey
+		lr.orchestratorPub = lr.orchestratorPriv.Public().(ed25519.PublicKey)
+		lr.delegationRoot = root
+	case opts.OrchestratorKeyPath != "":
 		var loadErr error
 		lr.orchestratorPriv, loadErr = LoadOrchestratorSigningKey(opts.OrchestratorKeyPath)
 		if loadErr != nil {
@@ -299,7 +356,7 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 			err = fmt.Errorf("default orchestrator key %s does not match PublishedOrchestratorPubKeyHex", opts.OrchestratorKeyPath)
 			return nil, err
 		}
-	} else {
+	default:
 		lr.orchestratorPub, lr.orchestratorPriv, err = signing.GenerateKeyPair()
 		if err != nil {
 			return nil, fmt.Errorf("orchestrator keygen: %w", err)
@@ -458,6 +515,12 @@ func StartLiveRun(ctx context.Context, opts LiveRunOpts) (*LiveRun, error) {
 		StartedAt:       time.Now().UTC(),
 		Contained:       opts.Contained,
 		AgentKind:       manifestAgentKind(opts.ModelBaseURL),
+	}
+	if opts.Delegation != nil {
+		d := *opts.Delegation
+		lr.delegation = &d
+		lr.manifest.DelegationID = d.DelegationID
+		lr.manifest.ImageDigest = d.ImageDigest
 	}
 	lr.manifest = SignLaunchManifest(lr.orchestratorPriv, lr.manifest)
 
@@ -781,7 +844,8 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 	// manual reset. The manifest/witness JSON files are overwritten in place.
 	_ = os.RemoveAll(filepath.Join(runDir, "packet"))
 	_ = os.RemoveAll(filepath.Join(runDir, sc.ID))
-	asmResult, asmErr := AssembleFromEvidenceWithScenario(
+	// This is the visitor sealing their own run, not a gallery publication.
+	asmResult, asmErr := AssembleSessionOwnerFromEvidence(
 		evidenceFile,
 		hex.EncodeToString(lr.pipelockPub),
 		&sc,
@@ -808,6 +872,16 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 	lmPath := filepath.Join(runDir, "launch-manifest.json")
 	if err := os.WriteFile(lmPath, lmBytes, 0o600); err != nil {
 		return VerifyReport{}, fmt.Errorf("write launch manifest: %w", err)
+	}
+	if lr.delegation != nil {
+		dBytes, dErr := json.Marshal(lr.delegation)
+		if dErr != nil {
+			return VerifyReport{}, fmt.Errorf("marshal orchestrator delegation: %w", dErr)
+		}
+		dPath := filepath.Join(runDir, orchestratorDelegationFile)
+		if err := os.WriteFile(dPath, dBytes, 0o600); err != nil {
+			return VerifyReport{}, fmt.Errorf("write orchestrator delegation: %w", err)
+		}
 	}
 
 	// --- Write witness ---
@@ -850,12 +924,12 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 	}
 
 	// --- Verify ---
-	rep, err := VerifyRun(runDir, hex.EncodeToString(lr.orchestratorPub))
+	rep, err := VerifyRun(runDir, lr.OrchestratorPubHex())
 	if err != nil {
 		return VerifyReport{}, fmt.Errorf("verify run: %w", err)
 	}
 	if !rep.OK {
-		return rep, fmt.Errorf("verify run: failed checks")
+		return rep, fmt.Errorf("verify run: %s", rep.FailureSummary())
 	}
 
 	return rep, nil
@@ -864,6 +938,9 @@ func (lr *LiveRun) AssembleAndVerify(runDir string) (VerifyReport, error) {
 // OrchestratorPubHex returns the run's trust-root (orchestrator) public key as
 // hex -- the key a downloaded session bundle is verified against offline.
 func (lr *LiveRun) OrchestratorPubHex() string {
+	if len(lr.delegationRoot) != 0 {
+		return hex.EncodeToString(lr.delegationRoot)
+	}
 	return hex.EncodeToString(lr.orchestratorPub)
 }
 

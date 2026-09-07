@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"bufio"
 	"context"
 	"crypto/ed25519"
 	"errors"
@@ -19,6 +20,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unicode"
@@ -257,6 +259,17 @@ func handleProxyError(err error, logW io.Writer, sentryClient *plsentry.Client) 
 	return err
 }
 
+func applyMCPA2AOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, baseline *mcp.CardBaseline, cardURL string) {
+	if cfg != nil {
+		a2a := cfg.A2AScanning
+		opts.A2ACfg = &a2a
+	}
+	opts.CardBaseline = baseline
+	if cardURL != "" {
+		opts.A2ACardURL = cardURL
+	}
+}
+
 func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, serverName string) {
 	opts.ServerName = serverName
 	trust := config.ResponseTrustUntrusted
@@ -269,7 +282,7 @@ func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, se
 		taintTrusted = cfg.TaintTrustsMCPServer(serverName)
 	}
 	opts.ResponseTrustClass = trust
-	opts.ResponseActionOverride = config.MCPResponseActionForTrust(trust)
+	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(serverName)
 	opts.TaintTrustedSource = taintTrusted
 }
 
@@ -321,7 +334,10 @@ func buildDeferManager(cfg *config.Config, warningWriter io.Writer) *deferred.Ma
 		MaxPendingBytes:      cfg.Defer.MaxPendingBytes,
 		MaxCascadeDepth:      cfg.Defer.MaxCascadeDepth,
 		JournalPath:          deferJournalPath(cfg),
-		Warningf:             warningf,
+		JournalWriteGuard: func(write func() error) error {
+			return recorder.WithEvidenceWriterCeremonyLock(cfg.FlightRecorder.Dir, write)
+		},
+		Warningf: warningf,
 	})
 }
 
@@ -532,6 +548,16 @@ var ErrMCPResponseSecurityFinding = errors.New("MCP response security finding de
 // ErrMCPResponseSecurityFinding.
 var ErrInjectionDetected = ErrMCPResponseSecurityFinding
 
+// ErrMCPScanMalformedInput is returned when pipelock mcp scan could not fully
+// inspect a line. It carries the exit code this binary reserves for bad input
+// rather than the security-finding code, because "this could not be scanned"
+// and "this was scanned and something was found" are different answers for a
+// caller.
+var ErrMCPScanMalformedInput = cliutil.ExitCodeError(
+	cliutil.ExitConfig,
+	errors.New("malformed MCP input: one or more lines could not be fully inspected and were not verified clean"),
+)
+
 // safeWriter wraps an io.Writer with a mutex for concurrent use.
 // Used to synchronize file sentry goroutines and RunProxy stderr output.
 type safeWriter struct {
@@ -614,13 +640,19 @@ For bidirectional MCP protection, use pipelock mcp proxy: responses are scanned
 before forwarding, and requests are scanned for DLP leaks and injection in tool
 arguments.
 
-Exit code 0 if all responses are clean, 1 if any response security finding
-(prompt injection or generic inbound credential) is detected.
-In text mode, only findings are printed. In JSON mode, every line produces a verdict.
+Exit code 0 only if every response was scanned and all were clean, 1 if any
+response security finding (prompt injection or generic inbound credential) is
+detected, and 2 if any line could not be fully inspected and was therefore not
+verified clean. A finding outranks an inspection failure. Scanning covers response
+injection and inbound DLP; it does not include tool scanning or tool policy,
+which are proxy features.
+In text mode, findings and input-inspection errors are printed. In JSON mode,
+each line that can be read produces a verdict.
 
 Examples:
   mcp-server | pipelock mcp scan
   pipelock mcp scan --json --config pipelock.yaml < responses.jsonl`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := cliutil.LoadConfigOrDefault(configFile)
 			if err != nil {
@@ -654,12 +686,22 @@ Examples:
 			}
 			defer sc.Close()
 
-			found, err := mcp.ScanStream(cmd.InOrStdin(), cmd.OutOrStdout(), sc, jsonOutput)
-			if err != nil {
+			found, malformed, err := mcp.ScanStreamResult(cmd.InOrStdin(), cmd.OutOrStdout(), sc, jsonOutput)
+			if err != nil && !errors.Is(err, bufio.ErrTooLong) {
 				return err
 			}
 			if found {
 				return ErrMCPResponseSecurityFinding
+			}
+			// A line that could not be fully inspected was not verified clean, so
+			// it must not share an exit code with verified-clean input. A caller
+			// gating CI on process status would otherwise read incomplete scanning
+			// as safe.
+			// Exit 2 is the code this binary already reserves for bad input, and
+			// `pipelock explain mcp-response` already returns it for the same
+			// input, so this makes the two agree rather than inventing a scheme.
+			if malformed {
+				return ErrMCPScanMalformedInput
 			}
 
 			return nil
@@ -685,9 +727,13 @@ func mcpProxyCmdWithAuditLoggerFactory(newAuditLogger mcpAuditLoggerFactory) *co
 	var agentName string
 	var serverName string
 	var adaptiveResetFile string
+	var adaptiveResetAuthorityPublicKeyFile string
+	var adaptiveResetTarget string
 	var sandboxEnabled bool
 	var sandboxStrict bool
 	var sandboxBestEffort bool
+	var sandboxBestEffortReason string
+	var sandboxBestEffortExpiry string
 	var sandboxWorkspace string
 	var captureOutput string
 	var captureEscrowKey string
@@ -782,6 +828,20 @@ Key-free evidence capture:
 			if adaptiveResetFile != "" && (hasUpstream || hasListen) {
 				return errors.New("--adaptive-reset-file is only supported with local subprocess MCP servers")
 			}
+			// Any sandbox flag is sandbox intent. Checking here, before the
+			// remote-mode branches, means a best-effort flag on --upstream or
+			// --listen is refused instead of silently ignored.
+			sandboxIntent := sandboxEnabled || sandboxStrict || sandboxBestEffort ||
+				cmd.Flags().Changed("sandbox-best-effort-reason") || cmd.Flags().Changed("sandbox-best-effort-expiry")
+			if sandboxIntent && hasListen {
+				return errors.New("--sandbox cannot be used with --listen (cannot sandbox a remote server)")
+			}
+			if sandboxIntent && hasUpstream {
+				return errors.New("--sandbox cannot be used with --upstream (cannot sandbox a remote server)")
+			}
+			if adaptiveResetFile == "" && (adaptiveResetAuthorityPublicKeyFile != "" || adaptiveResetTarget != "") {
+				return errors.New("--adaptive-reset-authority-public-key-file and --adaptive-reset-target require --adaptive-reset-file")
+			}
 			if !hasListen && (listenerAuthTokenFile != "" || len(listenerAllowedOrigins) > 0 || listenerAllowUnauthenticated) {
 				return errors.New("MCP listener authentication flags require --listen")
 			}
@@ -794,14 +854,6 @@ Key-free evidence capture:
 			}
 			if err := validateMCPListenerBoundary(listenAddr, listenerAuthToken, listenerAllowUnauthenticated); err != nil {
 				return err
-			}
-			if adaptiveResetFile != "" && runtime.GOOS == "windows" {
-				// The reset file authorizes a privilege de-escalation; its owner
-				// cannot be verified via file mode on Windows (the bits never
-				// reflect the NTFS ACL), so honoring it would not be secure.
-				// Fail closed at the door rather than silently no-op. Restart the
-				// proxy to clear an escalation on Windows.
-				return errors.New("--adaptive-reset-file is not supported on Windows: file ownership cannot be verified; restart the proxy to clear an adaptive escalation")
 			}
 			// Reject sandbox CLI flag with remote modes.
 			if sandboxEnabled {
@@ -957,11 +1009,34 @@ Key-free evidence capture:
 					ListenerDriftResetFile: cfg.MCPToolScanning.ListenerDriftResetFile,
 					ExtraPoison:            extraPoison,
 				}
+				resetTarget := cfg.MCPToolScanning.ListenerDriftResetTarget
+				if cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile != "" &&
+					len(cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKey) != 0 && resetTarget != "" {
+					toolCfg.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKey...)
+					toolCfg.ListenerDriftResetTarget = resetTarget
+				}
 				// Wire session binding into tool scanning when enabled.
 				if cfg.MCPSessionBinding.Enabled {
 					toolCfg.BindingUnknownAction = cfg.MCPSessionBinding.UnknownToolAction
 					toolCfg.BindingNoBaselineAction = cfg.MCPSessionBinding.NoBaselineAction
 				}
+			}
+
+			var adaptiveResetAuthority *mcp.ResetAuthority
+			var adaptiveResetEpoch atomic.Uint64
+			if adaptiveResetFile != "" {
+				if adaptiveResetAuthorityPublicKeyFile == "" || adaptiveResetTarget == "" {
+					return errors.New("--adaptive-reset-file requires --adaptive-reset-authority-public-key-file and --adaptive-reset-target")
+				}
+				publicKey, err := signing.LoadPublicKey(adaptiveResetAuthorityPublicKeyFile)
+				if err != nil {
+					return fmt.Errorf("load adaptive reset authority public key: %w", err)
+				}
+				adaptiveResetAuthority, err = mcp.NewResetAuthority(publicKey, adaptiveResetTarget)
+				if err != nil {
+					return fmt.Errorf("create adaptive reset authority: %w", err)
+				}
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: MCP reset authority target=%q instance=%q epoch=0\n", adaptiveResetAuthority.Target(), adaptiveResetAuthority.InstanceID())
 			}
 
 			var policyCfg *policy.Config
@@ -1059,7 +1134,12 @@ Key-free evidence capture:
 					retentionCancel()
 					retentionWG.Wait()
 				}()
-				postureBinding, bindErr := posturebinding.LoadRuntime()
+				postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
+					ReceiptSigningEnabled:      cfg.FlightRecorder.SigningKeyPath != "",
+					RequireContainmentEvidence: cfg.FlightRecorder.RequireContainmentEvidence,
+					PinnedPostureSignerKey:     cfg.FlightRecorder.PostureSignerPublicKey,
+					Stderr:                     cmd.ErrOrStderr(),
+				})
 				if bindErr != nil {
 					return fmt.Errorf("loading posture binding: %w", bindErr)
 				}
@@ -1075,14 +1155,15 @@ Key-free evidence capture:
 				// bundle merge and auto-enable.
 				// The shared MCP registry also captures receipt emission failures.
 				receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
-					Recorder:         rec,
-					PrivKey:          recPrivKey,
-					ConfigHash:       cfg.Hash(),
-					Principal:        "local",
-					Actor:            "pipelock",
-					Metrics:          mcpMetrics,
-					PostureBinding:   postureBinding,
-					HeartbeatSeconds: cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+					Recorder:            rec,
+					PrivKey:             recPrivKey,
+					ConfigHash:          cfg.Hash(),
+					Principal:           "local",
+					Actor:               "pipelock",
+					Metrics:             mcpMetrics,
+					PostureBinding:      postureResult.Binding,
+					PostureAvailability: string(postureResult.Availability),
+					HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
 				})
 
 				cmd.PrintErrf("  Recorder: %s (flight recorder enabled)\n", cfg.FlightRecorder.Dir)
@@ -1254,6 +1335,7 @@ Key-free evidence capture:
 			if policyCfg != nil {
 				policyAction = policyCfg.Action
 			}
+			a2aCardBaseline := mcp.NewCardBaseline(1000)
 			deferManager := buildDeferManager(cfg, cmd.ErrOrStderr())
 			if err := recoverDeferredActions(deferManager, deferJournalPath(cfg), receiptEmitter, v2ReceiptEmitter, captureConfigHash, cmd.ErrOrStderr()); err != nil {
 				return err
@@ -1301,8 +1383,11 @@ Key-free evidence capture:
 						ListenerBearerToken:          listenerAuthToken,
 						ListenerAllowedOrigins:       listenerAllowedOrigins,
 						ListenerAllowUnauthenticated: listenerAllowUnauthenticated,
-						UpstreamHeaders:              extraHeaders,
-						Scanner:                      sc, Approver: approver,
+						ListenerStateTokenRequiredFn: func() *bool {
+							return cfg.MCPSessionBinding.ListenerRequireStateToken
+						},
+						UpstreamHeaders: extraHeaders,
+						Scanner:         sc, Approver: approver,
 						AuditLogger: auditLogger,
 						InputCfg:    inputCfg, RequestBodyCfg: &cfg.RequestBodyScanning,
 						ToolCfg: toolCfg, PolicyCfg: policyCfg,
@@ -1329,6 +1414,7 @@ Key-free evidence capture:
 							return readMCPListenerTokenFile(listenerAuthTokenFile)
 						}
 					}
+					applyMCPA2AOpts(&listenerOpts, cfg, a2aCardBaseline, upstreamURL)
 					applyMCPResponseSuppressOpts(&listenerOpts, cfg, serverName)
 					listenerOpts = mcpReceiptParityOpts(listenerOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 					respAction, respTrust, respServer := mcpResponseLogFields(listenerOpts)
@@ -1379,6 +1465,7 @@ Key-free evidence capture:
 						DialContext:            upstreamDialContext,
 					}
 					applyMCPDoWOpts(&wsOpts, dowWiring, false)
+					applyMCPA2AOpts(&wsOpts, cfg, a2aCardBaseline, upstreamURL)
 					applyMCPResponseSuppressOpts(&wsOpts, cfg, serverName)
 					wsOpts = mcpReceiptParityOpts(wsOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 					respAction, respTrust, respServer := mcpResponseLogFields(wsOpts)
@@ -1433,6 +1520,7 @@ Key-free evidence capture:
 					DialContext:            upstreamDialContext,
 				}
 				applyMCPDoWOpts(&httpOpts, dowWiring, false)
+				applyMCPA2AOpts(&httpOpts, cfg, a2aCardBaseline, upstreamURL)
 				applyMCPResponseSuppressOpts(&httpOpts, cfg, serverName)
 				httpOpts = mcpReceiptParityOpts(httpOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 				respAction, respTrust, respServer := mcpResponseLogFields(httpOpts)
@@ -1528,19 +1616,39 @@ Key-free evidence capture:
 				defer stopDeferAPI()
 
 				mcpStrict := sandboxStrict || cfg.Sandbox.Strict
-				mcpBestEffort := sandboxBestEffort || cfg.Sandbox.BestEffort
-
-				if mcpStrict && mcpBestEffort {
+				if mcpStrict && (sandboxBestEffort || cfg.Sandbox.BestEffort) {
 					return errors.New("--sandbox-strict and --sandbox-best-effort are mutually exclusive")
+				}
+				mcpBestEffort, mcpBestEffortReason, mcpBestEffortExpiry, err := resolveBestEffortOverride(
+					sandboxBestEffort,
+					sandboxBestEffortReason,
+					sandboxBestEffortExpiry,
+					cmd.Flags().Changed("sandbox-best-effort-reason"),
+					cmd.Flags().Changed("sandbox-best-effort-expiry"),
+					cfg.Sandbox.BestEffort,
+					cfg.Sandbox.BestEffortReason,
+					cfg.Sandbox.BestEffortExpiry,
+				)
+				if err != nil {
+					return err
+				}
+				if mcpBestEffort {
+					mcpBestEffortExpiry, err = anchorBestEffortExpiry(mcpBestEffortReason, mcpBestEffortExpiry)
+					if err != nil {
+						return err
+					}
 				}
 
 				launchCfg := sandbox.LaunchConfig{
-					Ctx:        ctx,
-					Command:    serverCmd,
-					Workspace:  workspace,
-					Strict:     mcpStrict,
-					BestEffort: mcpBestEffort,
-					ExtraEnv:   extraEnv,
+					Ctx:              ctx,
+					Command:          serverCmd,
+					Workspace:        workspace,
+					Strict:           mcpStrict,
+					BestEffort:       mcpBestEffort,
+					BestEffortReason: mcpBestEffortReason,
+					BestEffortExpiry: mcpBestEffortExpiry,
+					ExtraEnv:         extraEnv,
+					GateTargetStart:  true,
 				}
 				if cfg.Sandbox.FS != nil {
 					p := sandbox.DefaultPolicy(workspace)
@@ -1560,6 +1668,9 @@ Key-free evidence capture:
 					if err := mcp.VerifyBinaryIntegrity(serverCmd, &cfg.MCPBinaryIntegrity, cmd.ErrOrStderr(), workspace); err != nil {
 						return err
 					}
+				}
+				if mcpBestEffort {
+					reportBestEffortAdmission(cmd.ErrOrStderr())
 				}
 
 				closeBridge, bridgeErr := setupMCPSandboxBridge(mcpSandboxBridgeSetupOptions{
@@ -1581,11 +1692,11 @@ Key-free evidence capture:
 				}
 				defer closeBridge()
 
-				sandboxCmd, sErr := sandbox.PrepareSandboxCmd(launchCfg)
+				sandboxLaunch, sErr := sandbox.PrepareSandboxLaunch(launchCfg)
 				if sErr != nil {
 					return fmt.Errorf("sandbox prepare: %w", sErr)
 				}
-				sandboxCmd.Stderr = cmd.ErrOrStderr()
+				sandboxLaunch.Cmd.Stderr = cmd.ErrOrStderr()
 
 				proxyOpts := mcp.MCPProxyOpts{
 					Scanner: sc, Approver: approver,
@@ -1609,16 +1720,19 @@ Key-free evidence capture:
 					ContractLoader:         contractLoader,
 					ContractAgent:          contractAgent,
 					AdaptiveResetFile:      adaptiveResetFile,
+					AdaptiveResetAuthority: adaptiveResetAuthority,
+					AdaptiveResetEpoch:     &adaptiveResetEpoch,
 					DeferManager:           deferManager,
 				}
 				applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+				applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
 				applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
 				proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
 				respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 					"pipelock: proxying MCP server %v [SANDBOXED] (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s, workspace=%s)\n",
 					serverCmd, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction, workspace)
-				if err := mcp.RunProxyWithSandbox(ctx, sandboxCmd, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), proxyOpts, mcpStrict); err != nil {
+				if err := mcp.RunProxyWithSandboxLaunch(ctx, sandboxLaunch, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), proxyOpts, mcpStrict); err != nil {
 					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 						return heartbeatErr
 					}
@@ -1652,6 +1766,7 @@ Key-free evidence capture:
 			// to prevent early writes from being missed.
 			var lin filesentry.Lineage
 			var onChildReady func()
+			stopFileSentry := func() error { return nil }
 			if cfg.FileSentry.Enabled {
 				lin = filesentry.NewLineage()
 				// Error handler for non-fatal runtime errors (e.g. failing to watch new dirs).
@@ -1692,24 +1807,40 @@ Key-free evidence capture:
 						OnFinding: findingHook,
 						Cancel:    cancel,
 					})
-					// Single defer: close watcher (flushes + closes channel),
-					// then wait for consumer to finish processing.
-					defer func() {
-						_ = watcher.Close()
-						waitConsumer()
-					}()
+					var failure fileSentryRuntimeFailure
+					var watcherWG sync.WaitGroup
+					var watcherStartOnce sync.Once
+					var stopOnce sync.Once
+					var stopErr error
+					stopFileSentry = func() error {
+						stopOnce.Do(func() {
+							_ = watcher.Close()
+							watcherWG.Wait()
+							waitConsumer()
+							if err := failure.get(); err != nil {
+								stopErr = fmt.Errorf("file sentry runtime failed: %w", err)
+							}
+						})
+						return stopErr
+					}
+					defer func() { _ = stopFileSentry() }()
 					reportFileSentryCoverage(logW, len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action, watcher.DegradedPathCount())
 
 					// onChildReady: called by RunProxy after cmd.Start() + TrackPID.
 					// Starts the file sentry event loop AFTER the child PID is registered,
 					// so attribution is ready before classifying any writes.
 					onChildReady = func() {
-						go func() {
-							if startErr := watcher.Start(ctx); startErr != nil {
-								_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
-								cancel()
-							}
-						}()
+						watcherStartOnce.Do(func() {
+							watcherWG.Add(1)
+							go func() {
+								defer watcherWG.Done()
+								if startErr := watcher.Start(ctx); startErr != nil {
+									_, _ = fmt.Fprintf(logW, "pipelock: file sentry fatal: %v — cancelling proxy\n", startErr)
+									failure.set(startErr)
+									cancel()
+								}
+							}()
+						})
 					}
 				} // watcher != nil
 			}
@@ -1734,22 +1865,43 @@ Key-free evidence capture:
 				RedactProfile:          cfg.Redaction.DefaultProfile,
 				TaintCfg:               &cfg.Taint,
 				Lineage:                lin, OnChildReady: onChildReady,
-				ContractLoader:    contractLoader,
-				ContractAgent:     contractAgent,
-				AdaptiveResetFile: adaptiveResetFile,
-				DeferManager:      deferManager,
+				ContractLoader:         contractLoader,
+				ContractAgent:          contractAgent,
+				AdaptiveResetFile:      adaptiveResetFile,
+				AdaptiveResetAuthority: adaptiveResetAuthority,
+				AdaptiveResetEpoch:     &adaptiveResetEpoch,
+				DeferManager:           deferManager,
 			}
 			applyMCPDoWOpts(&proxyOpts, dowWiring, false)
+			applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
 			applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
 			proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+			// The unsandboxed path has no UID/GID map setup. Harden before
+			// RunProxy can start its wrapped command.
+			if err := mcp.HardenProxyProcess(); err != nil {
+				return fmt.Errorf("harden MCP proxy process: %w", err)
+			}
 			respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying MCP server %v (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
 				serverCmd, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
 			if err := mcp.RunProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), logW, serverCmd, proxyOpts, extraEnv...); err != nil {
+				if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+					return fileSentryErr
+				}
 				if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 					return heartbeatErr
 				}
+				// signal.NotifyContext terminates the wrapped child during an
+				// ordinary parent cancellation. That resulting process status is
+				// teardown noise, not a proxy failure. File-sentry and required
+				// heartbeat failures are checked above so they still fail closed.
+				if ctx.Err() != nil {
+					return nil
+				}
 				return handleProxyError(err, logW, sentryClient)
+			}
+			if fileSentryErr := stopFileSentry(); fileSentryErr != nil {
+				return fileSentryErr
 			}
 			if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 				return heartbeatErr
@@ -1769,12 +1921,16 @@ Key-free evidence capture:
 	cmd.Flags().StringVar(&headerFile, "header-file", "", "path to a headers file (one 'Key: Value' per line, '#' comments) merged with --header; on Unix it must be mode 0o600 or 0o640, on Windows restrict access with file ACLs")
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent profile name (resolves to config profile for policy/scanner)")
 	cmd.Flags().StringVar(&serverName, "server-name", "", "stable identity for this MCP server; enables per-server response suppression via target 'mcp://<name>/response'")
-	cmd.Flags().StringVar(&adaptiveResetFile, "adaptive-reset-file", "", "local control file (must be regular, mode 0600, owned by the proxy user); when it appears the proxy clears this session's adaptive-enforcement escalation and removes it")
+	cmd.Flags().StringVar(&adaptiveResetFile, "adaptive-reset-file", "", "signed adaptive reset delegation control file")
+	cmd.Flags().StringVar(&adaptiveResetAuthorityPublicKeyFile, "adaptive-reset-authority-public-key-file", "", "exported mcp-reset-authority public key for --adaptive-reset-file")
+	cmd.Flags().StringVar(&adaptiveResetTarget, "adaptive-reset-target", "", "stable target identity for --adaptive-reset-file delegations")
 	cmd.Flags().StringVar(&captureOutput, "capture-output", "", "directory for key-free evidence capture (evidence-*.jsonl); mirrors 'pipelock run --capture-output'")
 	cmd.Flags().StringVar(&captureEscrowKey, "capture-escrow-public-key", "", "X25519 public key (64 hex chars) to encrypt captured payload sidecars; requires --capture-output")
-	cmd.Flags().BoolVar(&sandboxEnabled, "sandbox", false, "run child in sandbox (Landlock + seccomp + network namespace, Linux only)")
+	cmd.Flags().BoolVar(&sandboxEnabled, "sandbox", false, "run child in sandbox (Landlock + network namespace on Linux, plus seccomp on linux/amd64)")
 	cmd.Flags().BoolVar(&sandboxStrict, "sandbox-strict", false, "strict sandbox: error on missing layers, private /dev/shm, block clone3 (implies --sandbox)")
 	cmd.Flags().BoolVar(&sandboxBestEffort, "sandbox-best-effort", false, "degrade gracefully when namespace isolation is unavailable (implies --sandbox)")
+	cmd.Flags().StringVar(&sandboxBestEffortReason, "sandbox-best-effort-reason", "", "reason for a command-line best-effort override (must be supplied with --sandbox-best-effort)")
+	cmd.Flags().StringVar(&sandboxBestEffortExpiry, "sandbox-best-effort-expiry", "", "admission-time duration or RFC3339 expiry for a command-line best-effort override; does not stop a running child; later launches require re-authorization")
 	cmd.Flags().StringVar(&sandboxWorkspace, "workspace", "", "sandbox workspace directory (default: current directory)")
 	return cmd
 }

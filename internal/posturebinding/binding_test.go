@@ -52,6 +52,34 @@ func mintContainmentCapsule(t *testing.T) (*posture.Capsule, []byte) {
 	return capsule, data
 }
 
+func capsuleSignerKey(t *testing.T, capsule *posture.Capsule) ed25519.PublicKey {
+	t.Helper()
+	key, err := hex.DecodeString(capsule.SignerKeyID)
+	if err != nil {
+		t.Fatalf("decode capsule signer key: %v", err)
+	}
+	if len(key) != ed25519.PublicKeySize {
+		t.Fatalf("capsule signer key length = %d, want %d", len(key), ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(key)
+}
+
+func newPublicKey(t *testing.T) ed25519.PublicKey {
+	t.Helper()
+	key, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	return key
+}
+
+func requireAvailability(t *testing.T, got Result, want Availability) {
+	t.Helper()
+	if got.Availability != want {
+		t.Fatalf("availability = %q, want %q (result = %+v)", got.Availability, want, got)
+	}
+}
+
 // writeMutatedCapsule rewrites one or more top-level capsule fields in the
 // marshaled JSON while leaving the signature untouched, then writes it to a
 // fresh temp file. It preserves the exact field set so the capsule still
@@ -88,9 +116,11 @@ func TestLoadFileTamperedBodyRejected(t *testing.T) {
 	path := writeMutatedCapsule(t, data, map[string]string{
 		"config_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
 	})
-	if _, err := LoadFile(path); err == nil {
+	got, err := LoadFile(path)
+	if err == nil {
 		t.Fatal("LoadFile error = nil, want signature verification failure on tampered body")
 	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadFileExpiredCapsuleRejected(t *testing.T) {
@@ -103,7 +133,7 @@ func TestLoadFileExpiredCapsuleRejected(t *testing.T) {
 		"generated_at": now.Add(-48 * time.Hour).Format(time.RFC3339Nano),
 		"expires_at":   now.Add(-24 * time.Hour).Format(time.RFC3339Nano),
 	})
-	_, err := LoadFile(path)
+	got, err := LoadFile(path)
 	if err == nil {
 		t.Fatal("LoadFile error = nil, want expiry rejection")
 	}
@@ -113,6 +143,7 @@ func TestLoadFileExpiredCapsuleRejected(t *testing.T) {
 	if !strings.Contains(err.Error(), "expired") {
 		t.Fatalf("LoadFile error = %v, want an expiry rejection", err)
 	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadFileNonHexSignerKeyRejected(t *testing.T) {
@@ -120,9 +151,11 @@ func TestLoadFileNonHexSignerKeyRejected(t *testing.T) {
 	// A signer_key_id that is not valid hex must fail closed at the key-decode
 	// step, before any signature verification.
 	path := writeMutatedCapsule(t, data, map[string]string{"signer_key_id": "not-hex-zz"})
-	if _, err := LoadFile(path); err == nil {
+	got, err := LoadFile(path)
+	if err == nil {
 		t.Fatal("LoadFile error = nil, want signer-key decode rejection")
 	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadFileValidContainmentCapsuleStillBinds(t *testing.T) {
@@ -131,16 +164,28 @@ func TestLoadFileValidContainmentCapsuleStillBinds(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	got, err := LoadFile(path)
+	result, err := LoadFile(path)
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
+	requireAvailability(t, result, AvailabilityAttested)
+	got := result.Binding
 	sum := sha256.Sum256(data)
 	if got.CapsuleSHA256 != hex.EncodeToString(sum[:]) ||
 		got.SignerKeyID != capsule.SignerKeyID ||
 		got.ContainmentNonce != capsule.Signature ||
 		got.ContainedUID != "966" {
 		t.Fatalf("binding = %+v, want fields from valid capsule", got)
+	}
+	if result.HasAnchoredContainmentAttestation() {
+		t.Fatal("ordinary LoadFile result reported an anchored containment attestation")
+	}
+	anchored, err := loadFile(path, capsuleSignerKey(t, capsule))
+	if err != nil {
+		t.Fatalf("loadFile with pinned signer: %v", err)
+	}
+	if !anchored.HasAnchoredContainmentAttestation() {
+		t.Fatal("pinned load did not report an anchored containment attestation")
 	}
 }
 
@@ -155,9 +200,11 @@ func TestLoadFileRejectsGroupWritableProof(t *testing.T) {
 		t.Fatalf("Chmod() error = %v", err)
 	}
 
-	if _, err := LoadFile(path); err == nil || !strings.Contains(err.Error(), "permissions") {
+	got, err := LoadFile(path)
+	if err == nil || !strings.Contains(err.Error(), "permissions") {
 		t.Fatalf("LoadFile(group-writable proof) error = %v, want permission rejection", err)
 	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadRuntimeRelativeOverrideRejected(t *testing.T) {
@@ -174,29 +221,27 @@ func TestLoadRuntimeAbsoluteOverrideWorks(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 	t.Setenv(RuntimeProofEnv, path)
-	got, err := LoadRuntime()
+	result, err := LoadRuntime()
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)
 	}
+	requireAvailability(t, result, AvailabilityAttested)
+	got := result.Binding
 	if got.SignerKeyID != capsule.SignerKeyID || got.ContainedUID != "966" {
 		t.Fatalf("binding = %+v, want fields from capsule at absolute override", got)
 	}
 }
 
-func TestLoadRuntimeUnsetUsesDefaultPath(t *testing.T) {
-	// With no override, LoadRuntime reads DefaultContainRunProofPath. Skip if a
-	// real proof exists on the host so the test never depends on (or reads) live
-	// local state; the missing-default case is what we assert here.
-	if _, err := os.Stat(DefaultContainRunProofPath); err == nil {
-		t.Skipf("host has a real proof at %s; skipping missing-default assertion", DefaultContainRunProofPath)
-	}
-	t.Setenv(RuntimeProofEnv, "")
+func TestLoadRuntimeAbsentOverride(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-proof.json")
+	t.Setenv(RuntimeProofEnv, path)
 	got, err := LoadRuntime()
 	if err != nil {
 		t.Fatalf("LoadRuntime: %v", err)
 	}
-	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
-		t.Fatalf("binding = %+v, want zero from missing default proof", got)
+	requireAvailability(t, got, AvailabilityAbsent)
+	if got.Binding.CapsuleSHA256 != "" || got.Binding.SignerKeyID != "" || got.Binding.ContainmentNonce != "" || got.Binding.ContainedUID != "" {
+		t.Fatalf("binding = %+v, want zero from missing proof", got.Binding)
 	}
 }
 
@@ -205,8 +250,196 @@ func TestLoadFileMissingReturnsZeroBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
-	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
+	requireAvailability(t, got, AvailabilityAbsent)
+	if got.Binding.CapsuleSHA256 != "" || got.Binding.SignerKeyID != "" || got.Binding.ContainmentNonce != "" || got.Binding.ContainedUID != "" {
 		t.Fatalf("binding = %+v, want zero", got)
+	}
+}
+
+func TestLoadRuntimeForReceiptsAbsentPolicy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-proof.json")
+	t.Setenv(RuntimeProofEnv, path)
+
+	binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{ReceiptSigningEnabled: true})
+	if err != nil {
+		t.Fatalf("ordinary receipt policy: %v", err)
+	}
+	if binding.Availability != AvailabilityAbsent {
+		t.Fatalf("ordinary receipt availability = %q, want %q", binding.Availability, AvailabilityAbsent)
+	}
+	_, err = LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+		PinnedPostureSignerKey:     newPublicKey(t),
+	})
+	if err == nil || !strings.Contains(err.Error(), "containment evidence is required") || !strings.Contains(err.Error(), "absent") {
+		t.Fatalf("required receipt policy error = %v, want absent containment requirement", err)
+	}
+}
+
+func TestLoadRuntimeForReceiptsOrdinaryAvailabilityStates(t *testing.T) {
+	t.Run("attested", func(t *testing.T) {
+		_, data := mintContainmentCapsule(t)
+		path := filepath.Join(t.TempDir(), "proof.json")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		t.Setenv(RuntimeProofEnv, path)
+		binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{ReceiptSigningEnabled: true})
+		if err != nil {
+			t.Fatalf("ordinary attested proof: %v", err)
+		}
+		if binding.Availability != AvailabilityAttested {
+			t.Fatalf("ordinary attested availability = %q, want %q", binding.Availability, AvailabilityAttested)
+		}
+	})
+	t.Run("absent", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "missing-proof.json")
+		t.Setenv(RuntimeProofEnv, path)
+		binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{ReceiptSigningEnabled: true})
+		if err != nil {
+			t.Fatalf("ordinary absent proof: %v", err)
+		}
+		if binding.Availability != AvailabilityAbsent {
+			t.Fatalf("ordinary absent availability = %q, want %q", binding.Availability, AvailabilityAbsent)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "proof.json")
+		if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		t.Setenv(RuntimeProofEnv, path)
+		_, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{ReceiptSigningEnabled: true})
+		if err == nil || !strings.Contains(err.Error(), "parse posture proof") {
+			t.Fatalf("ordinary invalid proof error = %v, want parse failure", err)
+		}
+	})
+}
+
+func TestLoadRuntimeForReceiptsSkipsProofWithoutSigning(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "invalid-proof.json")
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+
+	binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{})
+	if err != nil {
+		t.Fatalf("recorder-only runtime loaded posture proof: %v", err)
+	}
+	if binding != (Result{}) {
+		t.Fatalf("recorder-only posture binding = %+v, want zero", binding)
+	}
+
+	_, err = LoadRuntimeForReceipts(RuntimeReceiptOptions{RequireContainmentEvidence: true})
+	if err == nil || !strings.Contains(err.Error(), "requires signed receipts") {
+		t.Fatalf("required containment without receipts error = %v", err)
+	}
+}
+
+func TestLoadRuntimeForReceiptsRequiresAttestedContainment(t *testing.T) {
+	capsule, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+	binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+		PinnedPostureSignerKey:     capsuleSignerKey(t, capsule),
+	})
+	if err != nil {
+		t.Fatalf("required receipt policy: %v", err)
+	}
+	if binding.Availability != AvailabilityAttested || binding.Binding.CapsuleSHA256 == "" {
+		t.Fatalf("required receipt binding = %+v, want attested containment", binding)
+	}
+}
+
+func TestLoadRuntimeForReceiptsRejectsProofFromDifferentSigner(t *testing.T) {
+	pinnedCapsule, _ := mintContainmentCapsule(t)
+	_, attackerProof := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "caller-selected-proof.json")
+	if err := os.WriteFile(path, attackerProof, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+
+	_, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+		PinnedPostureSignerKey:     capsuleSignerKey(t, pinnedCapsule),
+	})
+	if err == nil || !strings.Contains(err.Error(), "pinned signer key") || !strings.Contains(err.Error(), "does not match trusted key") {
+		t.Fatalf("different signer error = %v, want pinned-key rejection", err)
+	}
+}
+
+func TestLoadRuntimeForReceiptsRequiresPinnedSigner(t *testing.T) {
+	_, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+
+	_, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "flight_recorder.posture_signer_key") {
+		t.Fatalf("missing pinned signer error = %v, want actionable rejection", err)
+	}
+}
+
+func TestLoadRuntimeForReceiptsVerifiesOverrideAgainstPinnedSigner(t *testing.T) {
+	capsule, data := mintContainmentCapsule(t)
+	path := filepath.Join(t.TempDir(), "caller-selected-proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+
+	binding, err := LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+		PinnedPostureSignerKey:     capsuleSignerKey(t, capsule),
+	})
+	if err != nil {
+		t.Fatalf("required override with matching pinned signer: %v", err)
+	}
+	if binding.Availability != AvailabilityAttested || binding.Binding.CapsuleSHA256 == "" {
+		t.Fatalf("required override binding = %+v, want attested containment", binding)
+	}
+}
+
+func TestLoadRuntimeForReceiptsRejectsAttestedProofWithoutContainment(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	capsule, err := posture.Emit(config.Defaults(), posture.Options{SigningKey: priv})
+	if err != nil {
+		t.Fatalf("posture.Emit: %v", err)
+	}
+	data, err := json.Marshal(capsule)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	t.Setenv(RuntimeProofEnv, path)
+	_, err = LoadRuntimeForReceipts(RuntimeReceiptOptions{
+		ReceiptSigningEnabled:      true,
+		RequireContainmentEvidence: true,
+		PinnedPostureSignerKey:     capsuleSignerKey(t, capsule),
+	})
+	if err == nil || !strings.Contains(err.Error(), "containment evidence is required") || !strings.Contains(err.Error(), "attested") {
+		t.Fatalf("required receipt policy error = %v, want rejected proof without containment", err)
 	}
 }
 
@@ -217,10 +450,12 @@ func TestLoadFileDerivesContainmentBinding(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	got, err := LoadFile(path)
+	result, err := LoadFile(path)
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
+	requireAvailability(t, result, AvailabilityAttested)
+	got := result.Binding
 	canonicalSum := sha256.Sum256(data)
 	if got.CapsuleSHA256 != hex.EncodeToString(canonicalSum[:]) {
 		t.Fatalf("CapsuleSHA256 = %q, want canonical capsule hash", got.CapsuleSHA256)
@@ -262,9 +497,26 @@ func TestLoadFileNoContainmentReturnsZeroBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadFile: %v", err)
 	}
-	if got.CapsuleSHA256 != "" || got.SignerKeyID != "" || got.ContainmentNonce != "" || got.ContainedUID != "" {
+	requireAvailability(t, got, AvailabilityAttested)
+	if got.Binding.CapsuleSHA256 != "" || got.Binding.SignerKeyID != "" || got.Binding.ContainmentNonce != "" || got.Binding.ContainedUID != "" {
 		t.Fatalf("binding = %+v, want zero (no containment evidence)", got)
 	}
+}
+
+func TestLoadFileUnsignedNoContainmentIsInvalid(t *testing.T) {
+	// A readable capsule that carries no containment evidence AND cannot be
+	// verified must be invalid, not attested. Before the fix, this exact file
+	// produced an "attested" advisory posture-availability value.
+	path := filepath.Join(t.TempDir(), "proof.json")
+	if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	got, err := LoadFile(path)
+	if err == nil {
+		t.Fatalf("LoadFile: want error for unverifiable capsule, got nil (availability=%q)", got.Availability)
+	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadFileMalformedReturnsError(t *testing.T) {
@@ -272,9 +524,11 @@ func TestLoadFileMalformedReturnsError(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{not-json"), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
-	if _, err := LoadFile(path); err == nil {
+	got, err := LoadFile(path)
+	if err == nil {
 		t.Fatal("LoadFile error = nil, want parse error")
 	}
+	requireAvailability(t, got, AvailabilityInvalid)
 }
 
 func TestLoadFileRejectsOversizedAndEscapingSymlink(t *testing.T) {

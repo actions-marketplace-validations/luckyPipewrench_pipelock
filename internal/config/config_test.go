@@ -5078,6 +5078,65 @@ func TestValidate_MCPToolScanningDisabledSkipsValidation(t *testing.T) {
 	}
 }
 
+func TestValidate_MCPToolScanningListenerDriftResetAuthority(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "reset-authority.pub")
+	if err := os.WriteFile(keyPath, []byte(hex.EncodeToString(publicKey)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	malformedKeyPath := filepath.Join(t.TempDir(), "malformed-reset-authority.pub")
+	if err := os.WriteFile(malformedKeyPath, []byte("not-hex"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	shortKeyPath := filepath.Join(t.TempDir(), "short-reset-authority.pub")
+	if err := os.WriteFile(shortKeyPath, []byte(hex.EncodeToString(publicKey[:16])), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	valid := Defaults()
+	valid.MCPToolScanning.ListenerDriftResetFile = "/run/pipelock/drift.reset"
+	valid.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = keyPath
+	valid.MCPToolScanning.ListenerDriftResetTarget = "mcp://listener-a"
+	if err := valid.Validate(); err != nil {
+		t.Fatalf("valid listener reset authority rejected: %v", err)
+	}
+	if !bytes.Equal(valid.MCPToolScanning.ListenerDriftResetAuthorityPublicKey, publicKey) {
+		t.Fatal("validated listener reset authority did not pin the parsed public key")
+	}
+	cloned := valid.Clone()
+	cloned.MCPToolScanning.ListenerDriftResetAuthorityPublicKey[0] ^= 0xff
+	if bytes.Equal(cloned.MCPToolScanning.ListenerDriftResetAuthorityPublicKey, valid.MCPToolScanning.ListenerDriftResetAuthorityPublicKey) {
+		t.Fatal("cloned listener reset authority aliases the validated public key")
+	}
+
+	for name, mutate := range map[string]func(*Config){
+		"missing control file": func(cfg *Config) { cfg.MCPToolScanning.ListenerDriftResetFile = "" },
+		"missing public key":   func(cfg *Config) { cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = "" },
+		"missing target":       func(cfg *Config) { cfg.MCPToolScanning.ListenerDriftResetTarget = "" },
+		"blank target":         func(cfg *Config) { cfg.MCPToolScanning.ListenerDriftResetTarget = "   " },
+		"missing public key file": func(cfg *Config) {
+			cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = "/missing/reset-authority.pub"
+		},
+		"malformed public key": func(cfg *Config) {
+			cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = malformedKeyPath
+		},
+		"short public key": func(cfg *Config) {
+			cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile = shortKeyPath
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := valid.Clone()
+			mutate(cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid listener reset authority accepted")
+			}
+		})
+	}
+}
+
 func TestValidateReload_MCPToolScanningDisabled(t *testing.T) {
 	old := Defaults()
 	old.MCPToolScanning.Enabled = true
@@ -9159,6 +9218,9 @@ func TestApplyDefaults_RequestBodyScanning_ConditionalDefaults(t *testing.T) {
 	if cfg.RequestBodyScanning.MaxBodyBytes != 5*1024*1024 {
 		t.Fatalf("expected default max_body_bytes 5MB, got %d", cfg.RequestBodyScanning.MaxBodyBytes)
 	}
+	if cfg.ReverseProxy.MaxInflightScanBytes != DefaultReverseProxyMaxInflightScanBytes {
+		t.Fatalf("expected default reverse_proxy.max_inflight_scan_bytes %d, got %d", DefaultReverseProxyMaxInflightScanBytes, cfg.ReverseProxy.MaxInflightScanBytes)
+	}
 	if cfg.RequestBodyScanning.HeaderMode != HeaderModeSensitive {
 		t.Fatalf("expected default header_mode %q, got %q", HeaderModeSensitive, cfg.RequestBodyScanning.HeaderMode)
 	}
@@ -11643,6 +11705,97 @@ func TestLoad_FlightRecorderRequireReceiptsReloadStates(t *testing.T) {
 	}
 }
 
+func TestLoad_FlightRecorderRequireContainmentEvidenceStates(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		section string
+		want    bool
+	}{
+		{name: "omitted_whole_section", section: "", want: false},
+		{name: "key_null", section: "flight_recorder:\n  require_containment_evidence:\n", want: false},
+		{name: "key_blank", section: "flight_recorder:\n  require_containment_evidence: \n", want: false},
+		{name: "explicit_false", section: "flight_recorder:\n  require_containment_evidence: false\n", want: false},
+		{name: "explicit_true", section: "flight_recorder:\n  enabled: true\n  dir: /tmp/recorder\n  signing_key_path: /tmp/recorder.key\n  posture_signer_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  require_containment_evidence: true\n", want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfgPath := filepath.Join(t.TempDir(), "fr-require-containment.yaml")
+			if err := os.WriteFile(cfgPath, []byte("mode: balanced\n"+tt.section), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(cfgPath)
+			if err != nil {
+				t.Fatalf("Load() error: %v", err)
+			}
+			if cfg.FlightRecorder.RequireContainmentEvidence != tt.want {
+				t.Errorf("FlightRecorder.RequireContainmentEvidence = %v, want %v", cfg.FlightRecorder.RequireContainmentEvidence, tt.want)
+			}
+		})
+	}
+}
+
+func TestLoad_FlightRecorderRequireContainmentEvidenceReloadStates(t *testing.T) {
+	t.Parallel()
+	cfgPath := filepath.Join(t.TempDir(), "fr-require-containment-reload.yaml")
+	firstContent := "mode: balanced\nflight_recorder:\n  require_containment_evidence: false\n"
+	if err := os.WriteFile(cfgPath, []byte(firstContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	first, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load #1: %v", err)
+	}
+	if first.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("first load RequireContainmentEvidence = true, want false")
+	}
+
+	changedContent := "mode: balanced\nflight_recorder:\n  enabled: true\n  dir: /tmp/recorder\n  signing_key_path: /tmp/recorder.key\n  posture_signer_key: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n  require_containment_evidence: true\n"
+	if err := os.WriteFile(cfgPath, []byte(changedContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load #2: %v", err)
+	}
+	if !second.FlightRecorder.RequireContainmentEvidence {
+		t.Fatal("reload with change RequireContainmentEvidence = false, want true")
+	}
+
+	third, err := Load(cfgPath)
+	if err != nil {
+		t.Fatalf("Load #3: %v", err)
+	}
+	if third.FlightRecorder.RequireContainmentEvidence != second.FlightRecorder.RequireContainmentEvidence {
+		t.Fatalf("reload without change RequireContainmentEvidence = %v, want %v",
+			third.FlightRecorder.RequireContainmentEvidence, second.FlightRecorder.RequireContainmentEvidence)
+	}
+}
+
+func TestValidate_FlightRecorderContainmentPinsPostureSignerKey(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	cfg := Defaults()
+	cfg.FlightRecorder.RequireContainmentEvidence = true
+	cfg.FlightRecorder.Dir = testRecorderDir
+	cfg.FlightRecorder.SigningKeyPath = "/tmp/recorder.key"
+	cfg.FlightRecorder.PostureSignerKey = hex.EncodeToString(publicKey)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if !bytes.Equal(cfg.FlightRecorder.PostureSignerPublicKey, publicKey) {
+		t.Fatal("validated posture signer key did not match configured pin")
+	}
+	clone := cfg.Clone()
+	clone.FlightRecorder.PostureSignerPublicKey[0] ^= 0xff
+	if bytes.Equal(clone.FlightRecorder.PostureSignerPublicKey, cfg.FlightRecorder.PostureSignerPublicKey) {
+		t.Fatal("cloned posture signer key aliases the validated config")
+	}
+}
+
 func TestLoad_MCPToolProvenanceDefaults(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "prov.yaml")
@@ -12984,9 +13137,156 @@ func TestValidate_SandboxBestEffortAlone(t *testing.T) {
 	cfg.Internal = nil
 	cfg.SSRF.IPAllowlist = testLoopbackAllowlist
 	cfg.Sandbox.BestEffort = true
+	cfg.Sandbox.BestEffortReason = "test override"
+	cfg.Sandbox.BestEffortExpiry = time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
 	cfg.Sandbox.Strict = false
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("best_effort alone should be valid: %v", err)
+	}
+}
+
+func TestValidate_SandboxBestEffortRejectsExpiredExpiry(t *testing.T) {
+	for _, tt := range []struct {
+		expiry  string
+		wantErr string
+	}{
+		{expiry: "0s", wantErr: "durations are command-line only"},
+		{expiry: "2000-01-01T00:00:00Z", wantErr: "expired"},
+	} {
+		t.Run(tt.expiry, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Internal = nil
+			cfg.SSRF.IPAllowlist = testLoopbackAllowlist
+			cfg.Sandbox.BestEffort = true
+			cfg.Sandbox.BestEffortReason = "test override"
+			cfg.Sandbox.BestEffortExpiry = tt.expiry
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoad_SandboxBestEffortRejectsRelativeExpiryRegardlessOfModificationTime(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+	configBody := []byte("sandbox:\n  best_effort: true\n  best_effort_reason: test override\n  best_effort_expiry: 1h\n")
+	if err := os.WriteFile(configPath, configBody, 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	for _, tt := range []struct {
+		name        string
+		modifiedAt  time.Time
+		rewriteFile bool
+	}{
+		{name: "restored older file", modifiedAt: time.Now().Add(-2 * time.Hour)},
+		{name: "future modification time", modifiedAt: time.Now().Add(24 * time.Hour)},
+		{name: "byte-identical rewrite", rewriteFile: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.rewriteFile {
+				if err := os.WriteFile(configPath, configBody, 0o600); err != nil {
+					t.Fatalf("rewrite byte-identical config: %v", err)
+				}
+			} else if err := os.Chtimes(configPath, tt.modifiedAt, tt.modifiedAt); err != nil {
+				t.Fatalf("set config modification time: %v", err)
+			}
+			if _, err := Load(configPath); err == nil || !strings.Contains(err.Error(), "durations are command-line only") {
+				t.Fatalf("Load() error = %v, want relative-expiry refusal", err)
+			}
+		})
+	}
+}
+
+func TestLoadBytes_SandboxBestEffortRelativeExpiryRequiresRFC3339(t *testing.T) {
+	_, err := LoadBytes([]byte("sandbox:\n  best_effort: true\n  best_effort_reason: test override\n  best_effort_expiry: 1h\n"))
+	if err == nil || !strings.Contains(err.Error(), "durations are command-line only") {
+		t.Fatalf("LoadBytes() error = %v, want relative-expiry refusal", err)
+	}
+}
+
+func TestLoadBytes_SandboxBestEffortRejectsNonPositiveRelativeExpiry(t *testing.T) {
+	_, err := LoadBytes([]byte("sandbox:\n  best_effort: true\n  best_effort_reason: test override\n  best_effort_expiry: 0s\n"))
+	if err == nil || !strings.Contains(err.Error(), "durations are command-line only") {
+		t.Fatalf("LoadBytes() error = %v, want relative-expiry refusal", err)
+	}
+}
+
+func TestValidateReload_SandboxBestEffortMetadataChanged(t *testing.T) {
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	later := time.Now().Add(2 * time.Hour).UTC().Format(time.RFC3339)
+	tests := []struct {
+		name   string
+		mutate func(old, updated *Config)
+	}{
+		{"reason", func(old, updated *Config) {
+			old.Sandbox.BestEffortReason = "old reason"
+			updated.Sandbox.BestEffortReason = "new reason"
+		}},
+		{"expiry", func(old, updated *Config) {
+			old.Sandbox.BestEffortExpiry = future
+			updated.Sandbox.BestEffortExpiry = later
+		}},
+		{"best_effort toggle", func(old, updated *Config) {
+			updated.Sandbox.BestEffort = true
+			updated.Sandbox.BestEffortReason = "new reason"
+			updated.Sandbox.BestEffortExpiry = future
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			old := Defaults()
+			updated := Defaults()
+			tt.mutate(old, updated)
+			for _, warning := range ValidateReload(old, updated) {
+				if warning.Field == fieldSandbox {
+					return
+				}
+			}
+			t.Fatalf("expected sandbox restart warning when best_effort %s changes", tt.name)
+		})
+	}
+}
+
+func TestValidate_SandboxBestEffortRequiresReasonAndExpiry(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		reason  string
+		expiry  string
+		wantErr string
+	}{
+		{name: "missing reason", reason: "", expiry: time.Now().Add(time.Hour).UTC().Format(time.RFC3339), wantErr: "best_effort_reason is required"},
+		{name: "missing expiry", reason: "container user namespaces disabled", expiry: "", wantErr: "best_effort_expiry is required"},
+		{name: "blank expiry", reason: "container user namespaces disabled", expiry: "   ", wantErr: "best_effort_expiry is required"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Internal = nil
+			cfg.SSRF.IPAllowlist = testLoopbackAllowlist
+			cfg.Sandbox.BestEffort = true
+			cfg.Sandbox.BestEffortReason = tt.reason
+			cfg.Sandbox.BestEffortExpiry = tt.expiry
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateReload_SandboxBestEffortUnchangedDoesNotWarn(t *testing.T) {
+	future := time.Now().Add(time.Hour).UTC().Format(time.RFC3339)
+	old := Defaults()
+	old.Sandbox.BestEffort = true
+	old.Sandbox.BestEffortReason = "same reason"
+	old.Sandbox.BestEffortExpiry = future
+	updated := Defaults()
+	updated.Sandbox.BestEffort = true
+	updated.Sandbox.BestEffortReason = "same reason"
+	updated.Sandbox.BestEffortExpiry = future
+
+	for _, warning := range ValidateReload(old, updated) {
+		if warning.Field == fieldSandbox {
+			t.Fatalf("unchanged best_effort override must not warn, got %+v", warning)
+		}
 	}
 }
 
@@ -14497,6 +14797,44 @@ func TestValidate_ReverseProxy_ValidConfig(t *testing.T) {
 	}
 }
 
+func TestValidate_ReverseProxy_MaxInflightScanBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{
+			name: "nonpositive rejected",
+			mutate: func(cfg *Config) {
+				cfg.ReverseProxy.MaxInflightScanBytes = -1
+			},
+			wantErr: "max_inflight_scan_bytes must be positive",
+		},
+		{
+			name: "below one configured body rejected",
+			mutate: func(cfg *Config) {
+				cfg.RequestBodyScanning.MaxBodyBytes = 1024
+				cfg.ReverseProxy.MaxInflightScanBytes = 1023
+			},
+			wantErr: "must be >= request_body_scanning.max_body_bytes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.ReverseProxy.Enabled = true
+			cfg.ReverseProxy.Listen = testRevProxyListen
+			cfg.ReverseProxy.Upstream = testRevProxyUpstream
+			tt.mutate(cfg)
+			cfg.ApplyDefaults()
+			if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestValidate_ReverseProxy_DisabledSkipsValidation(t *testing.T) {
 	cfg := Defaults()
 	cfg.ReverseProxy.Enabled = false
@@ -15123,6 +15461,63 @@ func TestValidate_FlightRecorder(t *testing.T) {
 				return c
 			},
 			wantErr: "require_receipts requires flight_recorder.signing_key_path",
+		},
+		{
+			name: "require_containment_evidence_requires_enabled",
+			cfg: func() *Config {
+				c := Defaults()
+				c.FlightRecorder.Enabled = false
+				c.FlightRecorder.RequireContainmentEvidence = true
+				c.FlightRecorder.Dir = testRecorderDir
+				c.FlightRecorder.SigningKeyPath = "/tmp/recorder.key"
+				return c
+			},
+			wantErr: "require_containment_evidence requires flight_recorder.enabled",
+		},
+		{
+			name: "require_containment_evidence_requires_dir",
+			cfg: func() *Config {
+				c := Defaults()
+				c.FlightRecorder.RequireContainmentEvidence = true
+				c.FlightRecorder.Dir = ""
+				c.FlightRecorder.SigningKeyPath = "/tmp/recorder.key"
+				return c
+			},
+			wantErr: "require_containment_evidence requires flight_recorder.dir",
+		},
+		{
+			name: "require_containment_evidence_requires_signing_key_path",
+			cfg: func() *Config {
+				c := Defaults()
+				c.FlightRecorder.RequireContainmentEvidence = true
+				c.FlightRecorder.Dir = testRecorderDir
+				c.FlightRecorder.SigningKeyPath = ""
+				return c
+			},
+			wantErr: "require_containment_evidence requires flight_recorder.signing_key_path",
+		},
+		{
+			name: "require_containment_evidence_requires_posture_signer_key",
+			cfg: func() *Config {
+				c := Defaults()
+				c.FlightRecorder.RequireContainmentEvidence = true
+				c.FlightRecorder.Dir = testRecorderDir
+				c.FlightRecorder.SigningKeyPath = "/tmp/recorder.key"
+				return c
+			},
+			wantErr: "require_containment_evidence requires flight_recorder.posture_signer_key",
+		},
+		{
+			name: "require_containment_evidence_rejects_invalid_posture_signer_key",
+			cfg: func() *Config {
+				c := Defaults()
+				c.FlightRecorder.RequireContainmentEvidence = true
+				c.FlightRecorder.Dir = testRecorderDir
+				c.FlightRecorder.SigningKeyPath = "/tmp/recorder.key"
+				c.FlightRecorder.PostureSignerKey = "not-a-public-key"
+				return c
+			},
+			wantErr: "load flight_recorder.posture_signer_key",
 		},
 		{
 			// Enabled is on by default; without a dir the recorder is inert

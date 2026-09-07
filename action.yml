@@ -321,13 +321,45 @@ runs:
           done <<< "$PIPELOCK_EXCLUDE"
         fi
 
-        if ! git diff "origin/${BASE_REF}...HEAD" | pipelock git scan-diff "${SCAN_ARGS[@]}"; then
+        # Exit 0 is a verified clean scan, 1 is a verified scan with findings,
+        # and 2 is an instrument error. JSON shape alone cannot prove which
+        # state occurred.
+        SCAN_OUT="$(mktemp)"
+        SCAN_ERR="$(mktemp)"
+        trap 'rm -f "$SCAN_OUT" "$SCAN_ERR"' EXIT
+        SCAN_RC=0
+        git diff "origin/${BASE_REF}...HEAD" | pipelock git scan-diff --json "${SCAN_ARGS[@]}" > "$SCAN_OUT" 2> "$SCAN_ERR" || SCAN_RC=$?
+
+        if [ "$SCAN_RC" -ne 0 ] && [ "$SCAN_RC" -ne 1 ]; then
+          echo "::error::Pipelock could not scan the PR diff, so it is unverified (exit ${SCAN_RC}). This is a scan failure, not a secret finding."
+          sed 's/^/  /' "$SCAN_ERR"
+          exit 1
+        fi
+
+        if ! FINDINGS="$(jq -e 'if type == "array" then length else empty end' < "$SCAN_OUT" 2>/dev/null)"; then
+          # Fail closed regardless of fail-on-findings. That input decides what
+          # to do about secrets that were found; it cannot speak for a diff that
+          # was never examined, and treating an unscanned diff as clean is the
+          # one outcome this step exists to prevent.
+          echo "::error::Pipelock could not scan the PR diff, so it is unverified. This is a scan failure, not a secret finding."
+          sed 's/^/  /' "$SCAN_ERR"
+          exit 1
+        fi
+
+        if { [ "$FINDINGS" -eq 0 ] && [ "$SCAN_RC" -ne 0 ]; } || { [ "$FINDINGS" -gt 0 ] && [ "$SCAN_RC" -ne 1 ]; }; then
+          echo "::error::Pipelock scan result disagrees with its exit status, so the PR diff is unverified."
+          exit 1
+        fi
+
+        if [ "$FINDINGS" -gt 0 ]; then
+          jq -r '.[] | "  \(.file):\(.line)  \(.pattern) (\(.severity))"' < "$SCAN_OUT"
           if [ "$PIPELOCK_FAIL_ON_FINDINGS" = "true" ]; then
-            echo "::error::Secrets detected in PR diff. Failing because fail-on-findings is enabled."
+            echo "::error::Secrets detected in PR diff (${FINDINGS}). Failing because fail-on-findings is enabled."
             exit 1
-          else
-            echo "::warning::Potential secrets detected in PR diff. Review the output above."
           fi
+          echo "::warning::Potential secrets detected in PR diff (${FINDINGS}). Review the output above."
+        else
+          echo "No secrets found in diff."
         fi
 
     - name: Upload audit report

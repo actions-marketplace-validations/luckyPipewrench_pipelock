@@ -15,13 +15,17 @@ LDFLAGS := -ldflags "-s -w \
 	-X $(MODULE)/internal/license.PublicKeyHex=$(LICENSE_PUBLIC_KEY) \
 	-X $(MODULE)/internal/rules.KeyringHex=$(RULES_KEYRING_HEX)"
 
-.PHONY: all build build-verifier test test-wasm-verifier bench bench-baseline bench-regression bench-egress bench-egress-long bench-egress-release lint test-stability-check clean docker install fmt vet tidy-check fuzz stats docs-check source-header-check reproducible-build-check \
+.PHONY: all build build-verifier verify-examples test test-wasm-verifier bench bench-baseline bench-regression bench-egress bench-egress-long bench-egress-release lint test-stability-check clean docker install fmt vet tidy-check fuzz stats docs-check brand-assets brand-check source-header-check reproducible-build-check \
 	test-runtime-critical test-replay-harness test-sharded test-sharded-enterprise release-audit runtime-policy-audit debt-check release-check hermes-e2e test-liveproof
 
 all: build
 
 build:
 	go build -trimpath $(LDFLAGS) -o $(BINARY) ./cmd/pipelock
+
+verify-examples: build
+	python3 -m unittest scripts.test_e2e_hermetic scripts.test_example_verification_workflow
+	PIPELOCK_BIN="$(CURDIR)/$(BINARY)" ./scripts/verify-examples.sh
 
 VERIFIER_BINARY := pipelock-verifier
 LDFLAGS_VERIFIER := -ldflags "-s -w \
@@ -37,13 +41,13 @@ install:
 	go install $(LDFLAGS) ./cmd/pipelock
 
 test:
-	go test -race -count=1 ./...
+	$(MAKE) --no-print-directory test-sharded
 
 test-wasm-verifier:
 	node --test deploy/wasm-verify/chain-parity.test.js
 
 test-runtime-critical:
-	go test -race -count=1 -timeout 15m ./internal/config ./internal/cli ./internal/mcp ./internal/proxy
+	scripts/run-race-test.sh --packages "./internal/config ./internal/cli ./internal/mcp ./internal/proxy"
 
 # Test shards mirror CI (scripts/ci_test_packages.py): the three heavy packages
 # (proxy, scanner, mcp) plus three balanced rest shards. Their union is the same
@@ -58,37 +62,25 @@ FORCE:
 
 # Run one CI-equivalent OSS shard, e.g. `make test-shard-proxy`.
 test-shard-%: FORCE
-	packages=$$(python3 scripts/ci_test_packages.py --shard $*) || exit $$?; \
-	package_parallelism=2; \
-	if [ "$*" = "proxy" ]; then package_parallelism=1; fi; \
-	go test -race -p=$$package_parallelism -parallel=2 -count=1 -timeout=15m $$packages
+	scripts/run-race-test.sh --shard $*
 
 # Run one CI-equivalent enterprise shard, e.g. `make test-shard-enterprise-mcp`.
 test-shard-enterprise-%: FORCE
-	packages=$$(python3 scripts/ci_test_packages.py --tags enterprise --shard $*) || exit $$?; \
-	package_parallelism=2; \
-	if [ "$*" = "proxy" ]; then package_parallelism=1; fi; \
-	go test -tags enterprise -race -p=$$package_parallelism -parallel=2 -count=1 -timeout=15m $$packages
+	scripts/run-race-test.sh --tags enterprise --shard $*
 
 # Run every OSS shard sequentially: same coverage as `make test`, sharded and
 # labelled (serial to respect the local single-race-at-a-time constraint).
 test-sharded:
 	@for shard in $(TEST_SHARDS); do \
 		echo "=== OSS test shard: $$shard ==="; \
-		packages=$$(python3 scripts/ci_test_packages.py --shard $$shard) || exit $$?; \
-		package_parallelism=2; \
-		if [ "$$shard" = "proxy" ]; then package_parallelism=1; fi; \
-		go test -race -p=$$package_parallelism -parallel=2 -count=1 -timeout=15m $$packages || exit $$?; \
+		scripts/run-race-test.sh --shard $$shard || exit $$?; \
 	done
 
-# Run every enterprise shard sequentially (mirrors the CI test-enterprise matrix).
+# Run every enterprise shard sequentially (mirrors both CI enterprise matrices).
 test-sharded-enterprise:
 	@for shard in $(TEST_SHARDS); do \
 		echo "=== enterprise test shard: $$shard ==="; \
-		packages=$$(python3 scripts/ci_test_packages.py --tags enterprise --shard $$shard) || exit $$?; \
-		package_parallelism=2; \
-		if [ "$$shard" = "proxy" ]; then package_parallelism=1; fi; \
-		go test -tags enterprise -race -p=$$package_parallelism -parallel=2 -count=1 -timeout=15m $$packages || exit $$?; \
+		scripts/run-race-test.sh --tags enterprise --shard $$shard || exit $$?; \
 	done
 
 # test-replay-harness exercises the synthetic replay regression suite:
@@ -96,10 +88,10 @@ test-sharded-enterprise:
 # Refresh goldens after intentional logic changes:
 #   go test ./internal/capture -run TestReplayHarness -update
 test-replay-harness:
-	go test -race -count=1 -run TestReplayHarness ./internal/capture
+	scripts/run-race-test.sh --packages ./internal/capture --run TestReplayHarness
 
 test-cover:
-	go test -race -coverprofile=coverage.out ./...
+	go test -count=1 -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
 	@echo "Coverage report: coverage.html"
 
@@ -135,8 +127,32 @@ bench-egress-long:
 bench-egress-release:
 	bash bench/egress/run-all.sh --release
 
-fmt:
-	gofumpt -w .
+# The pinned linter version is read from the workflow rather than repeated here,
+# so the two cannot drift apart. A second copy of a version is a second thing to
+# forget.
+GOLANGCI_LINT_PIN := $(shell sed -n 's/[[:space:]]*version:[[:space:]]*v\([0-9][0-9.]*\).*/\1/p' .github/workflows/ci.yaml | head -1)
+
+.PHONY: check-lint-version
+check-lint-version:
+	@pin='$(GOLANGCI_LINT_PIN)'; \
+	if [ -z "$$pin" ]; then \
+	  printf 'warning: could not read the pinned golangci-lint version from the CI workflow, so local and CI formatting are unchecked.\n' >&2; \
+	  exit 0; \
+	fi; \
+	have=$$(golangci-lint --version 2>/dev/null | sed -n 's/.*version v\{0,1\}\([0-9][0-9.]*\).*/\1/p' | head -1); \
+	if [ -z "$$have" ]; then \
+	  printf 'warning: could not read the local golangci-lint version; CI pins %s.\n' "$$pin" >&2; \
+	elif [ "$$have" != "$$pin" ]; then \
+	  printf 'warning: golangci-lint %s locally, CI pins %s. Formatting and lint results can differ from CI.\n' \
+	    "$$have" "$$pin" >&2; \
+	fi
+
+fmt: check-lint-version
+	# Format with the gofumpt that golangci-lint bundles, not whatever gofumpt
+	# happens to be on PATH. A standalone binary drifts from the pinned one and
+	# then disagrees with CI in both directions: a newer local gofumpt reports
+	# files CI accepts, and an older one accepts files CI rejects.
+	golangci-lint fmt ./...
 
 vet:
 	go vet ./...
@@ -157,7 +173,7 @@ runtime-policy-audit:
 debt-check:
 	golangci-lint run --enable-only dupl,gocyclo,gocognit,maintidx ./...
 
-release-check: test lint test-runtime-critical test-replay-harness release-audit runtime-policy-audit
+release-check: test lint release-audit runtime-policy-audit
 
 tidy-check:
 	go mod tidy
@@ -193,6 +209,12 @@ stats: ## Print canonical stats
 
 docs-check: ## Check public docs for known stale claims and print canonical stats
 	@./scripts/docs-check.sh
+
+brand-assets: ## Regenerate canonical SVG brand assets
+	@python3 scripts/render_brand.py
+
+brand-check: ## Verify SVG masters and raster provenance
+	@python3 scripts/render_brand.py --check
 
 source-header-check: ## Verify source files carry the required copyright and license notices
 	@./scripts/check-source-headers.sh

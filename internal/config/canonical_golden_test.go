@@ -316,7 +316,51 @@ const (
 	// Re-bumped for airlock.triggers.anomaly_window_minutes default 0:
 	// the reserved window is now rejected when nonzero, so the default
 	// cannot stay at the previous inert 5.
-	goldenHashDefaults = "b30392fd23d378ddb33ba25884b54ad0c419cf91c3d6f5b33e8c51b8570a2990"
+	// Re-bumped for New Instructions authority/action context narrowing.
+	// Re-bumped again for the New Instructions proximity form: the narrowing
+	// above required a literal ":" or "-" between the phrase and its context,
+	// so a period, newline, comma, or em-dash evaded it. Proximity keeps the
+	// context requirement without depending on one punctuation mark.
+	// Re-bumped to require an authority label or concrete override action;
+	// ordinary publication and developer-guide prose must remain clean.
+	// Re-bumped for singular directive nouns, authority-after-phrase forms,
+	// and hard-separator action anchoring that excludes ordinary run guidance.
+	// Re-bumped so authority-qualified directives remain detectable across
+	// period, comma, em-dash, and newline separators.
+	// Re-bumped for action-anchored connective forms such as "rules say to"
+	// and "instructions are to" without broadening ordinary task prose.
+	// Re-bumped for the reverse-proxy scan admission budget: ReverseProxy
+	// now carries max_inflight_scan_bytes, which decides whether a request
+	// is scanned or refused with 413 under load. That is an enforcement
+	// outcome rather than plumbing, so it belongs in the policy view and
+	// must shift ph. Listen and Upstream on the same struct stay excluded,
+	// which the ops-field invariance test confirms by landing on this same
+	// hash.
+	// Re-bumped for provider-key left-boundary precision. The change prevents
+	// ordinary prose from being redacted or blocked, while deliberately losing
+	// detection for a key glued to a preceding token-alphabet character.
+	// Re-bumped for response_scanning.authenticated_artifacts: the canonical
+	// view now carries the exact signed-artifact allowlist. It is
+	// policy-relevant because an entry lets the proxy release a verified
+	// official rules bundle with response injection matching skipped, so
+	// verifiers must observe the schema change through ph.
+	// Re-bumped for request_body_scanning.content_entropy_warn_routes. The
+	// exact route exception changes an entropy block to a visible warning, so
+	// mixed versions must not report the same policy identity.
+	// Re-bumped for request_body_scanning.sigv4_credential_routes. The exact
+	// route grant changes whether a request body may carry a structurally valid
+	// presigned URL and therefore belongs in the policy identity.
+	// Re-bumped for issuer-backed GitHub stateless-token and decoded Azure SAS
+	// coverage in the default DLP pattern set.
+	// Re-bumped for fetch_proxy.monitoring.scan_nested_urls: nested query
+	// destinations are an enforcement floor, so mixed versions must not
+	// report the same policy identity.
+	// Re-bumped when host-set hashing adopted runtime-equivalent case,
+	// duplicate, and trailing-dot normalization.
+	// Re-bumped for Credential in URL grammar: line-start assignments require
+	// adjacency around '=', while delimiter-led query parameters retain
+	// whitespace tolerance. This detection-relevant default changes policy.
+	goldenHashDefaults = "43c689f65d90d4cd7e6a90a298df97a6b4d01150066006d37e7e618d1f968063"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -470,7 +514,39 @@ const (
 	// Re-bumped for cookie query keys plus curl/wget upload-form coverage.
 	// Re-bumped for URL-first curl and wget upload-command coverage.
 	// Re-bumped for natural-language password and private-key transfers.
-	goldenHashRichConfig = "3b8492e676ab7527987ad8fccf4be9375015b785108c8852893fccc2f7fa5ddc"
+	// Re-bumped for New Instructions authority/action context narrowing.
+	// Re-bumped again for the New Instructions proximity form; see the
+	// goldenHashDefaults note. Both invariance tests compare against this
+	// constant and produced this same hash, so ops-field and allowlist-order
+	// invariance are intact and only the shared baseline moved.
+	// Re-bumped for the authority-label/action narrowing above.
+	// Re-bumped for the singular and hard-separator refinement above.
+	// Re-bumped for the authority-label separator expansion above.
+	// Re-bumped for the hard-separated directive expansion above.
+	// Re-bumped for the reverse-proxy scan admission budget: ReverseProxy
+	// now carries max_inflight_scan_bytes, which decides whether a request
+	// is scanned or refused with 413 under load. That is an enforcement
+	// outcome rather than plumbing, so it belongs in the policy view and
+	// must shift ph. Listen and Upstream on the same struct stay excluded,
+	// which the ops-field invariance test confirms by landing on this same
+	// hash.
+	// Re-bumped for provider-key left-boundary precision; see goldenHashDefaults.
+	// Re-bumped for response_scanning.authenticated_artifacts: see
+	// goldenHashDefaults note above. The rich fixture omits the field, so the
+	// nil allowlist flows into ph identically to Defaults() and the hash
+	// shifts in lockstep.
+	// Re-bumped for route-scoped entropy warnings: see goldenHashDefaults.
+	// Re-bumped for route-scoped SigV4 body credentials: see goldenHashDefaults.
+	// Re-bumped for issuer-backed GitHub stateless-token and decoded Azure SAS
+	// coverage: the rich fixture inherits the default DLP pattern set.
+	// Re-bumped for fetch_proxy.monitoring.scan_nested_urls: see
+	// goldenHashDefaults. The rich fixture omits the field, so nil (enabled)
+	// flows into ph identically to Defaults().
+	// Re-bumped for runtime-equivalent host-set normalization; see
+	// goldenHashDefaults above.
+	// Re-bumped for the Credential in URL grammar change above; the rich
+	// fixture inherits the built-in DLP patterns.
+	goldenHashRichConfig = "649c59d3cf9cb07e446c22dc88769316c6ea3ba3600659a669bb5ade43b7e7af"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It

@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -54,6 +55,93 @@ func TestScanRequestBody_Redaction_BeforeDLPEarlyReturn(t *testing.T) {
 	}
 	if len(result.DLPMatches) == 0 {
 		t.Fatal("expected pre-redaction DLP evidence to survive redaction")
+	}
+}
+
+func TestScanRequestBody_RedactsGitHubStatelessInstallationToken(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	githubJWTHeader := strings.Join([]string{"ghs_", "eyJ", "hbG", "ciOi", "JFUz", "I1Ni", "J9."}, "")
+	token := githubJWTHeader + strings.Repeat("A", 240) + "." + strings.Repeat("B", 220) + "-_"
+	body := `{"token":"` + token + `"}`
+	buf, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:          strings.NewReader(body),
+		ContentType:   contentTypeJSON,
+		MaxBytes:      len(body) * 2,
+		Scanner:       sc,
+		RedactMatcher: redact.NewDefaultMatcher(),
+	})
+
+	var redacted struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(buf, &redacted); err != nil {
+		t.Fatalf("parse redacted body: %v", err)
+	}
+	if redacted.Token != "<pl:github-token:1>" {
+		t.Fatalf("redacted token = %q, want complete placeholder", redacted.Token)
+	}
+	if result.RedactionReport == nil || !result.RedactionReport.Applied {
+		t.Fatalf("RedactionReport missing or not applied: %+v", result.RedactionReport)
+	}
+}
+
+func TestScanRequestBody_Redaction_ProviderKeyProsePassesUnmodified(t *testing.T) {
+	t.Parallel()
+
+	type providerCase struct {
+		name   string
+		prefix string
+	}
+	providers := []providerCase{
+		{name: "anthropic", prefix: "ant-"},
+		{name: "openai-project", prefix: "proj-"},
+		{name: "openai-service", prefix: "svcacct-"},
+	}
+	prosePrefixes := []string{"desk", "kiosk", "risk", "task"}
+
+	for _, provider := range providers {
+		provider := provider
+		for _, prosePrefix := range prosePrefixes {
+			prosePrefix := prosePrefix
+			t.Run(provider.name+"/"+prosePrefix, func(t *testing.T) {
+				t.Parallel()
+				cfg := testScannerConfig()
+				sc := scanner.MustNew(cfg)
+				defer sc.Close()
+
+				// Two glue shapes, both benign. The first is the reported false
+				// positive, where the prose word itself ends in "sk" and supplies
+				// the prefix. The second glues a complete "sk-" onto that word, so
+				// the case cannot pass merely because the credential prefix was
+				// never fully present in the input.
+				for _, prose := range []string{
+					prosePrefix + "-" + provider.prefix + strings.Repeat("a", 20),
+					prosePrefix + "sk-" + provider.prefix + strings.Repeat("a", 20),
+				} {
+					body := `{"message":"` + prose + `"}`
+					buf, result := scanRequestBody(context.Background(), BodyScanRequest{
+						Body:          strings.NewReader(body),
+						ContentType:   contentTypeJSON,
+						MaxBytes:      cfg.RequestBodyScanning.MaxBodyBytes,
+						Scanner:       sc,
+						RedactMatcher: redact.NewDefaultMatcher(),
+					})
+
+					if string(buf) != body {
+						t.Fatalf("benign body was rewritten: got %q, want %q", buf, body)
+					}
+					if !result.Clean || len(result.DLPMatches) != 0 {
+						t.Fatalf("benign body was flagged: %+v", result)
+					}
+					if result.RedactionReport == nil || result.RedactionReport.TotalRedactions != 0 {
+						t.Fatalf("benign body was redacted: %+v", result.RedactionReport)
+					}
+				}
+			})
+		}
 	}
 }
 

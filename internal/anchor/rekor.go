@@ -53,6 +53,20 @@ const (
 	DefaultRekorHashAlgorithm = rekorDefaultSubmitHashAlgorithm
 )
 
+// clientWithoutRedirects copies base (or http.DefaultClient) and refuses
+// later hops. Submit validates only the configured Rekor URL; following a
+// redirect would POST the checkpoint to a host that never passed that check.
+func clientWithoutRedirects(base *http.Client) *http.Client {
+	if base == nil {
+		base = http.DefaultClient
+	}
+	cloned := *base
+	cloned.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &cloned
+}
+
 // RekorLog submits receipt-chain checkpoints to Rekor and stores the returned
 // submission metadata. Verify requires a pinned Rekor log public key and checks
 // the SET, signed checkpoint, and inclusion proof offline.
@@ -195,11 +209,7 @@ func (r RekorLog) Submit(checkpoint Checkpoint) (Proof, error) {
 		return Proof{}, fmt.Errorf("build rekor request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := r.HTTPClient
-	if client == nil {
-		client = http.DefaultClient
-	}
-	resp, err := client.Do(req)
+	resp, err := clientWithoutRedirects(r.HTTPClient).Do(req)
 	if err != nil {
 		return Proof{}, fmt.Errorf("submit rekor entry: %w", err)
 	}
@@ -211,6 +221,17 @@ func (r RekorLog) Submit(checkpoint Checkpoint) (Proof, error) {
 	if len(respBody) > rekorMaxResponseBytes {
 		return Proof{}, fmt.Errorf("read rekor response: exceeds %d bytes", rekorMaxResponseBytes)
 	}
+	if resp.StatusCode == http.StatusConflict {
+		uuid, err := rekorConflictUUID(resp.Header.Get("Location"), baseURL)
+		if err != nil {
+			return Proof{}, err
+		}
+		entry, err := r.getRekorEntry(ctx, baseURL, uuid)
+		if err != nil {
+			return Proof{}, err
+		}
+		return rekorSubmissionProof(baseURL, uuid, entry, publicKey, signature, checkpoint)
+	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Proof{}, fmt.Errorf("rekor submit status %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
@@ -218,6 +239,41 @@ func (r RekorLog) Submit(checkpoint Checkpoint) (Proof, error) {
 	if err != nil {
 		return Proof{}, err
 	}
+	return rekorSubmissionProof(baseURL, uuid, entry, publicKey, signature, checkpoint)
+}
+
+func (r RekorLog) getRekorEntry(ctx context.Context, baseURL, uuid string) (rekorEntry, error) {
+	entryURL, err := rekorEntryURL(baseURL, uuid)
+	if err != nil {
+		return rekorEntry{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, entryURL, nil)
+	if err != nil {
+		return rekorEntry{}, fmt.Errorf("build rekor conflict recovery request: %w", err)
+	}
+	resp, err := clientWithoutRedirects(r.HTTPClient).Do(req)
+	if err != nil {
+		return rekorEntry{}, fmt.Errorf("retrieve rekor conflict entry %q: %w", uuid, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, rekorMaxResponseBytes+1))
+	if err != nil {
+		return rekorEntry{}, fmt.Errorf("read rekor conflict entry %q: %w", uuid, err)
+	}
+	if len(respBody) > rekorMaxResponseBytes {
+		return rekorEntry{}, fmt.Errorf("read rekor conflict entry %q: exceeds %d bytes", uuid, rekorMaxResponseBytes)
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return rekorEntry{}, fmt.Errorf("retrieve rekor conflict entry %q status %d: %s", uuid, resp.StatusCode, strings.TrimSpace(string(respBody)))
+	}
+	entry, _, err := decodeRekorEntry(respBody)
+	if err != nil {
+		return rekorEntry{}, fmt.Errorf("parse rekor conflict entry %q: %w", uuid, err)
+	}
+	return entry, nil
+}
+
+func rekorSubmissionProof(baseURL, uuid string, entry rekorEntry, publicKey, signature string, checkpoint Checkpoint) (Proof, error) {
 	if uuid == "" {
 		return Proof{}, errors.New("rekor response UUID required")
 	}
@@ -370,8 +426,11 @@ func validateRekorInclusionProof(proof Proof) error {
 	if inc.TreeSize == 0 {
 		return errors.New("rekor proof inclusion_proof.tree_size required")
 	}
-	if inc.LogIndex != proof.LogIndex {
-		return fmt.Errorf("rekor proof inclusion_proof.log_index %d does not match log_index %d", inc.LogIndex, proof.LogIndex)
+	// Rekor's entry logIndex is virtual across its shards, while the inclusion
+	// proof logIndex is relative to the shard's tree. The active-tree index
+	// therefore cannot exceed the virtual entry index, but need not equal it.
+	if inc.LogIndex > proof.LogIndex {
+		return fmt.Errorf("rekor proof inclusion_proof.log_index %d exceeds log_index %d", inc.LogIndex, proof.LogIndex)
 	}
 	if inc.LogIndex >= inc.TreeSize {
 		return fmt.Errorf("rekor proof inclusion_proof.log_index %d outside tree_size %d", inc.LogIndex, inc.TreeSize)
@@ -1078,6 +1137,59 @@ func rekorEntriesURL(raw string) (string, error) {
 	base.RawQuery = ""
 	base.Fragment = ""
 	return base.String(), nil
+}
+
+func rekorEntryURL(baseURL, uuid string) (string, error) {
+	if !isRekorUUID(uuid) {
+		return "", fmt.Errorf("invalid rekor entry UUID %q", uuid)
+	}
+	entriesURL, err := rekorEntriesURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	return entriesURL + "/" + strings.ToLower(uuid), nil
+}
+
+// rekorConflictUUID extracts the pre-existing entry handle from Rekor's
+// documented conflict Location header. The error response message is not a
+// stable API field, so recovery must never infer an entry UUID from its text.
+func rekorConflictUUID(location, baseURL string) (string, error) {
+	if strings.TrimSpace(location) == "" {
+		return "", errors.New("rekor submit conflict has no entry Location header; the entry may already be committed, so retrieve its UUID from Rekor and retry")
+	}
+	locationURL, err := url.Parse(location)
+	if err != nil {
+		return "", fmt.Errorf("parse rekor conflict Location header: %w", err)
+	}
+	entriesURL, err := rekorEntriesURL(baseURL)
+	if err != nil {
+		return "", err
+	}
+	entries, err := url.Parse(entriesURL)
+	if err != nil {
+		return "", fmt.Errorf("parse rekor entries URL: %w", err)
+	}
+	resolved := entries.ResolveReference(locationURL)
+	if resolved.Scheme != entries.Scheme || resolved.Host != entries.Host || resolved.RawQuery != "" || resolved.Fragment != "" {
+		return "", errors.New("rekor submit conflict Location header does not identify an entry on the configured log")
+	}
+	prefix := strings.TrimRight(entries.Path, "/") + "/"
+	if !strings.HasPrefix(resolved.Path, prefix) {
+		return "", errors.New("rekor submit conflict Location header does not identify a log entry")
+	}
+	uuid := strings.TrimPrefix(resolved.Path, prefix)
+	if strings.Contains(uuid, "/") || !isRekorUUID(uuid) {
+		return "", errors.New("rekor submit conflict Location header has an invalid entry UUID")
+	}
+	return strings.ToLower(uuid), nil
+}
+
+func isRekorUUID(uuid string) bool {
+	if len(uuid) != 64 && len(uuid) != 80 {
+		return false
+	}
+	_, err := hex.DecodeString(uuid)
+	return err == nil
 }
 
 func decodeRekorEntry(data []byte) (rekorEntry, string, error) {

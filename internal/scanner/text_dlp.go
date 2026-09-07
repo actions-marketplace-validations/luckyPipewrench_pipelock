@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/normalize"
@@ -174,13 +175,21 @@ var strictAWSAccessIDRe = regexp.MustCompile(config.AWSAccessIDRegex)
 // returns all evidence; this helper owns the narrower enforcement decision so
 // callers do not need local one-off exceptions.
 func EnforceableInboundTextDLPMatches(text string, matches []TextDLPMatch) []TextDLPMatch {
+	enforceable, _ := PartitionInboundTextDLPMatches(text, matches)
+	return enforceable
+}
+
+// PartitionInboundTextDLPMatches separates enforceable inbound DLP matches
+// from the narrowly-defined low-confidence AWS Access ID false-positive class.
+// Both slices retain pattern metadata and coordinates but never matched bytes.
+func PartitionInboundTextDLPMatches(text string, matches []TextDLPMatch) (enforceable, lowConfidence []TextDLPMatch) {
 	if len(matches) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	var awsCtx inboundAWSAccessIDContext
 	haveAWSCtx := false
-	enforceable := make([]TextDLPMatch, 0, len(matches))
+	enforceable = make([]TextDLPMatch, 0, len(matches))
 	for _, match := range matches {
 		if isInboundAWSAccessIDWhitespaceMatch(match) {
 			if !haveAWSCtx {
@@ -188,12 +197,13 @@ func EnforceableInboundTextDLPMatches(text string, matches []TextDLPMatch) []Tex
 				haveAWSCtx = true
 			}
 			if isLowConfidenceInboundAWSAccessID(awsCtx, match) {
+				lowConfidence = append(lowConfidence, match)
 				continue
 			}
 		}
 		enforceable = append(enforceable, match)
 	}
-	return enforceable
+	return enforceable, lowConfidence
 }
 
 // IsLowConfidenceInboundAWSAccessID reports whether match is an inbound-only
@@ -316,6 +326,41 @@ type textDLPOptions struct {
 // This is the full OUTBOUND scan: it runs the agent's-own-secret exfil checks.
 func (s *Scanner) ScanTextForDLP(ctx context.Context, text string) TextDLPResult {
 	return s.scanTextForDLP(ctx, text, textDLPOptions{emitWarns: true, scanSecretLeak: true})
+}
+
+// ScanRequestBodyTextForDLP scans outbound request-body text after applying
+// the embedded SigV4 credential carve-out. Callers must independently verify
+// that the request matches an explicit destination route before using it.
+func (s *Scanner) ScanRequestBodyTextForDLP(ctx context.Context, text string) TextDLPResult {
+	return s.ScanRequestBodyTextPartsForDLP(ctx, []string{text}, "")
+}
+
+// ScanRequestBodyTextPartsForDLP scans outbound request-body text parts after
+// applying the embedded SigV4 credential carve-out to each part independently.
+// Keeping synthetic join separators outside URL parsing preserves cross-field
+// DLP without letting a separator corrupt a URL's final query parameter.
+// Callers must independently verify that the request matches an explicit
+// destination route before using it.
+func (s *Scanner) ScanRequestBodyTextPartsForDLP(ctx context.Context, parts []string, separator string) TextDLPResult {
+	scrubbedParts := make([]string, 0, len(parts))
+	var detections []sigV4Detection
+	for _, part := range parts {
+		scrubbed, partDetections := scrubEmbeddedSigV4Credentials(part)
+		scrubbedParts = append(scrubbedParts, scrubbed)
+		detections = append(detections, partDetections...)
+	}
+	result := s.scanTextForDLP(ctx, strings.Join(scrubbedParts, separator), textDLPOptions{emitWarns: true, scanSecretLeak: true})
+
+	for _, detection := range detections {
+		if detection.Expires <= sigV4LongExpiryThreshold {
+			continue
+		}
+		match := TextDLPMatch{PatternName: WarnPatternSigV4LongExpiry, Severity: "info", Warn: true}
+		result.InformationalMatches = append(result.InformationalMatches, match)
+		s.emitDLPWarns(ctx, []WarnMatch{{PatternName: match.PatternName, Severity: match.Severity}})
+		break
+	}
+	return result
 }
 
 // ScanTextForDLPQuiet runs the same text-DLP detection logic as ScanTextForDLP
@@ -482,7 +527,7 @@ func (s *Scanner) scanTextForDLP(ctx context.Context, text string, opts textDLPO
 	// This catches secrets that aren't URL-encoded.
 	for _, idx := range s.dlpPreFilter.patternsToCheck(cleaned) {
 		p := s.dlpPatterns[idx]
-		if start, end, ok := p.matchSpan(cleaned); ok {
+		if start, end, ok := p.matchSpanInView(cleaned, text); ok {
 			matches = append(matches, TextDLPMatch{
 				PatternName:   p.name,
 				Severity:      p.severity,
@@ -513,12 +558,13 @@ func (s *Scanner) scanTextForDLP(ctx context.Context, text string, opts textDLPO
 	if strings.Contains(cleaned, ".") {
 		dotless := removeHostnameDots(cleaned)
 		if dotless != cleaned {
-			matches = append(matches, s.matchDLPPatterns(dotless, "subdomain")...)
+			matches = append(matches, s.matchDLPPatternsInView(dotless, "subdomain", cleaned)...)
 		}
 	}
 
 	if len(segmentViews) > 1 {
-		matches = append(matches, s.matchDLPPatterns(segmentViews[1].text, "whitespace")...)
+		compacted, offsets := compactTextDLPWhitespaceWithOffsets(cleaned)
+		matches = append(matches, s.matchDLPPatternsInWhitespaceView(compacted, cleaned, offsets)...)
 	}
 
 	// Hostname exfiltration: extract URL hostnames from the text and run the
@@ -634,11 +680,18 @@ func (s *Scanner) decodeAndMatchRecursive(text string, _ int) []TextDLPMatch {
 // Applies full normalization to decoded text, since URL/base64/hex decoding can
 // reintroduce control chars and confusable characters after the initial pass.
 func (s *Scanner) matchDLPPatterns(text, encoding string) []TextDLPMatch {
+	return s.matchDLPPatternsInView(text, encoding, text)
+}
+
+func (s *Scanner) matchDLPPatternsInView(text, encoding, proseSource string) []TextDLPMatch {
+	// The whitespace view deliberately skips this re-normalization
+	// (matchDLPPatternsInWhitespaceView): its offsets index the emitted view
+	// bytes, and normalizing again would shift every span.
 	text = normalize.ForDLP(text)
 	var matches []TextDLPMatch
 	for _, idx := range s.dlpPreFilter.patternsToCheck(text) {
 		p := s.dlpPatterns[idx]
-		if start, end, ok := p.matchSpan(text); ok {
+		if start, end, ok := p.matchSpanInView(text, proseSource); ok {
 			matches = append(matches, TextDLPMatch{
 				PatternName:   p.name,
 				Severity:      p.severity,
@@ -651,6 +704,66 @@ func (s *Scanner) matchDLPPatterns(text, encoding string) []TextDLPMatch {
 		}
 	}
 	return matches
+}
+
+// matchDLPPatternsInWhitespaceView preserves the whitespace-compacted view and
+// its spans for every pattern. The built-in Credential in URL grammar alone
+// rejects a match that compaction manufactured from a spaced line-start
+// assignment; this is intentionally not an operator-configurable behavior.
+func (s *Scanner) matchDLPPatternsInWhitespaceView(text, proseSource string, offsets []int) []TextDLPMatch {
+	// text is already compacted from normalize.ForDLP(proseSource). Do not
+	// transform it again: offsets index this exact emitted view.
+	var matches []TextDLPMatch
+	for _, idx := range s.dlpPreFilter.patternsToCheck(text) {
+		p := s.dlpPatterns[idx]
+		if start, end, ok := p.matchSpanInView(text, proseSource); ok {
+			if p.credentialURLWhitespaceGrammar && !credentialURLWhitespaceMatchAllowed(text, proseSource, offsets, start, end) {
+				continue
+			}
+			matches = append(matches, TextDLPMatch{
+				PatternName:   p.name,
+				Severity:      p.severity,
+				Encoded:       "whitespace",
+				Bundle:        p.bundle,
+				BundleVersion: p.bundleVersion,
+				Warn:          p.warn,
+				span:          newMatchSpan(start, end, dlpViewLabel("whitespace"), p.name, p.bundle, p.bundleVersion),
+			})
+		}
+	}
+	return matches
+}
+
+func credentialURLWhitespaceMatchAllowed(compacted, source string, offsets []int, start, end int) bool {
+	if start < 0 || end > len(compacted) || start >= end || end > len(offsets) {
+		return true // Invalid context must stay fail-closed for detection.
+	}
+	if delimiter := compacted[start]; delimiter == '?' || delimiter == '&' || delimiter == ';' {
+		return true
+	}
+	equalAt := start + strings.IndexByte(compacted[start:end], '=')
+	if equalAt < start || equalAt >= len(offsets) {
+		return true
+	}
+	sourceEqualAt := offsets[equalAt]
+	if sourceEqualAt < 0 || sourceEqualAt >= len(source) || source[sourceEqualAt] != '=' {
+		return true
+	}
+	return !hasWhitespaceAdjacentToByte(source, sourceEqualAt)
+}
+
+func hasWhitespaceAdjacentToByte(text string, at int) bool {
+	if at > 0 {
+		left, _ := utf8.DecodeLastRuneInString(text[:at])
+		if unicode.IsSpace(left) {
+			return true
+		}
+	}
+	if at+1 < len(text) {
+		right, _ := utf8.DecodeRuneInString(text[at+1:])
+		return unicode.IsSpace(right)
+	}
+	return false
 }
 
 //pipelock:provenance-transform whitespace_compact

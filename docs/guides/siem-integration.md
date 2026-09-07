@@ -214,10 +214,11 @@ Operator lifecycle:
 - Recover: restore a matching spool/cursor pair. If only the cursor is corrupt,
   moving it aside replays the spool from offset zero (duplicates, but no silent
   skip). Preserve the corrupt pair for investigation first.
-- Revoke: remove `emit.forwarder.url` and reload; Pipelock closes the worker and
-  leaves state files for operator-controlled retention or deletion.
-- Approve changes: destination or state-path changes are config-controlled and
-  revalidated before the replacement worker starts.
+- Revoke: remove `emit.forwarder.url` and restart Pipelock. The stopped worker
+  leaves its state files for operator-controlled retention or deletion.
+- Approve changes: all `emit` settings require a restart, including filters,
+  `instance_id`, webhook, syslog, OTLP, forwarder destinations, and state paths.
+  Pipelock validates the new settings before the replacement workers start.
 
 **Severity filtering:** Events below `min_severity` are silently dropped before
 reaching the sink. Set to `warn` for all security events (recommended), or

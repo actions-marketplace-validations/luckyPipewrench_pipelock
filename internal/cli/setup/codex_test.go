@@ -106,89 +106,159 @@ func TestParseCodexMCPList(t *testing.T) {
 	}
 }
 
-func TestIsCodexWrapped(t *testing.T) {
+func TestCodexMCPListCommandStreams(t *testing.T) {
+	if runtime.GOOS == osWindows {
+		t.Skip("shell helper not supported on Windows")
+	}
+
+	const validList = `[{"name":"demo","transport":{"type":"stdio","command":"node"}}]`
 	tests := []struct {
-		name        string
-		server      codexMCPServer
-		pipelockBin string
-		want        bool
+		name       string
+		stdout     string
+		stderr     string
+		exitCode   int
+		wantErr    bool
+		wantErrSub string
+		wantNames  []string
 	}{
 		{
-			name: "stdio with pipelock + mcp proxy prefix is wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type:    "stdio",
-					Command: pipelockBin,
-					Args:    []string{"mcp", "proxy", "--", "node", "x.js"},
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        true,
+			name:      "valid stdout ignores stderr warning",
+			stdout:    validList,
+			stderr:    "warning: helper alias is unavailable",
+			wantNames: []string{"demo"},
 		},
 		{
-			name: "stdio with pipelock but wrong subcommand is NOT wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type:    "stdio",
-					Command: pipelockBin,
-					Args:    []string{"run", "--config", "x.yaml"},
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        false,
+			name:       "malformed stdout remains an error",
+			stdout:     `[{"name":`,
+			stderr:     "warning: helper alias is unavailable",
+			wantErr:    true,
+			wantErrSub: "parsing codex mcp list JSON",
 		},
 		{
-			name: "stdio with different binary is NOT wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type:    "stdio",
-					Command: "/usr/bin/node",
-					Args:    []string{"mcp", "proxy"},
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        false,
-		},
-		{
-			name: "stdio command containing 'pipelock' substring is NOT wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type:    "stdio",
-					Command: "/some/path/with-pipelock-in-name/run.sh",
-					Args:    []string{"mcp", "proxy"},
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        false,
-		},
-		{
-			name: "URL transport is NOT wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type: "streamable_http",
-					URL:  "https://api.example.com/mcp",
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        false,
-		},
-		{
-			name: "stdio with too-short args is NOT wrapped",
-			server: codexMCPServer{
-				Transport: codexMCPTransport{
-					Type:    "stdio",
-					Command: pipelockBin,
-					Args:    []string{"mcp"},
-				},
-			},
-			pipelockBin: pipelockBin,
-			want:        false,
+			name:       "nonzero command preserves stderr diagnostic",
+			stdout:     validList,
+			stderr:     "Error: Codex configuration is unavailable",
+			exitCode:   1,
+			wantErr:    true,
+			wantErrSub: "Codex configuration is unavailable",
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := isCodexWrapped(tt.server, tt.pipelockBin); got != tt.want {
-				t.Errorf("got %v, want %v", got, tt.want)
+			dir := t.TempDir()
+			codexBin := filepath.Join(dir, "codex")
+			script := fmt.Sprintf(`#!/bin/sh
+printf '%%s' %q
+printf '%%s' %q >&2
+exit %d
+`, tt.stdout, tt.stderr, tt.exitCode)
+			writeShellScript(t, codexBin, script)
+
+			servers, err := codexMCPList(context.Background(), codexBin)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.wantErrSub) {
+					t.Errorf("error = %v, want it to contain %q", err, tt.wantErrSub)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("codexMCPList: %v", err)
+			}
+			gotNames := make([]string, 0, len(servers))
+			for _, server := range servers {
+				gotNames = append(gotNames, server.Name)
+			}
+			if !reflect.DeepEqual(gotNames, tt.wantNames) {
+				t.Errorf("server names = %v, want %v", gotNames, tt.wantNames)
+			}
+		})
+	}
+}
+
+func TestClassifyCodexWrapper(t *testing.T) {
+	// The binary that is genuinely mediating is the one running this test, since
+	// that is what an install writes into the config. A path merely NAMED pipelock
+	// is not: that basename check was the bypass this replaced.
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		server codexMCPServer
+		want   wrapperState
+	}{
+		{
+			name: "this binary with the proxy subcommand is mediated",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: self,
+				Args: []string{"mcp", "proxy", "--", "node", "x.js"},
+			}},
+			want: stateSelf,
+		},
+		{
+			name: "a binary merely named pipelock is a foreign wrapper, never mediated",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: "/usr/local/bin/pipelock",
+				Args: []string{"mcp", "proxy", "--", "node", "x.js"},
+			}},
+			want: stateForeignWrapper,
+		},
+		{
+			name: "an attacker binary named pipelock in the project is a foreign wrapper",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: "./tools/pipelock",
+				Args: []string{"mcp", "proxy", "--", "whoami"},
+			}},
+			want: stateForeignWrapper,
+		},
+		{
+			name: "this binary with the wrong subcommand is not a wrapper",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: self,
+				Args: []string{"run", "--config", "x.yaml"},
+			}},
+			want: stateNotWrapper,
+		},
+		{
+			name: "a path containing pipelock as a substring is a foreign wrapper",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: "/some/path/with-pipelock-in-name/run.sh",
+				Args: []string{"mcp", "proxy"},
+			}},
+			want: stateForeignWrapper,
+		},
+		{
+			name: "a URL transport is not a wrapper",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "streamable_http", URL: "https://api.vendor.example/mcp",
+			}},
+			want: stateNotWrapper,
+		},
+		{
+			name: "too-short args are not a wrapper",
+			server: codexMCPServer{Transport: codexMCPTransport{
+				Type: "stdio", Command: self, Args: []string{"mcp"},
+			}},
+			want: stateNotWrapper,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyCodexWrapper(tc.server); got != tc.want {
+				t.Fatalf("classifyCodexWrapper = %v, want %v", got, tc.want)
+			}
+			// Only this binary may be skipped by an installer; a foreign wrapper
+			// must still be restorable so an upgrade can remove it.
+			if got := isCodexWrappedBySelf(tc.server); got != (tc.want == stateSelf) {
+				t.Fatalf("isCodexWrappedBySelf = %v, want %v", got, tc.want == stateSelf)
+			}
+			if got := isCodexRestorableWrapper(tc.server); got != (tc.want != stateNotWrapper) {
+				t.Fatalf("isCodexRestorableWrapper = %v, want %v", got, tc.want != stateNotWrapper)
 			}
 		})
 	}
@@ -377,7 +447,7 @@ func TestPlanCodexInstall(t *testing.T) {
 			Name: "already-wrapped",
 			Transport: codexMCPTransport{
 				Type:    "stdio",
-				Command: pipelockBin,
+				Command: testSelfExe(t),
 				Args:    []string{"mcp", "proxy", "--", "node", "x.js"},
 			},
 		},
@@ -440,13 +510,20 @@ func TestPlanCodexInstall(t *testing.T) {
 	}
 }
 
-func TestPlanCodexInstall_DifferentPipelockBinIsSkipped(t *testing.T) {
-	// Server is wrapped with an OLDER pipelock binary path (e.g.,
-	// /tmp/pipelock-dev or a previous install location). A fresh install from
-	// a different pipelock binary must NOT re-wrap it - that would produce
-	// nested `pipelock proxy -- pipelock proxy -- node x.js` and break unwrap.
-	// Detection keys on basename "pipelock" + canonical args prefix, not on
-	// exact-match against the running pipelock path.
+func TestPlanCodexInstall_DifferentPipelockBinIsWrapped(t *testing.T) {
+	// A server wrapped by a pipelock at ANOTHER path is wrapped again rather than
+	// skipped, and that inverts what this test used to assert.
+	//
+	// The old behaviour keyed on a "pipelock" basename plus the canonical argument
+	// prefix, so it was location-independent and idempotent across paths. That is a
+	// fail-open: any config can name an attacker binary "pipelock" and be skipped,
+	// leaving it unmediated. Identity cannot be forged by naming, and the installer
+	// cannot prove that some other file called pipelock is pipelock.
+	//
+	// The cost is the nesting this test's original comment worried about. It is
+	// accepted deliberately: the result is still mediated by this binary, the
+	// installer warns, and the operator can remove-then-install for a single clean
+	// wrap. Normalising the nested invocation instead is tracked separately.
 	servers := []codexMCPServer{{
 		Name: "old-wrap",
 		Transport: codexMCPTransport{
@@ -459,8 +536,8 @@ func TestPlanCodexInstall_DifferentPipelockBinIsSkipped(t *testing.T) {
 	if len(plans) != 1 {
 		t.Fatalf("expected 1 plan, got %d", len(plans))
 	}
-	if plans[0].Action != codexActionSkipWrapped {
-		t.Errorf("expected skip-already-wrapped (idempotent across pipelock paths), got %q", plans[0].Action)
+	if plans[0].Action == codexActionSkipWrapped {
+		t.Errorf("a pipelock at another path was skipped; it cannot be proven to be pipelock, so it must be wrapped")
 	}
 }
 
@@ -543,30 +620,6 @@ func TestPlanCodexInstall_SkipsUnsupportedCodexState(t *testing.T) {
 	}
 }
 
-func TestLooksLikePipelockBinary(t *testing.T) {
-	tests := []struct {
-		command string
-		want    bool
-	}{
-		{"/usr/local/bin/pipelock", true},
-		{"/tmp/pipelock-dev", true},
-		{"/opt/build/pipelock-rc1", true},
-		{"./pipelock.exe", true},
-		{"pipelock", true},
-		{"/usr/bin/node", false},
-		{"/some/path/with-pipelock-in-name/run.sh", false},
-		{"", false},
-		{"/usr/bin/pipelocker", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.command, func(t *testing.T) {
-			if got := looksLikePipelockBinary(tt.command); got != tt.want {
-				t.Errorf("looksLikePipelockBinary(%q) = %v, want %v", tt.command, got, tt.want)
-			}
-		})
-	}
-}
-
 func TestPlanCodexRemove(t *testing.T) {
 	servers := []codexMCPServer{
 		{
@@ -595,7 +648,7 @@ func TestPlanCodexRemove(t *testing.T) {
 			},
 		},
 	}
-	plans, err := planCodexRemove(servers, pipelockBin)
+	plans, err := planCodexRemove(servers)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -636,7 +689,7 @@ func TestPlanCodexRemove_MalformedWrapErrors(t *testing.T) {
 			Args:    []string{"mcp", "proxy", "--config"}, // trailing flag
 		},
 	}}
-	_, err := planCodexRemove(servers, pipelockBin)
+	_, err := planCodexRemove(servers)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -703,7 +756,7 @@ func TestPlanCodexRemove_UnsupportedCodexStateErrors(t *testing.T) {
 				StartupTimeoutSec: tt.startupRaw,
 				ToolTimeoutSec:    tt.toolRaw,
 			}}
-			_, err := planCodexRemove(servers, pipelockBin)
+			_, err := planCodexRemove(servers)
 			if err == nil {
 				t.Fatalf("expected error, got nil")
 			}
@@ -727,7 +780,7 @@ func TestPlanCodexRemove_DisabledServerErrors(t *testing.T) {
 			Args:    []string{"mcp", "proxy", "--", "node", "x.js"},
 		},
 	}}
-	_, err := planCodexRemove(servers, pipelockBin)
+	_, err := planCodexRemove(servers)
 	if err == nil {
 		t.Fatalf("expected error, got nil")
 	}
@@ -921,15 +974,16 @@ func TestRunCodexInstall_RealInstall(t *testing.T) {
 }
 
 func TestRunCodexInstall_AlreadyWrappedSkipped(t *testing.T) {
-	// Wrapped server's command is a "pipelock" basename at any path -
-	// detection is location-independent so a server wrapped by an earlier
-	// pipelock binary at a different path is still treated as already-wrapped.
+	// An already-wrapped server is one this binary actually mediates, so the
+	// fixture names the running executable. Detection is no longer
+	// location-independent: a "pipelock" basename at any path was forgeable, and a
+	// config naming an attacker binary that way was skipped and left unmediated.
 	listJSON := `[{
 		"name": "preWrapped",
 		"enabled": true,
 		"transport": {
 			"type": "stdio",
-			"command": "/some/prior/install/pipelock",
+			"command": ` + selfCommandJSON(t) + `,
 			"args": ["mcp", "proxy", "--", "node", "x.js"]
 		}
 	}]`
@@ -1534,4 +1588,28 @@ func newCodexTestRoot() *cobra.Command {
 	root := &cobra.Command{Use: "pipelock"}
 	root.AddCommand(CodexCmd())
 	return root
+}
+
+// testSelfExe is the binary running the test, which is what an install writes into
+// a config. A fixture that means "already mediated" must name this, because a path
+// merely NAMED pipelock is a foreign wrapper and gets wrapped rather than skipped.
+func testSelfExe(t *testing.T) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	return self
+}
+
+// selfCommandJSON encodes this test binary's path as a JSON string. Go's quoting
+// and JSON's diverge on non-ASCII and non-printable bytes, so a JSON fixture uses
+// the JSON encoder even where a temp path happens to be plain ASCII.
+func selfCommandJSON(t *testing.T) string {
+	t.Helper()
+	encoded, err := json.Marshal(testSelfExe(t))
+	if err != nil {
+		t.Fatalf("marshal exe path: %v", err)
+	}
+	return string(encoded)
 }

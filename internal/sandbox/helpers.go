@@ -5,12 +5,15 @@ package sandbox
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // initEnvKey is the environment variable that signals the process is in
@@ -31,6 +34,20 @@ const strictEnvKey = "__PIPELOCK_SANDBOX_STRICT"
 // (best-effort mode where CLONE_NEWUSER is blocked, e.g. inside containers).
 const noNetNSEnvKey = "__PIPELOCK_SANDBOX_NO_NETNS"
 
+// sandboxReadinessFDEnv names the inherited read end of the parent-controlled
+// gate. sandbox-init consumes one byte before it can exec or start its target.
+const sandboxReadinessFDEnv = "__PIPELOCK_SANDBOX_READINESS_FD"
+
+type AppliedLaunchOutcome string
+
+const (
+	LaunchOutcomeFull                    AppliedLaunchOutcome = "full"
+	LaunchOutcomePartial                 AppliedLaunchOutcome = "partial"
+	LaunchOutcomeAdvisoryOverride        AppliedLaunchOutcome = "advisory_override"
+	LaunchOutcomeAdvisoryOverridePartial AppliedLaunchOutcome = "advisory_override_partial"
+	LaunchOutcomeRefused                 AppliedLaunchOutcome = "refused"
+)
+
 // IsStrictMode returns true if the child process should enforce strict
 // sandbox containment (error on missing layers, private /dev/shm, etc.).
 func IsStrictMode() bool {
@@ -41,6 +58,44 @@ func IsStrictMode() bool {
 // isolation (best-effort fallback when CLONE_NEWUSER is unavailable).
 func IsNoNetNS() bool {
 	return os.Getenv(noNetNSEnvKey) == "1"
+}
+
+// waitForParentHardening establishes the target-start happens-after relation
+// for mapped launches. EOF and malformed descriptors deny startup because the
+// parent did not prove that it hardened before releasing this child.
+func waitForParentHardening() error {
+	rawFD := os.Getenv(sandboxReadinessFDEnv)
+	if rawFD == "" {
+		return nil
+	}
+	fd, err := strconv.Atoi(rawFD)
+	if err != nil || fd < 0 {
+		return fmt.Errorf("invalid readiness descriptor %q", rawFD)
+	}
+	ready := os.NewFile(uintptr(fd), "sandbox-readiness")
+	if ready == nil {
+		return fmt.Errorf("opening readiness descriptor %d", fd)
+	}
+	defer func() { _ = ready.Close() }()
+	var token [1]byte
+	readResult := make(chan error, 1)
+	go func() {
+		_, readErr := io.ReadFull(ready, token[:])
+		readResult <- readErr
+	}()
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
+	select {
+	case err := <-readResult:
+		if err == nil {
+			return nil
+		}
+		return fmt.Errorf("waiting for parent hardening: %w", err)
+	case <-timer.C:
+		_ = ready.Close()
+		<-readResult
+		return errors.New("waiting for parent hardening: timed out")
+	}
 }
 
 // reportLayer prints a sandbox layer status line to stderr.
@@ -69,6 +124,75 @@ func countActive(layers ...LayerStatus) int {
 		}
 	}
 	return n
+}
+
+// appliedLaunchOutcome classifies only layers the child actually applied.
+// Capability probes are deliberately excluded: they cannot prove the launch.
+func appliedLaunchOutcome(strict, noNetNS, seccompSupported bool, landlock, seccomp LayerStatus) (AppliedLaunchOutcome, error) {
+	if !landlock.Active {
+		return LaunchOutcomeRefused, fmt.Errorf("landlock is required for sandbox filesystem containment; use a kernel with Landlock support or a separately labelled `pipelock contain` host boundary")
+	}
+	if !seccomp.Active && (strict || seccompSupported) {
+		return LaunchOutcomeRefused, fmt.Errorf("seccomp was not applied; refusing a launch whose build supports the filter")
+	}
+	if strict && noNetNS {
+		return LaunchOutcomeRefused, fmt.Errorf("strict mode requires a network namespace")
+	}
+	if noNetNS {
+		if !seccomp.Active {
+			return LaunchOutcomeAdvisoryOverridePartial, nil
+		}
+		return LaunchOutcomeAdvisoryOverride, nil
+	}
+	if !seccomp.Active {
+		return LaunchOutcomePartial, nil
+	}
+	return LaunchOutcomeFull, nil
+}
+
+func reportAppliedLaunchOutcome(w io.Writer, outcome AppliedLaunchOutcome) {
+	switch outcome {
+	case LaunchOutcomeFull:
+		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: FULL (Landlock + seccomp + network namespace applied)")
+	case LaunchOutcomePartial:
+		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: PARTIAL (Landlock + network namespace applied; seccomp filter unavailable in this build)")
+	case LaunchOutcomeAdvisoryOverride:
+		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (no network namespace; direct egress may bypass Pipelock)")
+	case LaunchOutcomeAdvisoryOverridePartial:
+		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (network) + PARTIAL (seccomp unavailable in this build; direct egress may bypass Pipelock)")
+	}
+}
+
+// validateBestEffortOverride requires a bounded, operator-attributable
+// exception before a launch may fall back from kernel-enforced network
+// isolation to cooperative proxy environment variables.
+func validateBestEffortOverride(reason, expiry string, now time.Time) (time.Time, error) {
+	if strings.TrimSpace(reason) == "" {
+		return time.Time{}, errors.New("best-effort override requires a reason")
+	}
+	if strings.TrimSpace(expiry) == "" {
+		return time.Time{}, errors.New("best-effort override requires an expiry (duration or RFC3339 timestamp)")
+	}
+	if duration, err := time.ParseDuration(expiry); err == nil {
+		if duration <= 0 {
+			return time.Time{}, errors.New("best-effort override has expired")
+		}
+		return now.Add(duration), nil
+	}
+	expiresAt, err := time.Parse(time.RFC3339, expiry)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("best-effort override expiry must be a duration or RFC3339 timestamp: %w", err)
+	}
+	if !expiresAt.After(now) {
+		return time.Time{}, errors.New("best-effort override has expired")
+	}
+	return expiresAt, nil
+}
+
+// ValidateBestEffortOverride validates a best-effort override against the
+// current time. CLI preflight uses this before reporting a launchable posture.
+func ValidateBestEffortOverride(reason, expiry string) (time.Time, error) {
+	return validateBestEffortOverride(reason, expiry, time.Now())
 }
 
 // removeEnvKey removes all entries with the given key from an env slice.

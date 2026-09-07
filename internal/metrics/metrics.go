@@ -57,6 +57,7 @@ type Metrics struct {
 	bodyRedactions     *prometheus.CounterVec
 	headerDLPHits      *prometheus.CounterVec
 	dlpWarnMatches     *prometheus.CounterVec
+	dlpDroppedMatches  *prometheus.CounterVec
 	AddressFindings    *prometheus.CounterVec
 	FileSentryFindings *prometheus.CounterVec
 
@@ -88,9 +89,11 @@ type Metrics struct {
 	requestPolicyDecisions *prometheus.CounterVec
 
 	// Cross-request exfiltration detection (cross_request.go).
-	CrossRequestEntropyExceeded prometheus.Counter
-	CrossRequestDLPMatch        prometheus.Counter
-	CrossRequestFragmentBytes   prometheus.Gauge
+	CrossRequestEntropyExceeded          prometheus.Counter
+	CrossRequestDLPMatch                 prometheus.Counter
+	CrossRequestFragmentCapacityExceeded prometheus.Counter
+	CrossRequestPathDepthExceeded        prometheus.Counter
+	CrossRequestFragmentBytes            prometheus.Gauge
 
 	// Scan API (scan_api.go).
 	ScanAPIRequests *prometheus.CounterVec
@@ -110,6 +113,7 @@ type Metrics struct {
 	shieldOversizeScanHead                  *prometheus.CounterVec
 	shieldLatency                           *prometheus.HistogramVec
 	responseScanExemptTotal                 *prometheus.CounterVec
+	responseSuppressedMatches               *prometheus.CounterVec
 	responseScanExemptOverCapUnscannedTotal *prometheus.CounterVec
 
 	// Capture (capture.go).

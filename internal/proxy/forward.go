@@ -18,12 +18,12 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/addressprotect"
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
-	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
@@ -125,10 +125,16 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if agent == "" {
 		agent = agentAnonymous
 	}
+	// Carry the provenance grade from the moment identity resolves, so every
+	// audit context built from r.Context() below reports the real grade.
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyAgentAuth, string(id.Auth)))
 	// Pre-generate a single ActionID for correlation between envelope and receipt.
 	actionID := receipt.NewActionID()
 	emitConnectReceipt := func(opts receipt.EmitOpts) {
-		_ = p.emitReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
+		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		if e := p.receiptEmitterPtr.Load(); e != nil && p.emitReceiptWithEmitter(opts, e) == nil {
+			blockreason.SetRecordedReceipt(w.Header(), opts.ActionID)
+		}
 	}
 
 	if err := p.verifyInboundEnvelope(r, cfg); err != nil {
@@ -153,6 +159,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
@@ -227,7 +234,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 	}
-	targetCtx := newConnectAuditContext(p.logger, target, clientIP, requestID, agent)
+	targetCtx := newConnectAuditContext(r.Context(), p.logger, target, clientIP, requestID, agent)
 	headerCtx := targetCtx
 
 	// Scan through all layers (URL pipeline).
@@ -308,6 +315,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				Hostname:   host,
 				RequestID:  requestID,
 				UserAgent:  r.UserAgent(),
+				ActorAuth:  id.Auth,
 				Result:     scanner.Result{Allowed: true},
 				Config:     cfg,
 				Logger:     p.logger,
@@ -320,6 +328,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				Hostname:   host,
 				RequestID:  requestID,
 				UserAgent:  r.UserAgent(),
+				ActorAuth:  id.Auth,
 				Result:     scanner.Result{Allowed: false, Score: 0.9},
 				Config:     cfg,
 				Logger:     p.logger,
@@ -343,6 +352,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		Hostname:   host,
 		RequestID:  requestID,
 		UserAgent:  r.UserAgent(),
+		ActorAuth:  id.Auth,
 		Result:     result,
 		Config:     cfg,
 		Logger:     p.logger,
@@ -594,6 +604,28 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ActionRead),
+		Destination: target,
+	}, targetCtx, TransportConnect); err != nil {
+		emitConnectReceipt(receipt.EmitOpts{
+			ActionID:  actionID,
+			Verdict:   config.ActionBlock,
+			Layer:     blockLayerAuthority,
+			Pattern:   "authority verification failed",
+			Transport: TransportConnect,
+			Method:    http.MethodConnect,
+			Target:    connectReceiptTarget,
+			RequestID: requestID,
+			Agent:     agent,
+		})
+		p.metrics.RecordTunnelBlocked(agentLabel)
+		writeBlockedError(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			"CONNECT blocked: authority verification failed", http.StatusForbidden)
+		return
+	}
 
 	allowReceipt := receipt.EmitOpts{
 		ActionID:  actionID,
@@ -617,6 +649,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				"CONNECT blocked: "+blockedErr.reason, http.StatusForbidden)
 			return
 		}
+		blockreason.SetRecordedReceipt(w.Header(), allowReceipt.ActionID)
 	}
 	outcomeStatus := "unknown"
 	outcomeBytes := int64(-1)
@@ -638,7 +671,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &ssrfErr) {
 			p.logger.LogBlocked(targetCtx, scanner.ScannerSSRF, ssrfErr.logDetail())
 			p.metrics.RecordTunnelBlocked(agentLabel)
-			_ = p.emitReceipt(withReceiptPolicyHash(receipt.EmitOpts{
+			if p.emitRecordedReceipt(receipt.EmitOpts{
 				ActionID:  actionID,
 				Verdict:   config.ActionBlock,
 				Layer:     scanner.ScannerSSRF,
@@ -648,7 +681,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				Target:    connectReceiptTarget,
 				RequestID: requestID,
 				Agent:     agent,
-			}, cfg.CanonicalPolicyHash()))
+			}) {
+				blockreason.SetRecordedReceipt(w.Header(), actionID)
+			}
 			writeBlockedError(w, ssrfErr.blockInfo(), "CONNECT blocked: "+ssrfErr.detail, http.StatusForbidden)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeReason = string(ssrfErr.reason)
@@ -686,8 +721,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	defer safeClose(clientConn, "clientConn", p.logger)
 
-	// Send 200 Connection Established
-	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	// Send 200 Connection Established. A hijacked connection bypasses net/http's
+	// normal header serialization, so carry the already-validated recorded
+	// receipt explicitly when required-receipt admission completed.
+	if recordedReceipt := w.Header().Get(blockreason.HeaderRecordedReceipt); recordedReceipt != "" {
+		_, _ = fmt.Fprintf(clientConn, "HTTP/1.1 200 Connection Established\r\n%s: %s\r\n\r\n", blockreason.HeaderRecordedReceipt, recordedReceipt)
+	} else {
+		_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	}
 
 	// SNI verification: read ClientHello via Peek, check SNI matches CONNECT
 	// target. Peek() leaves bytes in the buffer for the relay to forward.
@@ -865,8 +906,16 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	if agent == "" {
 		agent = agentAnonymous
 	}
+	// Carry the provenance grade from the moment identity resolves, so every
+	// audit context built from r.Context() below reports the real grade.
+	r = r.WithContext(context.WithValue(r.Context(), ctxKeyAgentAuth, string(id.Auth)))
 	emitForwardReceipt := func(opts receipt.EmitOpts) {
-		_ = p.emitReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
+		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		if e := p.receiptEmitterPtr.Load(); e != nil && p.emitReceiptWithEmitter(opts, e) == nil {
+			if opts.Verdict == config.ActionBlock {
+				blockreason.SetRecordedReceipt(w.Header(), opts.ActionID)
+			}
+		}
 	}
 	if err := p.verifyInboundEnvelope(r, cfg); err != nil {
 		pattern := inboundEnvelopeFailurePattern(err)
@@ -890,6 +939,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// Strip inbound mediation envelope headers after optional trust
 	// verification so forged mediation metadata cannot survive to upstreams.
 	envelope.StripInbound(r.Header)
+	authorityRef, authorityCarrierErr := consumeAuthorityHeader(r)
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
@@ -939,7 +989,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		}))
 	}
-	actx := newHTTPAuditContext(p.logger, r.Method, targetURL, clientIP, requestID, agent)
+	actx := newHTTPAuditContext(r.Context(), p.logger, httpAuditEvent{Method: r.Method, TargetURL: targetURL, ClientIP: clientIP, RequestID: requestID, Agent: agent})
 
 	// Scan through all layers (URL pipeline)
 	fwdScanCtx := scanner.WithDLPWarnContext(r.Context(), scanner.DLPWarnContext{
@@ -1022,13 +1072,14 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		Hostname:   r.URL.Hostname(),
 		RequestID:  requestID,
 		UserAgent:  r.UserAgent(),
+		ActorAuth:  id.Auth,
 		Result:     result,
 		Config:     cfg,
 		Logger:     p.logger,
 		DeferClean: true,
 	})
 
-	forwardSessionKey := ceeSessionKey(agent, clientIP, id.Auth)
+	forwardSessionKey := responseTaintSessionKey(agent, clientIP, id.Auth)
 	var forwardRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
 		forwardRec = sm.GetOrCreate(forwardSessionKey)
@@ -1118,7 +1169,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if gitPush := evaluateGitPushAllowlist(cfg.GitProtection, r.URL); gitPush.Block {
+	if gitPush := evaluateGitPushAllowlist(cfg.GitProtection, r.Method, r.URL); gitPush.Block {
 		p.logger.LogBlocked(actx, "git_protection", gitPush.Reason)
 		emitForwardReceipt(receipt.EmitOpts{
 			ActionID:  actionID,
@@ -1148,8 +1199,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				Authority:   forwardTaint.Authority.String(),
 				Decision:    forwardTaint.Result.Decision.String(),
 				Reason:      forwardTaint.Result.Reason,
-				SourceURL:   forwardTaint.Risk.LastExternalURL,
-				SourceKind:  forwardTaint.Risk.LastExternalKind,
+				SourceURL:   forwardTaint.Risk.SecurityOriginURL(),
+				SourceKind:  forwardTaint.Risk.SecurityOriginKind(),
 			},
 		)
 	}
@@ -1182,22 +1233,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	case session.PolicyAsk:
 		forwardRequiresReauth = true
-		decision := hitl.DecisionBlock
-		blockReason := forwardTaint.Result.Reason
-		switch {
-		case p.approver == nil:
-			blockReason += " (no HITL approver)"
-		case !p.approver.IsTerminal():
-			blockReason += " (HITL stdin is not a terminal)"
-		default:
-			decision = p.approver.Ask(&hitl.Request{
-				Agent:   agent,
-				URL:     targetURL,
-				Reason:  forwardTaint.Result.Reason,
-				Preview: fmt.Sprintf("%s %s", r.Method, targetURL),
-			})
-		}
-		if decision != hitl.DecisionAllow {
+		approved, blockReason := p.resolveTaintAsk(agent, targetURL, r.Method, forwardTaint.Result.Reason)
+		if !approved {
 			emitForwardReceipt(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -1245,6 +1282,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// the signer would have to re-drain req.Body itself and the caller
 	// would lose deterministic bookkeeping about byte counts.
 	var forwardBodyBytes []byte
+	var forwardEntropyWarnRoute *BodyEntropyWarnRouteMatch
 	scanA2AForwardBody := func(buf []byte) bool {
 		a2aBodyResult := mcp.ScanA2ARequestBody(r.Context(), buf, sc, &cfg.A2AScanning, a2aContentEntropyOptions(r.URL.Hostname(), cfg))
 		if a2aBodyResult.Clean {
@@ -1295,7 +1333,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return false
 	}
 	if !cfg.RequestBodyScanning.Enabled && isA2A && cfg.A2AScanning.Enabled && r.Body != nil && r.Body != http.NoBody {
-		buf, err := readForwardBodyForProtocolScan(r.Body, r.Header.Get("Content-Encoding"), cfg.RequestBodyScanning.MaxBodyBytes)
+		buf, err := readForwardBodyForProtocolScan(r.Body, r.Header.Get("Content-Encoding"), cfg.RequestBodyScanning.MaxBodyBytes, r.Trailer)
 		if err != nil {
 			reason := "a2a: " + err.Error()
 			p.logger.LogBlocked(actx, scannerLabelA2A, reason)
@@ -1338,27 +1376,38 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if cfg.RequestBodyScanning.Enabled && r.Body != nil && r.Body != http.NoBody {
 		bodyReq := BodyScanRequest{
-			Body:            r.Body,
-			Method:          r.Method,
-			ContentType:     r.Header.Get("Content-Type"),
-			ContentEncoding: r.Header.Get("Content-Encoding"),
-			MaxBytes:        cfg.RequestBodyScanning.MaxBodyBytes,
-			Scanner:         sc,
-			AgentID:         agent,
-			Host:            r.URL.Hostname(),
-			Path:            r.URL.Path,
-			Target:          targetURL,
-			Suppress:        cfg.Suppress,
-			Action:          cfg.RequestBodyScanning.Action,
-			DisablePatterns: cfg.RequestBodyScanning.DisablePatterns,
-			PatternActions:  cfg.RequestBodyScanning.PatternActions,
+			Body:             r.Body,
+			Trailer:          r.Trailer,
+			Scheme:           r.URL.Scheme,
+			Method:           r.Method,
+			ContentType:      r.Header.Get("Content-Type"),
+			ContentEncoding:  r.Header.Get("Content-Encoding"),
+			MaxBytes:         cfg.RequestBodyScanning.MaxBodyBytes,
+			Scanner:          sc,
+			AgentID:          agent,
+			Host:             r.URL.Hostname(),
+			Path:             r.URL.Path,
+			EntropyRoutePath: r.URL.EscapedPath(),
+			Target:           targetURL,
+			Suppress:         cfg.Suppress,
+			Action:           cfg.RequestBodyScanning.Action,
+			DisablePatterns:  cfg.RequestBodyScanning.DisablePatterns,
+			PatternActions:   cfg.RequestBodyScanning.PatternActions,
+			OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+				if p.logger != nil {
+					p.logger.LogDLPDropped(actx, match.PatternName, match.Severity, "body", reason)
+				}
+				p.metrics.RecordDLPDroppedMatch(match.PatternName, "body", reason)
+			},
 		}
 		applyContentEntropyConfig(&bodyReq, cfg)
+		applySigV4CredentialRouteConfig(&bodyReq, cfg)
 		if isA2A {
 			bodyReq.ContentEntropyEnabled = false
 		}
 		applyBodyScanRedaction(&bodyReq, p.currentRedactionRuntimeFor(cfg))
 		buf, bodyResult := scanRequestBody(r.Context(), bodyReq)
+		forwardEntropyWarnRoute = bodyResult.EntropyWarnRoute
 
 		// Capture observer: record forward body DLP verdict for policy replay.
 		{
@@ -1395,6 +1444,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		recordBodyRedactionMetrics(p.metrics, "forward", agentLabel, bodyResult.RedactionReport)
 
 		if !bodyResult.Clean {
+			// An authorized entropy warning remains a finding for receipts and
+			// does not count as a clean adaptive-recovery event. Its exemption
+			// below prevents score signals and action re-promotion only.
 			hasFinding = true
 			action := bodyResult.Action
 			if action == "" {
@@ -1427,13 +1479,11 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				case len(patternNames) > 0:
 					reason = fmt.Sprintf("request body contains secret: %s", strings.Join(patternNames, ", "))
 				case bodyResult.EntropyFinding != nil:
-					reason = contentEntropyReason(bodyResult.EntropyFinding)
+					reason = bodyEntropyReason(bodyResult)
 				}
 			}
 			promptInjectionHardBlock := shouldHardBlockBodyPromptInjection(bodyResult, r.URL.Hostname(), cfg)
-			fwdBodyExempt := scannerLabel == scannerLabelBodyDLP &&
-				len(bodyResult.DLPMatches) > 0 &&
-				isAdaptiveExempt(r.URL.Hostname(), cfg.AdaptiveEnforcement.ExemptDomains)
+			bodyAdaptiveExempt := isBodyAdaptiveExempt(scannerLabel, bodyResult, r.URL.Hostname(), cfg)
 			dlpHardBlock := shouldHardBlockBodyCriticalDLP(bodyResult, r.URL.Hostname(), cfg)
 			if promptInjectionHardBlock || dlpHardBlock {
 				action = config.ActionBlock
@@ -1465,7 +1515,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if bodyResult.EntropyFinding != nil {
 				p.metrics.RecordBodyEntropy(action, agentLabel)
-				p.logger.LogBodyScan(actx, scanner.AuditBodyEntropy, action, 1, []string{contentEntropyReason(bodyResult.EntropyFinding)})
+				p.logger.LogBodyScan(actx, scanner.AuditBodyEntropy, action, 1, []string{bodyEntropyReason(bodyResult)})
 			}
 
 			// Fail-closed: if the body cannot be replayed or redaction explicitly
@@ -1500,12 +1550,11 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 
-			// Adaptive enforcement: upgrade the body action.
-			// DLP-only exemption: skip upgrade for DLP pattern findings on
-			// adaptive-exempt destinations. Address protection findings and
-			// fail-closed body errors are NOT exempted.
+			// Adaptive enforcement: upgrade the body action except for the
+			// existing DLP destination exemption and an exact entropy warning
+			// route. Address, injection, and fail-closed errors remain eligible.
 			originalBodyAction := action
-			if !fwdBodyExempt {
+			if !bodyAdaptiveExempt {
 				action = decide.UpgradeAction(action, sr.Level, &cfg.AdaptiveEnforcement)
 			}
 			if action != originalBodyAction {
@@ -1696,7 +1745,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// URL path, query params, and request body as outbound data.
 	ceeAdmission := p.admitCurrentCEE(r.Context(), ceeAdmitRequest{
 		SessionKey: ceeSessionKey(agent, clientIP, id.Auth), Outbound: extractOutboundPayload(r),
-		KeyPayload: queryParamKeys(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
+		KeyPayload: queryParamKeys(r.URL), PathPayload: pathSegments(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
 		RequestID: requestID, IncludeFragments: true,
 	})
 	if ceeAdmission.Active {
@@ -1852,6 +1901,27 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		writeGateBlockedError(w, gate, "blocked: "+reason)
 		return
 	}
+	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
+		Actor:       agent,
+		Action:      string(receipt.ClassifyHTTP(r.Method)),
+		Destination: targetURL,
+	}, actx, TransportForward); err != nil {
+		emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
+			ActionID:  actionID,
+			RequestID: requestID,
+			Agent:     agent,
+			Method:    r.Method,
+			Target:    targetURL,
+			Layer:     blockLayerAuthority,
+			Pattern:   "authority verification failed",
+			Taint:     forwardTaint,
+		})))
+		p.metrics.RecordBlocked(r.URL.Hostname(), blockLayerAuthority, time.Since(start), agentLabel)
+		writeBlockedError(w,
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			"blocked: authority verification failed", http.StatusForbidden)
+		return
+	}
 
 	// Clone request with context keys so CheckRedirect uses the per-agent
 	// config/scanner for redirect enforcement, not the global default.
@@ -1862,9 +1932,16 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportForward)
+	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, forwardRec)
+	if forwardEntropyWarnRoute != nil {
+		ctx = context.WithValue(ctx, ctxKeyEntropyWarnRoute, forwardEntropyWarnRoute)
+	}
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, r.URL.Hostname(), effectiveURLPort(r.URL), result)
 	outReq := r.Clone(ctx)
 	outReq.RequestURI = "" // required for http.Client
+	// The URL authority is the value policy admitted. Never propagate a
+	// client-controlled Host override to the upstream request.
+	outReq.Host = outReq.URL.Host
 	outReq = outReq.WithContext(context.WithValue(outReq.Context(), ctxKeyEnvelopeEmitter, envelopeEmitterSnapshot{emitter: envEmitter}))
 	// Strip the internal identity header AND the ?agent= query param before
 	// the request leaves pipelock. Either vector could otherwise bleed an
@@ -1958,6 +2035,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				"blocked: "+blockedErr.reason, http.StatusForbidden)
 			return
 		}
+		blockreason.SetRecordedReceipt(w.Header(), forwardAllowReceipt.ActionID)
 	}
 	outcomeStatus := "unknown"
 	outcomeBytes := int64(-1)
@@ -2005,6 +2083,13 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		if blockedErr, ok := blockedRequestErrorFrom(err); ok {
 			p.logger.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
+			// A redirect-time taint denial supersedes the admission decision.
+			// Preserve whether the matrix blocked outright or requested HITL;
+			// the receipt verdict already records the terminal block outcome.
+			redirectTaint := forwardTaint
+			if blockedErr.taint != nil {
+				redirectTaint = *blockedErr.taint
+			}
 			emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
@@ -2012,18 +2097,18 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				Pattern:             blockedErr.reason,
 				Transport:           "forward",
 				Method:              r.Method,
-				Target:              targetURL,
+				Target:              redirectReceiptTarget(blockedErr, targetURL),
 				RequestID:           requestID,
 				Agent:               agent,
-				SessionTaintLevel:   forwardTaint.Risk.Level.String(),
-				SessionContaminated: forwardTaint.Risk.Contaminated,
-				RecentTaintSources:  forwardTaint.Risk.Sources,
-				SessionTaskID:       forwardTaint.Task.CurrentTaskID,
-				SessionTaskLabel:    forwardTaint.Task.CurrentTaskLabel,
-				AuthorityKind:       forwardTaint.Authority.String(),
-				TaintDecision:       forwardTaint.Result.Decision.String(),
-				TaintDecisionReason: forwardTaint.Result.Reason,
-				TaskOverrideApplied: forwardTaint.TaskOverrideApplied,
+				SessionTaintLevel:   redirectTaint.Risk.Level.String(),
+				SessionContaminated: redirectTaint.Risk.Contaminated,
+				RecentTaintSources:  redirectTaint.Risk.Sources,
+				SessionTaskID:       redirectTaint.Task.CurrentTaskID,
+				SessionTaskLabel:    redirectTaint.Task.CurrentTaskLabel,
+				AuthorityKind:       redirectTaint.Authority.String(),
+				TaintDecision:       redirectTaint.Result.Decision.String(),
+				TaintDecisionReason: redirectTaint.Result.Reason,
+				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			}))
 			p.metrics.RecordBlocked(r.URL.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
 			// Open-redirect hint fires on any fail-closed redirect
@@ -2047,6 +2132,23 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer safeClose(resp.Body, "resp.Body", p.logger)
+	stripUpstreamShieldRewriteMarker(resp)
+	// An authenticated artifact is not a destination exemption. The proxy
+	// buffers and verifies this exact response before allowing only injection
+	// matching to be skipped; all other response controls remain below.
+	fwdAuthenticatedArtifact := false
+	if artifact, artifactErr := verifyAuthenticatedArtifact(outReq.Context(), outReq, resp, p.client.Transport, time.Duration(cfg.FetchProxy.TimeoutSeconds)*time.Second, cfg.ResponseScanning.AuthenticatedArtifacts); artifactErr != nil {
+		p.logger.LogBlocked(actx, "authenticated_artifact", artifactErr.Error())
+		p.metrics.RecordBlocked(r.URL.Hostname(), "authenticated_artifact", time.Since(start), agentLabel)
+		emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{ActionID: actionID, Verdict: config.ActionBlock, Layer: "authenticated_artifact", Pattern: artifactErr.Error(), Transport: "forward", Method: r.Method, Target: targetURL, RequestID: requestID, Agent: agent}))
+		writeBlockedError(w, blockInfoFor(blockreason.EnvelopeVerifyFailed, "authenticated_artifact"), "blocked: authenticated artifact verification failed", http.StatusForbidden)
+		outcomeStatus, outcomeReason = strconv.Itoa(http.StatusForbidden), "authenticated_artifact"
+		return
+	} else if artifact != nil {
+		fwdAuthenticatedArtifact = true
+		p.logger.LogAnomaly(actx, "authenticated_artifact", "official signed artifact verified before response release", 0)
+		emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{ActionID: actionID, Verdict: config.ActionAllow, Layer: "authenticated_artifact", Pattern: "official signed artifact verified before response release", Transport: "forward", Method: r.Method, Target: targetURL, RequestID: requestID, Agent: agent}))
+	}
 
 	responsePromptHit := false
 	defer func() {
@@ -2060,7 +2162,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// intercept and reverse proxy paths. Exceeding the data BUDGET is a
 	// deliberate, separately-logged truncation policy and must not turn into a
 	// 403. See the buffered-scan over-limit handling below.
-	configMaxBytes := int64(cfg.FetchProxy.MaxResponseMB) * 1024 * 1024
+	configMaxBytes := p.responseScanBodyLimit(cfg)
 	maxBytes := configMaxBytes
 	budgetRemaining := resolved.Budget.RemainingBytes()
 	budgetLimited := false
@@ -2087,7 +2189,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// pipelock must never forward inspection-resistant bytes through a
 	// security boundary.
 	fwdRespIsSSE := HasSingleSSEContentType(resp.Header)
-	if fwdRespIsSSE {
+	if fwdRespIsSSE && !fwdAuthenticatedArtifact {
 		if sc.ResponseScanningEnabled() && fwdRespExempt {
 			p.logger.LogResponseScanExempt(actx, fwdRespHost)
 			p.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportForward)
@@ -2112,6 +2214,12 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					responsePromptHit = true
 					hasFinding = true
 					p.logger.LogAnomaly(actx, LayerSSEStream, err.Error(), 0)
+				},
+				OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+					if p.logger != nil {
+						p.logger.LogDLPDropped(actx, match.PatternName, match.Severity, "mcp_sse", reason)
+					}
+					p.metrics.RecordDLPDroppedMatch(match.PatternName, "mcp_sse", reason)
 				},
 			},
 		}
@@ -2170,7 +2278,40 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			// mode, A2A findings are logged without an additional receipt.
 			// Generic SSE warn-mode findings are handled inline by
 			// GenericSSEScanOptions.OnFinding and return nil.
-			if IsSSEStreamFinding(err) && sseAction == config.ActionWarn {
+			if IsSSEStreamScanError(err) {
+				reason := "response scan failed: " + err.Error()
+				p.logger.LogError(actx, fmt.Errorf("%s", reason))
+				p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan_error", time.Since(start), agentLabel)
+				emitForwardReceipt(withForwardRedaction(receipt.EmitOpts{
+					ActionID:            actionID,
+					Verdict:             config.ActionBlock,
+					Layer:               "response_scan_error",
+					Pattern:             reason,
+					Transport:           "forward",
+					Method:              r.Method,
+					Target:              targetURL,
+					RequestID:           requestID,
+					Agent:               agent,
+					SessionTaintLevel:   forwardTaint.Risk.Level.String(),
+					SessionContaminated: forwardTaint.Risk.Contaminated,
+					RecentTaintSources:  forwardTaint.Risk.Sources,
+					SessionTaskID:       forwardTaint.Task.CurrentTaskID,
+					SessionTaskLabel:    forwardTaint.Task.CurrentTaskLabel,
+					AuthorityKind:       forwardTaint.Authority.String(),
+					TaintDecision:       forwardTaint.Result.Decision.String(),
+					TaintDecisionReason: forwardTaint.Result.Reason,
+					TaskOverrideApplied: forwardTaint.TaskOverrideApplied,
+				}))
+				// Streaming headers are already committed. Preserve the
+				// client-visible upstream status and record the incomplete scan
+				// in the outcome reason.
+				outcomeStatus = strconv.Itoa(resp.StatusCode)
+				outcomeReason = "response_scan_error"
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				p.logger.LogError(actx, err)
+				outcomeStatus = strconv.Itoa(resp.StatusCode)
+				outcomeReason = "sse_stream_cancelled"
+			} else if IsSSEStreamFinding(err) && sseAction == config.ActionWarn {
 				p.logger.LogAnomaly(actx, sseLayer, err.Error(), 0)
 				outcomeStatus = strconv.Itoa(resp.StatusCode)
 				outcomeReason = sseLayer
@@ -2208,9 +2349,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			outcomeStatus = strconv.Itoa(resp.StatusCode)
 			outcomeBytes = 0
 			outcomeReason = "complete"
-			if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
+			if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !fwdAuthenticatedArtifact {
 				forwardScope := adaptiveScopeForHost(r.URL.Hostname())
-				recordCleanForAdaptiveScope(forwardRec, forwardScope, &cfg.AdaptiveEnforcement, !fwdRespExempt, adaptiveRecoveryContext{
+				recordCleanForAdaptiveScope(forwardRec, forwardScope, &cfg.AdaptiveEnforcement, !fwdRespExempt && !fwdAuthenticatedArtifact, adaptiveRecoveryContext{
 					sessionKey: sessionKeyFor(agent, clientIP),
 					scope:      forwardScope,
 					reason:     adaptiveRecoveryClean,
@@ -2280,7 +2421,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		outcomeStatus = strconv.Itoa(resp.StatusCode)
 		outcomeBytes = written
 		outcomeReason = "complete"
-		if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
+		if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !fwdAuthenticatedArtifact {
 			recordCleanForAdaptiveScope(forwardRec, adaptiveScopeForHost(r.URL.Hostname()), &cfg.AdaptiveEnforcement, false, adaptiveRecoveryContext{})
 		}
 		return
@@ -2298,20 +2439,18 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	// lose image metadata stripping, audio/video blocks, and exposure
 	// events.
 	//
-	// SSE responses are excluded: the streaming branch above is the
-	// authoritative path for text/event-stream, and the exclusion here
-	// is defense-in-depth that protects SSE TTFB if future refactors
-	// reorder the blocks. MediaPolicy/BrowserShield have no work to do on
-	// text/event-stream payloads - both target images/audio/video/HTML
-	// content types.
-	if !fwdRespIsSSE &&
+	// Ordinary SSE responses are excluded: the streaming branch above is the
+	// authoritative path for text/event-stream. A verified artifact is already
+	// buffered, so it stays on this path for response-size and encoding controls;
+	// only its injection matching is skipped below.
+	if (!fwdRespIsSSE || fwdAuthenticatedArtifact) &&
 		(sc.ResponseScanningEnabled() || cfg.BrowserShield.Enabled || cfg.MediaPolicy.IsEnabled()) {
 		// Fail-closed on compressed responses: regex can't match compressed content.
 		if hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
-			p.logger.LogBlocked(actx, "response_scan", "compressed response cannot be scanned")
-			p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan", time.Since(start), agentLabel)
+			p.logger.LogBlocked(actx, responseScanLayer, "compressed response cannot be scanned")
+			p.metrics.RecordBlocked(r.URL.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 			writeBlockedError(w,
-				blockInfoFor(blockreason.CompressedResponse, "response_scan"),
+				blockInfoFor(blockreason.CompressedResponse, responseScanLayer),
 				"blocked: compressed response cannot be scanned", http.StatusForbidden)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeReason = "compressed_response"
@@ -2328,7 +2467,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		if readErr != nil {
 			p.logger.LogError(actx, readErr)
 			writeBlockedError(w,
-				blockInfoFor(blockreason.ParseError, "response_scan"),
+				blockInfoFor(blockreason.ParseError, responseScanLayer),
 				"blocked: response read error", http.StatusForbidden)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeReason = "response_read_error"
@@ -2416,21 +2555,21 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 						if scanFailure.Err != nil {
 							p.logger.LogError(actx, scanFailure.Err)
 						}
-						p.logger.LogBlocked(actx, "response_scan", scanFailure.Reason)
+						p.logger.LogBlocked(actx, responseScanLayer, scanFailure.Reason)
 						emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
 							ActionID:  actionID,
 							RequestID: requestID,
 							Agent:     agent,
 							Method:    r.Method,
 							Target:    targetURL,
-							Layer:     "response_scan",
+							Layer:     responseScanLayer,
 							Pattern:   scanFailure.Reason,
 							Taint:     forwardTaint,
 						})))
-						p.metrics.RecordBlocked(fwdRespHost, "response_scan", time.Since(start), agentLabel)
-						info := blockInfoFor(blockreason.ResponseSize, "response_scan")
+						p.metrics.RecordBlocked(fwdRespHost, responseScanLayer, time.Since(start), agentLabel)
+						info := blockInfoFor(blockreason.ResponseSize, responseScanLayer)
 						if scanFailure.Kind == sizeExemptReadFailureReadError {
-							info = blockInfoFor(blockreason.ParseError, "response_scan")
+							info = blockInfoFor(blockreason.ParseError, responseScanLayer)
 						}
 						writeBlockedError(w, info, "blocked: "+scanFailure.Reason, http.StatusForbidden)
 						outcomeStatus = strconv.Itoa(http.StatusForbidden)
@@ -2441,20 +2580,20 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					defer releaseSizeExemptScan()
 				} else {
 					reason := responseSizeBlockReason(fwdRespHost, int64(len(respBody)), maxBytes, "fetch_proxy.max_response_mb", true)
-					p.logger.LogBlocked(actx, "response_scan", reason)
+					p.logger.LogBlocked(actx, responseScanLayer, reason)
 					emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
 						ActionID:  actionID,
 						RequestID: requestID,
 						Agent:     agent,
 						Method:    r.Method,
 						Target:    targetURL,
-						Layer:     "response_scan",
+						Layer:     responseScanLayer,
 						Pattern:   reason,
 						Taint:     forwardTaint,
 					})))
-					p.metrics.RecordBlocked(fwdRespHost, "response_scan", time.Since(start), agentLabel)
+					p.metrics.RecordBlocked(fwdRespHost, responseScanLayer, time.Since(start), agentLabel)
 					writeBlockedError(w,
-						blockInfoFor(blockreason.ResponseSize, "response_scan"),
+						blockInfoFor(blockreason.ResponseSize, responseScanLayer),
 						"blocked: "+reason, http.StatusForbidden)
 					outcomeStatus = strconv.Itoa(http.StatusForbidden)
 					outcomeBytes = int64(len(respBody))
@@ -2466,20 +2605,23 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Browser Shield on forward proxy responses. Use post-redirect host
 		// so exempt_domains checks match the actual response origin.
+		shieldBodyLen := len(respBody)
 		var shieldBlocked bool
 		var shieldSummary *receipt.ShieldSummary
+		shieldMaxBytes := shieldMaxBytesForResponse(cfg, fwdRespHost, TransportForward)
 		respBody, shieldSummary, shieldBlocked = p.applyShield(respBody, resp.Header.Get("Content-Type"), fwdRespHost, resp.Header, cfg, actx, clientIP, requestID, TransportForward, actionID)
 		if shieldBlocked {
 			p.metrics.RecordBlocked(fwdRespHost, "shield_oversize", time.Since(start), agentLabel)
 			writeBlockedError(w,
 				blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
-				"blocked: response body exceeds browser shield size limit", http.StatusForbidden)
+				"blocked: "+shieldOversizeBlockReason(fwdRespHost, shieldBodyLen, shieldMaxBytes), http.StatusForbidden)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeBytes = int64(len(respBody))
 			outcomeReason = "shield_oversize"
 			return
 		}
 		if shieldSummary != nil {
+			setShieldRewriteHeader(resp.Header, shieldSummary)
 			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
 			resp.Header.Del("ETag")
 			resp.Header.Del("Digest")
@@ -2555,6 +2697,22 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				a2aResult = mcp.ScanA2AResponseBody(r.Context(), respBody, sc, &cfg.A2AScanning)
 			}
+			if a2aResult.ScanError != "" {
+				reason := "response scan failed: " + a2aResult.ScanError
+				p.logger.LogError(actx, fmt.Errorf("%s", reason))
+				emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
+					ActionID: actionID, RequestID: requestID, Agent: agent, Method: r.Method, Target: targetURL,
+					Layer: "response_scan_error", Pattern: reason, Taint: forwardTaint,
+				})))
+				p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan_error", time.Since(start), agentLabel)
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				outcomeStatus = strconv.Itoa(http.StatusServiceUnavailable)
+				outcomeBytes = int64(len(respBody))
+				outcomeReason = "response_scan_error"
+				return
+			}
 			if !a2aResult.Clean {
 				responsePromptHit = true
 				hasFinding = true
@@ -2603,10 +2761,11 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		// Response injection scanning: only runs when the scanner feature
 		// is enabled. Media policy above always runs when MediaPolicy
 		// is enabled, even if response scanning is off.
-		if sc.ResponseScanningEnabled() {
-			scanResult := sc.ScanResponseWithSuppress(r.Context(), string(respBody), resp.Request.URL.String(), cfg.Suppress)
+		if sc.ResponseScanningEnabled() && !fwdAuthenticatedArtifact {
+			scanResult := sc.ScanResponseBodyWithSuppress(r.Context(), respBody, resp.Request.URL.String(), cfg.Suppress)
 			recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportForward)
-			if !scanResult.Clean {
+			recordDroppedResponseScanMatches(p.metrics, p.logger, actx, scanResult.SuppressedMatches, TransportForward)
+			if !scanResult.Clean && !scanResult.Failed() {
 				responsePromptHit = true
 			}
 
@@ -2620,6 +2779,8 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				if scanResult.Clean {
 					fwdRespAction = config.ActionAllow
+				} else if scanResult.Failed() {
+					fwdRespAction = config.ActionBlock
 				}
 				p.captureObs.ObserveResponseVerdict(r.Context(), &capture.ResponseVerdictRecord{
 					Subsurface:        "response_forward",
@@ -2638,6 +2799,22 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					EffectiveAction:   fwdRespAction,
 					Outcome:           captureOutcome(fwdRespAction, scanResult.Clean),
 				})
+			}
+			if scanResult.Failed() {
+				reason := "response scan failed: " + scanResult.ScanError
+				p.logger.LogError(actx, fmt.Errorf("%s", reason))
+				emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
+					ActionID: actionID, RequestID: requestID, Agent: agent, Method: r.Method, Target: targetURL,
+					Layer: "response_scan_error", Pattern: reason, Taint: forwardTaint,
+				})))
+				p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan_error", time.Since(start), agentLabel)
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				outcomeStatus = strconv.Itoa(http.StatusServiceUnavailable)
+				outcomeBytes = int64(len(respBody))
+				outcomeReason = "response_scan_error"
+				return
 			}
 			if !scanResult.Clean {
 				hasFinding = true
@@ -2660,30 +2837,30 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					action = decide.UpgradeAction(action, forwardRec.EscalationLevel(), &cfg.AdaptiveEnforcement)
 					if action != originalAction {
 						sessionKey := sessionKeyFor(agent, clientIP)
-						recordAdaptiveUpgrade(p.logger, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(forwardRec.EscalationLevel()), FromAction: originalAction, ToAction: action, Scanner: "response_scan", ClientIP: clientIP, RequestID: requestID})
+						recordAdaptiveUpgrade(p.logger, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(forwardRec.EscalationLevel()), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: clientIP, RequestID: requestID})
 					}
 				}
 
 				switch action {
 				case config.ActionBlock, config.ActionAsk:
-					p.logger.LogBlocked(actx, "response_scan", reason)
+					p.logger.LogBlocked(actx, responseScanLayer, reason)
 					emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
 						ActionID:  actionID,
 						RequestID: requestID,
 						Agent:     agent,
 						Method:    r.Method,
 						Target:    targetURL,
-						Layer:     "response_scan",
+						Layer:     responseScanLayer,
 						Pattern:   reason,
 						Taint:     forwardTaint,
 					})))
-					p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan", time.Since(start), agentLabel)
+					p.metrics.RecordBlocked(r.URL.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 					writeBlockedError(w,
-						blockInfoFor(blockreason.PromptInjection, "response_scan"),
+						blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 						"blocked: response contains injection", http.StatusForbidden)
 					outcomeStatus = strconv.Itoa(http.StatusForbidden)
 					outcomeBytes = int64(len(respBody))
-					outcomeReason = "response_scan"
+					outcomeReason = responseScanLayer
 					return
 				case config.ActionStrip:
 					// Record SignalStrip for adaptive enforcement scoring.
@@ -2710,24 +2887,24 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 						resp.Header.Del("Digest")
 					} else {
 						stripFailureReason := reason + " (strip failed)"
-						p.logger.LogBlocked(actx, "response_scan", stripFailureReason)
+						p.logger.LogBlocked(actx, responseScanLayer, stripFailureReason)
 						emitForwardReceipt(withForwardRedaction(forwardBlockReceiptOpts(ForwardBlockReceiptInput{
 							ActionID:  actionID,
 							RequestID: requestID,
 							Agent:     agent,
 							Method:    r.Method,
 							Target:    targetURL,
-							Layer:     "response_scan",
+							Layer:     responseScanLayer,
 							Pattern:   stripFailureReason,
 							Taint:     forwardTaint,
 						})))
-						p.metrics.RecordBlocked(r.URL.Hostname(), "response_scan", time.Since(start), agentLabel)
+						p.metrics.RecordBlocked(r.URL.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 						writeBlockedError(w,
-							blockInfoFor(blockreason.PromptInjection, "response_scan"),
+							blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 							"blocked: response contains injection", http.StatusForbidden)
 						outcomeStatus = strconv.Itoa(http.StatusForbidden)
 						outcomeBytes = int64(len(respBody))
-						outcomeReason = "response_scan"
+						outcomeReason = responseScanLayer
 						return
 					}
 					p.logger.LogResponseScan(actx, config.ActionStrip, len(scanResult.Matches), patternNames, bundleRules)
@@ -2762,9 +2939,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 		if responseBudgetTruncated {
 			outcomeReason = "budget_truncated"
 		}
-		if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
+		if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !fwdAuthenticatedArtifact {
 			forwardScope := adaptiveScopeForHost(r.URL.Hostname())
-			recordCleanForAdaptiveScope(forwardRec, forwardScope, &cfg.AdaptiveEnforcement, sc.ResponseScanningEnabled() && !responseBudgetTruncated && !fwdRespExempt, adaptiveRecoveryContext{
+			recordCleanForAdaptiveScope(forwardRec, forwardScope, &cfg.AdaptiveEnforcement, sc.ResponseScanningEnabled() && !responseBudgetTruncated && !fwdRespExempt && !fwdAuthenticatedArtifact, adaptiveRecoveryContext{
 				sessionKey: sessionKeyFor(agent, clientIP),
 				scope:      forwardScope,
 				reason:     adaptiveRecoveryClean,
@@ -2811,7 +2988,7 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	if responseBudgetTruncated {
 		outcomeReason = "budget_truncated"
 	}
-	if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
+	if forwardRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding && !fwdAuthenticatedArtifact {
 		recordCleanForAdaptiveScope(forwardRec, adaptiveScopeForHost(r.URL.Hostname()), &cfg.AdaptiveEnforcement, false, adaptiveRecoveryContext{})
 	}
 }
@@ -2858,7 +3035,7 @@ func recordA2AContentEntropyTelemetry(logger *audit.Logger, m *metrics.Metrics, 
 	logger.LogBodyScan(actx, scanner.AuditBodyEntropy, action, 1, []string{contentEntropyReason(result.EntropyFinding)})
 }
 
-func readForwardBodyForProtocolScan(body io.Reader, contentEncoding string, maxBytes int) ([]byte, error) {
+func readForwardBodyForProtocolScan(body io.Reader, contentEncoding string, maxBytes int, trailer http.Header) ([]byte, error) {
 	if hasNonIdentityEncoding(contentEncoding) {
 		return nil, fmt.Errorf("request body uses Content-Encoding %q; compressed bodies cannot be scanned", contentEncoding)
 	}
@@ -2870,6 +3047,9 @@ func readForwardBodyForProtocolScan(body io.Reader, contentEncoding string, maxB
 	if len(buf) > maxBytes {
 		return nil, fmt.Errorf("request body exceeds max_body_bytes (%d)", maxBytes)
 	}
+	if len(trailer) != 0 {
+		return nil, fmt.Errorf("request trailers cannot be scanned for secrets")
+	}
 	return buf, nil
 }
 
@@ -2877,11 +3057,18 @@ func readForwardBodyForProtocolScan(body io.Reader, contentEncoding string, maxB
 // stripping hop-by-hop headers and Content-Length (which may be stale after
 // body truncation or stripping).
 func copyResponseHeaders(dst, src http.Header) {
+	// X-Pipelock-Receipt is proxy-owned evidence metadata. Preserve only an
+	// already-validated proxy value while deleting a value supplied upstream.
+	// This function is used immediately before every forward response write.
+	recordedReceipt := dst.Get(blockreason.HeaderRecordedReceipt)
+	blockreason.StripRecordedReceipt(dst)
 	for k, vv := range src {
 		for _, v := range vv {
 			dst.Add(k, v)
 		}
 	}
+	blockreason.StripRecordedReceipt(dst)
+	blockreason.SetRecordedReceipt(dst, recordedReceipt)
 	removeHopByHopHeaders(dst)
 	dst.Del("Content-Length")
 }

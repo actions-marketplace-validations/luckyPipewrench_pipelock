@@ -164,10 +164,9 @@ func TestRunHTTPListenerProxy_A2ASessionBindingBlocksNoBaseline(t *testing.T) {
 		BindingUnknownAction:    config.ActionBlock,
 		BindingNoBaselineAction: config.ActionBlock,
 	}
-	baseURL, _, logBuf := startListenerProxy(t, upstream.URL, sc,
+	baseURL, _, logBuf := startListenerProxyRequiringToken(t, upstream.URL, sc,
 		&InputScanConfig{Enabled: true, Action: config.ActionWarn, OnParseError: config.ActionBlock},
 		toolCfg,
-		nil,
 	)
 
 	token := listenerSetupToken(t, baseURL)
@@ -190,7 +189,7 @@ func TestRunHTTPListenerProxy_A2ASessionBindingBlocksNoBaseline(t *testing.T) {
 func TestScanHTTPInput_A2ASessionBindingDoesNotUseSameNamedTool(t *testing.T) {
 	sc := testScannerForHTTP(t)
 	baseline := tools.NewToolBaseline()
-	baseline.SetKnownTools([]string{a2aBaselineIdentity(testA2AMethod)})
+	requireKnownTools(t, baseline, []string{a2aBaselineIdentity(testA2AMethod)})
 	toolCfg := &tools.ToolScanConfig{
 		Baseline:                baseline,
 		Action:                  config.ActionBlock,
@@ -422,7 +421,7 @@ func TestForwardScannedInput_A2ADoWAllowDoesNotFalseBlock(t *testing.T) {
 func TestForwardScannedInput_A2ASessionBindingBlocksUnknownMethod(t *testing.T) {
 	sc := testInputScanner(t)
 	baseline := tools.NewToolBaseline()
-	baseline.SetKnownTools([]string{"read_file"})
+	requireKnownTools(t, baseline, []string{"read_file"})
 	bindingCfg := &SessionBindingConfig{
 		Baseline:          baseline,
 		UnknownToolAction: config.ActionBlock,
@@ -464,7 +463,7 @@ func TestForwardScannedInput_A2ASessionBindingBlocksUnknownMethod(t *testing.T) 
 func TestForwardScannedInput_A2ASessionBindingDoesNotUseSameNamedTool(t *testing.T) {
 	sc := testInputScanner(t)
 	baseline := tools.NewToolBaseline()
-	baseline.SetKnownTools([]string{a2aBaselineIdentity(testA2AMethod)})
+	requireKnownTools(t, baseline, []string{a2aBaselineIdentity(testA2AMethod)})
 	bindingCfg := &SessionBindingConfig{
 		Baseline:          baseline,
 		UnknownToolAction: config.ActionBlock,

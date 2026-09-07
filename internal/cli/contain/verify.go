@@ -143,6 +143,7 @@ type probeEnv struct {
 	pinPath            string
 	wrapperInvPath     string
 	toolsListPath      string
+	configPath         string
 	workspacePaths     []string
 	pipelockTarget     string
 	verifyRunningImage bool
@@ -190,6 +191,7 @@ func defaultProbeEnv() *probeEnv {
 		pinPath:            defaultIntegrityPin,
 		wrapperInvPath:     defaultWrapperInvPath,
 		toolsListPath:      defaultToolsListPath,
+		configPath:         filepath.Join(defaultConfigDir, "pipelock.yaml"),
 		pipelockTarget:     defaultPipelockTarget,
 		verifyRunningImage: true,
 		runCmd:             realRunCommand,
@@ -334,6 +336,7 @@ func allProbes() []probe {
 		{10, "binary_integrity_pin", "deployed and running pipelock binary match TOFU pin", probeBinaryIntegrity},
 		{11, "cc_launch_allow_list_enforced", "plk-launch rejects tools missing from the allow-list", probeCCLaunchAllowList},
 		{12, "listed_tool_targets_resolvable", "tools.list entries resolve for pipelock-agent", probeListedToolTargets},
+		{13, "managed_config_metrics", "managed config keeps metrics on loopback or a current, source-scoped exception", probeManagedConfigMetrics},
 	}
 }
 
@@ -348,7 +351,7 @@ func probesForEnv(env *probeEnv) []probe {
 		}
 	}
 	if len(env.workspacePaths) > 0 {
-		probes = append(probes, probe{13, "workspace_access", "pipelock-agent can read configured workspace paths", probeWorkspaceAccess})
+		probes = append(probes, probe{14, "workspace_access", "pipelock-agent can read configured workspace paths", probeWorkspaceAccess})
 	}
 	return probes
 }
@@ -753,7 +756,7 @@ func verifyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "verify",
 		Short: "Run read-only probes against the containment model",
-		Long: `Run twelve read-only probes to verify the workstation containment model
+		Long: `Run thirteen read-only probes to verify the workstation containment model
 is installed correctly and the boundary is intact.
 
 Probes inspect system users, the pipelock systemd unit, nftables rules,
@@ -761,8 +764,9 @@ wrapper scripts, the CA bundle, the pipelock loopback bind, the NO_PROXY
 policy, run two egress canaries (pipelock-agent must NOT reach the internet
 directly; the operator user must still reach the internet), verify the
 deployed and running service binaries match the TOFU integrity pin written at
-install time, and exercise plk-launch end-to-end with a sentinel tool to confirm
-the allow-list enforcement path actually fires. Pass --workspace to also
+install time, exercise plk-launch end-to-end with a sentinel tool to confirm
+the allow-list enforcement path actually fires, and check that the managed
+config keeps metrics on loopback or uses a current, source-scoped exception. Pass --workspace to also
 verify that pipelock-agent can read/traverse real project directories.
 Pass --enforcement-only when another process owns the proxy lifecycle;
 that mode verifies the kernel/user/wrapper controls and the pinned file at the
@@ -1032,6 +1036,34 @@ func parseSystemdShow(out string) map[string]string {
 }
 
 // ---------------------------------------------------------------------------
+// Probe 13: managed_config_metrics
+// ---------------------------------------------------------------------------
+
+// probeManagedConfigMetrics verifies the containment-specific metrics surface
+// from the managed config without starting or reloading Pipelock. An operator
+// may run verify without root, while the managed config is readable only by
+// root and pipelock-proxy, so an unreadable or absent file is incomplete
+// evidence and must not become a pass.
+func probeManagedConfigMetrics(_ context.Context, env *probeEnv) (string, string) {
+	configPath := filepath.Clean(env.configPath)
+	data, err := env.readFile(configPath)
+	if err != nil {
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			return statusSkip, fmt.Sprintf("managed config %s is missing", configPath)
+		case errors.Is(err, os.ErrPermission):
+			return statusSkip, fmt.Sprintf("managed config %s is not readable; rerun as root", configPath)
+		default:
+			return statusUnknown, fmt.Sprintf("read managed config %s: %v", configPath, err)
+		}
+	}
+	if _, err := containServiceReadOnlyPaths(data, env.port); err != nil {
+		return statusFail, fmt.Sprintf("managed config %s violates containment metrics policy: %v", configPath, err)
+	}
+	return statusPass, fmt.Sprintf("managed config %s keeps metrics off the agent-accessible proxy port", configPath)
+}
+
+// ---------------------------------------------------------------------------
 // Probe 3: nftables_containment_ruleset
 // ---------------------------------------------------------------------------
 
@@ -1087,7 +1119,7 @@ func probeNFTContainment(ctx context.Context, env *probeEnv) (string, string) {
 		return statusFail, fmt.Sprintf("chain %s is not the managed output base chain (want type filter hook output priority filter/0 policy accept)", env.nftChain)
 	}
 	if env.nftPersistUnitPath != "" && env.nftRulesPath != "" {
-		if err := verifyNFTPersistence(env); err != nil {
+		if err := verifyNFTPersistence(env, current); err != nil {
 			return statusFail, err.Error()
 		}
 	}
@@ -1204,7 +1236,7 @@ func parseNFTRulesHeaderUIDs(data []byte) (nftRulesHeaderUIDs, bool, error) {
 	return nftRulesHeaderUIDs{}, false, nil
 }
 
-func verifyNFTPersistence(env *probeEnv) error {
+func verifyNFTPersistence(env *probeEnv, current containmentUIDs) error {
 	data, err := env.readFile(env.nftPersistUnitPath)
 	if err != nil {
 		return fmt.Errorf("read nftables persistence unit %s: %w", env.nftPersistUnitPath, err)
@@ -1212,6 +1244,30 @@ func verifyNFTPersistence(env *probeEnv) error {
 	body := string(data)
 	if !execStartLineContains(body, env.nftRulesPath) {
 		return fmt.Errorf("%s missing ExecStart for %s", env.nftPersistUnitPath, env.nftRulesPath)
+	}
+	rules, err := env.readFile(env.nftRulesPath)
+	if err != nil {
+		return fmt.Errorf("read persisted nftables rules file %s: %w", env.nftRulesPath, err)
+	}
+	if !current.operatorKnown {
+		return fmt.Errorf("persisted nftables rules file %s is missing the managed operator uid header", env.nftRulesPath)
+	}
+	operatorUID := current.operatorUID
+	if env.operatorUser != "" {
+		operatorUID, err = lookupUID(env.lookupUser, env.operatorUser)
+		if err != nil {
+			return fmt.Errorf("lookup operator uid %s: %w", env.operatorUser, err)
+		}
+		if operatorUID == current.agentUID {
+			return fmt.Errorf("%s and %s both resolve to uid %d; contained agent must not be allow-listed", env.operatorUser, env.agentUserName, current.agentUID)
+		}
+		if current.operatorUID != operatorUID {
+			return fmt.Errorf("nftables rules file operator uid %d does not match current %s uid %d", current.operatorUID, env.operatorUser, operatorUID)
+		}
+	}
+	want := renderNFTRules(operatorUID, current.proxyUID, current.agentUID, env.port, env.nftTable, env.nftChain)
+	if string(rules) != want {
+		return fmt.Errorf("persisted nftables rules file %s does not match the canonical containment boundary; rerun pipelock contain install before reboot", env.nftRulesPath)
 	}
 	return nil
 }
@@ -1295,6 +1351,9 @@ func chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines []string, uids containment
 		if lineHasAgentProxyLoopbackAllow(line, uids.agentUID, proxyPort) {
 			return false
 		}
+		if lineHasAgentEstablishedReplyAllow(line, uids.agentUID) {
+			return false
+		}
 		if lineHasSkuidProtocolDPortVerdict(line, uids.agentUID, "udp", 53, "drop") ||
 			lineHasSkuidProtocolDPortVerdict(line, uids.agentUID, "tcp", 53, "drop") {
 			return false
@@ -1306,6 +1365,46 @@ func chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines []string, uids containment
 		}
 		return true
 	})
+}
+
+// lineHasAgentEstablishedReplyAllow recognizes a narrow server reply path.
+// Established TCP replies cannot admit the NEW outbound connection used by the
+// direct-egress canary. The explicit conntrack direction prevents an
+// established original-direction flow from being mistaken for a reply.
+func lineHasAgentEstablishedReplyAllow(line string, agentUID int) bool {
+	fields := nftLineFields(line)
+	const predicatesLen = 17
+	if len(fields) <= predicatesLen {
+		return false
+	}
+	interfaceOK := fields[3] == "oifname" && isQuotedNFTName(fields[4]) ||
+		fields[3] == "oif" && isPositiveInteger(fields[4])
+	if fields[0] != "meta" || fields[1] != "skuid" || fields[2] != strconv.Itoa(agentUID) ||
+		!interfaceOK ||
+		fields[5] != "ip" || (fields[6] != "saddr" && fields[6] != "daddr") || net.ParseIP(fields[7]).To4() == nil ||
+		fields[8] != "tcp" || fields[9] != "sport" || !isTCPPort(fields[10]) ||
+		fields[11] != "ct" || fields[12] != "state" || (fields[13] != "established" && fields[13] != "0x2") ||
+		fields[14] != "ct" || fields[15] != "direction" || (fields[16] != "reply" && fields[16] != "1") {
+		return false
+	}
+	acceptAt := indexTokenAfter(fields, "accept", predicatesLen)
+	return acceptAt != -1 &&
+		fieldsAreNFTBookkeeping(fields[predicatesLen:acceptAt]) &&
+		nftRuleTailIsCommentOnly(fields[acceptAt+1:])
+}
+
+func isQuotedNFTName(value string) bool {
+	return len(value) >= 3 && strings.HasPrefix(value, `"`) && strings.HasSuffix(value, `"`)
+}
+
+func isTCPPort(value string) bool {
+	port, err := strconv.Atoi(value)
+	return err == nil && port >= 1 && port <= 65535
+}
+
+func isPositiveInteger(value string) bool {
+	n, err := strconv.Atoi(value)
+	return err == nil && n > 0
 }
 
 // terminalSkuidUIDVerdict extracts the UID from an exact skuid verdict rule.

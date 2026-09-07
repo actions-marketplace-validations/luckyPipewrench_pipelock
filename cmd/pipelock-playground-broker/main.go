@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -35,6 +37,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/playground"
 	"github.com/luckyPipewrench/pipelock/internal/playground/broker"
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
 )
@@ -68,8 +71,18 @@ const (
 	cfAccessKeysTTL          = 5 * time.Minute
 	cfAccessNegativeCacheTTL = 30 * time.Second
 
-	envModelKey        = "PLAYGROUND_MODEL_" + "KEY"
+	envModelKey = "PLAYGROUND_MODEL_" + "KEY"
+	// envOrchestratorKey is the name a visitor VM reads for a durable signing
+	// key. The broker must never hold its root under this name: broker and
+	// guests are one Fly app and share app-level secrets, so a root stored
+	// here is delivered to every visitor VM. That sharing is what put the
+	// durable key on the guests before 2026-09-03. It survives only as the
+	// name checked when refusing to leak a root through SessionEnv.
 	envOrchestratorKey = "PLAYGROUND_ORCHESTRATOR_" + "KEY"
+	// envOrchestratorRoot is the broker-only name for the durable signing
+	// root. The guest entrypoint does not read it and refuses to boot if the
+	// guest-facing name is present at all.
+	envOrchestratorRoot = "PLAYGROUND_ORCHESTRATOR_" + "ROOT"
 
 	// warmPoolVMCodeBytes mirrors broker.vmInviteCodeBytes for warm-pool VM
 	// code generation. Kept in sync with the broker constant.
@@ -125,6 +138,7 @@ type serveFlags struct {
 	turnstileSitekey          string
 	turnstileOrigin           string
 	checkConfig               bool
+	printRequiredEnv          bool
 	sessionTTL                time.Duration
 	deadlineGrace             time.Duration
 	allowOrigin               string
@@ -145,6 +159,7 @@ type serveFlags struct {
 	modelKeyEnv               string
 	orchestratorKeyFile       string
 	orchestratorKeyEnv        string
+	vmImageDigest             string
 	requireSessionSecrets     bool
 	warmPoolSize              int
 	// VM model/session config, passed into each per-visitor VM via PLAYGROUND_*
@@ -158,6 +173,17 @@ type serveFlags struct {
 }
 
 type providerFactory func(context.Context, *serveFlags, string) (broker.MachineProvider, error)
+
+type archiveReplayFlags struct {
+	runDir              string
+	output              string
+	kitOutputDir        string
+	linuxVerifier       string
+	macOSVerifier       string
+	windowsVerifier     string
+	orchestratorKeyFile string
+	orchestratorKeyEnv  string
+}
 
 var newMachineProvider providerFactory = defaultMachineProvider
 
@@ -175,8 +201,180 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: false,
 		Version:       cliutil.Version,
 	}
-	root.AddCommand(newServeCmd())
+	root.AddCommand(newServeCmd(), newArchiveReplayCmd())
 	return root
+}
+
+func newArchiveReplayCmd() *cobra.Command {
+	f := &archiveReplayFlags{}
+	cmd := &cobra.Command{
+		Use:   "archive-replay",
+		Short: "Create a permanently verifiable published playground replay",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runArchiveReplay(cmd, f)
+		},
+	}
+	flags := cmd.Flags()
+	flags.StringVar(&f.runDir, "run-dir", "", "sealed playground run directory")
+	flags.StringVar(&f.output, "output", "", "new replay bundle output path")
+	flags.StringVar(&f.orchestratorKeyFile, "orchestrator-key-file", "", "path to the broker-held orchestrator root key")
+	flags.StringVar(&f.orchestratorKeyEnv, "orchestrator-key-env", "", "environment variable holding the broker-held orchestrator root key (default "+envOrchestratorRoot+")")
+	flags.StringVar(&f.kitOutputDir, "kit-output-dir", "", "new directory for Linux, macOS, and Windows verification kits (requires all --*-verifier flags)")
+	flags.StringVar(&f.linuxVerifier, "linux-verifier", "", "Linux pipelock-verifier binary for --kit-output-dir")
+	flags.StringVar(&f.macOSVerifier, "macos-verifier", "", "macOS pipelock-verifier binary for --kit-output-dir")
+	flags.StringVar(&f.windowsVerifier, "windows-verifier", "", "Windows pipelock-verifier binary for --kit-output-dir")
+	_ = cmd.MarkFlagRequired("run-dir")
+	_ = cmd.MarkFlagRequired("output")
+	return cmd
+}
+
+func runArchiveReplay(cmd *cobra.Command, f *archiveReplayFlags) error {
+	if err := refuseGuestFacingRootSecret(); err != nil {
+		return err
+	}
+	root, err := resolveOrchestratorRoot(&serveFlags{
+		orchestratorKeyFile:   f.orchestratorKeyFile,
+		orchestratorKeyEnv:    f.orchestratorKeyEnv,
+		requireSessionSecrets: true,
+	})
+	if err != nil {
+		return err
+	}
+	bundle, err := playground.ArchiveRunForPublishedReplay(f.runDir, root)
+	if err != nil {
+		return err
+	}
+	// Build every artifact before publishing any of them. A kit built from a
+	// different bundle than the one shipped is a silent mismatch a visitor only
+	// finds offline, and a half-written artifact set leaves visitors downloading
+	// a bundle whose kits never arrived.
+	kits, err := buildArchiveVerifyKits(f, bundle)
+	if err != nil {
+		return err
+	}
+	if err := publishArchiveArtifacts(f, bundle, kits); err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "published replay archive verified and written")
+	return nil
+}
+
+// archiveKit is one built, not-yet-written verification kit.
+type archiveKit struct {
+	name string
+	data []byte
+}
+
+// buildArchiveVerifyKits validates the kit flags and builds every kit in memory.
+// It writes nothing, so a build failure cannot leave output behind.
+func buildArchiveVerifyKits(f *archiveReplayFlags, bundle []byte) ([]archiveKit, error) {
+	paths := []string{f.linuxVerifier, f.macOSVerifier, f.windowsVerifier}
+	if f.kitOutputDir == "" {
+		for _, verifier := range paths {
+			if verifier != "" {
+				return nil, errors.New("--kit-output-dir is required when supplying a verifier binary")
+			}
+		}
+		return nil, nil
+	}
+	for _, verifier := range paths {
+		if verifier == "" {
+			return nil, errors.New("--kit-output-dir requires --linux-verifier, --macos-verifier, and --windows-verifier")
+		}
+	}
+	kits := make([]archiveKit, 0, len(paths))
+	for _, kit := range []struct {
+		osName   playground.VerifyKitOS
+		verifier string
+	}{
+		{playground.VerifyKitOSLinux, f.linuxVerifier},
+		{playground.VerifyKitOSMacOS, f.macOSVerifier},
+		{playground.VerifyKitOSWindows, f.windowsVerifier},
+	} {
+		data, name, err := playground.BuildPublishedReplayVerifyKit(kit.osName, kit.verifier, bundle)
+		if err != nil {
+			return nil, fmt.Errorf("build %s verification kit: %w", kit.osName, err)
+		}
+		kits = append(kits, archiveKit{name: name, data: data})
+	}
+	return kits, nil
+}
+
+// publishArchiveArtifacts writes the bundle and every kit, and removes anything
+// this invocation created if a later write fails. Every path it removes was
+// created here under O_EXCL, so it can never delete a pre-existing artifact.
+func publishArchiveArtifacts(f *archiveReplayFlags, bundle []byte, kits []archiveKit) (err error) {
+	var created []string
+	var createdDir string
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, path := range created {
+			_ = os.Remove(path)
+		}
+		if createdDir != "" {
+			_ = os.Remove(createdDir)
+		}
+	}()
+
+	// Record the path on CREATION, not on success, so a file that failed
+	// mid-write is still rolled back and the kit directory can be removed.
+	madeBundle, writeErr := writeNewArchiveFile(f.output, bundle)
+	if madeBundle {
+		created = append(created, f.output)
+	}
+	if writeErr != nil {
+		err = writeErr
+		return err
+	}
+
+	if len(kits) == 0 {
+		return nil
+	}
+	kitDir := filepath.Clean(f.kitOutputDir)
+	if err = os.Mkdir(kitDir, 0o750); err != nil {
+		return fmt.Errorf("create kit output directory: %w", err)
+	}
+	createdDir = kitDir
+	for _, kit := range kits {
+		path := filepath.Join(kitDir, kit.name)
+		madeKit, kitErr := writeNewArchiveFile(path, kit.data)
+		if madeKit {
+			created = append(created, path)
+		}
+		if kitErr != nil {
+			err = kitErr
+			return err
+		}
+	}
+	return nil
+}
+
+// writeNewArchiveFile exclusively creates path and writes data to it. It reports
+// whether the file was CREATED separately from whether the write succeeded,
+// because those are different facts for rollback: a file created and then failed
+// mid-write still exists and must be removed, while a path that failed to create
+// belongs to someone else and must never be touched.
+func writeNewArchiveFile(path string, data []byte) (created bool, err error) {
+	file, openErr := os.OpenFile(filepath.Clean(path), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if openErr != nil {
+		return false, fmt.Errorf("create output: %w", openErr)
+	}
+	// A close error on a successful write is a real write failure: the data may
+	// never have reached the filesystem. Reporting success there would publish a
+	// truncated artifact.
+	defer func() {
+		closeErr := file.Close()
+		if err == nil && closeErr != nil {
+			err = fmt.Errorf("close output: %w", closeErr)
+		}
+	}()
+	if _, err = file.Write(data); err != nil {
+		return true, fmt.Errorf("write output: %w", err)
+	}
+	return true, nil
 }
 
 func newServeCmd() *cobra.Command {
@@ -227,6 +425,7 @@ func newServeCmd() *cobra.Command {
 	fl.StringVar(&f.turnstileSitekey, "turnstile-sitekey", "", "public Cloudflare Turnstile site key; reported via /health so the viewer renders the widget (the secret is set separately via --turnstile-secret-*)")
 	fl.StringVar(&f.turnstileOrigin, "turnstile-origin", "", "validated browser origin used by the Turnstile widget and added to CSP only when configured")
 	fl.BoolVar(&f.checkConfig, "check-config", false, "validate flags and static UI compatibility, then exit without resolving secrets or contacting providers")
+	fl.BoolVar(&f.printRequiredEnv, "print-required-env", false, "print required environment variable names, one per line, then exit without reading their values")
 	fl.DurationVar(&f.sessionTTL, "session-ttl", defaultSessionTTL, "VM session token TTL")
 	fl.DurationVar(&f.deadlineGrace, "deadline-grace", defaultGrace, "lease teardown grace after VM session expiry")
 	fl.StringVar(&f.allowOrigin, "allow-origin", "", "Access-Control-Allow-Origin for the browser")
@@ -244,8 +443,9 @@ func newServeCmd() *cobra.Command {
 	fl.BoolVar(&f.trustForwardedFor, "trust-forwarded-for", false, "read client IP from X-Forwarded-For behind a trusted proxy")
 	fl.StringVar(&f.modelKeyFile, "model-key-file", "", "path to the model key file passed to the VM env")
 	fl.StringVar(&f.modelKeyEnv, "model-key-env", "", "environment variable holding the model key passed to the VM env")
-	fl.StringVar(&f.orchestratorKeyFile, "orchestrator-key-file", "", "path to the orchestrator key file passed to the VM env")
-	fl.StringVar(&f.orchestratorKeyEnv, "orchestrator-key-env", "", "environment variable holding the orchestrator key passed to the VM env")
+	fl.StringVar(&f.orchestratorKeyFile, "orchestrator-key-file", "", "path to the broker-held orchestrator root key; never copied into visitor VMs")
+	fl.StringVar(&f.orchestratorKeyEnv, "orchestrator-key-env", "", "environment variable holding the broker-held orchestrator root key (default "+envOrchestratorRoot+"); never copied into visitor VMs")
+	fl.StringVar(&f.vmImageDigest, "vm-image-digest", "", "immutable sha256 digest of the visitor VM image bound into session delegations")
 	fl.BoolVar(&f.requireSessionSecrets, "require-session-secrets", true, "require model and orchestrator keys from file/env")
 	fl.StringVar(&f.vmModelBaseURL, "vm-model-base-url", "", "model API base URL passed to each VM (enables the model-backed agent)")
 	fl.StringVar(&f.vmModel, "vm-model", "", "model name passed to each VM")
@@ -268,6 +468,12 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 	if err := validateStaticUI(f.staticDir, effectiveTurnstileOrigin(f), f.externalScriptOrigins); err != nil {
 		return err
 	}
+	if f.printRequiredEnv {
+		for _, name := range requiredEnvironmentNames(f) {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), name)
+		}
+		return nil
+	}
 	if f.checkConfig {
 		if _, _, err := resolveBrokerCodes(f); err != nil {
 			return err
@@ -276,6 +482,12 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 			return err
 		}
 		if _, err := newCFAccessVerifier(f); err != nil {
+			return err
+		}
+		if _, err := resolveImageDigest(f); err != nil {
+			return err
+		}
+		if err := refuseGuestFacingRootSecret(); err != nil {
 			return err
 		}
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "broker flags, access gates, public hosts, access policy, and static UI valid; secrets and provider not contacted")
@@ -331,7 +543,37 @@ func runServe(cmd *cobra.Command, f *serveFlags) error {
 	return nil
 }
 
+func requiredEnvironmentNames(f *serveFlags) []string {
+	names := make([]string, 0, 6)
+	addEnvUnlessFile := func(file, configuredEnv, defaultEnv string, required bool) {
+		if strings.TrimSpace(file) != "" {
+			return
+		}
+		if name := strings.TrimSpace(configuredEnv); name != "" {
+			names = append(names, name)
+			return
+		}
+		if required && defaultEnv != "" {
+			names = append(names, defaultEnv)
+		}
+	}
+	addEnvUnlessFile(f.flyTokenFile, f.flyTokenEnv, "", true)
+	addEnvUnlessFile(f.gateSecretFile, f.gateSecretEnv, "", false)
+	addEnvUnlessFile(f.turnstileSecretFile, f.turnstileSecretEnv, "", false)
+	addEnvUnlessFile(f.adminTokenFile, f.adminTokenEnv, "", strings.TrimSpace(f.adminListen) != "")
+	addEnvUnlessFile(f.modelKeyFile, f.modelKeyEnv, envModelKey, f.requireSessionSecrets)
+	addEnvUnlessFile(f.orchestratorKeyFile, f.orchestratorKeyEnv, envOrchestratorRoot, f.requireSessionSecrets)
+	slices.Sort(names)
+	return slices.Compact(names)
+}
+
 func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Server, http.Handler, func(context.Context), *broker.Pool, error) {
+	// Refuse before resolving any secret or contacting a provider: a broker
+	// holding the guest-facing signing variable would hand the durable root to
+	// every visitor VM through shared app secrets.
+	if err := refuseGuestFacingRootSecret(); err != nil {
+		return nil, nil, nil, nil, err
+	}
 	if err := validateFlags(f); err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -365,6 +607,14 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	providerHealth := broker.NewProviderHealth(nil, out)
 	provider = broker.NewHealthTrackingProvider(provider, providerHealth)
 	sessionEnv, err := resolveSessionEnv(f)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	rootKey, err := resolveOrchestratorRoot(f)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	imageDigest, err := resolveImageDigest(f)
 	if err != nil {
 		return nil, nil, nil, nil, err
 	}
@@ -435,11 +685,17 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		PerCodeDailyBudget: f.perCodeDailyBudget,
 		GlobalDailyBudget:  f.globalDailyBudget,
 		SessionEnv:         sessionEnv,
-		InternalPort:       f.internalPort,
-		DeadlineGrace:      f.deadlineGrace,
-		TrustForwardedFor:  f.trustForwardedFor,
-		AllowOrigin:        f.allowOrigin,
-		ProviderHealth:     providerHealth,
+		OrchestratorRoot:   rootKey,
+		// The existing production secret policy is also the signing policy: when
+		// session secrets are required, every visitor must use a root-authorized
+		// delegated key. Development keeps both optional through the same switch.
+		RequireDelegatedSigning: f.requireSessionSecrets,
+		ImageDigest:             imageDigest,
+		InternalPort:            f.internalPort,
+		DeadlineGrace:           f.deadlineGrace,
+		TrustForwardedFor:       f.trustForwardedFor,
+		AllowOrigin:             f.allowOrigin,
+		ProviderHealth:          providerHealth,
 	})
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -1684,9 +1940,10 @@ func resolveBrokerCodes(f *serveFlags) ([]livechat.CodeSpec, string, error) {
 // buildVMBaseEnv assembles the PLAYGROUND_* environment shared by every
 // per-visitor VM. The deploy entrypoint (deploy/fly-playground/entrypoint.sh)
 // consumes these env vars into `serve` flags — keep the names in sync with it.
-// The per-session invite code (PLAYGROUND_CODE) and the secrets
-// (PLAYGROUND_MODEL_KEY / PLAYGROUND_ORCHESTRATOR_KEY) are layered in elsewhere
-// (broker sessionEnv / resolveSessionEnv), not here.
+// The per-session invite code (PLAYGROUND_CODE) and the model key
+// (PLAYGROUND_MODEL_KEY) are layered in elsewhere (broker sessionEnv /
+// resolveSessionEnv), not here. The durable orchestrator root stays on the
+// broker and is never copied into visitor VM env.
 func buildVMBaseEnv(f *serveFlags) map[string]string {
 	env := map[string]string{
 		"PLAYGROUND_LISTEN": fmt.Sprintf("0.0.0.0:%d", f.internalPort),
@@ -1766,18 +2023,102 @@ func resolveSessionEnv(f *serveFlags) (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	orchestrator, err := resolveSessionSecret(f.orchestratorKeyFile, f.orchestratorKeyEnv, "--orchestrator-key-file", envOrchestratorKey, f.requireSessionSecrets)
-	if err != nil {
-		return nil, err
-	}
 	env := make(map[string]string)
 	if model != "" {
 		env[envModelKey] = model
 	}
-	if orchestrator != "" {
-		env[envOrchestratorKey] = orchestrator
-	}
 	return env, nil
+}
+
+// refuseGuestFacingRootSecret fails closed while the guest-facing signing-key
+// variable is set in the broker own environment. Broker and visitor VMs are
+// one Fly app and share app-level secrets, so a value under that name reaches
+// every guest and turns delegation off with no other signal. Refusing here
+// makes that deployment state impossible to hold silently.
+func refuseGuestFacingRootSecret() error {
+	if strings.TrimSpace(os.Getenv(envOrchestratorKey)) == "" {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s is set in the broker environment; visitor VMs share app secrets and would receive the durable signing root. Clear that secret and store the root under %s instead",
+		envOrchestratorKey, envOrchestratorRoot)
+}
+
+func resolveOrchestratorRoot(f *serveFlags) (ed25519.PrivateKey, error) {
+	raw, err := resolveSessionSecret(f.orchestratorKeyFile, f.orchestratorKeyEnv, "--orchestrator-key-file", envOrchestratorRoot, f.requireSessionSecrets)
+	if err != nil {
+		return nil, err
+	}
+	if raw == "" {
+		return nil, nil
+	}
+	priv, err := playground.ParseOrchestratorPrivateKeyHex(raw)
+	if err != nil {
+		return nil, err
+	}
+	// Every shipped verifier, the browser verifier, and the downloadable kits
+	// all pin the published identity. A broker signing under any other root
+	// produces bundles that fail offline verification for every visitor, which
+	// is a silent break that only shows up after someone downloads a kit.
+	if !playground.OrchestratorKeyMatchesPublished(priv) {
+		return nil, fmt.Errorf("%s does not derive the published orchestrator identity; bundles signed by it would fail every shipped verifier", envOrchestratorRoot)
+	}
+	return priv, nil
+}
+
+// imageRefDigest returns the digest a reference is pinned to, or empty when the
+// reference names a mutable tag.
+func imageRefDigest(image string) string {
+	idx := strings.LastIndex(image, "@sha256:")
+	if idx < 0 {
+		return ""
+	}
+	return "sha256:" + image[idx+len("@sha256:"):]
+}
+
+func validateCanonicalDigest(digest string) error {
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
+		return fmt.Errorf("image digest %q is not a canonical sha256 digest", digest)
+	}
+	for _, c := range digest[len("sha256:"):] {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return fmt.Errorf("image digest %q is not a canonical sha256 digest", digest)
+		}
+	}
+	return nil
+}
+
+// resolveImageDigest returns the immutable image each session delegation binds.
+// The delegation attests which image ran, so the digest has to describe the
+// image the broker actually launches. A mutable --image tag beside an unrelated
+// --vm-image-digest would attest one image while launching another, so both are
+// refused rather than reconciled.
+func resolveImageDigest(f *serveFlags) (string, error) {
+	digest := strings.TrimSpace(f.vmImageDigest)
+	refDigest := imageRefDigest(f.image)
+	if digest == "" {
+		digest = refDigest
+	}
+	if digest == "" {
+		if f.requireSessionSecrets {
+			return "", errors.New("--vm-image-digest is required so session delegations bind an immutable image")
+		}
+		return "", nil
+	}
+	if err := validateCanonicalDigest(digest); err != nil {
+		return "", err
+	}
+	// Outside dev the launched reference must be pinned to exactly the digest
+	// the delegation attests.
+	if f.requireSessionSecrets {
+		if refDigest == "" {
+			return "", fmt.Errorf("--image %q must be pinned by digest so the delegated image is the image that launches", f.image)
+		}
+		if refDigest != digest {
+			return "", fmt.Errorf("--image is pinned to %s but --vm-image-digest is %s; a delegation would attest an image that never launched", refDigest, digest)
+		}
+	}
+	return digest, nil
 }
 
 func resolveSessionSecret(file, envName, flagName, defaultEnv string, required bool) (string, error) {
@@ -1796,7 +2137,7 @@ func resolveSessionSecret(file, envName, flagName, defaultEnv string, required b
 			return v, nil
 		}
 		if required {
-			return "", fmt.Errorf("%s or --%s-env is required", flagName, strings.TrimPrefix(strings.TrimPrefix(flagName, "--"), "-"))
+			return "", fmt.Errorf("%s, %s, or %s is required", defaultEnv, flagName, strings.TrimSuffix(flagName, "-file")+"-env")
 		}
 		return "", nil
 	}

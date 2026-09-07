@@ -12,15 +12,52 @@ Pipelock is an agent firewall: a network and tool proxy that mediates AI-agent H
 | Binary | Single Go binary; size varies by OS, build tags, and release flags |
 | Dependencies | See `go.mod`. Run `make stats` before citing the current direct-dependency count. |
 
+<!-- BEGIN capability-manifest (generated; run go generate ./internal/capabilitymanifest) -->
+
+## Capability surface
+
+The code-checked capability manifest is docs/security/capability-manifest.json. It lists the operator entry point and license gate for each surface below. Free means no license feature is required.
+
+| Capability | Access | Operator entry point | Platform or deployment qualifier |
+|---|---|---|---|
+| HTTP, WebSocket, and proxy mediation | Free | pipelock run | Applies only to traffic routed through Pipelock; direct agent egress needs containment or network policy. |
+| MCP proxy scanning | Free | pipelock mcp proxy | Applies only to MCP transports that run through the Pipelock proxy. |
+| Signed action receipts | Free | flight_recorder |  |
+| Host containment for agent processes | Free | pipelock contain | Kernel-enforced containment requires Linux, nftables, and the managed identities; other targets cannot provide this containment path. |
+| Single-agent process sandbox | Free | pipelock sandbox | Kernel isolation requires Linux user namespaces. Without them, best-effort network isolation only sets HTTP(S)_PROXY; seccomp adds restrictions only on linux/amd64. |
+| Global canary tokens | Free | canary_tokens |  |
+| Named agent profiles | Pro | agents.<profile> |  |
+| Per-agent sandbox overrides | Pro | agents.<profile>.sandbox |  |
+| Per-agent crypto address allowlists | Pro | agents.<profile>.allowed_addresses |  |
+| Read-only operator dashboard | Pro or Enterprise | pipelock dashboard serve |  |
+| Full assessment artifacts | Assess | pipelock assess finalize |  |
+| Conductor fleet coordination | Enterprise | pipelock conductor serve |  |
+| Per-agent coverage certificates | Pro | pipelock dashboard coverage-cert generate |  |
+| Exemption lifecycle records | Pro | pipelock dashboard exemption list |  |
+| Legal-hold metadata | Pro | pipelock dashboard legal-hold list |  |
+| Fleet audit sink | Enterprise | pipelock fleet-sink |  |
+| Fleet receipt reports | Enterprise | pipelock conductor fleet report |  |
+| Emergency kill switch | Free | kill_switch |  |
+| Rule bundles | Free | rules |  |
+| Adaptive enforcement | Free | adaptive_enforcement |  |
+| TLS interception | Free | tls_interception | Requires a configured local CA that the intercepted client trusts; passthrough traffic remains encrypted and cannot be body-scanned. |
+| A2A protocol scanning | Free | a2a_scanning | Applies to A2A traffic carried on Pipelock's supported forward-proxy and MCP HTTP paths. |
+| Browser shield | Free | browser_shield | Applies only to supported browser response traffic that flows through Pipelock. |
+| Offline receipt verification | Free | pipelock verify-receipt |  |
+| Verdict explanations | Free | pipelock explain |  |
+| Deployment diagnostics | Free | pipelock doctor |  |
+
+<!-- END capability-manifest -->
+
 ## Build, Test, Lint
 
 ```bash
 make build          # Compile with version ldflags
-make test           # go test -race -count=1 ./...
+make test           # Run the OSS race suite as sequential CI-shaped shards
 make test-cover     # Write coverage.html
 make lint           # go vet + golangci-lint v2 + gofumpt check
 make bench          # Scanner and MCP benchmarks
-make fmt            # gofumpt -w .
+make fmt            # gofumpt via the pinned golangci-lint formatter
 make vet            # Static analysis
 make tidy-check     # Verify go.mod/go.sum
 make docker         # Docker image
@@ -32,8 +69,8 @@ Pre-commit parity for OSS and enterprise builds:
 ```bash
 golangci-lint run --new-from-rev=HEAD ./...
 golangci-lint run --build-tags enterprise --new-from-rev=HEAD ./...
-go test -race -count=1 ./...
-go test -tags enterprise -race -count=1 ./...
+make test
+make test-sharded-enterprise
 ```
 
 Full-repo CI-equivalent lint:
@@ -68,10 +105,15 @@ Three proxy modes share the main listener:
 9. DLP (65 built-in credential patterns + checksum validators + env/file leak detection)
 10. Path entropy analysis
 11. Subdomain entropy analysis
-12. SSRF / DNS resolution for private IPs, metadata, and rebinding
-13. Rate limiting
-14. Data budget
-15. Final context check
+12. Nested URL destinations in query parameters (allowlist, blocklist, SSRF on URL-shaped values)
+13. SSRF / DNS resolution for private IPs, metadata, and rebinding
+14. Rate limiting
+15. Data budget
+16. Final context check
+
+Nested destinations sit after every check that needs no network and before the
+first that does. A check that can time out must not run ahead of one that cannot,
+or a slow resolver decides the request before the content findings are made.
 
 Core and configured DLP run before DNS resolution; SSRF/DNS runs after them. `cfg.Internal = nil` disables DNS-based configured SSRF checks, not the literal-IP core SSRF floor.
 
@@ -96,7 +138,7 @@ Emission is non-blocking for webhook output through an async buffer; syslog is s
 
 ## Testing
 
-- Race detector command: `go test -race -count=1 ./...`
+- Race detector command: `make test` (OSS) or `make test-sharded-enterprise` (enterprise)
 - Coverage target for new code: 95%, including error paths.
 - Test-count command: `go test -v ./... 2>&1 | grep -c -- '--- PASS:'`
 - Synchronization uses channels or poll-with-deadline, not `time.Sleep`.
@@ -132,7 +174,7 @@ net.ListenConfig{}.Listen(ctx, ...)   // free port binding
 | gosec | G304 | `filepath.Clean(path)`; validate containment across trust boundaries |
 | noctx | bare listener | `net.ListenConfig{}.Listen(ctx, ...)` |
 | unparam | unused param | `_` prefix |
-| gofumpt | formatting | `gofumpt -w <file>` |
+| gofumpt | formatting | `make fmt` (uses the pinned formatter) |
 
 ## Non-Obvious Task Traps
 

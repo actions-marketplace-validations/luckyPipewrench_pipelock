@@ -8,13 +8,17 @@ mode and HTTP fetch proxy mode.
 
 ```bash
 # 1. Install pipelock
-go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
+git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+make -C pipelock install
 
 # 2. Verify it works
 pipelock version
 
-# 3. Wrap an MCP server
-pipelock mcp proxy --preset claude-code -- npx -y @modelcontextprotocol/server-filesystem /tmp
+# 3. Generate a config from the Claude Code preset
+pipelock generate config --preset claude-code -o pipelock.yaml
+
+# 4. Wrap an MCP server with it
+pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 ## MCP Proxy Mode
@@ -74,6 +78,11 @@ members get the same MCP security configuration.
   }
 }
 ```
+
+Restart Claude Code after changing `.mcp.json`. When Claude Code asks you to
+approve a project MCP server, review the server and make that approval yourself.
+Then use Claude Code's MCP status view and a harmless tool action to confirm it
+connected. A project configuration entry is not itself a connection result.
 
 ### User-Level (`~/.claude.json`)
 
@@ -154,7 +163,7 @@ pipelock as an HTTP proxy server:
 
 ```bash
 # Start the proxy (background or separate terminal)
-pipelock run --preset claude-code
+pipelock run --config pipelock.yaml
 ```
 
 The proxy listens on `127.0.0.1:8888` by default and exposes:
@@ -192,6 +201,27 @@ At install time, Pipelock validates the config path, embeds the resolved
 absolute path into the generated hook command, and prints the config source. If
 no standard config is available, the hook is installed with built-in defaults
 and the setup output says so.
+
+`pipelock claude setup` and `pipelock claude remove` modify
+`~/.claude/settings.json` by default; add `--project` for
+`.claude/settings.json` in the current project. Preview the same scope before
+writing it. Both operations preserve unrelated settings and hooks, and a real
+change saves the previous file as a one-version `.bak` backup.
+
+```bash
+# Preview and remove only Pipelock-managed hooks from the user scope.
+pipelock claude remove --dry-run
+pipelock claude remove
+
+# Use this form for the current project's .claude/settings.json.
+pipelock claude remove --project --dry-run
+pipelock claude remove --project
+```
+
+Restart Claude Code and check the affected hooks or MCP connection after a
+change. If the settings file is not usable, inspect the `.bak` alongside that
+same settings file before restoring it; it contains only the version that
+immediately preceded the last real setup or removal.
 
 This registers pipelock as a `PreToolUse` hook for security-relevant tools:
 
@@ -244,7 +274,10 @@ interception. They scan traffic directly without certificates.
 
 ## Choosing a Config
 
-Pipelock ships with agent-specific presets selectable via `--preset`:
+Pipelock ships with agent-specific presets. A preset is selected when the config is
+generated, with `pipelock generate config --preset <name> -o pipelock.yaml`, and the
+resulting file is what `run` and `mcp proxy` take through `--config`. Run
+`pipelock presets` to list them:
 
 | Preset | Action | Entropy | Rate Limit | Best For |
 |--------|--------|---------|------------|----------|
@@ -269,7 +302,7 @@ Verify the command works without pipelock first:
 npx -y @modelcontextprotocol/server-filesystem /tmp
 
 # Then wrap it
-pipelock mcp proxy -- npx -y @modelcontextprotocol/server-filesystem /tmp
+pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```
 
 ### Config file not found
@@ -305,5 +338,5 @@ during development, run the MCP server manually:
 
 ```bash
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | \
-  pipelock mcp proxy --preset claude-code -- npx -y @modelcontextprotocol/server-filesystem /tmp
+  pipelock mcp proxy --config pipelock.yaml -- npx -y @modelcontextprotocol/server-filesystem /tmp
 ```

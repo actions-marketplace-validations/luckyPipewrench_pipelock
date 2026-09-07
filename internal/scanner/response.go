@@ -19,8 +19,12 @@ import (
 
 // ResponseScanResult describes the outcome of scanning response content.
 type ResponseScanResult struct {
-	Clean              bool
-	Matches            []ResponseMatch
+	Clean   bool
+	Matches []ResponseMatch
+	// ScanError records why scanning could not complete. It is deliberately
+	// separate from Matches: an incomplete scan must fail closed, but it is not
+	// evidence that response content matched a prompt-injection pattern.
+	ScanError          string
 	SuppressedMatches  []ResponseMatch `json:"-"`
 	TransformedContent string          // set for strip and ask actions
 
@@ -33,6 +37,13 @@ type ResponseScanResult struct {
 	// contract today. Maps to emit.EventTextStego.
 	StegoDetected bool
 	StegoDensity  int // raw combining-mark density on original content
+}
+
+// Failed reports whether the response could not be fully scanned. Failed
+// results are fail-closed and must be reported as scan errors, never as
+// injection detections.
+func (r ResponseScanResult) Failed() bool {
+	return r.ScanError != ""
 }
 
 // ResponseMatch describes a single pattern match in response content.
@@ -66,6 +77,37 @@ func (s *Scanner) ScanResponse(ctx context.Context, content string) ResponseScan
 	return s.ScanResponseWithSuppress(ctx, content, "", nil)
 }
 
+// ScanResponseBodyWithSuppress scans a raw HTTP response body. For verified PNG
+// and JPEG bodies it scans textual metadata but excludes compressed pixel data,
+// which can contain accidental pattern-shaped bytes. Declared Content-Type is
+// not consulted, so mislabeled text still takes the ordinary fail-closed path.
+func (s *Scanner) ScanResponseBodyWithSuppress(ctx context.Context, body []byte, suppressTarget string, suppress []config.SuppressEntry) ResponseScanResult {
+	if ctx != nil && ctx.Err() != nil {
+		return s.ScanResponseWithSuppress(ctx, "", suppressTarget, suppress)
+	}
+	metadata, image, err := responseImageMetadata(body)
+	if !image {
+		return s.ScanResponseWithSuppress(ctx, string(body), suppressTarget, suppress)
+	}
+	if err != nil {
+		return ResponseScanResult{
+			Clean:     false,
+			ScanError: fmt.Sprintf("image metadata inspection failed: %v", err),
+		}
+	}
+	if len(metadata) == 0 {
+		return ResponseScanResult{Clean: true}
+	}
+	result := s.ScanResponseWithSuppress(ctx, string(metadata), suppressTarget, suppress)
+	if !result.Clean {
+		// A metadata-only scan cannot safely transform the complete image body.
+		// Leave this empty so strip callers fail closed instead of replacing the
+		// image with redacted metadata bytes.
+		result.TransformedContent = ""
+	}
+	return result
+}
+
 // ScanResponseWithSuppress checks fetched content like ScanResponse, but applies
 // destination-scoped suppressions inside each normalization pass. This prevents
 // a suppressed first-pass hit from masking a later unsuppressed encoded or
@@ -81,7 +123,7 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 		}
 		kept := matches[:0]
 		for _, match := range matches {
-			if !config.IsSuppressed(match.PatternName, suppressTarget, suppress) {
+			if config.IsCoreResponsePatternName(match.PatternName) || !config.IsSuppressed(match.PatternName, suppressTarget, suppress) {
 				kept = append(kept, match)
 			} else {
 				key := responseMatchLogicalKey(match)
@@ -96,7 +138,7 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 
 	// Stego exposure signal. Computed on the raw content before normalization
 	// strips combining marks. The deferred setter stamps every return path -
-	// including the context_canceled and clean fast paths - so downstream
+	// including scan-error and clean fast paths - so downstream
 	// consumers (taint/authority layer, audit emitters) can key on the
 	// signal without re-scanning. The signal does NOT flip Clean: the
 	// matching passes already neutralize combining marks via
@@ -113,17 +155,14 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 	// Fail-closed: if context is already canceled, block immediately.
 	if ctx != nil && ctx.Err() != nil {
 		return ResponseScanResult{
-			Clean: false,
-			Matches: []ResponseMatch{{
-				PatternName: "context_canceled",
-				MatchText:   ctx.Err().Error(),
-			}},
+			Clean:     false,
+			ScanError: ctx.Err().Error(),
 		}
 	}
 
 	// Core response patterns run FIRST - immutable safety floor.
 	// These run regardless of response_scanning.enabled.
-	if coreSet := s.scanCoreResponse(ctx, content, filterSuppressed); len(coreSet.matches) > 0 {
+	if coreSet := s.scanCoreResponse(content, filterSuppressed); len(coreSet.matches) > 0 {
 		result := ResponseScanResult{
 			Clean:   false,
 			Matches: coreSet.matches,
@@ -155,7 +194,6 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 	// disable the pass - see scanCoreResponse, which reassembles from `original`.
 	preStripContent := content
 	content = normalize.ForMatching(content)
-	matchContent := content
 
 	// Primary: run response patterns whose keywords appear in content.
 	// Pre-filter checks are per-pass: each normalized variant gets its
@@ -180,7 +218,6 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 		if spaced != content {
 			matches = filterSuppressed(withResponseSpans(filterDefensiveCredentialSolicitationMatches(spaced, s.matchResponsePatternsPreFiltered(spaced)), ViewInvisibleSpaced))
 			if len(matches) > 0 {
-				matchContent = spaced
 				content = spaced // use spaced version for strip action
 			}
 		}
@@ -192,9 +229,6 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 		leeted := normalize.Leetspeak(content)
 		if leeted != content {
 			matches = filterSuppressed(withResponseSpans(filterDefensiveCredentialSolicitationMatches(leeted, s.matchResponsePatternsPreFiltered(leeted)), ViewLeetspeak))
-			if len(matches) > 0 {
-				matchContent = leeted
-			}
 		}
 	}
 
@@ -204,9 +238,6 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 	// Standard \s+ patterns fail on zero whitespace; \s* variants match.
 	if len(matches) == 0 && len(s.responseOptSpacePatterns) > 0 {
 		matches = filterSuppressed(withResponseSpans(filterDefensiveCredentialSolicitationMatches(content, matchPatternsPreFiltered(s.responseOptSpacePreFilter, s.responseOptSpacePatterns, content)), ViewForMatching))
-		if len(matches) > 0 {
-			matchContent = content
-		}
 	}
 
 	// Quinary: vowel-folded matching. Catches confusable-vowel attacks where
@@ -217,9 +248,6 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 		folded := normalize.FoldVowels(content)
 		if folded != content {
 			matches = filterSuppressed(withResponseSpans(filterDefensiveCredentialSolicitationMatches(folded, matchPatternsPreFiltered(s.responseVowelFoldPreFilter, s.responseVowelFoldPatterns, folded)), ViewVowelFold))
-			if len(matches) > 0 {
-				matchContent = folded
-			}
 		}
 	}
 
@@ -230,26 +258,23 @@ func (s *Scanner) ScanResponseWithSuppress(ctx context.Context, content, suppres
 	if len(matches) == 0 && hasEncodedRun(content) {
 		decodedSet := s.matchDecodedResponse(content)
 		matches = filterSuppressed(decodedSet.matches)
-		if len(matches) > 0 {
-			matchContent = decodedSet.content
-		}
 	}
 
 	// Post-scan context check: if context expired during scanning, fail closed.
 	if ctx != nil && ctx.Err() != nil {
 		return ResponseScanResult{
-			Clean: false,
-			Matches: []ResponseMatch{{
-				PatternName: "context_canceled",
-				MatchText:   ctx.Err().Error(),
-			}},
+			Clean:     false,
+			ScanError: ctx.Err().Error(),
 		}
 	}
 
 	if len(matches) == 0 {
 		return ResponseScanResult{Clean: true}
 	}
-	matches = filterSuppressed(filterEducationalQuotedResponseMatches(matchContent, matches))
+	// Response content cannot prove that a matched directive is harmless by
+	// describing itself as educational or placing the directive in quotes.
+	// Apply only operator-configured suppression after matching.
+	matches = filterSuppressed(matches)
 	if len(matches) == 0 {
 		return ResponseScanResult{Clean: true}
 	}
@@ -439,90 +464,6 @@ func hasSolicitationContinuation(suffix string) bool {
 		}
 	}
 	return false
-}
-
-func filterEducationalQuotedResponseMatches(content string, matches []ResponseMatch) []ResponseMatch {
-	if len(matches) == 0 || !hasEducationalPromptInjectionContext(content) {
-		return matches
-	}
-
-	filtered := matches[:0]
-	for _, match := range matches {
-		if isSystemPromptDisclosureMatch(match) {
-			filtered = append(filtered, match)
-			continue
-		}
-		if isQuotedResponseExampleMatch(content, match) {
-			continue
-		}
-		filtered = append(filtered, match)
-	}
-	return filtered
-}
-
-// isSystemPromptDisclosureMatch identifies matches from the immutable
-// "System Prompt Disclosure" core pattern, which targets system prompt,
-// tool definition, and developer instruction disclosure directives. The
-// pattern itself enforces the verb + target structure via its regex; the
-// name check alone is sufficient. Inspecting match.MatchText would be
-// unsafe - matchPatternsPreFiltered truncates MatchText at 100 runes and
-// an attacker can fill the regex's 80-char gap to push the target past
-// the truncation cap.
-func isSystemPromptDisclosureMatch(match ResponseMatch) bool {
-	return match.PatternName == "System Prompt Disclosure"
-}
-
-func hasEducationalPromptInjectionContext(content string) bool {
-	lower := strings.ToLower(normalize.ForMatching(content))
-	if !strings.Contains(lower, "prompt injection") {
-		return false
-	}
-
-	metaContext := strings.Contains(lower, "common injection pattern") ||
-		strings.Contains(lower, "common attack pattern") ||
-		strings.Contains(lower, "attack pattern is") ||
-		strings.Contains(lower, "include phrases like")
-	defensiveContext := strings.Contains(lower, "defense") ||
-		strings.Contains(lower, "defenders") ||
-		strings.Contains(lower, "input validation") ||
-		strings.Contains(lower, "scan for these patterns")
-	return metaContext && defensiveContext
-}
-
-func isQuotedResponseExampleMatch(content string, match ResponseMatch) bool {
-	start := match.Position
-	matchLength := match.matchLength
-	if matchLength == 0 {
-		matchLength = len(match.MatchText)
-	}
-	end := start + matchLength
-	if start < 0 || end > len(content) || start >= end {
-		return false
-	}
-	if !strings.HasPrefix(content[start:], match.MatchText) {
-		return false
-	}
-	return isASCIIQuotedSpan(content, start, end, '\'') || isASCIIQuotedSpan(content, start, end, '"')
-}
-
-func isASCIIQuotedSpan(content string, start, end int, quote byte) bool {
-	left := strings.LastIndexByte(content[:start], quote)
-	if left < 0 {
-		return false
-	}
-	lineStart := strings.LastIndexAny(content[:left], "\r\n") + 1
-	if strings.Count(content[lineStart:left], string(rune(quote)))%2 != 0 {
-		return false
-	}
-	nextAfterLeft := strings.IndexByte(content[left+1:], quote)
-	if nextAfterLeft < 0 {
-		return false
-	}
-	closing := left + 1 + nextAfterLeft
-	if closing < end {
-		return false
-	}
-	return !strings.ContainsAny(content[left+1:closing], "\r\n")
 }
 
 // matchPatternsAgainst runs a pattern set against content and returns matches.

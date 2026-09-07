@@ -235,6 +235,26 @@ func TestRunHTTPProxy_ForwardsCleanRequest(t *testing.T) {
 	}
 }
 
+func TestRunHTTPProxy_ConfusedDeputy_SeededMissingIDResponseBlocked(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":{"owned":"attack"}}`))
+	}))
+	defer srv.Close()
+
+	var stdout, stderr bytes.Buffer
+	err := RunHTTPProxy(context.Background(), strings.NewReader(jsonToolsCallEcho+"\n"), &stdout, &stderr, srv.URL, nil, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+	if err != nil {
+		t.Fatalf("RunHTTPProxy: %v", err)
+	}
+	if strings.Contains(stdout.String(), `"owned":"attack"`) {
+		t.Fatalf("uncorrelated response reached client: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "no correlatable ID") {
+		t.Fatalf("stdout = %q, want confused-deputy block", stdout.String())
+	}
+}
+
 func TestRunHTTPProxy_UpstreamUsesConfiguredDialContext(t *testing.T) {
 	sc := testScannerForHTTP(t)
 	errDialBlocked := errors.New("sentinel dial blocked")
@@ -518,6 +538,9 @@ func TestRunHTTPProxy_SSEStreamingResponse(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching every other transport.
 func TestRunHTTPProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	result := makeResponse(1, reasoningPromptInjectionAnalysis)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -526,7 +549,7 @@ func TestRunHTTPProxy_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.
 	}))
 	defer srv.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	stdin := strings.NewReader(jsonToolsCallEcho + "\n")
 	var stdout, stderr bytes.Buffer
 
@@ -1145,6 +1168,42 @@ func TestScanHTTPInput_PolicyOnlyBlock(t *testing.T) {
 	}
 	if blocked.ErrorCode != -32002 {
 		t.Errorf("ErrorCode = %d, want -32002", blocked.ErrorCode)
+	}
+}
+
+func TestScanHTTPInputDecision_RequiredMetadataDeferIdentity(t *testing.T) {
+	for _, method := range []string{"initialize", "tools/list", methodNotificationsInitialized} {
+		t.Run(method, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.Internal = nil
+			cfg.ResponseScanning.Patterns = []config.ResponseScanPattern{{Name: "manual-review-marker", Regex: "ordinary-review-marker"}}
+			sc := scanner.MustNew(cfg)
+			t.Cleanup(sc.Close)
+			emitter, rec, dir := newTestReceiptEmitter(t)
+			manager := deferred.NewManager(deferred.Config{Enabled: true, Timeout: time.Second, MaxPending: 4, MaxPendingPerSession: 4, MaxPendingBytes: 1024})
+			id := `,"id":1`
+			if method == methodNotificationsInitialized {
+				id = ""
+			}
+			msg := []byte(fmt.Sprintf(`{"jsonrpc":"2.0"%s,"method":%q,"params":{"note":"ordinary-review-marker"}}`, id, method))
+			decision := scanHTTPInputDecision(msg, io.Discard, "sess", "orig", MCPProxyOpts{
+				Scanner: sc, InputCfg: &InputScanConfig{Enabled: true, Action: config.ActionDefer, OnParseError: config.ActionBlock},
+				ReceiptEmitter: emitter, RequireReceipts: true, DeferManager: manager, Transport: deferred.SurfaceMCPHTTPUpstream,
+			})
+			if decision.Blocked != nil || decision.Deferred == nil {
+				t.Fatalf("expected deferred metadata, got blocked=%+v deferred=%+v", decision.Blocked, decision.Deferred)
+			}
+			if decision.Deferred.DeferID == "" {
+				t.Fatal("deferred metadata has no correlation identity")
+			}
+			if err := rec.Close(); err != nil {
+				t.Fatal(err)
+			}
+			record := findActionReceiptHTTP(t, readReceiptEntriesHTTP(t, dir)).ActionRecord
+			if record.ActionID != decision.Deferred.DeferID || record.DeferID != decision.Deferred.DeferID || record.Target != method || record.DecisionPhase != receipt.DecisionPhaseDefer {
+				t.Fatalf("receipt does not match deferred request: %+v", record)
+			}
+		})
 	}
 }
 
@@ -2590,10 +2649,10 @@ func TestRunHTTPListenerProxy_MetadataDialBlockSurfacesReason(t *testing.T) {
 	}
 }
 
-// startListenerProxy starts a production-default RunHTTPListenerProxy on a
+// startListenerProxy starts the production-default RunHTTPListenerProxy on a
 // free port and returns the base URL (e.g. "http://127.0.0.1:<port>") and a
-// cancel function. Tests that need compatibility behavior must opt in through
-// startLegacyListenerProxy instead.
+// cancel function. Tests that need a Pipelock-issued state token opt in through
+// startListenerProxyRequiringToken.
 func startListenerProxy(
 	t *testing.T,
 	upstreamURL string,
@@ -2608,6 +2667,23 @@ func startListenerProxy(
 		inputCfg:    inputCfg,
 		toolCfg:     toolCfg,
 		policyCfg:   policyCfg,
+	})
+}
+
+func startListenerProxyRequiringToken(
+	t *testing.T,
+	upstreamURL string,
+	sc *scanner.Scanner,
+	inputCfg *InputScanConfig,
+	toolCfg *tools.ToolScanConfig,
+) (string, context.CancelFunc, *bytes.Buffer) {
+	required := true
+	return startListenerProxyWithStateMode(t, listenerProxyTestOpts{
+		upstreamURL:        upstreamURL,
+		sc:                 sc,
+		inputCfg:           inputCfg,
+		toolCfg:            toolCfg,
+		stateTokenRequired: &required,
 	})
 }
 
@@ -2993,7 +3069,7 @@ func TestRunHTTPListenerProxy_SessionBindingBlocksNoBaseline(t *testing.T) {
 		BindingUnknownAction:    config.ActionBlock,
 		BindingNoBaselineAction: config.ActionBlock,
 	}
-	baseURL, _, logBuf := startListenerProxy(t, upstream.URL, sc, &InputScanConfig{Enabled: true, Action: config.ActionBlock, OnParseError: config.ActionBlock}, toolCfg, nil)
+	baseURL, _, logBuf := startListenerProxyRequiringToken(t, upstream.URL, sc, &InputScanConfig{Enabled: true, Action: config.ActionBlock, OnParseError: config.ActionBlock}, toolCfg)
 
 	token := listenerSetupToken(t, baseURL)
 	// The setup handshake is itself forwarded, so the invariant is that the
@@ -3122,7 +3198,7 @@ func TestRunHTTPListenerProxy_SessionBindingBlocksUnknownToolAfterToolsList(t *t
 		BindingUnknownAction:    config.ActionBlock,
 		BindingNoBaselineAction: config.ActionBlock,
 	}
-	baseURL, _, logBuf := startListenerProxy(t, upstream.URL, sc, &InputScanConfig{Enabled: true, Action: config.ActionBlock, OnParseError: config.ActionBlock}, toolCfg, nil)
+	baseURL, _, logBuf := startListenerProxyRequiringToken(t, upstream.URL, sc, &InputScanConfig{Enabled: true, Action: config.ActionBlock, OnParseError: config.ActionBlock}, toolCfg)
 	token := listenerSetupToken(t, baseURL)
 
 	listPayload := listenerPost(t, baseURL, token, `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`)
@@ -4074,6 +4150,9 @@ func TestHTTPListener_SSEUpstream_MultipleEvents(t *testing.T) {
 	}
 }
 
+// The section action is warn here on purpose. Trust may only make scanning stricter than the
+// enclosing response_scanning.action, so a reasoning server forwards with a warning under a warn
+// section. Under a block section it now blocks, matching every other transport.
 func TestHTTPListenerSSE_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testing.T) {
 	result := makeResponse(1, reasoningPromptInjectionAnalysis)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -4082,7 +4161,7 @@ func TestHTTPListenerSSE_MCPResponseTrustReasoningWarnsSecurityAnalysis(t *testi
 	}))
 	defer upstream.Close()
 
-	sc := testScannerWithAction(t, config.ActionBlock)
+	sc := testScannerWithAction(t, config.ActionWarn)
 	baseURL, logBuf := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
 		Scanner:                sc,
 		ServerName:             "codex",
@@ -5055,7 +5134,7 @@ func TestHTTPListener_ToolPoisoningBlock(t *testing.T) {
 		DetectDrift: true,
 	}
 
-	baseURL, _, _ := startListenerProxy(t, upstream.URL, sc, nil, toolCfg, nil)
+	baseURL, _, _ := startListenerProxyRequiringToken(t, upstream.URL, sc, nil, toolCfg)
 	token := listenerSetupToken(t, baseURL)
 
 	body := jsonToolsList
@@ -5156,8 +5235,9 @@ func startListenerProxyFull(
 
 	done := make(chan error, 1)
 	go func() {
+		required := true
 		done <- RunHTTPListenerProxy(ctx, ln, upstreamURL, &logBuf, MCPProxyOpts{
-			Scanner: sc, InputCfg: inputCfg, KillSwitch: ks, ChainMatcher: cm,
+			Scanner: sc, InputCfg: inputCfg, KillSwitch: ks, ChainMatcher: cm, listenerStateTokenRequired: &required,
 		})
 	}()
 
@@ -7568,6 +7648,171 @@ func TestScanHTTPInputDecision_RequireReceiptsBlocksEmissionFailure(t *testing.T
 	}
 	if !strings.Contains(string(decision.Blocked.ErrorData), string(blockreason.ReceiptEmissionFailed)) {
 		t.Fatalf("error data = %s, want %s", decision.Blocked.ErrorData, blockreason.ReceiptEmissionFailed)
+	}
+}
+
+func TestScanHTTPInputDecision_RequireReceiptsInitializedNotification(t *testing.T) {
+	for _, closed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("recorder_closed_%t", closed), func(t *testing.T) {
+			emitter, rec, dir, _ := newReceiptTestHarness(t)
+			if closed {
+				if err := rec.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			msg := []byte(`{"jsonrpc":"2.0","method":"notifications/initialized"}`)
+			decision := scanHTTPInputDecision(msg, io.Discard, "sess", "sess", MCPProxyOpts{
+				Scanner: testScannerForHTTP(t), ReceiptEmitter: emitter,
+				RequireReceipts: true, Transport: transportMCPHTTP,
+			})
+			if closed {
+				if decision.Blocked == nil || decision.Blocked.ErrorCode != -32007 {
+					t.Fatalf("unrecorded notification must be blocked: %+v", decision.Blocked)
+				}
+				return
+			}
+			if decision.Blocked != nil || !bytes.Equal(decision.ForwardMessage, msg) {
+				t.Fatalf("recorded notification was not forwarded: %+v", decision)
+			}
+			if decision.Outcome.Receipt.ActionID != "" {
+				t.Fatal("notification must not expect a response outcome")
+			}
+			if err := rec.Close(); err != nil {
+				t.Fatal(err)
+			}
+			records := receiptsByVerdict(readActionReceipts(t, dir), config.ActionForward)
+			if len(records) != 1 {
+				t.Fatalf("forward receipts = %d, want 1", len(records))
+			}
+			record := records[0].ActionRecord
+			if record.ActionID == "" || record.Target != methodNotificationsInitialized || record.DecisionPhase != "" {
+				t.Fatalf("expected identified single-phase notification receipt: %+v", record)
+			}
+		})
+	}
+}
+
+func TestScanHTTPInputDecision_RequireReceiptsRecordsHandshakeMetadata(t *testing.T) {
+	sc := testScannerForHTTP(t)
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	tests := []struct {
+		name       string
+		method     string
+		message    string
+		actionType receipt.ActionType
+	}{
+		{name: "initialize", method: "initialize", message: `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`, actionType: receipt.ActionUnclassified},
+		{name: "tools list", method: "tools/list", message: `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`, actionType: receipt.ActionRead},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			decision := scanHTTPInputDecision([]byte(tt.message), io.Discard, "sess", "sess", MCPProxyOpts{
+				Scanner:         sc,
+				ReceiptEmitter:  emitter,
+				RequireReceipts: true,
+				Transport:       transportMCPHTTP,
+			})
+			if decision.Blocked != nil {
+				t.Fatalf("handshake request blocked: %+v", decision.Blocked)
+			}
+		})
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	receipts := receiptsByVerdict(readActionReceipts(t, dir), config.ActionAllow)
+	if len(receipts) != len(tests) {
+		t.Fatalf("allow receipts = %d, want %d", len(receipts), len(tests))
+	}
+	for i, tt := range tests {
+		record := receipts[i].ActionRecord
+		if record.ActionID == "" {
+			t.Fatalf("%s action_id is empty", tt.name)
+		}
+		if record.Target != tt.method {
+			t.Fatalf("%s receipt target = %q, want %q", tt.name, record.Target, tt.method)
+		}
+		if record.ActionType != tt.actionType {
+			t.Fatalf("%s action_type = %q, want %q", tt.name, record.ActionType, tt.actionType)
+		}
+	}
+}
+
+func TestScanHTTPInputDecision_RequireReceiptsBlocksResourceReadWithoutIdentity(t *testing.T) {
+	emitter, _, _, _ := newReceiptTestHarness(t)
+	decision := scanHTTPInputDecision(
+		[]byte(`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///notes.txt"}}`),
+		io.Discard,
+		"sess",
+		"sess",
+		MCPProxyOpts{
+			Scanner:         testScannerForHTTP(t),
+			ReceiptEmitter:  emitter,
+			RequireReceipts: true,
+			Transport:       transportMCPHTTP,
+		},
+	)
+	if decision.Blocked == nil {
+		t.Fatal("expected resources/read to fail closed without a receipt identity")
+	}
+	if decision.Blocked.ErrorCode != -32007 {
+		t.Fatalf("error code = %d, want -32007", decision.Blocked.ErrorCode)
+	}
+	if decision.Blocked.ErrorMessage != "pipelock: required receipt identity is not defined for this MCP method" {
+		t.Fatalf("error message = %q", decision.Blocked.ErrorMessage)
+	}
+}
+
+func TestHTTPListener_RequireReceiptsRecordsInitializeOutcome(t *testing.T) {
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() { _ = r.Body.Close() }()
+		var request struct {
+			ID json.RawMessage `json:"id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"result":{}}`, request.ID)
+	}))
+	defer upstream.Close()
+
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
+		Scanner:         testScannerForHTTP(t),
+		ReceiptEmitter:  emitter,
+		RequireReceipts: true,
+		Transport:       "mcp_http_listener",
+	})
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(response.Body)
+		t.Fatalf("status = %d, want %d: %s", response.StatusCode, http.StatusOK, body)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	receipts := readActionReceipts(t, dir)
+	if len(receipts) != 2 {
+		t.Fatalf("receipt count = %d, want intent/outcome pair", len(receipts))
+	}
+	if receipts[0].ActionRecord.DecisionPhase != receipt.DecisionPhaseIntent || receipts[1].ActionRecord.DecisionPhase != receipt.DecisionPhaseOutcome {
+		t.Fatalf("phases = %q/%q, want intent/outcome", receipts[0].ActionRecord.DecisionPhase, receipts[1].ActionRecord.DecisionPhase)
+	}
+	if receipts[0].ActionRecord.ActionID == "" {
+		t.Fatal("intent action_id is empty")
+	}
+	if receipts[0].ActionRecord.ActionID != receipts[1].ActionRecord.ActionID {
+		t.Fatalf("outcome action_id = %q, want %q", receipts[1].ActionRecord.ActionID, receipts[0].ActionRecord.ActionID)
 	}
 }
 

@@ -62,9 +62,34 @@ func TestMCPListenerClientStates_EdgeTransitions(t *testing.T) {
 	if cfg := states.toolConfig(duplicate, &tools.ToolScanConfig{DetectDrift: true}); cfg == nil {
 		t.Fatal("drift config was discarded")
 	}
-	states.resetDriftState()
+	states.upstreamToolBaseline.ResetDriftState()
 	if got := listenerAuditSessionKey("", duplicate.key); got == "" {
 		t.Fatal("state key did not produce audit fallback")
+	}
+}
+
+func TestMCPListenerDetectDriftReloadCannotResetBaseline(t *testing.T) {
+	states := newMCPListenerClientStates(nil)
+	state := newMCPListenerClientState("reload", mcpListenerStateKey("reload"))
+	cfg := &tools.ToolScanConfig{Action: "block", DetectDrift: true}
+	if states.toolConfig(state, cfg) == nil {
+		t.Fatal("enabled drift config was discarded")
+	}
+	if drifted, _ := states.upstreamToolBaseline.CheckAndUpdate("approved", "hash-before-disable"); drifted {
+		t.Fatal("initial baseline unexpectedly drifted")
+	}
+
+	// A false->true reload used to clear this baseline without authority. It
+	// now preserves the last trusted hash until a signed reset is consumed.
+	cfg.DetectDrift = false
+	_ = states.toolConfig(state, cfg)
+	cfg.DetectDrift = true
+	_ = states.toolConfig(state, cfg)
+	if got := states.upstreamDriftEpoch(); got != 0 {
+		t.Fatalf("detect_drift reload reset epoch to %d without authority", got)
+	}
+	if drifted, previous, _ := states.upstreamToolBaseline.CheckAndUpdatePromote("approved", "hash-after-reload", false, false); !drifted || previous != "hash-before-disable" {
+		t.Fatalf("detect_drift reload discarded trusted baseline: drifted=%v previous=%q", drifted, previous)
 	}
 }
 
@@ -89,11 +114,41 @@ func TestMCPListenerTokenHelpers_EdgeCases(t *testing.T) {
 	}
 
 	disabled := false
+	enabled := true
+	if listenerRequiresStateToken(MCPProxyOpts{
+		ToolCfg: &tools.ToolScanConfig{Action: "block"},
+	}) {
+		t.Fatal("omitted requirement defaulted on")
+	}
 	if listenerRequiresStateToken(MCPProxyOpts{
 		ToolCfg:                    &tools.ToolScanConfig{Action: "block"},
 		listenerStateTokenRequired: &disabled,
 	}) {
 		t.Fatal("explicit compatibility mode required a listener token")
+	}
+	if !listenerRequiresStateToken(MCPProxyOpts{
+		ToolCfg:                    &tools.ToolScanConfig{Action: "block"},
+		listenerStateTokenRequired: &enabled,
+	}) {
+		t.Fatal("explicit requirement was ignored")
+	}
+	if listenerRequiresStateToken(MCPProxyOpts{
+		listenerStateTokenRequired:   &enabled,
+		ListenerStateTokenRequiredFn: func() *bool { return &disabled },
+	}) {
+		t.Fatal("live-reload function did not override the static requirement")
+	}
+	if !listenerRequiresStateToken(MCPProxyOpts{
+		listenerStateTokenRequired:   &disabled,
+		ListenerStateTokenRequiredFn: func() *bool { return &enabled },
+	}) {
+		t.Fatal("live-reload function did not enable the requirement")
+	}
+	if listenerRequiresStateToken(MCPProxyOpts{
+		listenerStateTokenRequired:   &enabled,
+		ListenerStateTokenRequiredFn: func() *bool { return nil },
+	}) {
+		t.Fatal("nil live-reload value did not override the static requirement")
 	}
 
 	state := newMCPListenerClientState("token", "key")
@@ -244,6 +299,33 @@ func TestMCPListenerClientStates_BoundedAdmissionDeletesEvictedRecorder(t *testi
 	}
 	if got := len(store.recorders); got != maxMCPListenerClients {
 		t.Fatalf("store entries after delayed response = %d, want %d", got, maxMCPListenerClients)
+	}
+}
+
+func TestMCPListenerClientStates_PrincipalAdmissionFailsClosedAtCapacity(t *testing.T) {
+	states := newMCPListenerClientStates(nil)
+	var first mcpListenerPrincipal
+	for i := range maxMCPListenerClients {
+		principal, err := states.principal("test", fmt.Sprintf("subject-%d", i), 1)
+		if err != nil {
+			t.Fatalf("principal(%d): %v", i, err)
+		}
+		if i == 0 {
+			first = principal
+		}
+		if _, ok := states.stateForPrincipal(principal); !ok {
+			t.Fatalf("stateForPrincipal(%d) rejected before capacity", i)
+		}
+	}
+	overflow, err := states.principal("test", "overflow", 1)
+	if err != nil {
+		t.Fatalf("overflow principal: %v", err)
+	}
+	if state, ok := states.stateForPrincipal(overflow); ok || state != nil {
+		t.Fatal("principal state admission succeeded at capacity")
+	}
+	if state, ok := states.stateForPrincipal(first); !ok || state == nil {
+		t.Fatal("capacity admission forgot an existing principal state")
 	}
 }
 

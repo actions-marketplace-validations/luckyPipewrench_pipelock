@@ -238,10 +238,12 @@ func TestReadGuardExecutionProofRejectsExecFailureAndTrailingSuccess(t *testing.
 
 func TestLaunchStandalone_RequireNetNSRejectsBestEffort(t *testing.T) {
 	err := LaunchStandalone(StandaloneLaunchConfig{
-		Command:      []string{"true"},
-		Workspace:    t.TempDir(),
-		BestEffort:   true,
-		RequireNetNS: true,
+		Command:          []string{"true"},
+		Workspace:        t.TempDir(),
+		BestEffort:       true,
+		BestEffortReason: "test override",
+		BestEffortExpiry: "1h",
+		RequireNetNS:     true,
 	})
 	if err == nil || !strings.Contains(err.Error(), "network namespace is required") {
 		t.Fatalf("LaunchStandalone error = %v, want required network namespace error", err)
@@ -360,8 +362,10 @@ func TestPreflightWithRequirements_IndependentlyReportsNetworkAndHandler(t *test
 	}
 
 	required := make(map[LayerName]bool, len(result.Layers))
+	available := make(map[LayerName]bool, len(result.Layers))
 	for _, layer := range result.Layers {
 		required[layer.Name] = layer.Required
+		available[layer.Name] = layer.Available
 	}
 	if !required[LayerNetNS] {
 		t.Fatal("network namespace was not reported as required")
@@ -369,7 +373,7 @@ func TestPreflightWithRequirements_IndependentlyReportsNetworkAndHandler(t *test
 	if required[LayerLandlock] || required[LayerSeccomp] {
 		t.Fatalf("optional layers reported as required: %#v", required)
 	}
-	if !Detect().UserNamespaces && result.Status != StatusError {
+	if !available[LayerNetNS] && result.Status != StatusError {
 		t.Fatalf("required unavailable network namespace status = %q, want error", result.Status)
 	}
 }
@@ -379,8 +383,8 @@ func TestPreflight_BackwardCompatibleStrictWrapper(t *testing.T) {
 	if result.Requirements != nil {
 		t.Fatalf("legacy Preflight exposed requirements = %#v", result.Requirements)
 	}
-	if result.Mode != "best-effort" {
-		t.Fatalf("legacy Preflight mode = %q, want best-effort", result.Mode)
+	if result.Mode != "required" {
+		t.Fatalf("legacy Preflight mode = %q, want required", result.Mode)
 	}
 }
 

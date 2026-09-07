@@ -7,8 +7,10 @@ import (
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +175,223 @@ func TestLoadResultErrorHelpers(t *testing.T) {
 	}
 }
 
+func TestLoadBundlesFreshnessSaveFailureIsIntegrityError(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	bundle := testBundleV2(testBundleName, TierCommunity, 1, []Rule{testDLPRule("dlp-save", confidenceHigh, StatusStable)})
+	bundle.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, bundleDir, bundle, pub, priv)
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys:     []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}},
+		saveFreshnessState: func(string, *FreshnessState) error {
+			return errors.New("forced durability failure")
+		},
+	})
+	if !result.Degraded {
+		t.Fatal("persistLoadedFreshness Degraded = false, want true")
+	}
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "forced durability failure") {
+		t.Fatalf("integrity errors = %+v, want freshness durability failure", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 0 || len(result.Injection) != 0 || len(result.ToolPoison) != 0 {
+		t.Fatalf("usable rules after freshness save failure = DLP:%d Injection:%d ToolPoison:%d, want none", len(result.DLP), len(result.Injection), len(result.ToolPoison))
+	}
+}
+
+func TestLoadBundlesFailedBundleIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+
+	failingDir := filepath.Join(dir, "a-failing")
+	if err := os.MkdirAll(failingDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll failing bundle: %v", err)
+	}
+	failing := testBundleV2("a-failing", TierCommunity, 7, []Rule{
+		testDLPRule("dlp-before-failure", confidenceHigh, StatusStable),
+		testToolPoisonRule("forced-failure", scanFieldDescription),
+	})
+	failing.KeyID = KeyFingerprint(pub)
+	failing.TestedThroughPipelock = "1.0.0"
+	writeSignedBundle(t, failingDir, failing, pub, priv)
+
+	successDir := filepath.Join(dir, "z-success")
+	if err := os.MkdirAll(successDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll successful bundle: %v", err)
+	}
+	success := testBundleV2("z-success", TierCommunity, 3, []Rule{
+		testDLPRule("dlp-success", confidenceHigh, StatusStable),
+	})
+	success.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, successDir, success, pub, priv)
+
+	definitions := append([]ruleTypeDefinition(nil), ruleTypeDefinitions...)
+	for i := range definitions {
+		if definitions[i].ID == RuleTypeToolPoison {
+			definitions[i].Load = func(_ *bundleExecCtx, _ *Bundle, _ *Rule, _, _ string, _ *LoadedBundle) error {
+				return errors.New("forced loader failure")
+			}
+		}
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		TrustedKeys:     []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}},
+		definitions:     definitions,
+	})
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "forced loader failure") {
+		t.Fatalf("integrity errors = %+v, want forced loader failure", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 1 || result.DLP[0].Bundle != "z-success" {
+		t.Fatalf("DLP patterns = %+v, want only the successful bundle", result.DLP)
+	}
+	if len(result.Loaded) != 1 || result.Loaded[0].Name != "z-success" {
+		t.Fatalf("loaded bundles = %+v, want only z-success", result.Loaded)
+	}
+	if len(result.Warnings) != 0 {
+		t.Fatalf("warnings = %q, want none from failed bundle", result.Warnings)
+	}
+
+	state, err := LoadFreshnessState(dir)
+	if err != nil {
+		t.Fatalf("LoadFreshnessState: %v", err)
+	}
+	if _, ok := state.HighestSeen[freshnessKey(TierCommunity, "a-failing")]; ok {
+		t.Fatalf("failed bundle version persisted: %+v", state.HighestSeen)
+	}
+	if _, ok := state.FormatFloor["a-failing"]; ok {
+		t.Fatalf("failed bundle format persisted: %+v", state.FormatFloor)
+	}
+	if got := state.HighestSeen[freshnessKey(TierCommunity, "z-success")]; got != 3 {
+		t.Fatalf("successful bundle version = %d, want 3", got)
+	}
+	if got := state.FormatFloor["z-success"]; got != 2 {
+		t.Fatalf("successful bundle format = %d, want 2", got)
+	}
+}
+
+func TestLoadBundlesMissingRuntimeLoaderIsAtomic(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "missing-loader")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bundle := testBundle("missing-loader", []Rule{
+		testDLPRule("dlp-before-missing-loader", confidenceHigh, StatusStable),
+		testToolPoisonRule("missing-loader", scanFieldDescription),
+	})
+	writeUnsignedBundle(t, bundleDir, bundle)
+
+	definitions := slices.DeleteFunc(append([]ruleTypeDefinition(nil), ruleTypeDefinitions...), func(definition ruleTypeDefinition) bool {
+		return definition.ID == RuleTypeToolPoison
+	})
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		definitions:     definitions,
+	})
+
+	if len(result.IntegrityErrors()) != 1 || !strings.Contains(result.IntegrityErrors()[0].Reason, "has no runtime loader") {
+		t.Fatalf("integrity errors = %+v, want missing runtime loader", result.IntegrityErrors())
+	}
+	if len(result.DLP) != 0 || len(result.Loaded) != 0 {
+		t.Fatalf("failed bundle leaked state: DLP=%+v loaded=%+v", result.DLP, result.Loaded)
+	}
+}
+
+func TestLoadBundlesOfficialLoaderFailureWarnsDegraded(t *testing.T) {
+	// Non-parallel: mutates keyring globals.
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	setupKeyring(t, pub)
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, StandardBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	bundle := testBundle(StandardBundleName, []Rule{
+		testToolPoisonRule("forced-failure", scanFieldDescription),
+	})
+	writeSignedBundle(t, bundleDir, bundle, pub, priv)
+
+	definitions := append([]ruleTypeDefinition(nil), ruleTypeDefinitions...)
+	for i := range definitions {
+		if definitions[i].ID == RuleTypeToolPoison {
+			definitions[i].Load = func(_ *bundleExecCtx, _ *Bundle, _ *Rule, _, _ string, _ *LoadedBundle) error {
+				return errors.New("forced official loader failure")
+			}
+		}
+	}
+
+	result := LoadBundles(dir, LoadOptions{
+		MinConfidence:   confidenceLow,
+		PipelockVersion: testPipelockVersion,
+		definitions:     definitions,
+	})
+	if len(result.IntegrityErrors()) != 1 {
+		t.Fatalf("integrity errors = %+v, want one forced loader failure", result.IntegrityErrors())
+	}
+	if !result.IntegrityErrors()[0].Official {
+		t.Fatal("official loader failure was not classified as official")
+	}
+	if !slices.ContainsFunc(result.Warnings, func(warning string) bool {
+		return strings.Contains(warning, "DEGRADED: standard pack") && strings.Contains(warning, "forced official loader failure")
+	}) {
+		t.Fatalf("warnings = %q, want degraded standard-pack warning", result.Warnings)
+	}
+}
+
+func TestLoadBundlesRejectsV1AfterAcceptedV2AcrossRestart(t *testing.T) {
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, testBundleName)
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	trustedKeys := []config.TrustedKey{{Name: "test", PublicKey: hex.EncodeToString(pub)}}
+	v2 := testBundleV2(testBundleName, TierCommunity, 7, []Rule{testDLPRule("dlp-v2", confidenceHigh, StatusStable)})
+	v2.KeyID = KeyFingerprint(pub)
+	writeSignedBundle(t, bundleDir, v2, pub, priv)
+
+	first := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion, TrustedKeys: trustedKeys})
+	if len(first.Errors) != 0 || len(first.DLP) != 1 {
+		t.Fatalf("first LoadBundles = errors %v, DLP %d; want accepted v2", first.Errors, len(first.DLP))
+	}
+
+	v1 := testBundle(testBundleName, []Rule{testDLPRule("dlp-v1", confidenceHigh, StatusStable)})
+	writeSignedBundle(t, bundleDir, v1, pub, priv)
+	second := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion, TrustedKeys: trustedKeys})
+	if !second.Degraded || len(second.DLP) != 0 {
+		t.Fatalf("second LoadBundles = degraded %v, DLP %d; want rejected v1", second.Degraded, len(second.DLP))
+	}
+	if len(second.IntegrityErrors()) != 1 || !strings.Contains(second.IntegrityErrors()[0].Reason, "format rollback") {
+		t.Fatalf("integrity errors = %+v, want format rollback", second.IntegrityErrors())
+	}
+}
+
 func TestClassifyBundleFileReadError(t *testing.T) {
 	if got := classifyBundleFileReadError(os.ErrNotExist); got != BundleErrorClassIntegrity {
 		t.Fatalf("missing bundle file class = %q, want %q", got, BundleErrorClassIntegrity)
@@ -200,15 +419,15 @@ func testInjectionRule(id, confidence string) Rule {
 }
 
 // testToolPoisonRule creates a valid tool-poison rule.
-func testToolPoisonRule(id, confidence, status, scanField string) Rule {
+func testToolPoisonRule(id, scanField string) Rule {
 	return Rule{
 		ID:          id,
 		Type:        RuleTypeToolPoison,
-		Status:      status,
+		Status:      StatusStable,
 		Name:        "Test Tool Poison Rule " + id,
 		Description: "Detects poisoned tool " + id,
 		Severity:    severityCritical,
-		Confidence:  confidence,
+		Confidence:  confidenceHigh,
 		Pattern:     RulePattern{Regex: `exec\s+curl`, ScanField: scanField},
 	}
 }
@@ -343,7 +562,7 @@ func TestLoadBundles_ValidUnsignedBundle(t *testing.T) {
 	b := testBundle(testBundleName, []Rule{
 		testDLPRule("dlp-rule-001", confidenceHigh, StatusStable),
 		testInjectionRule("inj-rule-001", confidenceMedium),
-		testToolPoisonRule("tp-rule-001", confidenceHigh, StatusStable, scanFieldDescription),
+		testToolPoisonRule("tp-rule-001", scanFieldDescription),
 	})
 	writeUnsignedBundle(t, bundleDir, b)
 
@@ -628,6 +847,125 @@ func TestLoadBundles_MinPipelockTooHigh(t *testing.T) {
 	}
 	if len(result.DLP) != 0 {
 		t.Errorf("expected 0 DLP rules, got %d", len(result.DLP))
+	}
+}
+
+func TestLoadBundles_RefusesCheckedCompatibilityAndIntegrityFailures(t *testing.T) {
+	tests := []struct {
+		name  string
+		write func(t *testing.T, dir string)
+		want  string
+	}{
+		{
+			name: "released version below minimum",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundle := testBundle("below-minimum", []Rule{testDLPRule("below-minimum-001", confidenceHigh, StatusStable)})
+				bundle.MinPipelock = "9.0.0"
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeUnsignedBundle(t, bundleDir, bundle)
+			},
+			want: "below minimum",
+		},
+		{
+			name: "incompatible format",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundle := testBundle("unsupported-format", []Rule{testDLPRule("unsupported-format-001", confidenceHigh, StatusStable)})
+				bundle.FormatVersion = 3
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeUnsignedBundle(t, bundleDir, bundle)
+			},
+			want: "format_version must be 1-2",
+		},
+		{
+			name: "signature failure",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				pub, priv, err := ed25519.GenerateKey(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				bundle := testBundle("bad-signature", []Rule{testDLPRule("bad-signature-001", confidenceHigh, StatusStable)})
+				bundleDir := filepath.Join(dir, bundle.Name)
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				writeSignedBundle(t, bundleDir, bundle, pub, priv)
+				if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), []byte("changed"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "integrity check",
+		},
+		{
+			name: "malformed manifest",
+			write: func(t *testing.T, dir string) {
+				t.Helper()
+				bundleDir := filepath.Join(dir, "malformed-manifest")
+				if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+					t.Fatal(err)
+				}
+				data := []byte("format_version: 1\n")
+				if err := os.WriteFile(filepath.Join(bundleDir, bundleFilename), data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				hash := sha256.Sum256(data)
+				if err := WriteLockFile(filepath.Join(bundleDir, lockFilename), &LockFile{BundleSHA256: hex.EncodeToString(hash[:]), Unsigned: true}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: "parse error",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.write(t, dir)
+
+			result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: testPipelockVersion})
+			if len(result.Loaded) != 0 {
+				t.Fatalf("loaded = %v, want no bundle loaded", result.Loaded)
+			}
+			if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Reason, tc.want) {
+				t.Fatalf("errors = %v, want refusal containing %q", result.Errors, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadBundles_TestedThroughPipelockWarning(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	bundleDir := filepath.Join(dir, "tested-ceiling")
+	if err := os.MkdirAll(bundleDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	b := testBundle("tested-ceiling", []Rule{testDLPRule("tested-ceiling-001", confidenceHigh, StatusStable)})
+	b.TestedThroughPipelock = "1.2.0"
+	writeUnsignedBundle(t, bundleDir, b)
+
+	result := LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: "1.3.0"})
+	if len(result.Errors) != 0 || len(result.Loaded) != 1 {
+		t.Fatalf("LoadBundles() errors=%v loaded=%v, want loaded bundle without errors", result.Errors, result.Loaded)
+	}
+	if len(result.Warnings) != 1 || !strings.Contains(result.Warnings[0], "tested through") {
+		t.Fatalf("LoadBundles() warnings=%v, want tested-through warning", result.Warnings)
+	}
+
+	b.MinPipelock = "2.0.0"
+	writeUnsignedBundle(t, bundleDir, b)
+	result = LoadBundles(dir, LoadOptions{MinConfidence: confidenceLow, PipelockVersion: "1.3.0"})
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Reason, "below minimum") {
+		t.Fatalf("LoadBundles() errors=%v, want fail-closed minimum-version rejection", result.Errors)
 	}
 }
 
@@ -1106,7 +1444,7 @@ func TestLoadBundles_RuleTypeRouting(t *testing.T) {
 		testDLPRule("dlp-001", confidenceHigh, StatusStable),
 		testDLPRule("dlp-002", confidenceHigh, StatusStable),
 		testInjectionRule("inj-001", confidenceHigh),
-		testToolPoisonRule("tp-001", confidenceHigh, StatusStable, scanFieldName),
+		testToolPoisonRule("tp-001", scanFieldName),
 	})
 	writeUnsignedBundle(t, bundleDir, b)
 

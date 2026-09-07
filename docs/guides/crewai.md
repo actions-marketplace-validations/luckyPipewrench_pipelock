@@ -8,7 +8,8 @@ This guide covers both the `mcps=` DSL and the `MCPServerAdapter` approach.
 
 ```bash
 # 1. Install pipelock
-go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
+git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+make -C pipelock install
 
 # 2. Generate a config (or copy a preset)
 pipelock generate config --preset generic-agent > pipelock.yaml
@@ -217,7 +218,7 @@ networks:
 
 services:
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock:latest
+    image: ghcr.io/luckypipewrench/pipelock:3.5.0
     networks:
       - pipelock-internal
       - pipelock-external
@@ -237,14 +238,19 @@ services:
       - pipelock-internal
     environment:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - PIPELOCK_FETCH_URL=http://pipelock:8888/fetch
+      - HTTP_PROXY=http://pipelock:8888
+      - HTTPS_PROXY=http://pipelock:8888
+      - NO_PROXY=localhost,127.0.0.1
     depends_on:
       pipelock:
         condition: service_healthy
 ```
 
-The agent container can only reach the `pipelock` service. All HTTP traffic goes
-through the fetch proxy. MCP servers running as subprocesses inside the agent
+The agent container can only reach the `pipelock` service. The proxy
+environment variables route HTTP libraries that honor them through Pipelock.
+`PIPELOCK_FETCH_URL` is an application-defined helper value: it is useful only
+when your code explicitly calls the `/fetch` endpoint and does not redirect a
+CrewAI request by itself. MCP servers running as subprocesses inside the agent
 container are wrapped with `pipelock mcp proxy` as shown above.
 
 You can also generate this template with:
@@ -259,7 +265,8 @@ For scanning HTTP traffic from CrewAI agents (web searches, API calls), run
 Pipelock as a fetch proxy:
 
 ```bash
-pipelock run --preset balanced
+pipelock generate config --preset balanced > pipelock.yaml
+pipelock run --config pipelock.yaml
 ```
 
 Configure your agent to route HTTP requests through `http://localhost:8888/fetch`.

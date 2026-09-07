@@ -32,6 +32,8 @@ import threading
 import time
 from pathlib import Path
 
+from hermetic import pipelock_environment
+
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -101,16 +103,53 @@ flight_recorder:
     return p
 
 
-def run_install(pipelock: Path, cfg_path: Path, pipelock_cfg: Path) -> None:
+def run_install(
+    pipelock: Path,
+    cfg_path: Path,
+    pipelock_cfg: Path,
+    env: dict[str, str],
+) -> None:
     result = subprocess.run(
         [str(pipelock), "cline", "install", "--path", str(cfg_path), "-c", str(pipelock_cfg)],
         capture_output=True,
         text=True,
+        env=env,
     )
     if result.returncode != 0:
         sys.exit(f"install failed: {result.stderr}")
     if "Wrapped 1 server" not in result.stdout:
         sys.exit(f"install did not wrap the expected count: {result.stdout!r}")
+
+
+def warm_upstream_package(env: dict[str, str]) -> bool:
+    """Fetch the upstream server package into the hermetic npm cache first.
+
+    The hermetic home starts with an empty npm cache, so the first ``npx``
+    of the package downloads it and its dependencies. Doing that inside the
+    timed MCP handshake made a slow registry look like a hung proxy, with an
+    empty stderr tail that could not tell the two apart. ``npm exec`` installs
+    the package but runs Node instead of the MCP server, so cache preparation
+    cannot block waiting for protocol input. The handshake budget below then
+    measures the proxy and the already-fetched server, not the network.
+    """
+    print("\n[1b] warm the upstream package cache")
+    try:
+        subprocess.run(
+            ["npm", "exec", "--yes", f"--package={EVERYTHING_PACKAGE}", "--", "node", "--version"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=60,
+            check=True,
+        )
+    except subprocess.TimeoutExpired:
+        print("SKIP: live npm upstream did not respond within 60s")
+        print("SKIP: 1")
+        return False
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"warm-up: npm could not fetch the upstream package: {exc.stderr}") from exc
+    print("  package fetched")
+    return True
 
 
 def extract_wrapped_argv(cfg_path: Path):
@@ -215,12 +254,27 @@ def main():
     # Opt-in gate. This E2E fetches an upstream npm package at runtime, which
     # is a supply-chain surface even with a pinned version. The default is to
     # skip; operators who want the live-upstream test set PIPELOCK_E2E_LIVE_UPSTREAM=1.
-    if not os.environ.get("PIPELOCK_E2E_LIVE_UPSTREAM"):
-        print(
-            "Skipping runtime MCP E2E. Set PIPELOCK_E2E_LIVE_UPSTREAM=1 to run "
-            "the test, which fetches @modelcontextprotocol/server-everything "
-            f"({EVERYTHING_PACKAGE}) from npm."
-        )
+    if os.environ.get("PIPELOCK_E2E_LIVE_UPSTREAM") != "1":
+        reason = "PIPELOCK_E2E_LIVE_UPSTREAM is not 1; the networked upstream was not requested"
+        print(f"SKIP: runtime MCP E2E ({reason})")
+        print("\n=== Summary ===")
+        print("PASS: 0")
+        print("FAIL: 0")
+        print("SKIP: 1")
+        return
+    if shutil.which("npx") is None:
+        print("SKIP: runtime MCP E2E (npx is not available)")
+        print("\n=== Summary ===")
+        print("PASS: 0")
+        print("FAIL: 0")
+        print("SKIP: 1")
+        return
+    if shutil.which("npm") is None:
+        print("SKIP: runtime MCP E2E (npm is not available)")
+        print("\n=== Summary ===")
+        print("PASS: 0")
+        print("FAIL: 0")
+        print("SKIP: 1")
         return
 
     workdir = Path(tempfile.mkdtemp(prefix="pipelock-cline-runtime-"))
@@ -231,12 +285,16 @@ def main():
         pipelock = build_pipelock(workdir)
         cfg_path = seed_config(workdir)
         pipelock_cfg = seed_pipelock_config(workdir)
+        runtime_env = pipelock_environment(workdir, pipelock_cfg)
 
         print("\n[1] install")
-        run_install(pipelock, cfg_path, pipelock_cfg)
+        run_install(pipelock, cfg_path, pipelock_cfg, runtime_env)
         cmd, args = extract_wrapped_argv(cfg_path)
         print(f"  wrapped command: {cmd}")
         print(f"  wrapped args head: {' '.join(args[:6])} ...")
+
+        if not warm_upstream_package(runtime_env):
+            return
 
         print("\n[2] spawn wrapped subprocess and drive MCP handshake")
         proc = subprocess.Popen(
@@ -245,6 +303,7 @@ def main():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            env=runtime_env,
         )
         stdout_lines, stdout_thread = start_stdout_reader(proc.stdout)
         stderr_tail = StreamTail()
@@ -307,7 +366,9 @@ def main():
         print("\n[3] remove and verify canonical-JSON restoration")
         remove = subprocess.run(
             [str(pipelock), "cline", "remove", "--path", str(cfg_path)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
+            env=runtime_env,
         )
         if remove.returncode != 0:
             sys.exit(f"remove failed: {remove.stderr}")

@@ -75,6 +75,20 @@ const (
 	flagConfig = "--config"
 )
 
+var continueConfigExtensions = []string{".yaml", ".yml"}
+
+// IsContinueConfigExtension reports whether ext is a documented Continue YAML
+// configuration extension. Setup imports this package so discovery and install
+// use this one extension set rather than duplicating it.
+func IsContinueConfigExtension(ext string) bool {
+	for _, supported := range continueConfigExtensions {
+		if ext == supported {
+			return true
+		}
+	}
+	return false
+}
+
 // Pipelock wrapper command/arg constants used by classifier + generator.
 const (
 	wrapperCommand  = "pipelock"
@@ -154,6 +168,8 @@ func Discover(home string) (*Report, error) {
 		// Claude Code has nested per-project servers
 		if cp.Client == clientClaudeCode {
 			parsed, err = parseClaudeCodeConfig(cp.Path)
+		} else if cp.Client == "continue" && (filepath.Ext(cp.Path) == ".yaml" || filepath.Ext(cp.Path) == ".yml") {
+			parsed, err = parseContinueYAMLConfig(cp.Path)
 		} else {
 			parsed, err = parseConfigFile(cp.Path, cp.Key, cp.Client)
 		}
@@ -273,9 +289,13 @@ func fileExists(path string) bool {
 // ~/Library/Application Support/, Windows uses %APPDATA%. Clients that store
 // config in the home directory (claude-code, cursor, continue) work on all platforms.
 func configPaths(home string) []clientPath {
-	appData := appDataDir(home)
+	return configPathsForOS(home, runtime.GOOS)
+}
 
-	return []clientPath{
+func configPathsForOS(home, goos string) []clientPath {
+	appData := appDataDirForOS(home, goos)
+
+	paths := []clientPath{
 		{
 			Client: clientClaudeCode,
 			Path:   filepath.Join(home, ".claude.json"),
@@ -303,6 +323,12 @@ func configPaths(home string) []clientPath {
 		{
 			Client: "cline",
 			Path:   filepath.Join(appData, "Code", "User", "globalStorage", "saoudrizwan.claude-dev", "settings", "cline_mcp_settings.json"),
+			Key:    configKeyMCPServers,
+			Scope:  scopeUser,
+		},
+		{
+			Client: "continue",
+			Path:   filepath.Join(home, ".continue", "config.yaml"),
 			Key:    configKeyMCPServers,
 			Scope:  scopeUser,
 		},
@@ -358,6 +384,28 @@ func configPaths(home string) []clientPath {
 		// an explicit project root parameter (future work). Consistent
 		// with VS Code (.vscode/mcp.json also not scanned).
 	}
+	for _, extension := range continueConfigExtensions {
+		continueBlocks, _ := filepath.Glob(filepath.Join(home, ".continue", "mcpServers", "*"+extension))
+		for _, path := range continueBlocks {
+			paths = append(paths, clientPath{Client: "continue", Path: path, Key: configKeyMCPServers, Scope: scopeUser})
+		}
+	}
+	if goos == osWindows {
+		// Packaged desktop apps can redirect Roaming data into their private
+		// LocalCache. Keep both locations: an existing classic installation
+		// can have different entries, and each result retains its source path.
+		// Family and config location verified on Claude Desktop 1.40609.0.0
+		// via Get-AppxPackage (2026-09-04). Windows package data redirection:
+		// https://learn.microsoft.com/windows/msix/desktop/desktop-to-uwp-behind-the-scenes
+		paths = append(paths, clientPath{
+			Client: clientClaudeDesktop,
+			Path: filepath.Join(home, "AppData", "Local", "Packages",
+				"Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude", "claude_desktop_config.json"),
+			Key:   configKeyMCPServers,
+			Scope: scopeUser,
+		})
+	}
+	return paths
 }
 
 // appDataDir returns the platform-specific application data directory
@@ -366,7 +414,11 @@ func configPaths(home string) []clientPath {
 // Linux: home/.config, macOS: home/Library/Application Support,
 // Windows: home/AppData/Roaming.
 func appDataDir(home string) string {
-	switch runtime.GOOS {
+	return appDataDirForOS(home, runtime.GOOS)
+}
+
+func appDataDirForOS(home, goos string) string {
+	switch goos {
 	case osDarwin:
 		return filepath.Join(home, "Library", "Application Support")
 	case osWindows:

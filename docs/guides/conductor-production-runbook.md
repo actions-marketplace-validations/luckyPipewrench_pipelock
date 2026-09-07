@@ -86,9 +86,12 @@ pipelock signing key generate --purpose roster-root \
 pipelock signing key generate --purpose policy-bundle-signing \
   --out /etc/pipelock/fleet-keys/policy-signing.json --id policy-primary
 
-# Remote-kill signing — signs fleet-wide kill messages. THRESHOLD key.
+# Remote-kill signing — each approver holds one distinct threshold key.
 pipelock signing key generate --purpose remote-kill-signing \
   --out /etc/pipelock/fleet-keys/kill-approver-1.json --id kill-approver-1
+
+pipelock signing key generate --purpose remote-kill-signing \
+  --out /etc/pipelock/fleet-keys/kill-approver-2.json --id kill-approver-2
 
 # Policy-bundle rollback — signs rollback authorizations. THRESHOLD key.
 pipelock signing key generate --purpose policy-bundle-rollback \
@@ -128,6 +131,7 @@ pipelock signing roster build \
   --root /etc/pipelock/fleet-keys/fleet-root.json \
   --include id=policy-primary,key=/etc/pipelock/fleet-keys/policy-signing.json,purpose=policy-bundle-signing,role=publisher \
   --include id=kill-approver-1,key=/etc/pipelock/fleet-keys/kill-approver-1.json,purpose=remote-kill-signing,role=kill-approver \
+  --include id=kill-approver-2,key=/etc/pipelock/fleet-keys/kill-approver-2.json,purpose=remote-kill-signing,role=kill-approver \
   --include id=rollback-approver-1,key=/etc/pipelock/fleet-keys/rollback-approver-1.json,purpose=policy-bundle-rollback,role=rollback-approver \
   --data-class internal \
   --out /etc/pipelock/fleet-keys/trust-roster.json
@@ -254,10 +258,14 @@ pipelock conductor serve \
   --tls-key /etc/pipelock/conductor/tls/server/tls.key \
   --client-ca /etc/pipelock/conductor/tls/client-ca/ca.crt \
   --publisher-token-file /etc/pipelock/conductor/tokens/publisher/token \
+  --publisher-org org-acme \
   --auditor-token-file /etc/pipelock/conductor/tokens/auditor/token \
+  --auditor-org org-acme \
   --admin-token-file /etc/pipelock/conductor/tokens/admin/token \
+  --admin-org org-acme \
   --trusted-audit-key "id=edge-01-audit,org=org-acme,inline=$(jq -r .public /etc/pipelock/fleet-keys/edge-01-audit.json)" \
   --trusted-control-key "id=kill-approver-1,purpose=remote-kill-signing,inline=$(jq -r .public /etc/pipelock/fleet-keys/kill-approver-1.json)" \
+  --trusted-control-key "id=kill-approver-2,purpose=remote-kill-signing,inline=$(jq -r .public /etc/pipelock/fleet-keys/kill-approver-2.json)" \
   --trusted-control-key "id=rollback-approver-1,purpose=policy-bundle-rollback,inline=$(jq -r .public /etc/pipelock/fleet-keys/rollback-approver-1.json)" \
   --remote-kill-max-validity 72h \
   --rollback-max-validity 24h
@@ -798,11 +806,11 @@ but it does not turn an invalid inventory into healthy delivery evidence.
 ## 14. Remove a follower
 
 `pipelock conductor follower remove` decommissions one exact follower identity.
-It deletes the active enrollment record from the Conductor store, so the
-follower disappears from `fleet status` and future audit evidence signed by that
-enrolled audit key is rejected. The command is admin-only and requires the full
-org/fleet/instance/environment tuple; a wrong or already-removed follower fails
-loud instead of being treated as success.
+It replaces the active enrollment with an inactive tombstone. The follower
+disappears from `fleet status`, and the removed identity can't submit evidence
+with its enrolled or matching static audit key. The command is admin-only and
+requires the full org/fleet/instance/environment tuple; a wrong or
+already-removed follower fails loud instead of being treated as success.
 
 ```bash
 pipelock conductor follower remove \

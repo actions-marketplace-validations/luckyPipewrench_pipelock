@@ -19,6 +19,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+
 	"github.com/luckyPipewrench/pipelock/internal/emit"
 	scannerpkg "github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/rs/zerolog"
@@ -228,6 +230,22 @@ func (e *logEntry) str(key, value string) *logEntry {
 	return e
 }
 
+// agentField emits the agent label together with its provenance grade. Use
+// this instead of optStr("agent", ...) everywhere: an agent name without its
+// grade is indistinguishable from a caller-controlled label once it reaches an
+// external consumer, so the two must never be emitted separately. An unknown
+// grade is written explicitly rather than omitted, so a consumer can tell
+// "not graded" apart from "field absent".
+func (e *logEntry) agentField(agent, auth string) *logEntry {
+	if agent == "" {
+		return e
+	}
+	if auth == "" {
+		auth = string(envelope.ActorAuthUnknown)
+	}
+	return e.str("agent", agent).str("agent_auth", auth)
+}
+
 func (e *logEntry) optStr(key, value string) *logEntry {
 	if value == "" {
 		return e
@@ -351,35 +369,36 @@ type EventType string
 
 // Event type constants for structured audit log entries.
 const (
-	EventStartup             EventType = "startup"
-	EventShutdown            EventType = "shutdown"
-	EventAllowed             EventType = "allowed"
-	EventBlocked             EventType = "blocked"
-	EventError               EventType = "error"
-	EventAnomaly             EventType = "anomaly"
-	EventResponseScan        EventType = "response_scan"
-	EventRedirect            EventType = "redirect"
-	EventTunnelOpen          EventType = "tunnel_open"
-	EventTunnelClose         EventType = "tunnel_close"
-	EventForwardHTTP         EventType = "forward_http"
-	EventConfigReload        EventType = "config_reload"
-	EventWSOpen              EventType = "ws_open"
-	EventWSClose             EventType = "ws_close"
-	EventWSBlocked           EventType = "ws_blocked"
-	EventWSScan              EventType = "ws_scan"
-	EventSessionAnomaly      EventType = "session_anomaly"
-	EventAdaptiveEscalation  EventType = "adaptive_escalation"
-	EventAdaptiveRecovery    EventType = "adaptive_recovery"
-	EventMCPUnknownTool      EventType = "mcp_unknown_tool"
-	EventKillSwitchDeny      EventType = "kill_switch_deny"
-	EventSNIMismatch         EventType = "sni_mismatch"
-	EventBodyDLP             EventType = "body_dlp"
-	EventBodyPromptInjection EventType = "body_prompt_injection"
-	EventHeaderDLP           EventType = "header_dlp"
-	EventChainDetection      EventType = "chain_detection"
-	EventAddressProtection   EventType = "address_protection"
-	EventAgentListener       EventType = "agent_listener"
-	EventFileSentryDLP       EventType = "file_sentry_dlp"
+	EventStartup                EventType = "startup"
+	EventShutdown               EventType = "shutdown"
+	EventAllowed                EventType = "allowed"
+	EventBlocked                EventType = "blocked"
+	EventError                  EventType = "error"
+	EventAnomaly                EventType = "anomaly"
+	EventResponseScan           EventType = "response_scan"
+	EventResponseScanSuppressed EventType = "response_scan_suppressed"
+	EventRedirect               EventType = "redirect"
+	EventTunnelOpen             EventType = "tunnel_open"
+	EventTunnelClose            EventType = "tunnel_close"
+	EventForwardHTTP            EventType = "forward_http"
+	EventConfigReload           EventType = "config_reload"
+	EventWSOpen                 EventType = "ws_open"
+	EventWSClose                EventType = "ws_close"
+	EventWSBlocked              EventType = "ws_blocked"
+	EventWSScan                 EventType = "ws_scan"
+	EventSessionAnomaly         EventType = "session_anomaly"
+	EventAdaptiveEscalation     EventType = "adaptive_escalation"
+	EventAdaptiveRecovery       EventType = "adaptive_recovery"
+	EventMCPUnknownTool         EventType = "mcp_unknown_tool"
+	EventKillSwitchDeny         EventType = "kill_switch_deny"
+	EventSNIMismatch            EventType = "sni_mismatch"
+	EventBodyDLP                EventType = "body_dlp"
+	EventBodyPromptInjection    EventType = "body_prompt_injection"
+	EventHeaderDLP              EventType = "header_dlp"
+	EventChainDetection         EventType = "chain_detection"
+	EventAddressProtection      EventType = "address_protection"
+	EventAgentListener          EventType = "agent_listener"
+	EventFileSentryDLP          EventType = "file_sentry_dlp"
 
 	EventCrossRequestEntropyExceeded EventType = "cross_request_entropy_exceeded"
 	EventCrossRequestDLPMatch        EventType = "cross_request_dlp_match"
@@ -399,6 +418,8 @@ const (
 	EventLicenseExpiry          EventType = "license_expiry"
 	EventRuleBundleDegraded     EventType = "rule_bundle_degraded"
 	EventCommitmentKeyLifecycle EventType = "commitment_key_lifecycle"
+	EventContainmentMetricsDeny EventType = "containment_metrics_access_denied"
+	EventAuthorityVerification  EventType = "authority_verification"
 )
 
 const responseScanExemptFullTrustEffect = "response_scanning.exempt_domains is a full-trust valve: injection scanning is disabled for ALL responses from this host, including oversized over-cap responses that stream unscanned"
@@ -446,6 +467,7 @@ type LogContext struct {
 	clientIP        string
 	requestID       string
 	agent           string
+	agentAuth       string
 	dowSubjectKey   string
 	dowSubjectTrust string
 }
@@ -457,6 +479,30 @@ func (c LogContext) Resource() string  { return c.resource }
 func (c LogContext) ClientIP() string  { return c.clientIP }
 func (c LogContext) RequestID() string { return c.requestID }
 func (c LogContext) Agent() string     { return c.agent }
+
+// AgentAuth reports the provenance grade of the agent label, using the
+// envelope.ActorAuth vocabulary ("bound", "config-default", "matched",
+// "self-declared"). An empty value means the grade is unknown and MUST be
+// treated as untrusted by every consumer.
+func (c LogContext) AgentAuth() string { return c.agentAuth }
+
+// agentAuthOrUnknown returns the recorded grade, or the fail-closed unknown
+// grade when the context never carried one.
+func (c LogContext) agentAuthOrUnknown() string {
+	if c.agentAuth == "" {
+		return string(envelope.ActorAuthUnknown)
+	}
+	return c.agentAuth
+}
+
+// WithActorAuth records how the agent label was established. It mirrors
+// WithDoWAttribution: the grade travels with the context so downstream
+// emitters can tell an infrastructure-bound identity from a caller-supplied
+// one. A caller that omits it gets the fail-closed unknown treatment.
+func (c LogContext) WithActorAuth(auth string) LogContext {
+	c.agentAuth = auth
+	return c
+}
 
 // WithDoWAttribution adds denial-of-wallet subject metadata to a copy of the
 // context. The raw subject key stays process-local and is HMAC-redacted by the
@@ -992,7 +1038,7 @@ func (l *Logger) LogAllowed(ctx LogContext, statusCode, sizeBytes int, duration 
 		intField("status_code", statusCode).
 		intField("size_bytes", sizeBytes).
 		durMS(duration).
-		optStr("agent", ctx.agent)
+		agentField(ctx.agent, ctx.agentAuth)
 	e.msg("request allowed")
 
 	if l.emitter != nil {
@@ -1084,7 +1130,7 @@ func (l *Logger) LogBlockedDetail(ctx LogContext, scanner, reason string, detail
 		optStr("request_id", ctx.requestID).
 		str("scanner", scanner).
 		str("reason", reason).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		optStr("subject_discriminator", l.subjectDiscriminator(ctx.dowSubjectKey)).
 		optStr("subject_trust", ctx.dowSubjectTrust).
 		optStr("display_label", displayLabel).
@@ -1110,7 +1156,7 @@ func (l *Logger) LogError(ctx LogContext, err error) {
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		errField(err)
 	e.msg("request error")
 
@@ -1140,7 +1186,7 @@ func (l *Logger) LogAnomaly(ctx LogContext, scanner, reason string, score float6
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		optStr("subject_discriminator", l.subjectDiscriminator(ctx.dowSubjectKey)).
 		optStr("subject_trust", ctx.dowSubjectTrust).
 		optStr("scanner", scanner).
@@ -1152,6 +1198,23 @@ func (l *Logger) LogAnomaly(ctx LogContext, scanner, reason string, score float6
 
 	if l.emitter != nil {
 		l.emitter.Emit(context.Background(), string(EventAnomaly), e.fields)
+	}
+}
+
+// LogContainmentMetricsDeny records a refused read of the containment-managed
+// observability listener. Callers pass only the parsed peer IP and fixed
+// endpoint path; request headers and metric contents are intentionally absent.
+func (l *Logger) LogContainmentMetricsDeny(endpoint, sourceIP, configuredListener, reason string) {
+	e := newLogEntry(l.zl.Warn(), EventContainmentMetricsDeny).
+		str("endpoint", endpoint).
+		str("client_ip", sourceIP).
+		str("configured_listener", configuredListener).
+		str("reason", reason).
+		str("outcome", "denied")
+	e.msg("containment metrics access denied")
+
+	if l.emitter != nil {
+		l.emitter.EmitWithSeverity(context.Background(), emit.SeverityWarn, string(EventContainmentMetricsDeny), e.fields)
 	}
 }
 
@@ -1168,7 +1231,7 @@ func (l *Logger) LogAgentIdentityCollision(ctx LogContext, reservedAgent string)
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		str("scanner", scanner).
 		optStr("mitre_technique", technique).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditAgentIdentity, "reserved control actor")).
@@ -1233,7 +1296,7 @@ func (l *Logger) logResponseScanExempt(ctx LogContext, hostname, effect string) 
 		event = event.Str("request_id", ctx.requestID)
 	}
 	if ctx.agent != "" {
-		event = event.Str("agent", sanitizeString(ctx.agent))
+		event = event.Str("agent", sanitizeString(ctx.agent)).Str("agent_auth", ctx.agentAuthOrUnknown())
 	}
 	event.Msg(msg)
 
@@ -1264,6 +1327,7 @@ func (l *Logger) logResponseScanExempt(ctx LogContext, hostname, effect string) 
 		}
 		if ctx.agent != "" {
 			fields["agent"] = sanitizeString(ctx.agent)
+			fields["agent_auth"] = ctx.agentAuthOrUnknown()
 		}
 		l.emitter.Emit(context.Background(), string(EventResponseScanExempt), fields)
 	}
@@ -1301,7 +1365,7 @@ func (l *Logger) LogResponseScanExemptOverCapUnscanned(ctx LogContext, hostname,
 		event = event.Str("request_id", ctx.requestID)
 	}
 	if ctx.agent != "" {
-		event = event.Str("agent", sanitizeString(ctx.agent))
+		event = event.Str("agent", sanitizeString(ctx.agent)).Str("agent_auth", ctx.agentAuthOrUnknown())
 	}
 	event.Msg("response scan exempt over-cap response streamed unscanned")
 
@@ -1333,6 +1397,7 @@ func (l *Logger) LogResponseScanExemptOverCapUnscanned(ctx LogContext, hostname,
 		}
 		if ctx.agent != "" {
 			fields["agent"] = sanitizeString(ctx.agent)
+			fields["agent_auth"] = ctx.agentAuthOrUnknown()
 		}
 		l.emitter.Emit(context.Background(), string(EventResponseScanExempt), fields)
 	}
@@ -1374,7 +1439,7 @@ func (l *Logger) LogMediaExposure(ctx LogContext, info MediaExposureInfo) {
 		str("url", ctx.url).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		str("transport", info.Transport).
 		str("content_type", info.ContentType).
 		optStr("format", info.Format).
@@ -1425,7 +1490,7 @@ func (l *Logger) LogResponseScan(ctx LogContext, action string, matchCount int, 
 		strs("patterns", patternNames).
 		str("mitre_technique", technique).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditResponseScan, strings.Join(patternNames, ", "))).
-		optStr("agent", ctx.agent)
+		agentField(ctx.agent, ctx.agentAuth)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)
 	}
@@ -1433,6 +1498,34 @@ func (l *Logger) LogResponseScan(ctx LogContext, action string, matchCount int, 
 
 	if l.emitter != nil {
 		l.emitter.Emit(context.Background(), string(EventResponseScan), e.fields)
+	}
+}
+
+// LogResponseScanSuppressed records a response-scanner finding deliberately
+// left unenforced by destination-scoped policy.
+func (l *Logger) LogResponseScanSuppressed(ctx LogContext, patternName, surface, reason string) {
+	const scanner = scannerpkg.AuditResponseScan
+	technique := TechniqueForScanner(scanner)
+	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, scanner)
+
+	e := newLogEntry(l.zl.Warn(), EventResponseScanSuppressed).
+		optStr("method", ctx.method).
+		optStr("url", loggedURL).
+		optStr("target", loggedTarget).
+		optStr("resource", loggedResource).
+		optStr("client_ip", ctx.clientIP).
+		optStr("request_id", ctx.requestID).
+		str("scanner", scanner).
+		str("mode", "informational").
+		str("pattern", patternName).
+		str("surface", surface).
+		str("reason", reason).
+		str("mitre_technique", technique).
+		agentField(ctx.agent, ctx.agentAuth)
+	e.msg("response scan finding suppressed by policy")
+
+	if l.emitter != nil {
+		l.emitter.Emit(context.Background(), string(EventResponseScanSuppressed), e.fields)
 	}
 }
 
@@ -1457,7 +1550,7 @@ func (l *Logger) LogTaintDecision(ctx LogContext, d TaintDecision) {
 		str("url", ctx.url).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		str("session_taint_level", d.TaintLevel).
 		str("action_class", d.ActionClass).
 		str("action_sensitivity", d.Sensitivity).
@@ -1483,7 +1576,7 @@ func (l *Logger) LogTunnelOpen(ctx LogContext) {
 		optStr("target", ctx.target).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent)
+		agentField(ctx.agent, ctx.agentAuth)
 	e.msg("tunnel opened")
 
 	if l.emitter != nil {
@@ -1500,7 +1593,7 @@ func (l *Logger) LogTunnelClose(ctx LogContext, totalBytes int64, duration time.
 		optStr("target", ctx.target).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		int64Field("total_bytes", totalBytes).
 		durMS(duration)
 	e.msg("tunnel closed")
@@ -1522,7 +1615,7 @@ func (l *Logger) LogForwardHTTP(ctx LogContext, statusCode, sizeBytes int, durat
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		intField("status_code", statusCode).
 		intField("size_bytes", sizeBytes).
 		durMS(duration)
@@ -1540,7 +1633,7 @@ func (l *Logger) LogRedirect(originalURL, redirectURL, clientIP, requestID, agen
 		str("redirect_url", redirectURL).
 		str("client_ip", clientIP).
 		str("request_id", requestID).
-		optStr("agent", agent).
+		agentField(agent, string(envelope.ActorAuthUnknown)).
 		intField("hop", hop)
 	e.msg("redirect followed")
 
@@ -1638,11 +1731,23 @@ func (l *Logger) LogRuleBundleDegraded(ev RuleBundleDegradedEvent) {
 	}
 }
 
+// LicenseExpiryWarning is the operator-facing data for an active license
+// expiry band.
+type LicenseExpiryWarning struct {
+	LicenseID     string
+	Tier          string
+	ThresholdDays int
+	DaysRemaining int
+	Severity      string
+	ExpiresAt     string
+	Message       string
+}
+
 // LogLicenseExpiry logs a renewal warning for the active enterprise license.
-func (l *Logger) LogLicenseExpiry(licenseID string, thresholdDays, daysRemaining int, severity, expiresAt string) {
+func (l *Logger) LogLicenseExpiry(warning LicenseExpiryWarning) {
 	level := l.zl.Info()
 	emitSeverity := emit.SeverityInfo
-	switch severity {
+	switch warning.Severity {
 	case severityCritical, "error":
 		level = l.zl.Error()
 		emitSeverity = emit.SeverityCritical
@@ -1651,12 +1756,14 @@ func (l *Logger) LogLicenseExpiry(licenseID string, thresholdDays, daysRemaining
 		emitSeverity = emit.SeverityWarn
 	}
 	e := newLogEntry(level, EventLicenseExpiry).
-		str("license_id", licenseID).
-		intField("threshold_days", thresholdDays).
-		intField("days_remaining", daysRemaining).
-		str("severity", severity).
-		str("expires_at", expiresAt)
-	e.msg("license expiry warning")
+		str("license_id", warning.LicenseID).
+		str("tier", warning.Tier).
+		intField("threshold_days", warning.ThresholdDays).
+		intField("days_remaining", warning.DaysRemaining).
+		str("severity", warning.Severity).
+		str("expires_at", warning.ExpiresAt).
+		str("message", warning.Message)
+	e.msg(warning.Message)
 
 	if l.emitter != nil {
 		l.emitter.EmitWithSeverity(context.Background(), emitSeverity, string(EventLicenseExpiry), e.fields)
@@ -1692,7 +1799,7 @@ func (l *Logger) LogShutdown(reason string) {
 func (l *Logger) LogAgentListener(addr, agent string) {
 	e := newLogEntry(l.zl.Info(), EventAgentListener).
 		str("listen", addr).
-		str("agent", agent)
+		agentField(agent, string(envelope.ActorAuthUnknown))
 	e.msg("agent listener started")
 
 	if l.emitter != nil {
@@ -1709,7 +1816,7 @@ func (l *Logger) LogWSOpen(target, clientIP, requestID, agent string) {
 		str("target", target).
 		str("client_ip", clientIP).
 		str("request_id", requestID).
-		str("agent", agent)
+		agentField(agent, string(envelope.ActorAuthUnknown))
 	e.msg("websocket opened")
 
 	if l.emitter != nil {
@@ -1719,10 +1826,14 @@ func (l *Logger) LogWSOpen(target, clientIP, requestID, agent string) {
 
 // WSCloseEvent bundles the per-event fields LogWSClose emits.
 type WSCloseEvent struct {
-	Target         string
-	ClientIP       string
-	RequestID      string
-	Agent          string
+	Target    string
+	ClientIP  string
+	RequestID string
+	Agent     string
+	// AgentAuth is how the agent label was established. It travels with the
+	// label so the pair is emitted together; an empty value is recorded as the
+	// fail-closed unknown grade rather than omitted.
+	AgentAuth      string
 	ClientToServer int64
 	ServerToClient int64
 	TextFrames     int64
@@ -1739,7 +1850,7 @@ func (l *Logger) LogWSClose(ev WSCloseEvent) {
 		str("target", ev.Target).
 		str("client_ip", ev.ClientIP).
 		str("request_id", ev.RequestID).
-		str("agent", ev.Agent).
+		agentField(ev.Agent, ev.AgentAuth).
 		int64Field("client_to_server_bytes", ev.ClientToServer).
 		int64Field("server_to_client_bytes", ev.ServerToClient).
 		int64Field("text_frames", ev.TextFrames).
@@ -1752,8 +1863,30 @@ func (l *Logger) LogWSClose(ev WSCloseEvent) {
 	}
 }
 
+// WSBlockedEvent bundles the per-event fields LogWSBlocked emits.
+//
+// This is a struct rather than a parameter list because the event needs the
+// agent label and its provenance grade, and a block decision is exactly where
+// an auditor needs to know whether the label was infrastructure-bound or merely
+// caller-supplied. Adding two more positional parameters would have pushed the
+// call past the project's six-parameter limit at twenty-one call sites.
+type WSBlockedEvent struct {
+	Target    string
+	Direction string
+	Scanner   string
+	Reason    string
+	ClientIP  string
+	RequestID string
+	Agent     string
+	// AgentAuth is how the agent label was established. An empty value is
+	// recorded as the fail-closed unknown grade.
+	AgentAuth string
+}
+
 // LogWSBlocked logs a blocked WebSocket frame or connection.
-func (l *Logger) LogWSBlocked(target, direction, scannerName, reason, clientIP, requestID string) {
+func (l *Logger) LogWSBlocked(ev WSBlockedEvent) {
+	target, direction, scannerName := ev.Target, ev.Direction, ev.Scanner
+	reason, clientIP, requestID := ev.Reason, ev.ClientIP, ev.RequestID
 	technique := TechniqueForScanner(scannerName)
 
 	e := newLogEntry(l.zl.Warn(), EventWSBlocked).
@@ -1763,6 +1896,7 @@ func (l *Logger) LogWSBlocked(target, direction, scannerName, reason, clientIP, 
 		str("reason", reason).
 		str("client_ip", clientIP).
 		str("request_id", requestID).
+		agentField(ev.Agent, ev.AgentAuth).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerName, reason)).
 		optStr("mitre_technique", technique)
 
@@ -1778,11 +1912,13 @@ func (l *Logger) LogWSBlocked(target, direction, scannerName, reason, clientIP, 
 // WSScanEvent bundles the per-event fields LogWSScan emits.
 // Direction is one of DirectionClientToServer / DirectionServerToClient.
 type WSScanEvent struct {
-	Target       string
-	Direction    string
-	ClientIP     string
-	RequestID    string
-	Agent        string
+	Target    string
+	Direction string
+	ClientIP  string
+	RequestID string
+	Agent     string
+	// AgentAuth is how the agent label was established. See WSCloseEvent.
+	AgentAuth    string
 	Action       string
 	Scanner      string
 	MatchCount   int
@@ -1813,7 +1949,7 @@ func (l *Logger) LogWSScan(ev WSScanEvent) {
 		str("direction", ev.Direction).
 		str("client_ip", ev.ClientIP).
 		str("request_id", ev.RequestID).
-		optStr("agent", ev.Agent).
+		agentField(ev.Agent, ev.AgentAuth).
 		str("action", ev.Action).
 		str("scanner", scanner).
 		intField("match_count", ev.MatchCount).
@@ -2009,7 +2145,7 @@ func (l *Logger) LogSNIMismatch(connectHost, sniHost, clientIP, requestID, agent
 		str("sni_host", sniHost).
 		str("client_ip", clientIP).
 		str("request_id", requestID).
-		optStr("agent", agent).
+		agentField(agent, string(envelope.ActorAuthUnknown)).
 		str("category", category).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditSNIMismatch, category)).
 		str("mitre_technique", technique)
@@ -2050,7 +2186,7 @@ func (l *Logger) LogBodyDLP(ctx LogContext, action string, matchCount int, patte
 		str("action", action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		intField("match_count", matchCount).
 		strs("patterns", patternNames).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.ScannerBodyDLP, "")).
@@ -2078,7 +2214,7 @@ func (l *Logger) LogBodyScan(ctx LogContext, eventType EventType, action string,
 		str("action", action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		intField("match_count", matchCount).
 		strs("findings", findingNames).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(string(eventType), strings.Join(findingNames, ", "))).
@@ -2104,7 +2240,7 @@ func (l *Logger) LogHeaderDLP(ctx LogContext, headerName, action string, pattern
 		str("action", action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
-		optStr("agent", ctx.agent).
+		agentField(ctx.agent, ctx.agentAuth).
 		strs("patterns", patternNames).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditHeaderDLP, strings.Join(patternNames, ", "))).
 		str("mitre_technique", technique)

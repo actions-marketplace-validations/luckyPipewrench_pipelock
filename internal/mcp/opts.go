@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
@@ -110,11 +111,14 @@ type MCPProxyOpts struct {
 	// without ListenerBearerToken. This is intended only for deployments whose
 	// network policy is the authentication boundary.
 	ListenerAllowUnauthenticated bool
-	// listenerStateTokenRequired controls the Pipelock-issued token required
-	// before stateful listener requests. Nil uses the secure production default
-	// of true. It exists for narrowly-scoped transport compatibility tests; no
-	// operator-facing configuration disables the requirement.
+	// listenerStateTokenRequired, when set, is the static token requirement
+	// used by tests. Nil means omitted. Production listeners should prefer
+	// ListenerStateTokenRequiredFn so a reload can change the value.
 	listenerStateTokenRequired *bool
+	// ListenerStateTokenRequiredFn is the live-reload source for the HTTP
+	// reverse-listener token requirement. A nil return is omitted (default
+	// off). When set, it wins over listenerStateTokenRequired.
+	ListenerStateTokenRequiredFn func() *bool
 	// UpstreamHeaders are operator-configured headers applied by the HTTP
 	// reverse listener. They take precedence over client-supplied headers, so a
 	// browser can use Authorization for listener authentication while Pipelock
@@ -172,6 +176,13 @@ type MCPProxyOpts struct {
 	AuditLogger *audit.Logger
 	Metrics     *metrics.Metrics
 
+	// AuthorityVerifier validates external grants immediately before an MCP
+	// request is forwarded. AuthorityActor and AuthorityDestination are
+	// resolved by the trusted transport/runtime, never from client metadata.
+	AuthorityVerifier    authority.Verifier
+	AuthorityActor       string
+	AuthorityDestination string
+
 	// Redirect handler runtime config (nil-safe).
 	RedirectRT   *RedirectRuntime
 	RedirectRTFn func() *RedirectRuntime
@@ -184,6 +195,14 @@ type MCPProxyOpts struct {
 	A2ACfg       *config.A2AScanning
 	A2ACfgFn     func() *config.A2AScanning
 	CardBaseline *CardBaseline
+	// A2ACardURL is the Agent Card origin used for signature verification
+	// and drift keys on MCP transports that have an upstream URL. Empty
+	// is valid for stdio; origin-scoped signature checks then fail closed.
+	A2ACardURL string
+	// A2ACardAuthFingerprint partitions Agent Card drift baselines by the
+	// effective upstream Authorization credential. It is a truncated digest,
+	// never the credential itself.
+	A2ACardAuthFingerprint string
 
 	// MediaPolicy enforces response-side media handling for base64 tool
 	// result content blocks (image/audio/video) before generic text scanning.
@@ -303,14 +322,17 @@ type MCPProxyOpts struct {
 	// for hot-reload-aware proxy surfaces. Nil falls back to ResponseActionOverride.
 	ResponseActionOverrideFn func() string
 
-	// AdaptiveResetFile, when set, is a local operator control file: when it
-	// appears (regular file, mode 0600, owned by the proxy user) the stdio
-	// proxy clears this session's adaptive-enforcement escalation on the next
-	// message and removes the file. It lets an airlocked invocation session
-	// recover without a restart (invocation sessions are otherwise
-	// un-resettable). Empty disables the reset path. Set from
-	// `pipelock mcp proxy --adaptive-reset-file`.
+	// AdaptiveResetFile is the signed local control-file path for an adaptive
+	// reset. It is honored only through AdaptiveResetAuthority.
 	AdaptiveResetFile string
+	// AdaptiveResetAuthority verifies signed adaptive reset delegations. The
+	// proxy holds only the operator's public key. Nil disables adaptive reset,
+	// including when AdaptiveResetFile is configured.
+	AdaptiveResetAuthority *ResetAuthority
+	// AdaptiveResetEpoch is incremented after every accepted reset, preventing
+	// a valid delegation from being reused within this proxy process. Nil
+	// disables adaptive reset and preserves the airlock.
+	AdaptiveResetEpoch *atomic.Uint64
 
 	// Transport identifies the MCP transport for capture records.
 	// Set by each proxy surface, for example "mcp_stdio", "mcp_http_upstream",
@@ -365,6 +387,25 @@ type MCPProxyOpts struct {
 	// swap-after-hash case can be reproduced; production wiring leaves it nil.
 	afterIntegrityPreparedForTest func()
 
+	// sessionExitForTest overrides the session-bound exit's parent-death
+	// watch and drain window. A test process cannot make its own parent
+	// die, so the in-process teardown path is otherwise reachable only
+	// from a helper subprocess; production wiring leaves it nil.
+	sessionExitForTest *sessionExitTestHooks
+	// outputForwardStartedForTest signals that RunProxy has entered its
+	// server-output forwarding loop. Production wiring leaves it nil.
+	outputForwardStartedForTest func()
+	// outputForwardDoneForTest signals that server-output forwarding returned.
+	// Tests use it to release a child held after closing stdout; production
+	// wiring leaves it nil.
+	outputForwardDoneForTest func()
+	// sessionExit marks Pipelock-initiated descriptor closes during a
+	// session-bound teardown. It is wired only by proxy entry points.
+	sessionExit *sessionExitState
+	// enableSubreaperForTest supplies a deterministic subreaper setup result.
+	// Production wiring leaves it nil and calls the platform implementation.
+	enableSubreaperForTest func() error
+
 	// File sentry (stdio proxy only)
 	Lineage      filesentry.Lineage
 	OnChildReady func() // called after child process starts
@@ -383,11 +424,35 @@ func (o MCPProxyOpts) responseTarget() string {
 // responseScanOptions builds the per-server suppression context passed into
 // the stdio response scan (ScanResponseOpts).
 func (o MCPProxyOpts) responseScanOptions() ResponseScanOptions {
+	// The audit resource falls back to a stable label when no server name is
+	// configured (the HTTP listener path), so building the context never logs
+	// a spurious "resource required" error and the record still names a
+	// surface an operator can search for.
+	auditResource := o.responseTarget()
+	if auditResource == "" {
+		auditResource = "mcp://response"
+	}
 	return ResponseScanOptions{
 		Target:         o.responseTarget(),
 		Suppress:       o.responseSuppress(),
 		ActionOverride: o.responseActionOverride(),
 		TrustClass:     o.responseTrustClass(),
+		OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+			if o.AuditLogger != nil {
+				o.AuditLogger.LogDLPDropped(mustMCPAuditContext(o.AuditLogger, "MCP", auditResource), match.PatternName, match.Severity, "mcp_stdio", reason)
+			}
+			if o.Metrics != nil {
+				o.Metrics.RecordDLPDroppedMatch(match.PatternName, "mcp_stdio", reason)
+			}
+		},
+		OnSuppressedResponse: func(match scanner.ResponseMatch) {
+			if o.AuditLogger != nil {
+				o.AuditLogger.LogResponseScanSuppressed(mustMCPAuditContext(o.AuditLogger, "MCP", auditResource), match.PatternName, "mcp_stdio", "suppressed")
+			}
+			if o.Metrics != nil {
+				o.Metrics.RecordResponseSuppressedMatch(match.PatternName, "mcp_stdio", "suppressed")
+			}
+		},
 	}
 }
 
@@ -563,6 +628,18 @@ func (o MCPProxyOpts) a2aCfg() *config.A2AScanning {
 		return o.A2ACfgFn()
 	}
 	return o.A2ACfg
+}
+
+func (o MCPProxyOpts) a2aResponseOpts(scanOpts ResponseScanOptions) *A2AResponseOpts {
+	return &A2AResponseOpts{
+		Cfg:      o.a2aCfg(),
+		Baseline: o.CardBaseline,
+		CardKey: cardCacheKey{
+			cardURL:         o.A2ACardURL,
+			authFingerprint: o.A2ACardAuthFingerprint,
+		},
+		ScanOpts: scanOpts,
+	}
 }
 
 func (o MCPProxyOpts) mediaPolicy() *config.MediaPolicy {

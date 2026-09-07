@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -75,9 +76,53 @@ func TestExtractText_MixedBlockTypes(t *testing.T) {
 }
 
 func TestExtractText_EmbeddedResourceText(t *testing.T) {
-	raw := json.RawMessage(`{"content":[{"type":"resource","resource":{"uri":"file:///workspace/report.txt","mimeType":"text/plain","text":"embedded resource text"}}]}`)
+	raw := json.RawMessage(`{"content":[{"type":"resource","resource":{"uri":"file:///workspace/report.txt","mimeType":"text/plain","text":"embedded resource text","blob":"opaque-base64-payload"}}]}`)
 	if got, want := ExtractText(raw), "embedded resource text"; got != want {
 		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestResourceContentsPreservesEmbeddedMediaFields(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		raw      json.RawMessage
+		wantURI  string
+		wantMime string
+		wantBlob string
+	}{
+		{
+			name:     "video_blob",
+			raw:      json.RawMessage(`{"content":[{"type":"resource","resource":{"uri":"file:///clip.mp4","mimeType":"video/mp4","blob":"ZmFrZS12aWRlby1ieXRlcw=="}}]}`),
+			wantURI:  "file:///clip.mp4",
+			wantMime: "video/mp4",
+			wantBlob: "ZmFrZS12aWRlby1ieXRlcw==",
+		},
+		{
+			name:     "text_and_blob",
+			raw:      json.RawMessage(`{"content":[{"type":"resource","resource":{"uri":"file:///report.txt","mimeType":"text/plain","text":"visible text","blob":"b3BhcXVl"}}]}`),
+			wantURI:  "file:///report.txt",
+			wantMime: "text/plain",
+			wantBlob: "b3BhcXVl",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var result ToolResult
+			if err := json.Unmarshal(tt.raw, &result); err != nil {
+				t.Fatalf("unmarshal tool result: %v", err)
+			}
+			if len(result.Content) != 1 || result.Content[0].Resource == nil {
+				t.Fatalf("resource content = %+v, want one embedded resource", result.Content)
+			}
+			resource := result.Content[0].Resource
+			if resource.URI != tt.wantURI || resource.MimeType != tt.wantMime || resource.Blob != tt.wantBlob {
+				t.Errorf("resource = %+v, want uri=%q mimeType=%q blob=%q", resource, tt.wantURI, tt.wantMime, tt.wantBlob)
+			}
+		})
 	}
 }
 
@@ -282,6 +327,22 @@ func TestExtractStringsFromJSON_NestedObjectValuesOnly(t *testing.T) {
 	got := ExtractStringsFromJSON(raw)
 	if len(got) != 1 || got[0] != "value" {
 		t.Errorf("expected [value] (not key), got %v", got)
+	}
+}
+
+func TestExtractKeysFromJSONResult(t *testing.T) {
+	raw := json.RawMessage(`{"top":{"nested":"value"},"items":[{"child":"value"}]}`)
+	got := ExtractKeysFromJSONResult(raw)
+	want := []string{"items", "child", "top", "nested"}
+	if !slices.Equal(got.Keys, want) || got.Truncated {
+		t.Fatalf("ExtractKeysFromJSONResult = %+v, want keys %v without truncation", got, want)
+	}
+}
+
+func TestExtractKeysFromJSONResult_DepthGuard(t *testing.T) {
+	got := ExtractKeysFromJSONResult(json.RawMessage(deepJSONRPCObject(maxExtractDepth + 2)))
+	if !got.Truncated {
+		t.Fatalf("ExtractKeysFromJSONResult = %+v, want truncated result", got)
 	}
 }
 

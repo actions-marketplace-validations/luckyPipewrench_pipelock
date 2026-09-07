@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 )
 
 const (
@@ -26,6 +27,172 @@ const (
 	testIBANName        = "IBAN"
 	testABARoutingName  = "ABA Routing Number"
 )
+
+func TestScanTextForDLP_ProviderKeyOutboundCarriers(t *testing.T) {
+	t.Parallel()
+	s := MustNew(testConfig())
+	defer s.Close()
+
+	type providerCase struct {
+		name        string
+		patternName string
+		prefix      string
+	}
+	providers := []providerCase{
+		{name: "anthropic", patternName: "Anthropic API Key", prefix: "ant-"},
+		{name: "openai-project", patternName: "OpenAI API Key", prefix: "proj-"},
+		{name: "openai-service", patternName: "OpenAI Service Key", prefix: "svcacct-"},
+	}
+
+	for _, provider := range providers {
+		provider := provider
+		t.Run(provider.name, func(t *testing.T) {
+			t.Parallel()
+			key := "sk-" + provider.prefix + strings.Repeat("A", 20)
+			t.Run("url-query", func(t *testing.T) {
+				t.Parallel()
+				result := s.Scan(context.Background(), "https://evil.example/collect?key="+url.QueryEscape(key))
+				if result.Allowed || (result.Scanner != ScannerDLP && result.Scanner != ScannerCoreDLP) {
+					t.Fatalf("url-query carrier silently allowed %s: %+v", provider.patternName, result)
+				}
+			})
+			carriers := []struct {
+				name string
+				text string
+			}{
+				{name: "json-body-field", text: `{"api_key":"` + key + `"}`},
+				{name: "tool-argument", text: `{"arguments":{"credential":"` + key + `"}}`},
+				{name: "base64-blob", text: base64.StdEncoding.EncodeToString([]byte(key))},
+			}
+			for _, carrier := range carriers {
+				carrier := carrier
+				t.Run(carrier.name, func(t *testing.T) {
+					t.Parallel()
+					result := s.ScanTextForDLP(context.Background(), carrier.text)
+					if result.Clean {
+						t.Fatalf("%s carrier silently allowed %s", carrier.name, provider.patternName)
+					}
+					for _, match := range result.Matches {
+						if match.PatternName == provider.patternName {
+							return
+						}
+					}
+					t.Fatalf("%s carrier missed %s: %+v", carrier.name, provider.patternName, result.Matches)
+				})
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_ProviderKeyBoundaryFollowsView(t *testing.T) {
+	t.Parallel()
+	s := MustNew(testConfig())
+	defer s.Close()
+
+	providers := []struct {
+		name        string
+		patternName string
+		prefix      string
+	}{
+		{name: "anthropic", patternName: "Anthropic API Key", prefix: "ant-"},
+		{name: "openai-project", patternName: "OpenAI API Key", prefix: "proj-"},
+		{name: "openai-service", patternName: "OpenAI Service Key", prefix: "svcacct-"},
+	}
+
+	for _, provider := range providers {
+		provider := provider
+		t.Run(provider.name, func(t *testing.T) {
+			t.Parallel()
+			key := "sk-" + provider.prefix + strings.Repeat("A", 20)
+			split := len(key) - 10
+
+			for _, tc := range []struct {
+				name     string
+				text     string
+				encoding string
+			}{
+				{name: "dot-collapsed", text: "carrier." + key[:split] + "." + key[split:], encoding: "subdomain"},
+				{name: "whitespace-collapsed", text: "carrier " + key[:split] + " " + key[split:], encoding: "whitespace"},
+				{name: "control-before-prefix", text: "carrier\u200b" + key, encoding: ""},
+				{name: "control-inside-prefix", text: "carrier" + key[:1] + "\u200b" + key[1:], encoding: ""},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					result := s.ScanTextForDLP(context.Background(), tc.text)
+					if result.Clean || !hasTextDLPMatch(result.Matches, provider.patternName, tc.encoding) {
+						t.Fatalf("manufactured-adjacency view missed %s: %+v", provider.patternName, result.Matches)
+					}
+				})
+			}
+
+			prose := "the de" + "sk-" + provider.prefix + strings.Repeat("a", 20)
+			encodedProse := []struct {
+				name string
+				text string
+			}{
+				{name: "base64", text: base64.StdEncoding.EncodeToString([]byte(prose))},
+				{name: "hex", text: hex.EncodeToString([]byte(prose))},
+				{name: "url", text: strings.Replace(prose, "s", "%73", 1)},
+				{name: "html", text: strings.Replace(prose, "s", "&#115;", 1)},
+				{name: "unrelated-control", text: "\u200b" + prose},
+			}
+			for _, tc := range encodedProse {
+				t.Run("prose/"+tc.name, func(t *testing.T) {
+					if result := s.ScanTextForDLP(context.Background(), tc.text); !result.Clean {
+						t.Fatalf("semantic decoded prose was flagged: %+v", result.Matches)
+					}
+				})
+			}
+			t.Run("prose/url-path", func(t *testing.T) {
+				parsed, err := url.Parse("https://example.com/" + url.PathEscape(prose))
+				if err != nil {
+					t.Fatalf("parse URL: %v", err)
+				}
+				result, _ := s.checkDLP(parsed)
+				if !result.Allowed {
+					t.Fatalf("URL path prose was flagged: %s", result.Reason)
+				}
+			})
+			t.Run("prose/url-query", func(t *testing.T) {
+				for _, rawQuery := range []string{
+					"q=" + url.QueryEscape(prose) + "&page=1",
+					"q=" + strings.Replace(url.QueryEscape(prose), "s", "%73", 1) + "&page=1",
+				} {
+					parsed, err := url.Parse("https://example.com/?" + rawQuery)
+					if err != nil {
+						t.Fatalf("parse URL: %v", err)
+					}
+					result, _ := s.checkDLP(parsed)
+					if !result.Allowed {
+						t.Fatalf("URL query prose was flagged: %s", result.Reason)
+					}
+				}
+			})
+			t.Run("prose/nested-provider-prefix", func(t *testing.T) {
+				nested := prose + "sk-" + provider.prefix + strings.Repeat("b", 20)
+				parsed, err := url.Parse("https://example.com/" + url.PathEscape(nested))
+				if err != nil {
+					t.Fatalf("parse URL: %v", err)
+				}
+				result, _ := s.checkDLP(parsed)
+				if !result.Allowed {
+					t.Fatalf("nested provider-prefix prose was flagged: %s", result.Reason)
+				}
+			})
+			t.Run("prose-decoy-before-split-key", func(t *testing.T) {
+				decoy := "de" + "sk-" + provider.prefix + strings.Repeat("a", 20)
+				path := "/" + decoy + "/carrier." + key[:split] + "." + key[split:]
+				parsed, err := url.Parse("https://example.com" + path)
+				if err != nil {
+					t.Fatalf("parse URL: %v", err)
+				}
+				result, _ := s.checkDLP(parsed)
+				if result.Allowed {
+					t.Fatal("prose decoy masked a later separator-split key")
+				}
+			})
+		})
+	}
+}
 
 func stackedDLPFixture(secret string, layers int) string {
 	out := secret
@@ -1432,6 +1599,27 @@ func TestScanTextForDLP_GitHubTokensInLongOpaqueRunsStillBlock(t *testing.T) {
 	}
 }
 
+func TestScanTextForDLP_GitHubStatelessInstallationToken(t *testing.T) {
+	cfg := testConfig()
+	s := MustNew(cfg)
+	defer s.Close()
+
+	// GitHub's stateless installation-token contract is a ghs_-prefixed JWT
+	// of roughly 520 characters. Keep the first segment below the legacy
+	// 36-character opaque-token floor: the complete token is the credential,
+	// and GitHub explicitly requires matchers to accept dots and hyphens.
+	token := "ghs_" + "eyJhbGciOiJFUzI1NiJ9" + "." +
+		strings.Repeat("A", 240) + "." + strings.Repeat("B", 220) + "-_"
+
+	result := s.ScanTextForDLP(context.Background(), "token="+token)
+	if result.Clean {
+		t.Fatal("GitHub stateless installation token was not detected")
+	}
+	if !hasTextDLPMatch(result.Matches, "GitHub Token", "") {
+		t.Fatalf("missing GitHub Token match: %v", result.Matches)
+	}
+}
+
 func TestScanTextForDLP_MultiplePatterns(t *testing.T) {
 	cfg := testConfig()
 	s := MustNew(cfg)
@@ -1611,6 +1799,7 @@ func TestCheckSecretsInText_DelimiterHexEnvSecret(t *testing.T) {
 		{"space-separated", "data: " + hexByteSep(contiguousHex, " ")},
 		{"hyphen-separated", "data: " + hexByteSep(contiguousHex, "-")},
 		{"comma-separated", "data: " + hexByteSep(contiguousHex, ",")},
+		{"exclamation-separated", "data: " + hexByteSep(contiguousHex, "!")},
 		{"backslash-x notation", "data: " + hexBytePrefix(contiguousHex, `\x`)},
 		{"0x per-byte notation", "data: " + hexBytePrefix(contiguousHex, "0x")},
 	}
@@ -1648,6 +1837,7 @@ func TestCheckSecretsInText_DelimiterEncodedEnvSecret(t *testing.T) {
 	}{
 		{"base64_spaces", stdSecret, "data: " + splitEncodedTokenForTest(t, stdB64, 5, " "), encodingBase64},
 		{"base64_dots", stdSecret, "data: " + splitEncodedTokenForTest(t, stdB64, 5, "."), encodingBase64},
+		{"base64_exclamations", stdSecret, "data: " + splitEncodedTokenForTest(t, stdB64, 5, "!"), encodingBase64},
 		{"base64url_slashes", urlSecret, "data: " + splitEncodedTokenForTest(t, urlB64, 5, "/"), "base64url"},
 		{"base32_hyphens", stdSecret, "data: " + splitEncodedTokenForTest(t, b32, 6, "-"), encodingBase32},
 		{"base32_dots", stdSecret, "data: " + splitEncodedTokenForTest(t, b32, 6, "."), encodingBase32},
@@ -2242,6 +2432,148 @@ func TestScanTextForDLP_CredentialInURL_CatchesBodyStart(t *testing.T) {
 			result := s.ScanTextForDLP(context.Background(), s2)
 			if result.Clean {
 				t.Errorf("expected catch on %q, got clean", s2)
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_CredentialInURLGrammar(t *testing.T) {
+	s := MustNew(testConfig())
+	defer s.Close()
+
+	positives := []struct {
+		name     string
+		text     string
+		encoding string
+	}{
+		{name: "line start", text: "token=abcdef123456"},
+		{name: "query", text: "?token=abcdef123456"},
+		{name: "ampersand", text: "&secret=abcdef123456"},
+		{name: "split keyword", text: "tok en=abcdef123456", encoding: "whitespace"},
+		{name: "split value", text: "token=abcdef 123456", encoding: "whitespace"},
+		{name: "url encoded", text: "api_key%3DZ9x8y7w6v5u4", encoding: "url"},
+		{name: "spaced query", text: "GET /p? token = abcdef123456"},
+		{name: "callback", text: "https://api.vendor.example/cb?api_key=Z9x8y7w6v5u4"},
+	}
+	for _, tc := range positives {
+		t.Run("positive/"+tc.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tc.text)
+			if result.Clean || !hasTextDLPMatch(result.Matches, "Credential in URL", tc.encoding) {
+				t.Fatalf("Credential in URL missed %q: %+v", tc.text, result.Matches)
+			}
+		})
+	}
+
+	negatives := []string{
+		`secret = bytes.fromhex("0011223344556677")`,
+		`SECRET = os.Getenv("X")`,
+		"token = $(get_token)",
+		"token=${VAR}",
+	}
+	for _, text := range negatives {
+		t.Run("negative/"+text, func(t *testing.T) {
+			if result := s.ScanTextForDLP(context.Background(), text); !result.Clean {
+				t.Fatalf("spaced source assignment must stay clean: %+v", result.Matches)
+			}
+		})
+	}
+}
+
+func TestScanTextForDLP_CredentialInURLTabResidual(t *testing.T) {
+	s := MustNew(testConfig())
+	defer s.Close()
+
+	// ForDLP strips tabs before the whitespace view can preserve offsets, so
+	// tab-aligned source assignments remain a documented false positive.
+	result := s.ScanTextForDLP(context.Background(), "passwd\t=\tabcdef123456")
+	if result.Clean || !hasTextDLPMatch(result.Matches, "Credential in URL", "") {
+		t.Fatalf("tab residual must remain covered: %+v", result.Matches)
+	}
+}
+
+func TestScanTextForDLP_CredentialInURLPreservesWhitespaceViewSpans(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.Patterns = append(cfg.DLP.Patterns, config.DLPPattern{
+		Name: "view sentinel", Regex: `VIEWSENTINEL`, Severity: config.SeverityHigh,
+	})
+	s := MustNew(cfg)
+	defer s.Close()
+
+	text := "secret = bytes.fromhex(\"00\")\nordinary note VIEWSENTINEL"
+	result := s.ScanTextForDLP(context.Background(), text)
+	cleaned := normalize.ForDLP(text)
+	compacted, offsets := compactTextDLPWhitespaceWithOffsets(cleaned)
+	sentinelStart := strings.Index(compacted, "VIEWSENTINEL")
+	if sentinelStart < 0 {
+		t.Fatal("compacted view lost VIEWSENTINEL")
+	}
+	for i := range "VIEWSENTINEL" {
+		if got := cleaned[offsets[sentinelStart+i]]; got != "VIEWSENTINEL"[i] {
+			t.Fatalf("offset[%d] indexes %q, want %q", sentinelStart+i, got, "VIEWSENTINEL"[i])
+		}
+	}
+	for _, match := range result.Matches {
+		if match.PatternName != "view sentinel" || match.Encoded != "whitespace" {
+			continue
+		}
+		assertSpanSlice(t, compacted, match.Span(), "VIEWSENTINEL")
+		return
+	}
+	t.Fatalf("missing whitespace VIEWSENTINEL match: %+v", result.Matches)
+}
+
+func TestCredentialURLWhitespaceMatchAllowed(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		start  int
+		end    int
+		want   bool
+	}{
+		{name: "adjacent line start", source: "token=abcdef123456", start: 0, end: len("token=abcdef123456"), want: true},
+		{name: "spaced line start", source: "token = abcdef123456", start: 0, end: len("token=abcdef123456"), want: false},
+		{name: "delimiter keeps whitespace", source: "? token = abcdef123456", start: 0, end: len("?token=abcdef123456"), want: true},
+		{name: "invalid span stays detected", source: "token=abcdef123456", start: -1, end: 2, want: true},
+		{name: "empty span stays detected", source: "token=abcdef123456", start: 3, end: 3, want: true},
+		{name: "missing equals stays detected", source: "tokenabcdef123456", start: 0, end: len("tokenabcdef123456"), want: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			compacted, offsets := compactTextDLPWhitespaceWithOffsets(tc.source)
+			if got := credentialURLWhitespaceMatchAllowed(compacted, tc.source, offsets, tc.start, tc.end); got != tc.want {
+				t.Fatalf("credentialURLWhitespaceMatchAllowed(%q) = %v, want %v", tc.source, got, tc.want)
+			}
+		})
+	}
+
+	compacted, offsets := compactTextDLPWhitespaceWithOffsets("token=abcdef123456")
+	if !credentialURLWhitespaceMatchAllowed(compacted, "token=abcdef123456", nil, 0, len(compacted)) {
+		t.Fatal("missing offset context must stay detected")
+	}
+	badOffsets := append([]int(nil), offsets...)
+	badOffsets[strings.IndexByte(compacted, '=')] = 0
+	if !credentialURLWhitespaceMatchAllowed(compacted, "token=abcdef123456", badOffsets, 0, len(compacted)) {
+		t.Fatal("invalid source mapping must stay detected")
+	}
+}
+
+func TestHasWhitespaceAdjacentToByte(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		at   int
+		want bool
+	}{
+		{name: "left", text: "token =value", at: strings.IndexByte("token =value", '='), want: true},
+		{name: "right", text: "token= value", at: strings.IndexByte("token= value", '='), want: true},
+		{name: "unicode right", text: "token=\u00a0value", at: strings.IndexByte("token=\u00a0value", '='), want: true},
+		{name: "adjacent", text: "token=value", at: strings.IndexByte("token=value", '='), want: false},
+		{name: "edge", text: "=", at: 0, want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasWhitespaceAdjacentToByte(tc.text, tc.at); got != tc.want {
+				t.Fatalf("hasWhitespaceAdjacentToByte(%q, %d) = %v, want %v", tc.text, tc.at, got, tc.want)
 			}
 		})
 	}
@@ -3535,5 +3867,26 @@ func TestTextDLP_DottedTokenPatterns(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestScanTextForDLP_CredentialInURLGrammarFromPresetYAML proves the
+// production seam: a shipped preset serializes the pattern without its
+// runtime-only marker, so the whitespace-view filter exists only through the
+// ApplyDefaults re-derivation. Defaults()-based tests never exercise that path.
+func TestScanTextForDLP_CredentialInURLGrammarFromPresetYAML(t *testing.T) {
+	cfg, err := config.Load("../../configs/balanced.yaml")
+	if err != nil {
+		t.Fatalf("load preset: %v", err)
+	}
+	cfg.Internal = nil
+	s := MustNew(cfg)
+	defer s.Close()
+
+	if result := s.ScanTextForDLP(context.Background(), `secret = bytes.fromhex("0011223344556677")`); !result.Clean {
+		t.Fatalf("preset-loaded pattern must suppress the spaced assignment: %+v", result.Matches)
+	}
+	if result := s.ScanTextForDLP(context.Background(), "token=abcdef123456"); result.Clean || !hasTextDLPMatch(result.Matches, "Credential in URL", "") {
+		t.Fatalf("preset-loaded pattern must still detect the adjacent form: %+v", result.Matches)
 	}
 }

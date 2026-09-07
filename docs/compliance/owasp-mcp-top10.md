@@ -6,9 +6,13 @@ See also: [OWASP Agentic Top 10 mapping](../owasp-mapping.md) | [OWASP AIVSS cov
 
 > **Note:** Coverage levels reflect architectural capabilities against known attack patterns, not guarantees of threat prevention. Pipelock is a network-layer proxy; some MCP risks require complementary controls at the client, server, or identity layer. This mapping is for informational purposes and does not constitute compliance certification.
 
-**Last reviewed:** July 2026 against v3.3.0. This mapping describes current
+**Last reviewed:** August 2026 against v3.4.0. This mapping describes current
 behavior; see [CHANGELOG.md](../../CHANGELOG.md) for release history. The
 appendix remains an explicitly historical list of v2.5 deltas.
+
+The v3.4 review includes fail-closed media-body scanning, stricter composition
+of MCP reasoning trust with response actions, and removal of inert airlock
+trigger fields.
 
 ---
 
@@ -107,7 +111,7 @@ appendix remains an explicitly historical list of v2.5 deltas.
 
 - **Tool policy with shell normalization:** `mcp_tool_policy` ships a default rule set covering destructive operations, persistence mechanisms, and credential access. Shell obfuscation (octal encoding, hex encoding, brace expansion, variable assignment, command substitution, IFS manipulation) is normalized before matching.
 - **Argument-level matching:** `arg_key` scopes pattern matching to specific tool argument keys, preventing overly broad rules.
-- **Sandbox containment (v2.0):** Landlock LSM + network namespaces + seccomp restrict filesystem access, network egress, and syscall surface for sandboxed agent processes. Even if injection succeeds, the command runs in a contained environment.
+- **Sandbox containment (v2.0):** Landlock LSM and network namespaces restrict filesystem access and network egress for sandboxed agent processes, and on linux/amd64 seccomp also restricts the syscall surface. Even if injection succeeds, the command runs in a contained environment.
 - **`pipelock claude hook` unknown-tool full-scan fallback (v2.5):** the Claude Code IDE-hook entry point routes unknown `tool_name` values through the full tool-use decision path with complete `tool_input` scanning instead of returning clean. Unknown clean inputs are still allowed after scanning; unknown inputs that carry malicious or secret-bearing payloads are denied. Null tool input errors explicitly. Closes a fail-open path where Pipelock previously short-circuited on tool names it had not yet enumerated. The hook itself is fail-closed on unsupported hook events (`PostToolUse`, `PreCompact`, `SessionStart`); see appendix.
 
 **Configuration:** `mcp_tool_policy`, `sandbox`. (The `pipelock claude hook` subcommand is a CLI surface — registered under `pipelock claude` and invoked from `~/.claude/settings.json` `PreToolUse` matchers — not a YAML config block. Other Claude Code hook events such as `PostToolUse`, `PreCompact`, and `SessionStart` are fail-closed today; `pipelock claude hook` returns deny when invoked from any non-`PreToolUse` event.)
@@ -175,7 +179,7 @@ appendix remains an explicitly historical list of v2.5 deltas.
 
 **Pipelock coverage:**
 
-- **Discovery:** `pipelock discover` auto-detects MCP server configurations across Claude Code, Cursor, Windsurf, VS Code, Gemini CLI, and other agent platforms on the local machine.
+- **Discovery:** `pipelock discover` reports MCP server configurations for its supported local clients, including Claude Code, Claude Desktop, Cursor, VS Code, Cline, Continue, Junie, and Zed.
 - **Preflight checks:** `pipelock preflight` validates deployment readiness (network isolation, config completeness, proxy routing).
 - **Diagnostics:** `pipelock diagnose` reports environment state, connectivity, and configuration issues.
 

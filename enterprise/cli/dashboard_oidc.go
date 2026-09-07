@@ -698,7 +698,11 @@ func walkDashboardJSONValue(decoder *json.Decoder, depth int) error {
 }
 
 func dashboardBearerToken(r *http.Request) (string, error) {
-	parts := strings.Fields(r.Header.Get("Authorization"))
+	authorization, ok := dashboardAuthorizationHeader(r)
+	if !ok {
+		return "", errors.New("OIDC bearer token is missing")
+	}
+	parts := strings.Fields(authorization)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") || parts[1] == "" {
 		return "", errors.New("OIDC bearer token is missing")
 	}
@@ -879,7 +883,11 @@ func (a *dashboardOIDCAuthenticator) middleware(next http.Handler) http.Handler 
 }
 
 func dashboardBearerAttempted(r *http.Request) bool {
-	parts := strings.Fields(r.Header.Get("Authorization"))
+	authorization, ok := dashboardAuthorizationHeader(r)
+	if !ok {
+		return false
+	}
+	parts := strings.Fields(authorization)
 	return len(parts) > 0 && strings.EqualFold(parts[0], "Bearer")
 }
 
@@ -964,6 +972,8 @@ func (a *dashboardRequestAuthorization) authAuditInfo(r *http.Request) dashboard
 		return dashboard.AuthAuditInfo{Method: "raw-access-token", Roles: []string{"raw"}}
 	case dashboardConfiguredTokenMatches(r, a.metadataToken):
 		return dashboard.AuthAuditInfo{Method: "token", Roles: []string{"metadata"}}
+	case dashboardAuthorizationHeaderCount(r) > 1:
+		return dashboard.AuthAuditInfo{Method: "none", FailureReason: "malformed"}
 	case dashboardOIDCFailureReasonFromRequest(r) != "":
 		return dashboard.AuthAuditInfo{Method: "oidc", FailureReason: dashboardOIDCFailureReasonFromRequest(r)}
 	case dashboardCredentialAttempted(r):
@@ -973,11 +983,30 @@ func (a *dashboardRequestAuthorization) authAuditInfo(r *http.Request) dashboard
 	}
 }
 
+// failedAuthMode attributes a rejected request from server-recorded OIDC
+// failure state. An HTTP client cannot set that context value. OIDC takes
+// precedence because both authenticators use the Bearer scheme.
+func (a *dashboardRequestAuthorization) failedAuthMode(r *http.Request) string {
+	if dashboardAuthorizationHeaderCount(r) > 1 {
+		return "none"
+	}
+	if dashboardOIDCFailureReasonFromRequest(r) != "" {
+		return "oidc"
+	}
+	if dashboardCredentialAttempted(r) {
+		return "operator_token"
+	}
+	return "none"
+}
+
 func dashboardCredentialAttempted(r *http.Request) bool {
 	if r == nil {
 		return false
 	}
-	if strings.TrimSpace(r.Header.Get("Authorization")) != "" {
+	if authorization, ok := dashboardAuthorizationHeader(r); ok && strings.TrimSpace(authorization) != "" {
+		return true
+	}
+	if dashboardAuthorizationHeaderCount(r) > 1 {
 		return true
 	}
 	_, _, ok := r.BasicAuth()
@@ -985,7 +1014,7 @@ func dashboardCredentialAttempted(r *http.Request) bool {
 }
 
 func (a *dashboardRequestAuthorization) wrap(next http.Handler, auditWriter io.Writer) http.Handler {
-	handler := dashboardAuthHandler(a.authenticated, a.authAuditInfo, auditWriter, next)
+	handler := dashboardAuthHandler(a.authenticated, a.authAuditInfo, auditWriter, nil, a.failedAuthMode, next)
 	if a.oidc != nil {
 		return a.oidc.middleware(handler)
 	}

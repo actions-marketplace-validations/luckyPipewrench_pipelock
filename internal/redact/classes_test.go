@@ -91,6 +91,7 @@ func TestDefaultMatcher_StructuredClasses(t *testing.T) {
 		{"azure-storage-key", "conn AccountKey=" + strings.Repeat("A", 86) + "==", ClassAzureStorageKey},
 		// Azure SAS signature parameter.
 		{"azure-sas-token", "url sig=" + strings.Repeat("A", 43) + "%3d", ClassAzureSAS},
+		{"azure-sas-token-decoded", "url sig=" + strings.Repeat("A", 43) + "=", ClassAzureSAS},
 		{"env-secret", fakeTelegramEnvSecret(), ClassEnvSecret},
 		{"seed-phrase", "mnemonic abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about", ClassSeedPhrase},
 		{"ad-user", "CONTOSO\\jsmith logged in", ClassADUser},
@@ -220,6 +221,49 @@ func TestDefaultMatcher_ProviderTokenBoundaries(t *testing.T) {
 	}
 }
 
+func TestDefaultMatcher_ProviderKeyProsePrefixesDoNotMatch(t *testing.T) {
+	t.Parallel()
+	m := NewDefaultMatcher()
+
+	type providerCase struct {
+		name   string
+		prefix string
+		class  Class
+	}
+	providers := []providerCase{
+		{name: "anthropic", prefix: "ant-", class: ClassAnthropicKey},
+		{name: "openai-project", prefix: "proj-", class: ClassOpenAIAPIKey},
+		{name: "openai-service", prefix: "svcacct-", class: ClassOpenAIAPIKey},
+	}
+	prosePrefixes := []string{"desk", "kiosk", "risk", "task"}
+
+	for _, provider := range providers {
+		provider := provider
+		t.Run(provider.name+"/real-key", func(t *testing.T) {
+			t.Parallel()
+			key := "sk-" + provider.prefix + strings.Repeat("A", 20)
+			for _, match := range m.Scan(key) {
+				if match.Class == provider.class && match.Original == key {
+					return
+				}
+			}
+			t.Fatalf("real-shaped key %q did not match %s", key, provider.class)
+		})
+		for _, prosePrefix := range prosePrefixes {
+			prosePrefix := prosePrefix
+			t.Run(provider.name+"/"+prosePrefix, func(t *testing.T) {
+				t.Parallel()
+				prose := prosePrefix + "-" + provider.prefix + strings.Repeat("a", 20)
+				for _, match := range m.Scan(prose) {
+					if match.Class == provider.class {
+						t.Fatalf("ordinary prose %q matched %s: %+v", prose, provider.class, match)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestDefaultMatcher_GitHubTokenInOpaqueRunStillMatches(t *testing.T) {
 	t.Parallel()
 	m := NewDefaultMatcher()
@@ -253,6 +297,23 @@ func TestDefaultMatcher_GitHubTokenInOpaqueRunStillMatches(t *testing.T) {
 	}
 }
 
+func TestDefaultMatcher_AzureSASPreservesQueryDelimiter(t *testing.T) {
+	t.Parallel()
+
+	signature := "sig=" + strings.Repeat("A", 43) + "="
+	input := signature + "&next=value"
+	matches := NewDefaultMatcher().Scan(input)
+	for _, match := range matches {
+		if match.Class == ClassAzureSAS {
+			if match.Original != signature {
+				t.Fatalf("Azure SAS match = %q, want %q", match.Original, signature)
+			}
+			return
+		}
+	}
+	t.Fatalf("Azure SAS signature was not detected in %q", input)
+}
+
 func TestDefaultMatcher_ProviderKeyGlueParity(t *testing.T) {
 	t.Parallel()
 	m := NewDefaultMatcher()
@@ -280,6 +341,7 @@ func TestDefaultMatcher_ProviderKeyGlueParity(t *testing.T) {
 		{"sentry", "sntrys_" + strings.Repeat("A", 40), ClassSentryAuthToken},
 		// Round 2: source-control, messaging, package-registry, platform tokens
 		{"github-ghp", "ghp_" + strings.Repeat("A", 36), ClassGitHubToken},
+		{"github-ghs-stateless", "ghs_eyJhbGciOiJFUzI1NiJ9." + strings.Repeat("A", 240) + "." + strings.Repeat("B", 220) + "-_", ClassGitHubToken},
 		{"github-pat", "github_pat_" + strings.Repeat("B", 36), ClassGitHubToken},
 		{"gitlab-pat", "glpat-" + strings.Repeat("C", 24), ClassGitLabToken},
 		{"gitlab-deploy", "gldt-" + strings.Repeat("D", 24), ClassGitLabToken},
@@ -375,6 +437,16 @@ func TestDefaultMatcher_Negative(t *testing.T) {
 		strings.Repeat("d", 128),                    // bare 128-hex
 		strings.Repeat("e", 40),                     // bare 40-hex
 		strings.Repeat("f", 32),                     // bare 32-hex
+		// Issue #1308: only AKIA/ASIA are redactable AWS access-key IDs.
+		// IAM resource-ID prefixes and obfuscated/overlong forms are still
+		// caught by the detection floor but must NOT be redacted (they fail
+		// closed instead of being rewritten).
+		"AIDA" + "IOSFODNN7EXAMPLE",          // IAM user ID prefix, not an access key
+		"AGPA" + "IOSFODNN7EXAMPLE",          // IAM group ID prefix
+		"AROA" + "IOSFODNN7EXAMPLE",          // IAM role ID prefix
+		"AKIA" + "IOSFODNN7EXAMPLE" + "ABCD", // overlong: no trailing word boundary
+		"akia" + "iosfodnn7example",          // lowercase: class is case-sensitive
+		"AKIA" + " " + "IOSFODNN7EXAMPLE",    // whitespace-split: not a contiguous span
 	}
 	for _, s := range cases {
 		t.Run(s, func(t *testing.T) {

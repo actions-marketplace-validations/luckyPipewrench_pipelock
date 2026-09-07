@@ -105,7 +105,29 @@ dlp:
 ### Suppression rules
 
 The `suppress` configuration section lets you suppress specific scanner
-findings by scanner name and pattern. See the [suppression guide](suppression.md).
+findings by scanner name and pattern. It applies only to non-core rules; core
+DLP and core response floor names fail config validation. See the
+[suppression guide](suppression.md).
+
+### Presigned URLs inside request bodies
+
+An API may accept an AWS SigV4 presigned URL in a request body so it can fetch an attachment. That URL contains an AWS access-key ID, so the immutable DLP floor blocks it even though the full URL is a scoped capability. Do not add a core-pattern suppression.
+
+Add an exact, expiring `request_body_scanning.sigv4_credential_routes` entry for the outbound HTTPS endpoint instead. Pin the host, canonical path, HTTP method, and content type. Pipelock exempts only the access-key ID inside a complete, structurally valid presigned URL on that route. A malformed URL, bare key, second credential, header value, different route, or non-HTTPS request still blocks.
+
+```yaml
+request_body_scanning:
+  sigv4_credential_routes:
+    - host: api.vendor.example
+      path: /v1/graphql
+      content_types: [application/json]
+      methods: [POST]
+      reason: register attachment URL
+      owner: platform team
+      expires: 2099-12-31
+```
+
+Deploy the supporting Pipelock version before adding this field to shared configuration. Older versions reject unknown fields instead of ignoring them.
 
 ### Opaque content entropy
 
@@ -119,16 +141,21 @@ positive is an audit line, not a block. Tune before setting
 `request_body_scanning.content_entropy_action: block` for the deployment or
 selecting a blocking preset (strict/hostile presets already block):
 
-- **Narrowest first:** add the specific upload or hash endpoint host to
-  `request_body_scanning.content_entropy_exclusions` (or
-  `websocket_proxy.content_entropy_exclusions` for a WebSocket-only endpoint).
-  This lifts only the entropy check for that host; DLP still applies.
-- **Broader:** if the host is fully trusted, `trusted_domains` covers it for
+- **Narrowest first:** for an HTTPS request-body endpoint, add an exact,
+  expiring `request_body_scanning.content_entropy_warn_routes` entry. The
+  entropy finding remains visible while DLP, prompt injection, address, body
+  size, and redirect checks keep their normal actions.
+- **WebSocket:** use `websocket_proxy.content_entropy_exclusions` for a
+  WebSocket-only endpoint. Route warning entries do not affect WebSocket or
+  A2A entropy scanning.
+- **Broader:** a host in `request_body_scanning.content_entropy_exclusions`
+  skips request-body entropy across every path on that host. If the host is
+  fully trusted, `trusted_domains` covers it for
   entropy and other destination-trust checks at once.
 - **Global (last resort):** raising `request_body_scanning.content_entropy_threshold`
-  lowers sensitivity for every destination. Prefer a per-host exclusion.
+  lowers sensitivity for every destination. Prefer an exact route warning.
 
 `content_entropy_min_length` applies to both individual leaves and their stable
 aggregate views. Raising it can reduce flags for one short identifier, but a
-collection of short identifiers may still exceed the aggregate floor. Prefer a
-per-host exclusion when opaque identifiers are a normal part of that protocol.
+collection of short identifiers may still exceed the aggregate floor. Prefer
+an exact route warning when opaque identifiers are normal at one HTTPS endpoint.

@@ -1,8 +1,6 @@
-<p align="center">
-  <img src="assets/pipelock-logo.svg" alt="Pipelock" width="200">
-</p>
-
-<h1 align="center">Pipelock</h1>
+<h1 align="center">
+  <img src="assets/pipelock-lockup.svg" alt="Pipelock" width="465">
+</h1>
 
 <p align="center">
   <strong>Open-source AI agent firewall for <a href="https://pipelab.org/learn/verifiable-egress-control/">Verifiable Egress Control</a>.</strong>
@@ -11,6 +9,7 @@
 <p align="center">
   <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/ci.yaml"><img alt="CI" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/ci.yaml/badge.svg"></a>
   <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/security.yaml"><img alt="Security" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/security.yaml/badge.svg"></a>
+  <a href="https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml"><img alt="Gauntlet exam" src="https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml/badge.svg"></a>
   <a href="go.mod"><img alt="Go 1.25+" src="https://img.shields.io/github/go-mod/go-version/luckyPipewrench/pipelock?logo=go&label=Go"></a>
   <a href="https://github.com/luckyPipewrench/pipelock/releases"><img alt="Release" src="https://img.shields.io/github/v/release/luckyPipewrench/pipelock"></a>
 </p>
@@ -35,9 +34,9 @@
 
 Pipelock sits between AI agents and the network. It inspects mediated HTTP, WebSocket, MCP, and A2A traffic, plus CONNECT tunnel contents when TLS interception is enabled, for secret exfiltration, prompt injection, SSRF, tool poisoning, and risky tool-call chains. Plain CONNECT without interception is scanned at the hostname and URL level.
 
-Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/action-receipt-spec/) over content-aware boundary decisions, so a reviewer can verify what Pipelock decided outside the agent runtime. The public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus exercises the detections. Learn more: [Open-source AI firewall](https://pipelab.org/learn/open-source-ai-firewall/).
+Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/action-receipt-spec/) over content-aware boundary decisions, so a reviewer can verify what Pipelock decided outside the agent runtime. The public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus exercises the detections. The [Gauntlet](https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml) workflow is the product's scheduled candidate exam against a pinned corpus commit; it does not auto-publish a public score. Learn more: [Open-source AI firewall](https://pipelab.org/learn/open-source-ai-firewall/).
 
-**Works with:** Claude Code · OpenAI Codex · Cline · OpenCode · Zed · Cursor · VS Code · JetBrains · OpenAI Agents SDK · Google ADK · AutoGen · CrewAI · LangGraph
+**Works with:** Claude Code · OpenAI Codex · Cline · OpenCode · Pi · Zed · Cursor · VS Code · JetBrains · OpenAI Agents SDK · Google ADK · AutoGen · CrewAI · LangGraph
 
 <p align="center">
   <a href="#the-problem">Problem</a> ·
@@ -48,13 +47,13 @@ Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/actio
   <a href="#what-it-does">Features</a> ·
   <a href="#how-it-works">Architecture</a> ·
   <a href="#docs">Docs</a> ·
-  <a href="https://playground.pipelab.org">Playground</a> ·
+  <a href="https://pipelab.org/playground">Playground</a> ·
   <a href="https://pipelab.org/blog/">Blog</a> ·
   <a href="https://app.dosu.dev/bcccd1cf-be85-4c0e-ae05-edeb0ff50b59/ask">Ask Dosu</a>
 </p>
 
 <p align="center">
-  <strong>Try it in your browser at the <a href="https://playground.pipelab.org">live playground</a>. If Pipelock earns it, <a href="https://github.com/luckyPipewrench/pipelock/stargazers">star the repo</a> so other people find it.</strong>
+  <strong>Try it in your browser at the <a href="https://pipelab.org/playground">live playground</a>. If Pipelock earns it, <a href="https://github.com/luckyPipewrench/pipelock/stargazers">star the repo</a> so other people find it.</strong>
 </p>
 
 ---
@@ -88,11 +87,15 @@ pipelock verify-receipt "$(ls ./out/*.json | head -1)" --key ./out/signer.pub  #
 
 The scorecard grades each claim on its own and states what it does not prove: whether anything happened outside the boundary Pipelock mediates. Below it, the receipt timeline lists the recorded mediated decisions with their verdicts and hash links. A receipt that is honest about its own limits beats a green checkmark that hides them.
 
-The evidence viewer is free and needs no license:
+The evidence viewer is free and needs no license. It reads a flight-recorder
+session, which is what Pipelock writes while it runs, rather than the demo
+receipts above:
 
 ```bash
-pipelock evidence serve --receipt-dir ./out   # read-only HTML report for one recorded session
-pipelock evidence view --receipt-dir ./out    # static offline report, no server
+pipelock init --output ./pipelock.yaml        # names a recorder directory and generates its signing key
+pipelock run --config ./pipelock.yaml         # record while your agent works
+pipelock evidence view --receipt-dir ./recorder --out report.html   # static offline report, no server
+pipelock evidence serve --receipt-dir ./recorder                    # same report, served read-only
 ```
 
 Two honesty notes, stated up front. The demo signs with an ephemeral key it prints for the run, which proves the receipts are self-consistent rather than tied to a named identity. The public Pipelock playground is a separate path that verifies against a key Pipelock publishes. And the operator running Pipelock holds the signing key, so a receipt proves what the boundary decided and that the key holder signed it, not that the operator is honest. `pipelock anchor receipts` records receipt-chain checkpoints to a local backend or a Rekor transparency log for later audit, and operator-independent verification against that anchor is still being proven end to end.
@@ -104,8 +107,9 @@ The full argument for why proof beats promises is in [demonstration over attesta
 ## Quick Start
 
 ```bash
-# Install from source (Go 1.25+)
-go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
+# Build the current release from source (Community edition, Go 1.25+)
+git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+make -C pipelock install
 
 # Set up local agent integrations and generate a config
 pipelock init
@@ -123,7 +127,7 @@ pipelock check --url "https://docs.python.org/3/"                # allowed
 # See https://github.com/luckyPipewrench/pipelock/releases
 
 # Docker
-docker pull ghcr.io/luckypipewrench/pipelock:latest
+docker pull ghcr.io/luckypipewrench/pipelock:3.5.0
 
 # Homebrew on macOS
 brew install luckyPipewrench/tap/pipelock
@@ -135,11 +139,11 @@ brew install luckyPipewrench/tap/pipelock
 <summary>Verify release integrity</summary>
 
 ```bash
-gh attestation verify pipelock_3.3.0_linux_amd64.tar.gz --owner luckyPipewrench
-gh attestation verify oci://ghcr.io/luckypipewrench/pipelock:3.3.0 --owner luckyPipewrench
+gh attestation verify pipelock_3.5.0_linux_amd64.tar.gz --owner luckyPipewrench
+gh attestation verify oci://ghcr.io/luckypipewrench/pipelock:3.5.0 --owner luckyPipewrench
 ```
 
-Release workflows publish SLSA provenance, CycloneDX SBOMs, checksums, and signed container images. Source builds with `go install` produce a Community-only binary; pre-built release artifacts include paid-tier code that activates with a valid license key.
+Release workflows publish SLSA provenance, CycloneDX SBOMs, checksums, and signed container images. Source builds made with `make build` or `make install` produce a Community-only binary; pre-built release artifacts include paid-tier code that activates with a valid license key.
 
 </details>
 
@@ -213,7 +217,7 @@ The free single-session evidence viewer shown above is separate. It needs no lic
 
 [**agent-egress-bench**](https://github.com/luckyPipewrench/agent-egress-bench) runs a corpus of agent-exfiltration and prompt-injection attacks against Pipelock, or against any other tool. The numbers come from a run anyone can repeat, not a claim.
 
-[**See the live results**](https://pipelab.org/gauntlet/) · [**Run it yourself**](https://github.com/luckyPipewrench/agent-egress-bench)
+[**See the live results**](https://pipelab.org/gauntlet/results/) · [**Run it yourself**](https://github.com/luckyPipewrench/agent-egress-bench)
 
 </div>
 
@@ -251,7 +255,7 @@ For agents running uncensored or abliterated models, the [`hostile-model` preset
 | Emergency kill switch (6 sources) | Yes | No | No | No |
 | Tool call chain detection | Yes | No | No | No |
 | Process sandbox (no Docker) | Yes | No | No | Yes (kernel-level) |
-| Single binary, zero deps | Yes | No (Python) | No (npm) | No (kernel) |
+| Single binary, no runtime deps | Yes | No (Python) | No (npm) | No (kernel) |
 
 Reference matrix: [docs/comparison.md](docs/comparison.md)
 
@@ -321,11 +325,13 @@ pipelock run --config pipelock.yaml --mcp-listen 127.0.0.1:8889 --mcp-upstream h
 
 ### Containment
 
-Unprivileged process containment uses OS-native primitives. Linux uses Landlock, seccomp, and network namespaces. macOS uses `sandbox-exec` profiles. In containers, `--best-effort` keeps Landlock and seccomp when namespace creation is restricted, while network scanning uses proxy-based routing.
+Unprivileged process containment uses OS-native primitives. Linux uses Landlock and network namespaces; `linux/amd64` also applies seccomp. Other Linux builds label the launch partial while the network namespace is active, and `--strict` refuses them. macOS uses `sandbox-exec` profiles. In containers, `--best-effort` keeps Landlock and, on `linux/amd64`, seccomp when namespace creation is restricted. Its expiry bounds admission only: it never stops a child already running, and each later launch must be re-authorized. A launch without the namespace is labelled advisory-override regardless of architecture, because the missing namespace is the more serious gap: network scanning then uses proxy-based routing and may be bypassed by direct egress.
 
 ```bash
 pipelock sandbox --config pipelock.yaml -- python agent.py
-pipelock sandbox --best-effort -- python agent.py
+pipelock sandbox --best-effort \
+  --best-effort-reason "container user namespaces disabled" \
+  --best-effort-expiry 30m -- python agent.py
 pipelock mcp proxy --sandbox --config pipelock.yaml -- npx server
 ```
 
@@ -420,7 +426,7 @@ pipelock contain run -- claude-code
 
 ## Free, Pro, and Enterprise
 
-All detection, enforcement, containment, and single-agent evidence is free forever under Apache 2.0. Paid tiers add multi-agent coordination (Pro) and fleet governance plus compliance (Enterprise).
+All detection, enforcement, containment, receipt verification, and the free single-agent evidence viewer are free forever under Apache 2.0. Pro adds named-agent operations, including per-agent coverage certificates; Enterprise adds fleet governance and compliance.
 
 | Capability | Free | Pro | Enterprise |
 |---|:--:|:--:|:--:|
@@ -527,7 +533,9 @@ For false positive tuning: **[docs/false-positive-tuning.md](docs/false-positive
 - **[Claude Code](docs/guides/claude-code.md):** MCP proxy setup, `.claude.json` configuration
 - **[OpenAI Codex](docs/guides/codex.md):** MCP proxy wrapping, forward proxy, sandbox integration
 - **[Cline](docs/guides/cline.md):** MCP proxy wrapping for Cline's `mcp.json`
+- **[Continue.dev](docs/guides/continue.md):** MCP proxy wrapping for Continue YAML configuration
 - **[OpenCode](docs/guides/opencode.md):** MCP proxy wrapping for OpenCode's local and remote MCP servers
+- **[Pi](docs/guides/pi.md):** global `httpProxy` setup with a named agent listener ([example](examples/pi-integration/))
 - **[Zed](docs/guides/zed.md):** MCP proxy wrapping for Zed's `context_servers` block in `settings.json`
 - **[OpenAI Agents SDK](docs/guides/openai-agents.md):** `MCPServerStdio`, multi-agent handoffs
 - **[Google ADK](docs/guides/google-adk.md):** `McpToolset`, `StdioConnectionParams`
@@ -547,9 +555,9 @@ For false positive tuning: **[docs/false-positive-tuning.md](docs/false-positive
 
 ```bash
 # Docker
-docker pull ghcr.io/luckypipewrench/pipelock:latest
+docker pull ghcr.io/luckypipewrench/pipelock:3.5.0
 docker run -p 8888:8888 -v ./pipelock.yaml:/config/pipelock.yaml:ro \
-  ghcr.io/luckypipewrench/pipelock:latest \
+  ghcr.io/luckypipewrench/pipelock:3.5.0 \
   run --config /config/pipelock.yaml --listen 0.0.0.0:8888
 
 # Network-isolated agent with Docker Compose
@@ -557,7 +565,7 @@ pipelock generate docker-compose --agent claude-code -o docker-compose.yaml
 docker compose up
 
 # Kubernetes with Helm (published chart, Helm 3.8+)
-helm install pipelock oci://ghcr.io/luckypipewrench/charts/pipelock
+helm install pipelock oci://ghcr.io/luckypipewrench/charts/pipelock --version 3.5.0
 ```
 
 Production recipes for Docker Compose, Kubernetes sidecar + NetworkPolicy, iptables/nftables, and macOS PF: **[docs/guides/deployment-recipes.md](docs/guides/deployment-recipes.md)**
@@ -568,7 +576,7 @@ Production recipes for Docker Compose, Kubernetes sidecar + NetworkPolicy, iptab
 
 ```yaml
 # .github/workflows/pipelock.yaml
-- uses: luckyPipewrench/pipelock@v2
+- uses: luckyPipewrench/pipelock@ca05ed06f360f5aac5518ab6ea2b11d729b70bee # v3.5.0
   with:
     scan-diff: 'true'
     fail-on-findings: 'true'
@@ -744,7 +752,7 @@ Pipelock is tested like a security product. The open-source core has unit, integ
 | CI matrix | Go 1.25 + 1.26, CodeQL, golangci-lint |
 | Supply chain | SLSA provenance, CycloneDX SBOM, cosign signatures |
 
-Run `make test` to verify locally. Independent benchmark: the public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus. See the [live results](https://pipelab.org/gauntlet/).
+Run `make test` to verify locally. First-party benchmark evidence: the public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus. See the [live results](https://pipelab.org/gauntlet/results/).
 
 ---
 
@@ -773,7 +781,7 @@ The open-source core works independently without paid features. All scanning, de
 and single-agent protection is free.
 
 Pre-built release artifacts (Homebrew, GitHub releases, Docker images) include paid-tier
-code that activates with a valid license key. Building from source with `go install` or the
+code that activates with a valid license key. Building from source with `make build`, `make install`, or the
 repository `Dockerfile` produces a Community-only binary.
 
 See [LICENSE](LICENSE) for the Apache 2.0 text and [enterprise/LICENSE](enterprise/LICENSE) for the ELv2 text.

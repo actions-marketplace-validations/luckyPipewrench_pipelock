@@ -10,8 +10,7 @@ import (
 )
 
 // A classPattern associates a secret class with a compiled regex that
-// matches instances of that class in arbitrary text. Patterns must not have
-// anchors (^ / $) because they are applied inside larger string scalars.
+// matches instances of that class in arbitrary text.
 type classPattern struct {
 	class   Class
 	pattern *regexp.Regexp
@@ -50,6 +49,18 @@ var sigV4CredentialScope = regexp.MustCompile(
 // scoped to a real X-Amz-Credential value, so a SigV4-shaped substring that
 // merely appears in arbitrary text is still redacted.
 var sigV4CredentialPrefix = regexp.MustCompile(`(?i)x-amz-credential(?:=|%3d)$`)
+
+// Provider-key prefixes must not match after a token-alphabet character: a
+// word ending in "sk" followed by "-ant-..." is prose, not a credential. RE2
+// has no lookbehind, so the matcher uses its existing skip guards: the
+// start-anchored trailing guard always matches and the leading guard rejects
+// only candidates immediately preceded by [A-Za-z0-9_-]. This intentionally
+// loses detection of a real key glued to such a character to avoid rewriting
+// ordinary request text. Do not add a length floor; these formats are opaque.
+var (
+	providerKeySkipTrailing   = regexp.MustCompile(`^`)
+	providerKeyInvalidLeading = regexp.MustCompile(`[A-Za-z0-9_-]$`)
+)
 
 // Shared regex fragments reused across category-specific registries.
 const (
@@ -94,10 +105,16 @@ func tokenClasses() []classPattern {
 		// KEY=<placeholder> does not remain shaped like an env-secret leak
 		// after redaction.
 		{class: ClassEnvSecret, pattern: regexp.MustCompile(`\b` + envSecretName + `\b\s*=\s*\S{8,}`), priority: 120},
-		{class: ClassAWSAccessKey, pattern: regexp.MustCompile(`\b(?:AKIA|ASIA|AIDA|AGPA|AROA)[A-Z0-9]{16}\b`), priority: 100, skipTrailing: sigV4CredentialScope, skipLeading: sigV4CredentialPrefix},
+		// Only AKIA (long-term) and ASIA (STS temporary) are AWS access-key IDs
+		// that can be safely placeholdered. AIDA/AGPA/AROA (and the detection-only
+		// AIPA/ANPA/ANVA) are IAM resource IDs, not secrets — rewriting one would
+		// corrupt a legitimate request. The broad detector (config.AWSAccessIDRegex)
+		// still flags those, plus any overlong or obfuscated form; matches the
+		// redactor cannot map back to raw text stay detection-only and fail closed.
+		{class: ClassAWSAccessKey, pattern: regexp.MustCompile(`\b(?:AKIA|ASIA)[A-Z0-9]{16}\b`), priority: 100, skipTrailing: sigV4CredentialScope, skipLeading: sigV4CredentialPrefix},
 		{class: ClassAWSSecretKey, pattern: regexp.MustCompile(`(?i)\b(?:aws_secret_access_key|secret.?access.?key|SecretAccessKey)\s*["'=:\s]{1,5}\s*[A-Za-z0-9/+=]{40}\b`), priority: 100},
 		{class: ClassGoogleAPIKey, pattern: regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}\b`), priority: 100},
-		{class: ClassGitHubToken, pattern: regexp.MustCompile(`(?i)(?:(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9_]{36,}|github_pat_[A-Za-z0-9_]{36,})`), priority: 100},
+		{class: ClassGitHubToken, pattern: regexp.MustCompile(`(?i)(?:(?:ghp|gho|ghu|ghr)_[A-Za-z0-9_]{36,}|ghs_[A-Za-z0-9.\-_]{36,}|github_pat_[A-Za-z0-9_]{36,})`), priority: 100},
 		// All documented GitLab token prefixes (token overview: glpat-,
 		// gloas-, gldt-, glrt-/glrtr-, glcbt-, glptt-, glft-, glimt-,
 		// glagent-, glwt-, glsoat-, glffct-) share the gl<type>- + base64url
@@ -114,10 +131,10 @@ func tokenClasses() []classPattern {
 		// in an AccountKey= connection-string field. Anchored on AccountKey= to
 		// avoid matching arbitrary base64.
 		{class: ClassAzureStorageKey, pattern: regexp.MustCompile(`(?i)\bAccountKey=[A-Za-z0-9+/]{86}==`), priority: 100},
-		// Azure SAS signature: the sig= parameter is a URL-encoded base64
-		// HMAC-SHA256 (32 bytes -> 44 base64 chars, trailing '=' as %3D).
-		// Anchored on the urlencoded padding to bound the match.
-		{class: ClassAzureSAS, pattern: regexp.MustCompile(`(?i)\bsig=[A-Za-z0-9%]{43,}%3d\b`), priority: 100},
+		// Azure SAS signature: the sig= parameter is a base64 HMAC-SHA256
+		// (32 bytes -> 44 base64 chars). Match encoded or decoded padding;
+		// the padding itself terminates the value without consuming a query delimiter.
+		{class: ClassAzureSAS, pattern: regexp.MustCompile(`(?i)\bsig=(?:[A-Za-z0-9%]{43,}%3d\b|[A-Za-z0-9+/]{43}=)`), priority: 100},
 		{class: ClassSlackToken, pattern: regexp.MustCompile(`xox[baprs]-[A-Za-z0-9-]{10,}\b`), priority: 100},
 		{class: ClassFireworksAPIKey, pattern: regexp.MustCompile(`(?i)fw_[A-Za-z0-9]{22}\b`), priority: 100},
 		{class: ClassAIProviderKey, pattern: regexp.MustCompile(`(?i)(?:sk-or-v1-[A-Fa-f0-9]{20,}|pplx-[A-Za-z0-9]{20,}|tvly-[A-Za-z0-9]{20,}|pcsk_[A-Za-z0-9]{36,}|gsk_[A-Za-z0-9]{48,}|xai-[A-Za-z0-9_-]{80,})\b`), priority: 100},
@@ -128,8 +145,11 @@ func tokenClasses() []classPattern {
 		{class: ClassVercelToken, pattern: regexp.MustCompile(`(?i)(?:vercel|vc[piark])_[A-Za-z0-9]{24,}\b`), priority: 100},
 		{class: ClassSupabaseKey, pattern: regexp.MustCompile(`(?i)sb_secret_[A-Za-z0-9_-]{22}_(?:[A-Za-z0-9_-]{7}[A-Za-z0-9_]\b|[A-Za-z0-9_-]{7}-\B)`), priority: 100},
 		{class: ClassDatabricksPAT, pattern: regexp.MustCompile(`(?i)dapi[0-9a-f]{32,}\b`), priority: 100},
-		{class: ClassOpenAIAPIKey, pattern: regexp.MustCompile(`sk-(?:proj|svcacct)-[A-Za-z0-9_-]{20,}\b`), priority: 100},
-		{class: ClassAnthropicKey, pattern: regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}\b`), priority: 100},
+		// Keep the pattern span to the credential so redaction preserves the
+		// surrounding JSON/text delimiter. The skip guards above express the
+		// RE2-unavailable left lookbehind without consuming that delimiter.
+		{class: ClassOpenAIAPIKey, pattern: regexp.MustCompile(`sk-(?:proj|svcacct)-[A-Za-z0-9_-]{20,}`), priority: 100, skipTrailing: providerKeySkipTrailing, skipLeading: providerKeyInvalidLeading},
+		{class: ClassAnthropicKey, pattern: regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]{20,}`), priority: 100, skipTrailing: providerKeySkipTrailing, skipLeading: providerKeyInvalidLeading},
 		{class: ClassNPMToken, pattern: regexp.MustCompile(`(?i)npm_[A-Za-z0-9]{36,}\b`), priority: 100},
 		// PyPI API tokens use the stable "pypi-AgE" prefix for v2 macaroons
 		// with empty location. Update this if PyPI rotates token format.

@@ -2597,7 +2597,10 @@ func TestLogWSBlocked_JSONFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.LogWSBlocked("ws://evil.com/exfil", DirectionClientToServer, ScannerDLP, "secret detected", testClientIP, "req-300")
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com/exfil", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret detected", ClientIP: testClientIP, RequestID: "req-300",
+	})
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -2632,7 +2635,10 @@ func TestLogWSBlocked_Filtered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.LogWSBlocked("ws://evil.com/exfil", DirectionClientToServer, ScannerDLP, "secret detected", testClientIP, "req-300")
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com/exfil", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret detected", ClientIP: testClientIP, RequestID: "req-300",
+	})
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -2883,6 +2889,32 @@ func newLoggerWithEmitter(t *testing.T) (*Logger, *collectingSink) {
 	logger.SetEmitter(emitter)
 	t.Cleanup(func() { _ = emitter.Close() })
 	return logger, sink
+}
+
+func TestLogContainmentMetricsDenyEmitsStructuredFields(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogContainmentMetricsDeny("/metrics", "192.0.2.42", "192.0.2.20:9091", "source_cidr_mismatch")
+	event, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted containment metrics denial")
+	}
+	if event.Type != string(EventContainmentMetricsDeny) || event.Severity != emit.SeverityWarn {
+		t.Fatalf("event type/severity = %q/%v", event.Type, event.Severity)
+	}
+	want := map[string]any{
+		"endpoint":            "/metrics",
+		"client_ip":           "192.0.2.42",
+		"configured_listener": "192.0.2.20:9091",
+		"reason":              "source_cidr_mismatch",
+		"outcome":             "denied",
+	}
+	for field, value := range want {
+		if got := event.Fields[field]; got != value {
+			t.Errorf("%s = %v, want %v", field, got, value)
+		}
+	}
 }
 
 func mustHTTPLogContext(t *testing.T, method, targetURL, requestID string) LogContext {
@@ -3243,42 +3275,44 @@ func TestEmit_SecurityEventsUseWarnSeverity(t *testing.T) {
 
 func TestAuditEmitLookupEventsHaveExplicitSeverity(t *testing.T) {
 	lookupEvents := map[EventType]string{
-		EventStartup:             emit.EventStartup,
-		EventShutdown:            emit.EventShutdown,
-		EventAllowed:             emit.EventAllowed,
-		EventBlocked:             emit.EventBlocked,
-		EventDLPWarn:             emit.EventDLPWarn,
-		EventError:               emit.EventError,
-		EventAnomaly:             emit.EventAnomaly,
-		EventResponseScanExempt:  emit.EventResponseScanExempt,
-		EventMediaExposure:       emit.EventMediaExposure,
-		EventResponseScan:        emit.EventResponseScan,
-		EventTaintDecision:       emit.EventTaintDecision,
-		EventTunnelOpen:          emit.EventTunnelOpen,
-		EventTunnelClose:         emit.EventTunnelClose,
-		EventForwardHTTP:         emit.EventForwardHTTP,
-		EventRedirect:            emit.EventRedirect,
-		EventToolRedirect:        emit.EventToolRedirect,
-		EventConfigReload:        emit.EventConfigReload,
-		EventAgentListener:       emit.EventAgentListener,
-		EventWSOpen:              emit.EventWSOpen,
-		EventWSClose:             emit.EventWSClose,
-		EventWSBlocked:           emit.EventWSBlocked,
-		EventWSScan:              emit.EventWSScan,
-		EventSessionAnomaly:      emit.EventSessionAnomaly,
-		EventAdaptiveRecovery:    emit.EventAdaptiveRecovery,
-		EventMCPUnknownTool:      emit.EventMCPUnknownTool,
-		EventSNIMismatch:         emit.EventSNIMismatch,
-		EventKillSwitchDeny:      emit.EventKillSwitchDeny,
-		EventBodyDLP:             emit.EventBodyDLP,
-		EventBodyPromptInjection: emit.EventBodyPromptInjection,
-		EventAddressProtection:   emit.EventAddressProtection,
-		EventHeaderDLP:           emit.EventHeaderDLP,
-		EventSessionAdmin:        emit.EventSessionAdmin,
-		EventAirlockEnter:        emit.EventAirlockEnter,
-		EventAirlockDeny:         emit.EventAirlockDeny,
-		EventAirlockDeescalate:   emit.EventAirlockDeescalate,
-		EventShieldRewrite:       emit.EventShieldRewrite,
+		EventStartup:                emit.EventStartup,
+		EventShutdown:               emit.EventShutdown,
+		EventAllowed:                emit.EventAllowed,
+		EventBlocked:                emit.EventBlocked,
+		EventDLPWarn:                emit.EventDLPWarn,
+		EventAuthorityVerification:  emit.EventAuthorityVerification,
+		EventError:                  emit.EventError,
+		EventAnomaly:                emit.EventAnomaly,
+		EventResponseScanExempt:     emit.EventResponseScanExempt,
+		EventMediaExposure:          emit.EventMediaExposure,
+		EventResponseScan:           emit.EventResponseScan,
+		EventResponseScanSuppressed: emit.EventResponseScanSuppressed,
+		EventTaintDecision:          emit.EventTaintDecision,
+		EventTunnelOpen:             emit.EventTunnelOpen,
+		EventTunnelClose:            emit.EventTunnelClose,
+		EventForwardHTTP:            emit.EventForwardHTTP,
+		EventRedirect:               emit.EventRedirect,
+		EventToolRedirect:           emit.EventToolRedirect,
+		EventConfigReload:           emit.EventConfigReload,
+		EventAgentListener:          emit.EventAgentListener,
+		EventWSOpen:                 emit.EventWSOpen,
+		EventWSClose:                emit.EventWSClose,
+		EventWSBlocked:              emit.EventWSBlocked,
+		EventWSScan:                 emit.EventWSScan,
+		EventSessionAnomaly:         emit.EventSessionAnomaly,
+		EventAdaptiveRecovery:       emit.EventAdaptiveRecovery,
+		EventMCPUnknownTool:         emit.EventMCPUnknownTool,
+		EventSNIMismatch:            emit.EventSNIMismatch,
+		EventKillSwitchDeny:         emit.EventKillSwitchDeny,
+		EventBodyDLP:                emit.EventBodyDLP,
+		EventBodyPromptInjection:    emit.EventBodyPromptInjection,
+		EventAddressProtection:      emit.EventAddressProtection,
+		EventHeaderDLP:              emit.EventHeaderDLP,
+		EventSessionAdmin:           emit.EventSessionAdmin,
+		EventAirlockEnter:           emit.EventAirlockEnter,
+		EventAirlockDeny:            emit.EventAirlockDeny,
+		EventAirlockDeescalate:      emit.EventAirlockDeescalate,
+		EventShieldRewrite:          emit.EventShieldRewrite,
 	}
 
 	for auditEvent, emitEvent := range lookupEvents {
@@ -3940,6 +3974,38 @@ func TestEmit_LogResponseScan(t *testing.T) {
 	}
 }
 
+func TestEmit_LogResponseScanSuppressed(t *testing.T) {
+	logger, sink := newLoggerWithEmitter(t)
+	defer logger.Close()
+
+	logger.LogResponseScanSuppressed(
+		LogContext{method: testMethodGet, url: "https://example.com", clientIP: testClientIP, requestID: "req-suppressed", agent: testAgentName},
+		"new-instructions",
+		"forward",
+		"destination policy",
+	)
+
+	ev, ok := sink.lastEvent()
+	if !ok {
+		t.Fatal("expected emitted event")
+	}
+	if ev.Type != string(EventResponseScanSuppressed) {
+		t.Errorf("type = %q, want %q", ev.Type, EventResponseScanSuppressed)
+	}
+	for field, want := range map[string]any{
+		"scanner":         scannerpkg.AuditResponseScan,
+		"mode":            "informational",
+		"pattern":         "new-instructions",
+		"surface":         "forward",
+		"reason":          "destination policy",
+		"mitre_technique": mitreT1059,
+	} {
+		if got := ev.Fields[field]; got != want {
+			t.Errorf("fields[%s] = %v, want %v", field, got, want)
+		}
+	}
+}
+
 func TestEmit_LogForwardHTTP(t *testing.T) {
 	logger, sink := newLoggerWithEmitter(t)
 	defer logger.Close()
@@ -3986,7 +4052,10 @@ func TestEmit_LogWSBlocked(t *testing.T) {
 	logger, sink := newLoggerWithEmitter(t)
 	defer logger.Close()
 
-	logger.LogWSBlocked("ws://evil.com", DirectionClientToServer, ScannerDLP, "secret", testClientIP, "req-5")
+	logger.LogWSBlocked(WSBlockedEvent{
+		Target: "ws://evil.com", Direction: DirectionClientToServer, Scanner: ScannerDLP,
+		Reason: "secret", ClientIP: testClientIP, RequestID: "req-5",
+	})
 
 	ev, ok := sink.lastEvent()
 	if !ok {
@@ -4705,7 +4774,15 @@ func TestLogLicenseExpiry(t *testing.T) {
 			logger, sink := newLoggerWithEmitter(t)
 			defer logger.Close()
 
-			logger.LogLicenseExpiry("lic_expiry", 14, 13, tt.severity, "2026-06-01T00:00:00Z")
+			logger.LogLicenseExpiry(LicenseExpiryWarning{
+				LicenseID:     "lic_expiry",
+				Tier:          "trial",
+				ThresholdDays: 14,
+				DaysRemaining: 13,
+				Severity:      tt.severity,
+				ExpiresAt:     "2026-06-01T00:00:00Z",
+				Message:       "trial ends in 13 day(s)",
+			})
 
 			ev, ok := sink.lastEvent()
 			if !ok {
@@ -4720,6 +4797,9 @@ func TestLogLicenseExpiry(t *testing.T) {
 			if ev.Fields["license_id"] != "lic_expiry" {
 				t.Errorf("license_id = %v, want lic_expiry", ev.Fields["license_id"])
 			}
+			if ev.Fields["tier"] != "trial" {
+				t.Errorf("tier = %v, want trial", ev.Fields["tier"])
+			}
 			if ev.Fields["threshold_days"] != 14 {
 				t.Errorf("threshold_days = %v, want 14", ev.Fields["threshold_days"])
 			}
@@ -4731,6 +4811,9 @@ func TestLogLicenseExpiry(t *testing.T) {
 			}
 			if ev.Fields["expires_at"] != "2026-06-01T00:00:00Z" {
 				t.Errorf("expires_at = %v, want timestamp", ev.Fields["expires_at"])
+			}
+			if ev.Fields["message"] != "trial ends in 13 day(s)" {
+				t.Errorf("message = %v, want operator warning", ev.Fields["message"])
 			}
 		})
 	}

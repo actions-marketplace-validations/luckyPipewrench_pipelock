@@ -403,7 +403,7 @@ func interceptTunnel(
 		return fmt.Errorf("set handshake deadline: %w", err)
 	}
 
-	ictx := newConnectAuditContext(ic.Logger, net.JoinHostPort(ic.TargetHost, ic.TargetPort), ic.ClientIP, ic.RequestID, ic.Agent)
+	ictx := newConnectAuditContext(ic.actorAuthContext(), ic.Logger, net.JoinHostPort(ic.TargetHost, ic.TargetPort), ic.ClientIP, ic.RequestID, ic.Agent)
 
 	tlsConn := tls.Server(clientConn, tlsCfg)
 	handshakeStart := time.Now()
@@ -466,6 +466,12 @@ func interceptTunnel(
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: interceptReadHeaderTimeout,
+		// Every request served inside the tunnel inherits the grade that says
+		// how this connection's agent label was established. Without this the
+		// inner requests start from a bare context, so the envelope-failure,
+		// authority-mismatch, and primary audit events below all reported
+		// unknown provenance even though the tunnel knew the real grade.
+		BaseContext: ic.baseContext(),
 		ConnState: func(_ net.Conn, state http.ConnState) {
 			// Close the listener when the connection finishes so Serve()
 			// exits promptly instead of blocking on Accept() forever.
@@ -531,7 +537,7 @@ func newInterceptHandler(
 		if ic.Proxy != nil {
 			if err := ic.Proxy.verifyInboundEnvelope(r, ic.Config); err != nil {
 				pattern := inboundEnvelopeFailurePattern(err)
-				ic.Logger.LogBlocked(newHTTPAuditContext(ic.Logger, r.Method, r.URL.String(), ic.ClientIP, ic.RequestID, ic.Agent),
+				ic.Logger.LogBlocked(newHTTPAuditContext(r.Context(), ic.Logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: ic.ClientIP, RequestID: ic.RequestID, Agent: ic.Agent}),
 					blockLayerMediationEnvelope, pattern)
 				ic.Metrics.RecordTLSRequestBlocked(blockLayerMediationEnvelope)
 				_ = interceptEmitReceipt(ic, receipt.EmitOpts{
@@ -571,7 +577,7 @@ func newInterceptHandler(
 		if !strings.EqualFold(reqHost, ic.TargetHost) || reqPort != ic.TargetPort {
 			mismatch := r.Host + " vs " + target
 			mismatchURL := schemeHTTPS + "://" + net.JoinHostPort(reqHost, reqPort) + r.URL.RequestURI()
-			ic.Logger.LogBlocked(newHTTPAuditContext(ic.Logger, r.Method, mismatchURL, ic.ClientIP, ic.RequestID, ic.Agent), "tls_authority_mismatch", "authority mismatch: "+mismatch)
+			ic.Logger.LogBlocked(newHTTPAuditContext(r.Context(), ic.Logger, httpAuditEvent{Method: r.Method, TargetURL: mismatchURL, ClientIP: ic.ClientIP, RequestID: ic.RequestID, Agent: ic.Agent}), "tls_authority_mismatch", "authority mismatch: "+mismatch)
 			ic.Metrics.RecordTLSRequestBlocked("authority_mismatch")
 			_ = interceptEmitReceipt(ic, receipt.EmitOpts{
 				ActionID:  actionID,
@@ -609,7 +615,7 @@ func newInterceptHandler(
 
 		// Build shared audit context AFTER URL reconstruction so actx.URL
 		// contains the full intercepted URL, not just the origin-form path.
-		actx := newHTTPAuditContext(ic.Logger, r.Method, r.URL.String(), ic.ClientIP, ic.RequestID, ic.Agent)
+		actx := newHTTPAuditContext(r.Context(), ic.Logger, httpAuditEvent{Method: r.Method, TargetURL: r.URL.String(), ClientIP: ic.ClientIP, RequestID: ic.RequestID, Agent: ic.Agent})
 
 		// Track whether any finding occurred (URL, body DLP, or response scan).
 		// RecordClean is only applied when the request was fully clean so that
@@ -810,7 +816,7 @@ func newInterceptHandler(
 			ic.Logger.LogAnomaly(actx, urlResult.Scanner, urlResult.Reason, urlResult.Score)
 		}
 
-		if gitPush := evaluateGitPushAllowlist(ic.Config.GitProtection, r.URL); gitPush.Block {
+		if gitPush := evaluateGitPushAllowlist(ic.Config.GitProtection, r.Method, r.URL); gitPush.Block {
 			ic.Logger.LogBlocked(actx, "git_protection", gitPush.Reason)
 			ic.Metrics.RecordTLSRequestBlocked("git_protection")
 			_ = interceptEmitReceipt(ic, receipt.EmitOpts{
@@ -894,8 +900,9 @@ func newInterceptHandler(
 		// hand the already-buffered bytes to InjectAndSign for
 		// content-digest computation without a second drain pass.
 		var interceptBodyBytes []byte
+		var interceptEntropyWarningPattern string
 		if !ic.Config.RequestBodyScanning.Enabled && isA2A && ic.Config.A2AScanning.Enabled && r.Body != nil && r.Body != http.NoBody {
-			bodyBytes, err := readForwardBodyForProtocolScan(r.Body, r.Header.Get("Content-Encoding"), ic.Config.RequestBodyScanning.MaxBodyBytes)
+			bodyBytes, err := readForwardBodyForProtocolScan(r.Body, r.Header.Get("Content-Encoding"), ic.Config.RequestBodyScanning.MaxBodyBytes, r.Trailer)
 			if err != nil {
 				reason := "a2a: " + err.Error()
 				ic.Logger.LogBlocked(actx, scannerLabelA2A, reason)
@@ -979,22 +986,32 @@ func newInterceptHandler(
 				}
 			}
 			bodyReq := BodyScanRequest{
-				Body:            r.Body,
-				Method:          r.Method,
-				ContentType:     r.Header.Get("Content-Type"),
-				ContentEncoding: r.Header.Get("Content-Encoding"),
-				MaxBytes:        ic.Config.RequestBodyScanning.MaxBodyBytes,
-				Scanner:         ic.Scanner,
-				AgentID:         ic.Agent,
-				Host:            r.URL.Hostname(),
-				Path:            r.URL.Path,
-				Target:          targetURL,
-				Suppress:        ic.Config.Suppress,
-				Action:          ic.Config.RequestBodyScanning.Action,
-				DisablePatterns: ic.Config.RequestBodyScanning.DisablePatterns,
-				PatternActions:  ic.Config.RequestBodyScanning.PatternActions,
+				Body:             r.Body,
+				Trailer:          r.Trailer,
+				Scheme:           "https",
+				Method:           r.Method,
+				ContentType:      r.Header.Get("Content-Type"),
+				ContentEncoding:  r.Header.Get("Content-Encoding"),
+				MaxBytes:         ic.Config.RequestBodyScanning.MaxBodyBytes,
+				Scanner:          ic.Scanner,
+				AgentID:          ic.Agent,
+				Host:             r.URL.Hostname(),
+				Path:             r.URL.Path,
+				EntropyRoutePath: r.URL.EscapedPath(),
+				Target:           targetURL,
+				Suppress:         ic.Config.Suppress,
+				Action:           ic.Config.RequestBodyScanning.Action,
+				DisablePatterns:  ic.Config.RequestBodyScanning.DisablePatterns,
+				PatternActions:   ic.Config.RequestBodyScanning.PatternActions,
+				OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+					if ic.Logger != nil {
+						ic.Logger.LogDLPDropped(actx, match.PatternName, match.Severity, "body", reason)
+					}
+					ic.Metrics.RecordDLPDroppedMatch(match.PatternName, "body", reason)
+				},
 			}
 			applyContentEntropyConfig(&bodyReq, ic.Config)
+			applySigV4CredentialRouteConfig(&bodyReq, ic.Config)
 			if isA2A {
 				bodyReq.ContentEntropyEnabled = false
 			}
@@ -1049,6 +1066,9 @@ func newInterceptHandler(
 			}
 
 			if !result.Clean {
+				// An authorized entropy warning remains a finding for receipts and
+				// does not count as a clean adaptive-recovery event. Its exemption
+				// below prevents score signals and action re-promotion only.
 				hasFinding = true
 				action := result.Action
 				if action == "" {
@@ -1074,7 +1094,7 @@ func newInterceptHandler(
 					case len(injectionNames) > 0:
 						reason = fmt.Sprintf("request body contains prompt injection: %s", strings.Join(injectionNames, ", "))
 					case result.EntropyFinding != nil:
-						reason = contentEntropyReason(result.EntropyFinding)
+						reason = bodyEntropyReason(result)
 					default:
 						patternNames := dlpMatchNames(result.DLPMatches)
 						reason = fmt.Sprintf("request body contains secret: %s", strings.Join(patternNames, ", "))
@@ -1087,9 +1107,7 @@ func newInterceptHandler(
 				// weakening scoring on general allowlisted hosts like github.com.
 				// Address protection findings and fail-closed body errors are NOT
 				// exempted - only DLP pattern matches.
-				dlpExempt := scannerLabel == scannerLabelBodyDLP &&
-					len(result.DLPMatches) > 0 &&
-					isAdaptiveExempt(r.URL.Hostname(), ic.Config.AdaptiveEnforcement.ExemptDomains)
+				bodyAdaptiveExempt := isBodyAdaptiveExempt(scannerLabel, result, r.URL.Hostname(), ic.Config)
 				promptInjectionHardBlock := shouldHardBlockBodyPromptInjection(result, r.URL.Hostname(), ic.Config)
 				dlpHardBlock := shouldHardBlockBodyCriticalDLP(result, r.URL.Hostname(), ic.Config)
 				if promptInjectionHardBlock || dlpHardBlock {
@@ -1101,7 +1119,7 @@ func newInterceptHandler(
 				// legitimate LLM traffic from cascading into session blocks.
 				originalBodyAction := action
 				level := interceptEscalationLevel(ic)
-				if !dlpExempt {
+				if !bodyAdaptiveExempt {
 					action = decide.UpgradeAction(action, level, &ic.Config.AdaptiveEnforcement)
 				}
 				if action != originalBodyAction {
@@ -1121,7 +1139,7 @@ func newInterceptHandler(
 				// mode. ActionAsk also has no HITL terminal in intercepted
 				// tunnels, so it fails closed here.
 				if promptInjectionHardBlock || dlpHardBlock || isFailClosedBodyResult(result, bodyBytes) || action == config.ActionAsk || (action == config.ActionBlock && ic.Config.EnforceEnabled()) {
-					if !dlpExempt {
+					if !bodyAdaptiveExempt {
 						interceptRecordSignal(ic, session.SignalBlock)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason)
@@ -1148,7 +1166,7 @@ func newInterceptHandler(
 				// a base action that was already "block" would fire here even
 				// without any escalation, which is not the intent.
 				if action == config.ActionBlock && action != originalBodyAction && !ic.Config.EnforceEnabled() {
-					if !dlpExempt {
+					if !bodyAdaptiveExempt {
 						interceptRecordSignal(ic, session.SignalBlock)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason+" (escalated)")
@@ -1168,6 +1186,9 @@ func newInterceptHandler(
 					writeBlockedError(w, blockInfo(scannerLabel),
 						"blocked: "+reason+" (escalated)", http.StatusForbidden)
 					return
+				}
+				if action == config.ActionWarn && result.EntropyWarnRoute != nil {
+					interceptEntropyWarningPattern = bodyEntropyReason(result)
 				}
 				// Audit/warn mode: log finding but forward the request.
 				ic.Logger.LogAnomaly(actx, scannerLabel, reason, 0.8)
@@ -1247,7 +1268,12 @@ func newInterceptHandler(
 
 		// Request header DLP scanning.
 		if ic.Config.RequestBodyScanning.Enabled && ic.Config.RequestBodyScanning.ScanHeaders {
-			headerResult := scanRequestHeadersForTarget(r.Context(), r.Header, ic.Config, ic.Scanner, targetURL)
+			headerResult := scanRequestHeadersForTargetWithDropped(r.Context(), r.Header, ic.Config, ic.Scanner, targetURL, func(match scanner.TextDLPMatch, reason string) {
+				if ic.Logger != nil {
+					ic.Logger.LogDLPDropped(actx, match.PatternName, match.Severity, "header", reason)
+				}
+				ic.Metrics.RecordDLPDroppedMatch(match.PatternName, "header", reason)
+			})
 
 			// Capture observer: record intercept header DLP verdict for policy replay.
 			if ic.Proxy != nil {
@@ -1347,10 +1373,11 @@ func newInterceptHandler(
 		sessionKey := ceeSessionKey(ic.Agent, ic.ClientIP, ic.ActorAuth)
 		outbound := extractOutboundPayload(r)
 		keys := queryParamKeys(r.URL)
+		paths := pathSegments(r.URL)
 		var admission ceeAdmission
 		if ic.Proxy != nil {
 			admission = ic.Proxy.admitCurrentCEE(r.Context(), ceeAdmitRequest{
-				SessionKey: sessionKey, Outbound: outbound, KeyPayload: keys, TargetURL: r.URL.String(),
+				SessionKey: sessionKey, Outbound: outbound, KeyPayload: keys, PathPayload: paths, TargetURL: r.URL.String(),
 				Agent: ic.Agent, ClientIP: ic.ClientIP, RequestID: ic.RequestID, IncludeFragments: true,
 			})
 			// A missing live snapshot is security-relevant only when this
@@ -1368,8 +1395,13 @@ func newInterceptHandler(
 			ceeCfg := ceeEffectiveConfig(ic.Config.CrossRequestDetection, ic.Config.EnforceEnabled())
 			if ceeCfg.Enabled {
 				admission = ceeAdmission{
-					Result: ceeAdmit(r.Context(), sessionKey, outbound, keys, r.URL.String(), ic.Agent, ic.ClientIP, ic.RequestID,
-						ceeCfg, ic.EntropyTracker, ic.FragmentBuffer, ic.Scanner, ic.Logger, ic.Metrics),
+					Result: ceeAdmit(r.Context(), ceeAdmitOptions{
+						SessionKey: sessionKey, Outbound: outbound, KeyPayload: keys,
+						PathPayload: paths, TargetURL: r.URL.String(), Agent: ic.Agent,
+						ClientIP: ic.ClientIP, RequestID: ic.RequestID, Config: ceeCfg,
+						Entropy: ic.EntropyTracker, Fragments: ic.FragmentBuffer,
+						Scanner: ic.Scanner, Logger: ic.Logger, Metrics: ic.Metrics,
+					}),
 					Config:         ceeCfg,
 					AdaptiveConfig: ic.Config.AdaptiveEnforcement,
 					Sessions:       ic.SessionMgr,
@@ -1637,9 +1669,19 @@ func newInterceptHandler(
 		// fail closed BEFORE the inner request leaves the intercepted tunnel.
 		// Every field here is request-side, so response allow paths reuse this
 		// action and skip duplicate required intents after the durable gate.
+		receiptVerdict := config.ActionAllow
+		receiptLayer := ""
+		receiptPattern := ""
+		if interceptEntropyWarningPattern != "" {
+			receiptVerdict = config.ActionWarn
+			receiptLayer = scannerLabelBodyEntropy
+			receiptPattern = interceptEntropyWarningPattern
+		}
 		allowReceipt := withInterceptRedaction(receipt.EmitOpts{
 			ActionID:  actionID,
-			Verdict:   config.ActionAllow,
+			Verdict:   receiptVerdict,
+			Layer:     receiptLayer,
+			Pattern:   receiptPattern,
 			Transport: "intercept",
 			Method:    r.Method,
 			Target:    targetURL,
@@ -1687,6 +1729,22 @@ func newInterceptHandler(
 			return
 		}
 		defer resp.Body.Close() //nolint:errcheck // response body
+		stripUpstreamShieldRewriteMarker(resp)
+		// The authenticated-artifact exception is verified at the proxy before
+		// bytes reach the client; it is not a route-level response exemption.
+		interceptAuthenticatedArtifact := false
+		if artifact, artifactErr := verifyAuthenticatedArtifact(r.Context(), r, resp, upstream, time.Duration(ic.Config.FetchProxy.TimeoutSeconds)*time.Second, ic.Config.ResponseScanning.AuthenticatedArtifacts); artifactErr != nil {
+			ic.Logger.LogBlocked(actx, "authenticated_artifact", artifactErr.Error())
+			ic.Metrics.RecordTLSResponseBlocked("authenticated_artifact")
+			_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{ActionID: actionID, Verdict: config.ActionBlock, Layer: "authenticated_artifact", Pattern: artifactErr.Error(), Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent}))
+			writeBlockedError(w, blockInfoFor(blockreason.EnvelopeVerifyFailed, "authenticated_artifact"), "blocked: authenticated artifact verification failed", http.StatusForbidden)
+			emitBlockedPostRoundTripOutcome(http.StatusForbidden, "authenticated_artifact")
+			return
+		} else if artifact != nil {
+			interceptAuthenticatedArtifact = true
+			ic.Logger.LogAnomaly(actx, "authenticated_artifact", "official signed artifact verified before response release", 0)
+			_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{ActionID: actionID, Verdict: config.ActionAllow, Layer: "authenticated_artifact", Pattern: "official signed artifact verified before response release", Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent}))
+		}
 
 		// Fail-closed on compressed responses: DLP regex can't match
 		// compressed content. Block rather than forward unscanned data.
@@ -1723,7 +1781,7 @@ func newInterceptHandler(
 		// scanning state, because pipelock must never forward
 		// inspection-resistant bytes through a security boundary.
 		interceptRespExempt := isResponseScanExempt(r.URL.Hostname(), ic.Config.ResponseScanning.ExemptDomains)
-		if HasSingleSSEContentType(resp.Header) {
+		if HasSingleSSEContentType(resp.Header) && !interceptAuthenticatedArtifact {
 			if ic.Scanner.ResponseScanningEnabled() && interceptRespExempt {
 				ic.Logger.LogResponseScanExempt(actx, r.URL.Hostname())
 				ic.Metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportConnect)
@@ -1738,6 +1796,12 @@ func newInterceptHandler(
 					ResponseScanExempt: interceptRespExempt,
 					OnFinding: func(err error) {
 						ic.Logger.LogAnomaly(actx, LayerSSEStream, err.Error(), 0)
+					},
+					OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
+						if ic.Logger != nil {
+							ic.Logger.LogDLPDropped(actx, match.PatternName, match.Severity, "mcp_sse", reason)
+						}
+						ic.Metrics.RecordDLPDroppedMatch(match.PatternName, "mcp_sse", reason)
 					},
 				},
 			}
@@ -1796,7 +1860,24 @@ func newInterceptHandler(
 				// terminate the stream. Generic SSE warn-mode findings are
 				// handled inline by GenericSSEScanOptions.OnFinding and
 				// return nil.
-				if IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn {
+				if IsSSEStreamScanError(streamErr) {
+					reason := "response scan failed: " + streamErr.Error()
+					ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+					ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+						ActionID:  actionID,
+						Verdict:   config.ActionBlock,
+						Layer:     "response_scan_error",
+						Pattern:   reason,
+						Transport: "intercept",
+						Method:    r.Method,
+						Target:    targetURL,
+						RequestID: ic.RequestID,
+						Agent:     ic.Agent,
+					}))
+				} else if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+					ic.Logger.LogError(actx, streamErr)
+				} else if IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn {
 					ic.Logger.LogAnomaly(actx, sseLayer, streamErr.Error(), 0)
 				} else {
 					ic.Logger.LogBlocked(actx, sseLayer, streamErr.Error())
@@ -1819,6 +1900,10 @@ func newInterceptHandler(
 			// still the upstream status and the close reason carries the block.
 			if streamErr == nil || (IsSSEStreamFinding(streamErr) && sseAction == config.ActionWarn) {
 				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionAllow, resp.StatusCode, -1, "sse_stream")
+			} else if IsSSEStreamScanError(streamErr) {
+				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionBlock, resp.StatusCode, -1, "response_scan_error")
+			} else if errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionAllow, resp.StatusCode, -1, "sse_stream_cancelled")
 			} else {
 				interceptEmitOutcomeReceipt(ic, sseAllowReceipt, config.ActionBlock, resp.StatusCode, -1, sseLayer)
 			}
@@ -1886,7 +1971,7 @@ func newInterceptHandler(
 					Outcome:           captureOutcome(config.ActionAllow, true),
 				})
 			}
-			if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding {
+			if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding && !interceptAuthenticatedArtifact {
 				ic.Recorder.RecordClean(ic.Config.AdaptiveEnforcement.DecayPerCleanRequest)
 			}
 			ic.Metrics.RecordAllowed(time.Since(reqStart), agentAnonymous)
@@ -1970,7 +2055,7 @@ func newInterceptHandler(
 						})
 					}
 					ic.Metrics.RecordAllowed(time.Since(reqStart), agentAnonymous)
-					if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding {
+					if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding && !interceptAuthenticatedArtifact {
 						ic.Recorder.RecordClean(ic.Config.AdaptiveEnforcement.DecayPerCleanRequest)
 					}
 					return
@@ -2029,14 +2114,16 @@ func newInterceptHandler(
 
 		// Browser Shield on intercepted response body.
 		if ic.Proxy != nil {
+			shieldBodyLen := len(respBody)
 			var shieldBlocked bool
 			var shieldSummary *receipt.ShieldSummary
+			shieldMaxBytes := shieldMaxBytesForResponse(ic.Config, ic.TargetHost, TransportConnect)
 			respBody, shieldSummary, shieldBlocked = ic.Proxy.applyShield(respBody, resp.Header.Get("Content-Type"), ic.TargetHost, resp.Header, ic.Config, actx, ic.ClientIP, ic.RequestID, TransportConnect, actionID)
 			if shieldBlocked {
 				ic.Metrics.RecordTLSResponseBlocked("shield_oversize")
 				writeBlockedError(w,
 					blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
-					"blocked: response body exceeds browser shield size limit", http.StatusForbidden)
+					"blocked: "+shieldOversizeBlockReason(ic.TargetHost, shieldBodyLen, shieldMaxBytes), http.StatusForbidden)
 				emitBlockedPostRoundTripOutcome(http.StatusForbidden, "shield_oversize")
 				return
 			}
@@ -2044,6 +2131,7 @@ func newInterceptHandler(
 			// browser/client mismatch. Remove body-derived validators since
 			// the body is no longer the original.
 			if shieldSummary != nil {
+				setShieldRewriteHeader(resp.Header, shieldSummary)
 				resp.Header.Set("Content-Length", strconv.Itoa(len(respBody)))
 				resp.Header.Del("ETag")
 				resp.Header.Del("Digest")
@@ -2136,6 +2224,20 @@ func newInterceptHandler(
 			} else {
 				a2aRespResult = mcp.ScanA2AResponseBody(r.Context(), respBody, ic.Scanner, &ic.Config.A2AScanning)
 			}
+			if a2aRespResult.ScanError != "" {
+				reason := "response scan failed: " + a2aRespResult.ScanError
+				ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+				ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+					Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent,
+				}))
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				emitBlockedPostRoundTripOutcome(http.StatusServiceUnavailable, "response_scan_error")
+				return
+			}
 			if !a2aRespResult.Clean {
 				// Consistency with URL-scan path: infrastructure errors are
 				// score-neutral and must not set the finding flag.
@@ -2190,9 +2292,10 @@ func newInterceptHandler(
 			ic.Logger.LogResponseScanExempt(actx, r.URL.Hostname())
 			ic.Metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportConnect)
 		}
-		if ic.Scanner.ResponseScanningEnabled() {
-			scanResult := ic.Scanner.ScanResponseWithSuppress(r.Context(), string(respBody), r.URL.String(), ic.Config.Suppress)
+		if ic.Scanner.ResponseScanningEnabled() && !interceptAuthenticatedArtifact {
+			scanResult := ic.Scanner.ScanResponseBodyWithSuppress(r.Context(), respBody, r.URL.String(), ic.Config.Suppress)
 			recordSuppressedResponseScanExempts(ic.Metrics, scanResult.SuppressedMatches, TransportConnect)
+			recordDroppedResponseScanMatches(ic.Metrics, ic.Logger, actx, scanResult.SuppressedMatches, TransportConnect)
 
 			// Capture observer: record intercept response scan verdict for policy replay.
 			// Runs after suppression so the recorded action matches runtime.
@@ -2203,6 +2306,8 @@ func newInterceptHandler(
 				}
 				if scanResult.Clean {
 					iRespAction = config.ActionAllow
+				} else if scanResult.Failed() {
+					iRespAction = config.ActionBlock
 				}
 				ic.Proxy.captureObs.ObserveResponseVerdict(r.Context(), &capture.ResponseVerdictRecord{
 					Subsurface:        "response_intercept",
@@ -2221,6 +2326,20 @@ func newInterceptHandler(
 					EffectiveAction:   iRespAction,
 					Outcome:           captureOutcome(iRespAction, scanResult.Clean),
 				})
+			}
+			if scanResult.Failed() {
+				reason := "response scan failed: " + scanResult.ScanError
+				ic.Logger.LogError(actx, fmt.Errorf("%s", reason))
+				ic.Metrics.RecordTLSResponseBlocked("response_scan_error")
+				_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
+					ActionID: actionID, Verdict: config.ActionBlock, Layer: "response_scan_error", Pattern: reason,
+					Transport: "intercept", Method: r.Method, Target: targetURL, RequestID: ic.RequestID, Agent: ic.Agent,
+				}))
+				writeBlockedError(w,
+					blockInfoFor(blockreason.ParseError, "response_scan_error"),
+					"blocked: response scan incomplete", http.StatusServiceUnavailable)
+				emitBlockedPostRoundTripOutcome(http.StatusServiceUnavailable, "response_scan_error")
+				return
 			}
 			if !scanResult.Clean {
 				hasFinding = true
@@ -2242,7 +2361,7 @@ func newInterceptHandler(
 					if ic.Proxy != nil {
 						m = ic.Proxy.metrics
 					}
-					recordAdaptiveUpgrade(ic.Logger, m, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: originalAction, ToAction: action, Scanner: "response_scan", ClientIP: ic.ClientIP, RequestID: ic.RequestID})
+					recordAdaptiveUpgrade(ic.Logger, m, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(level), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: ic.ClientIP, RequestID: ic.RequestID})
 				}
 				patternNames := make([]string, len(scanResult.Matches))
 				for i, match := range scanResult.Matches {
@@ -2250,6 +2369,10 @@ func newInterceptHandler(
 				}
 				bundleRules := responseBundleRules(scanResult.Matches)
 				reason := fmt.Sprintf("response injection: %s", strings.Join(patternNames, ", "))
+				if action == config.ActionStrip && scanResult.TransformedContent == "" {
+					action = config.ActionBlock
+					reason += " (strip failed)"
+				}
 
 				switch action {
 				case config.ActionBlock, config.ActionAsk:
@@ -2258,12 +2381,12 @@ func newInterceptHandler(
 					if !interceptRespExempt {
 						interceptRecordSignal(ic, session.SignalBlock)
 					}
-					ic.Logger.LogBlocked(actx, "response_scan", reason)
+					ic.Logger.LogBlocked(actx, responseScanLayer, reason)
 					ic.Metrics.RecordTLSResponseBlocked("injection")
 					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
 						ActionID:  actionID,
 						Verdict:   config.ActionBlock,
-						Layer:     "response_scan",
+						Layer:     responseScanLayer,
 						Pattern:   reason,
 						Transport: "intercept",
 						Method:    r.Method,
@@ -2272,9 +2395,9 @@ func newInterceptHandler(
 						Agent:     ic.Agent,
 					}))
 					writeBlockedError(w,
-						blockInfoFor(blockreason.PromptInjection, "response_scan"),
+						blockInfoFor(blockreason.PromptInjection, responseScanLayer),
 						"blocked: response contains injection", http.StatusForbidden)
-					emitBlockedPostRoundTripOutcome(http.StatusForbidden, "response_scan")
+					emitBlockedPostRoundTripOutcome(http.StatusForbidden, responseScanLayer)
 					return
 				case config.ActionStrip:
 					// Record SignalStrip for adaptive enforcement scoring.
@@ -2297,7 +2420,7 @@ func newInterceptHandler(
 		// Record clean request for adaptive score decay. Only apply decay when no
 		// finding was detected; warn/strip paths indicate suspicious traffic and
 		// must not contribute to score decay.
-		if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding {
+		if ic.Recorder != nil && ic.Config.AdaptiveEnforcement.Enabled && !hasFinding && !interceptAuthenticatedArtifact {
 			ic.Recorder.RecordClean(ic.Config.AdaptiveEnforcement.DecayPerCleanRequest)
 		}
 
@@ -2380,4 +2503,28 @@ func (l *singleConnListener) Close() error {
 
 func (l *singleConnListener) Addr() net.Addr {
 	return l.addr
+}
+
+// actorAuthContext returns a context carrying this interception's agent-label
+// provenance grade, so audit contexts built here report it instead of unknown.
+func (ic *InterceptContext) actorAuthContext() context.Context {
+	return withActorAuth(context.Background(), ic.ActorAuth)
+}
+
+// baseContext returns the http.Server BaseContext hook for the tunnel's inner
+// server, so every request served inside the tunnel starts from a context
+// carrying this interception's agent-label provenance grade.
+//
+// It is a named method rather than an inline closure so a test can call the
+// exact function the server is wired with, instead of asserting that some
+// field is non-nil.
+func (ic *InterceptContext) baseContext() func(net.Listener) context.Context {
+	return func(net.Listener) context.Context {
+		return ic.actorAuthContext()
+	}
+}
+
+// withActorAuth attaches an agent-label provenance grade to a context.
+func withActorAuth(parent context.Context, auth envelope.ActorAuth) context.Context {
+	return context.WithValue(parent, ctxKeyAgentAuth, string(auth))
 }

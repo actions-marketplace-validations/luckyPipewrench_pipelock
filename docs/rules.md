@@ -98,6 +98,15 @@ At startup, pipelock scans the rules directory for installed bundles. Each bundl
 
 Bundle rules cannot override or disable built-in patterns. They are additive only.
 
+### Version-gate outcomes
+
+| Bundle check | Outcome |
+|---|---|
+| The running build version cannot be proven against `min_pipelock` | Warn and load the bundle by default. Set `rules.allow_unversioned_bundle_load: false` to refuse it. |
+| A released running version is below `min_pipelock` | Refuse the bundle. |
+| The bundle format is incompatible | Refuse the bundle. |
+
+During a rolling upgrade, set `allow_unversioned_bundle_load` explicitly on every instance. A binary from before this behavior treats an omitted value as refuse, so an omitted setting reads differently across a mixed fleet and the effective policy hash differs with it.
 ## Configuration
 
 ```yaml
@@ -135,6 +144,8 @@ Bundles are Ed25519-signed YAML files. Pipelock verifies signatures against a ke
 ### Official bundles
 
 Official bundles (like `pipelock-community`) are signed with the production key compiled into the source and also embedded in release binaries at build time. No additional configuration is needed.
+
+The first successful install is trust on first use for freshness. The signature proves who published the bundle and that its bytes are intact, but a machine with no saved history can't prove that the first valid bundle it sees is the newest one. Pipelock records that accepted bundle's monotonic version and format. Later installs and updates can't move either value backward. Removing or explicitly resetting the freshness state also removes that local rollback history, so verify the installed bundles before running `pipelock rules reset-freshness`.
 
 Private-root-only operators can set `rules.trust_embedded_keys: false` to remove the compiled official keyring from bundle verification. In that mode, bundles must be signed by `rules.trusted_keys`; unsigned local bundles are rejected, and strict mode treats non-matching installed bundles as integrity failures unless the operator explicitly enables `rules.allow_degraded`.
 
@@ -218,6 +229,22 @@ the `pattern.validator` field.
 | DLP pattern | `dlp` | `dlp.patterns` |
 | Injection pattern | `injection` | `response_scanning.patterns` |
 | Tool poison pattern | `tool-poison` | `mcp_tool_scanning` descriptions |
+
+Tool-poison rules with `scan_field: description` scan the tool's `description` and `description` fields nested in its input schema. Built-in scanning still covers every other agent-visible tool field, but those fields do not trigger description-scoped bundle rules.
+
+### Machine-readable reader contract
+
+A release-stamped Pipelock binary can export the rule-bundle contract it enforces:
+
+```bash
+pipelock rules schema > pipelock-rule-schema.json
+```
+
+The JSON records the exact Pipelock version and source revision, accepted bundle formats, YAML fields,
+enum values, rule types, type-specific pattern fields, merge targets, and bundle action semantics. The
+command refuses to produce an unversioned contract when the build can't report its source revision.
+Consumers should pin output from an exact Pipelock artifact by digest instead of fetching a moving
+release during ordinary pull-request checks.
 
 ### Signing your bundle
 

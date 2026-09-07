@@ -18,6 +18,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
+
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/emitformat"
 )
@@ -544,7 +546,7 @@ func TestSyslogSink_SuccessHealthTransitionIsAtomic(t *testing.T) {
 func TestSyslogSink_SuccessDoesNotEraseConcurrentDropDegraded(t *testing.T) {
 	var sink *SyslogSink
 	writer := &callbackSyslogWriter{writeFn: func() {
-		sink.recordDropped("queue_full", nil)
+		sink.recordDropped()
 	}}
 	sink = &SyslogSink{writer: writer, queue: make(chan syslogMessage, 1)}
 
@@ -566,7 +568,7 @@ func TestSyslogSink_RepeatedDegradeRecoverCycles(t *testing.T) {
 	}
 
 	for cycle := 1; cycle <= 3; cycle++ {
-		sink.recordDropped("queue_full", nil)
+		sink.recordDropped()
 		if stats := sink.Stats(); !stats.Degraded || stats.LastError != "queue_full" {
 			t.Fatalf("cycle %d degraded stats = %+v", cycle, stats)
 		}
@@ -801,9 +803,10 @@ func TestMakeSyslogMessage_CEF(t *testing.T) {
 		Timestamp:  time.Date(2026, 7, 5, 12, 0, 0, 0, time.UTC),
 		InstanceID: testInstanceName,
 		Fields: map[string]any{
-			"action":    conventionActionBlock,
-			"agent":     "agent-a",
-			fieldReason: "header token",
+			"action":     conventionActionBlock,
+			"agent":      "agent-a",
+			"agent_auth": string(envelope.ActorAuthBound),
+			fieldReason:  "header token",
 		},
 	}, FormatCEF, "1.2.3")
 	if err != nil {

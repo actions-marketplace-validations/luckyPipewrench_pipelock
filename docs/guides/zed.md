@@ -27,7 +27,8 @@ sequences.
 
 ```bash
 # 1. Install pipelock (requires Go 1.25+)
-go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
+git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
 # 2. Wrap every Zed MCP context_server (default discovery; no args needed)
@@ -188,13 +189,13 @@ and strips that field. Non-wrapped entries and non-server top-level fields
 
 | Preset | Action | Best For |
 |--------|--------|----------|
-| `balanced.yaml` | warn | Getting started, tuning phase |
-| `claude-code.yaml` | block | Unattended Zed agent sessions |
-| `strict.yaml` | block | High-security repos, sensitive code |
-| `hostile-model.yaml` | block | Local / uncensored models routed through Zed |
+| `balanced` | warn | Getting started, tuning phase |
+| `claude-code` | block | Unattended Zed agent sessions |
+| `strict` | block | High-security repos, sensitive code |
+| `hostile-model` | block | Local / uncensored models routed through Zed |
 
-Start with `balanced.yaml` to surface false positives without breaking your
-workflow. Switch to `claude-code.yaml` or `strict.yaml` once you've tuned
+Start with `balanced` to surface false positives without breaking your
+workflow. Switch to `claude-code` or `strict` once you've tuned
 the pattern set.
 
 ## Limitations

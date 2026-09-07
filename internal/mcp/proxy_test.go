@@ -2762,6 +2762,19 @@ func TestStripResponse_Batch(t *testing.T) {
 	}
 }
 
+func TestStripResponse_WhitespacePrefixedBatch(t *testing.T) {
+	sc := testScannerWithAction(t, "strip")
+	batch := " \t" + `[` + injectionResponse + `]`
+
+	stripped, err := stripResponse([]byte(batch), sc)
+	if err != nil {
+		t.Fatalf("stripResponse whitespace-prefixed batch: %v", err)
+	}
+	if !bytes.Contains(stripped, []byte("[REDACTED:")) {
+		t.Fatalf("whitespace-prefixed batch was not stripped: %s", stripped)
+	}
+}
+
 func TestStripResponse_BatchInvalidJSON(t *testing.T) {
 	sc := testScannerWithAction(t, "strip")
 	_, err := stripResponse([]byte(`[not valid`), sc)
@@ -3248,6 +3261,9 @@ func TestForwardScanned_ConfusedDeputy_UnsolicitedResponseBlocked(t *testing.T) 
 	var out, log bytes.Buffer
 
 	tracker := NewRequestTracker()
+	// Keep the tracker seeded: method-only server notifications are not
+	// result/error envelopes and must remain forwardable after a request.
+	tracker.Track(json.RawMessage(`1`))
 	// Track ID 1, but server sends response with ID 99.
 	tracker.Track(json.RawMessage(`1`))
 
@@ -3367,7 +3383,7 @@ func TestForwardScanned_ConfusedDeputy_NilTrackerDisabled(t *testing.T) {
 	}
 }
 
-func TestForwardScanned_ConfusedDeputy_NullIDResponsePassedThrough(t *testing.T) {
+func TestForwardScanned_ConfusedDeputy_PreSeedNullIDResponsePassedThrough(t *testing.T) {
 	sc := testScannerWithAction(t, "warn")
 	var out, log bytes.Buffer
 
@@ -3385,6 +3401,32 @@ func TestForwardScanned_ConfusedDeputy_NullIDResponsePassedThrough(t *testing.T)
 
 	if strings.Contains(log.String(), "confused deputy") {
 		t.Error("null ID response should not trigger confused deputy")
+	}
+}
+
+func TestRunProxy_ConfusedDeputy_SeededNullIDResponseBlocked(t *testing.T) {
+	sc := testScannerWithAction(t, "warn")
+	var out, log bytes.Buffer
+
+	// The child cannot send its response until it receives the request, so the
+	// proxy has registered the request ID before this null-ID result arrives.
+	serverScript := `IFS= read -r _; printf '%s\n' '{"jsonrpc":"2.0","id":null,"result":{"owned":"attack"}}'`
+	err := RunProxy(
+		context.Background(),
+		strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/list"}`+"\n"),
+		&out,
+		&log,
+		[]string{"sh", "-c", serverScript},
+		testOpts(sc),
+	)
+	if err != nil {
+		t.Fatalf("RunProxy: %v", err)
+	}
+	if strings.Contains(out.String(), `"owned":"attack"`) {
+		t.Fatalf("uncorrelated response reached client: %s", out.String())
+	}
+	if !strings.Contains(out.String(), "no correlatable ID") {
+		t.Fatalf("stdout = %q, want confused-deputy block", out.String())
 	}
 }
 
@@ -4439,6 +4481,42 @@ func TestForwardScanned_BatchJSONRPCBlocked(t *testing.T) {
 	if outBuf.Len() > 0 {
 		t.Errorf("expected no output for blocked batch, got: %s", outBuf.String())
 	}
+}
+
+func TestForwardScanned_BlocksWhitespacePrefixedBatchJSONRPC(t *testing.T) {
+	// Stdio trims, so this uses a raw reader matching WebSocket/SSE payloads.
+	batch := []byte("  \t" + `[{"jsonrpc":"2.0","id":1,"result":"ok"},{"jsonrpc":"2.0","id":999,"result":"injected"}]`)
+
+	sc := testScannerWithAction(t, config.ActionWarn)
+	var outBuf bytes.Buffer
+	logBuf := &syncBuffer{}
+	opts := MCPProxyOpts{Scanner: sc}
+
+	_, err := ForwardScanned(&oneShotMessageReader{msg: batch}, transport.NewStdioWriter(&outBuf), logBuf, nil, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if outBuf.Len() != 0 {
+		t.Errorf("expected no output for whitespace-prefixed batch, got: %s", outBuf.String())
+	}
+	if !strings.Contains(logBuf.String(), "blocked batch JSON-RPC") {
+		t.Errorf("expected batch block log, got: %s", logBuf.String())
+	}
+}
+
+type oneShotMessageReader struct {
+	msg  []byte
+	done bool
+}
+
+func (r *oneShotMessageReader) ReadMessage() ([]byte, error) {
+	if r.done {
+		return nil, io.EOF
+	}
+	r.done = true
+	out := make([]byte, len(r.msg))
+	copy(out, r.msg)
+	return out, nil
 }
 
 // TestForwardScanned_MidStreamBlockAllEscalation verifies that when

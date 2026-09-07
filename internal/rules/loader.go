@@ -37,9 +37,11 @@ type LoadOptions struct {
 	TrustedKeys          []config.TrustedKey // additional trusted signing keys
 	SkipEmbeddedKeys     bool                // exclude compiled official keyring from trust
 	PipelockVersion      string              // current binary version for min_pipelock check
-	AllowUnversionedLoad bool                // load min_pipelock bundles on a build with no released version
+	AllowUnversionedLoad bool                // load min_pipelock bundles with a warning on an unprovable version
 	AllowStale           bool                // accept expired bundles with warning
 	TierKeyMapping       map[string]string   // tier → expected signing key fingerprint
+	saveFreshnessState   func(string, *FreshnessState) error
+	definitions          []ruleTypeDefinition
 }
 
 // StandardBundleName is the reserved name for the official standard pack.
@@ -106,18 +108,21 @@ const (
 
 // LoadedBundle describes a successfully loaded bundle (for diagnostics).
 type LoadedBundle struct {
-	Name             string
-	Version          string
-	Tier             string // standard, community, pro (v2+)
-	MonotonicVersion uint64 // rollback-prevention counter (v2+)
-	Source           string
-	Rules            int // total rules loaded after filtering
-	DLP              int
-	Injection        int
-	ToolPoison       int
-	Unsigned         bool
-	Expired          bool // bundle is past expires_at but loaded in stale mode
+	Name                  string
+	Version               string
+	TestedThroughPipelock string
+	Tier                  string // standard, community, pro (v2+)
+	MonotonicVersion      uint64 // rollback-prevention counter (v2+)
+	Source                string
+	Rules                 int // total rules loaded after filtering
+	DLP                   int
+	Injection             int
+	ToolPoison            int
+	Unsigned              bool
+	Expired               bool // bundle is past expires_at but loaded in stale mode
 }
+
+type loadRuleFunc func(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, namespacedID string, loaded *LoadedBundle) error
 
 // IntegrityErrors returns load failures that indicate installed-bundle
 // provenance or freshness integrity loss.
@@ -195,34 +200,16 @@ func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
 	if rulesDir == "" {
 		return result
 	}
-
-	entries, err := os.ReadDir(rulesDir)
-	if err != nil {
+	// Preserve the optional-directory and availability semantics before opening
+	// the freshness lock. This reads names only; bundle bytes and freshness state
+	// are read below after interrupted transactions have recovered.
+	if _, err := os.ReadDir(rulesDir); err != nil {
 		if os.IsNotExist(err) {
 			return result
 		}
-		// Permission errors, ENOTDIR, I/O failures: report, don't swallow.
-		result.Errors = append(result.Errors, BundleError{
-			Name:   rulesDir,
-			Reason: fmt.Sprintf("reading rules directory: %v", err),
-			Class:  BundleErrorClassAvailability,
-		})
+		result.Errors = append(result.Errors, BundleError{Name: rulesDir, Reason: fmt.Sprintf("reading rules directory: %v", err), Class: BundleErrorClassAvailability})
 		return result
 	}
-
-	// Collect subdirectory names alphabetically (ReadDir returns sorted).
-	var dirs []os.DirEntry
-	for _, e := range entries {
-		// Skip non-directories, hidden staging dirs (.stage-*), and backup dirs (.bak suffix)
-		// left by interrupted install/update operations.
-		if e.IsDir() && !strings.HasPrefix(e.Name(), ".") && !strings.HasSuffix(e.Name(), ".bak") {
-			dirs = append(dirs, e)
-		}
-	}
-
-	sort.Slice(dirs, func(i, j int) bool {
-		return dirs[i].Name() < dirs[j].Name()
-	})
 
 	minRank := confidenceRank[opts.MinConfidence]
 	now := time.Now()
@@ -231,12 +218,36 @@ func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
 	// concurrent processes from racing on .freshness.json.
 	freshnessState := &FreshnessState{HighestSeen: make(map[string]uint64)}
 	lockErr := WithFreshnessLock(rulesDir, func() error {
-		var err error
-		freshnessState, err = LoadFreshnessState(rulesDir)
+		if err := RecoverBundleTransactionsLocked(rulesDir); err != nil {
+			result.Errors = append(result.Errors, BundleError{Name: ".pipelock-state/rules-transactions", Reason: err.Error(), Class: BundleErrorClassIntegrity})
+			result.Degraded = true
+			return nil
+		}
+		entries, err := os.ReadDir(rulesDir)
 		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			// Permission errors, ENOTDIR, I/O failures: report, don't swallow.
+			result.Errors = append(result.Errors, BundleError{Name: rulesDir, Reason: fmt.Sprintf("reading rules directory: %v", err), Class: BundleErrorClassAvailability})
+			return nil
+		}
+		// Read the directory only after recovery while holding the same lock that
+		// protects the freshness state, so a loader cannot observe a candidate
+		// between its rename and its redo recovery.
+		var dirs []os.DirEntry
+		for _, entry := range entries {
+			if entry.IsDir() && !strings.HasPrefix(entry.Name(), ".") && !strings.HasSuffix(entry.Name(), ".bak") {
+				dirs = append(dirs, entry)
+			}
+		}
+		sort.Slice(dirs, func(i, j int) bool { return dirs[i].Name() < dirs[j].Name() })
+		var loadErr error
+		freshnessState, loadErr = LoadFreshnessStateLocked(rulesDir)
+		if loadErr != nil {
 			result.Errors = append(result.Errors, BundleError{
 				Name:   ".freshness.json",
-				Reason: err.Error(),
+				Reason: loadErr.Error(),
 				Class:  BundleErrorClassIntegrity,
 			})
 			result.Degraded = true
@@ -247,6 +258,7 @@ func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
 			Result:         result,
 			FreshnessState: freshnessState,
 			Now:            now,
+			Definitions:    opts.definitions,
 		}
 		for _, d := range dirs {
 			bundleDir := filepath.Join(rulesDir, d.Name())
@@ -254,11 +266,13 @@ func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
 		}
 
 		// Save updated freshness state if any v2+ bundles were loaded.
+		saveFreshness := opts.saveFreshnessState
+		if saveFreshness == nil {
+			saveFreshness = SaveFreshnessState
+		}
 		for _, lb := range result.Loaded {
 			if lb.MonotonicVersion > 0 {
-				if saveErr := SaveFreshnessState(rulesDir, freshnessState); saveErr != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("saving freshness state: %v", saveErr))
-				}
+				persistLoadedFreshness(rulesDir, freshnessState, result, saveFreshness)
 				break
 			}
 		}
@@ -286,6 +300,22 @@ func LoadBundles(rulesDir string, opts LoadOptions) *LoadResult {
 	return result
 }
 
+func persistLoadedFreshness(rulesDir string, state *FreshnessState, result *LoadResult, save func(string, *FreshnessState) error) {
+	if err := save(rulesDir, state); err != nil {
+		result.Errors = append(result.Errors, BundleError{
+			Name:   ".freshness.json",
+			Reason: fmt.Sprintf("saving freshness state: %v", err),
+			Class:  BundleErrorClassIntegrity,
+		})
+		result.Degraded = true
+		// The accepted bundles are not durably protected against rollback after a
+		// failed save, so do not return any of their usable rules to the caller.
+		result.DLP = nil
+		result.Injection = nil
+		result.ToolPoison = nil
+	}
+}
+
 // bundleExecCtx groups execution context passed through the bundle loading
 // pipeline. Extracted from loadOneBundle's parameter list per the options-struct
 // convention (>6 params → struct).
@@ -294,6 +324,38 @@ type bundleExecCtx struct {
 	Result         *LoadResult
 	FreshnessState *FreshnessState
 	Now            time.Time
+	Definitions    []ruleTypeDefinition
+}
+
+func cloneFreshnessState(state *FreshnessState) *FreshnessState {
+	cloned := &FreshnessState{
+		HighestSeen: make(map[string]uint64),
+		FormatFloor: make(map[string]int),
+	}
+	if state == nil {
+		return cloned
+	}
+	cloned.Context = state.Context
+	cloned.Digest = state.Digest
+	for key, version := range state.HighestSeen {
+		cloned.HighestSeen[key] = version
+	}
+	for name, format := range state.FormatFloor {
+		cloned.FormatFloor[name] = format
+	}
+	return cloned
+}
+
+func (ctx *bundleExecCtx) ruleTypeDefinitionFor(ruleType string) (ruleTypeDefinition, bool) {
+	if ctx.Definitions == nil {
+		return ruleTypeDefinitionFor(ruleType)
+	}
+	for _, definition := range ctx.Definitions {
+		if definition.ID == ruleType {
+			return definition, true
+		}
+	}
+	return ruleTypeDefinition{}, false
 }
 
 // loadOneBundle loads a single bundle directory and appends results or errors.
@@ -302,7 +364,7 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 	lockPath := filepath.Join(bundleDir, lockFilename)
 
 	// Read and size-check bundle.yaml.
-	data, err := readBundleFile(bundlePath)
+	data, err := ReadBundleFile(bundlePath)
 	if err != nil {
 		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: classifyBundleFileReadError(err)})
 		return
@@ -328,11 +390,25 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: fmt.Sprintf("parse error: %v", err), Class: BundleErrorClassIntegrity})
 		return
 	}
+	bundleWarnings := make([]string, 0, 1)
 
-	// Check min_pipelock version requirement.
-	if err := CheckMinPipelock(bundle.MinPipelock, opts.PipelockVersion, opts.AllowUnversionedLoad); err != nil {
-		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassAvailability})
+	// Check min_pipelock version requirement. An unprovable development version
+	// warns and loads by default, while the strict opt-in and all checked
+	// compatibility failures refuse.
+	if err := CheckMinPipelockVerdict(bundle.MinPipelock, opts.PipelockVersion); err != nil {
+		if !errors.Is(err, ErrUnverifiableVersion) || !opts.AllowUnversionedLoad {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassAvailability})
+			return
+		}
+		bundleWarnings = append(bundleWarnings, fmt.Sprintf(
+			"bundle %q loaded although min_pipelock %q could not be verified: running version %q is not a released version",
+			bundle.Name, bundle.MinPipelock, opts.PipelockVersion))
+	}
+	if warning, err := TestedThroughPipelockWarning(bundle.TestedThroughPipelock, opts.PipelockVersion); err != nil {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Reason: err.Error(), Class: BundleErrorClassIntegrity})
 		return
+	} else if warning != "" {
+		bundleWarnings = append(bundleWarnings, fmt.Sprintf("bundle %q: %s", bundle.Name, warning))
 	}
 
 	// Check pipelock-* name reservation: only official signers allowed.
@@ -345,6 +421,13 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 			Reason: fmt.Sprintf("bundle name %q uses reserved prefix %q but signer is not official", bundle.Name, reservedBundlePrefix),
 			Class:  BundleErrorClassIntegrity,
 		})
+		return
+	}
+
+	// Once an identity has loaded v2, accepting its older v1 representation would
+	// bypass every v2 freshness field. Enforce the format floor for all formats.
+	if fr := CheckFormatFloor(bundle, ctx.FreshnessState); !fr.OK {
+		ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: fr.Message, Class: BundleErrorClassIntegrity})
 		return
 	}
 
@@ -385,21 +468,34 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 			return
 		}
 		if fr.Expired {
-			ctx.Result.Warnings = append(ctx.Result.Warnings, fr.Message)
+			bundleWarnings = append(bundleWarnings, fr.Message)
 		}
 
-		// Record version for future rollback prevention.
-		RecordVersion(ctx.FreshnessState, bundle.Tier, bundle.Name, bundle.MonotonicVersion)
 	}
+
+	// Stage every rule and freshness mutation so a later loader failure cannot
+	// leak part of this bundle into the shared result or persisted state.
+	stagedCtx := &bundleExecCtx{
+		MinRank:        ctx.MinRank,
+		Result:         &LoadResult{Warnings: bundleWarnings},
+		FreshnessState: cloneFreshnessState(ctx.FreshnessState),
+		Now:            ctx.Now,
+		Definitions:    ctx.Definitions,
+	}
+	if bundle.FormatVersion >= 2 {
+		RecordVersion(stagedCtx.FreshnessState, bundle.Tier, bundle.Name, bundle.MonotonicVersion)
+	}
+	RecordFormat(stagedCtx.FreshnessState, bundle.Name, bundle.FormatVersion)
 
 	// Filter and convert rules.
 	loaded := LoadedBundle{
-		Name:             bundle.Name,
-		Version:          bundle.Version,
-		Tier:             bundle.Tier,
-		MonotonicVersion: bundle.MonotonicVersion,
-		Source:           lock.Source,
-		Unsigned:         lock.Unsigned,
+		Name:                  bundle.Name,
+		Version:               bundle.Version,
+		TestedThroughPipelock: bundle.TestedThroughPipelock,
+		Tier:                  bundle.Tier,
+		MonotonicVersion:      bundle.MonotonicVersion,
+		Source:                lock.Source,
+		Unsigned:              lock.Unsigned,
 	}
 
 	for i := range bundle.Rules {
@@ -436,58 +532,78 @@ func loadOneBundle(bundleDir, dirName string, opts LoadOptions, ctx *bundleExecC
 		}
 
 		if len(r.Pattern.ExemptDomains) > 0 {
-			ctx.Result.Warnings = append(ctx.Result.Warnings, fmt.Sprintf(
+			stagedCtx.Result.Warnings = append(stagedCtx.Result.Warnings, fmt.Sprintf(
 				"bundle %q rule %q sets pattern.exempt_domains, which is ignored; exemptions belong in the local pipelock config, not in a deny-only bundle",
 				bundle.Name, r.ID))
 		}
 
-		// Convert rule to config-compatible type.
-		switch r.Type {
-		case RuleTypeDLP:
-			ctx.Result.DLP = append(ctx.Result.DLP, config.DLPPattern{
-				Name:          patternName,
-				Regex:         r.Pattern.Regex,
-				Severity:      r.Severity,
-				Validator:     r.Pattern.Validator,
-				Bundle:        bundle.Name,
-				BundleVersion: bundle.Version,
+		definition, ok := stagedCtx.ruleTypeDefinitionFor(r.Type)
+		if !ok || definition.Load == nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{
+				Name:   dirName,
+				Reason: fmt.Sprintf("rule type %q has no runtime loader", r.Type),
+				Class:  BundleErrorClassIntegrity,
 			})
-			loaded.DLP++
-
-		case RuleTypeInjection:
-			ctx.Result.Injection = append(ctx.Result.Injection, config.ResponseScanPattern{
-				Name:          patternName,
-				Regex:         r.Pattern.Regex,
-				Bundle:        bundle.Name,
-				BundleVersion: bundle.Version,
-			})
-			loaded.Injection++
-
-		case RuleTypeToolPoison:
-			// Tool-poison regexes use case-insensitive matching.
-			compiled, err := regexp.Compile("(?i)" + r.Pattern.Regex)
-			if err != nil {
-				// Pattern was already validated by ParseBundle, but guard anyway.
-				continue
-			}
-			ctx.Result.ToolPoison = append(ctx.Result.ToolPoison, CompiledToolPoisonRule{
-				Name:          nsID,
-				RuleID:        nsID,
-				Re:            compiled,
-				ScanField:     r.Pattern.ScanField,
-				Bundle:        bundle.Name,
-				BundleVersion: bundle.Version,
-			})
-			loaded.ToolPoison++
+			return
+		}
+		if err := definition.Load(stagedCtx, bundle, r, patternName, nsID, &loaded); err != nil {
+			ctx.Result.Errors = append(ctx.Result.Errors, BundleError{Name: dirName, Official: official, Reason: err.Error(), Class: BundleErrorClassIntegrity})
+			return
 		}
 	}
 
 	loaded.Rules = loaded.DLP + loaded.Injection + loaded.ToolPoison
+	ctx.Result.DLP = append(ctx.Result.DLP, stagedCtx.Result.DLP...)
+	ctx.Result.Injection = append(ctx.Result.Injection, stagedCtx.Result.Injection...)
+	ctx.Result.ToolPoison = append(ctx.Result.ToolPoison, stagedCtx.Result.ToolPoison...)
+	ctx.Result.Warnings = append(ctx.Result.Warnings, stagedCtx.Result.Warnings...)
+	*ctx.FreshnessState = *stagedCtx.FreshnessState
 	ctx.Result.Loaded = append(ctx.Result.Loaded, loaded)
 }
 
-// readBundleFile reads bundle.yaml with a size check.
-func readBundleFile(path string) ([]byte, error) {
+func loadDLPRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, _ string, loaded *LoadedBundle) error {
+	ctx.Result.DLP = append(ctx.Result.DLP, config.DLPPattern{
+		Name:          patternName,
+		Regex:         rule.Pattern.Regex,
+		Severity:      rule.Severity,
+		Validator:     rule.Pattern.Validator,
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.DLP++
+	return nil
+}
+
+func loadInjectionRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, patternName, _ string, loaded *LoadedBundle) error {
+	ctx.Result.Injection = append(ctx.Result.Injection, config.ResponseScanPattern{
+		Name:          patternName,
+		Regex:         rule.Pattern.Regex,
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.Injection++
+	return nil
+}
+
+func loadToolPoisonRule(ctx *bundleExecCtx, bundle *Bundle, rule *Rule, _ string, namespacedID string, loaded *LoadedBundle) error {
+	compiled, err := regexp.Compile("(?i)" + rule.Pattern.Regex)
+	if err != nil {
+		return fmt.Errorf("compile tool-poison rule %q after validation: %w", rule.ID, err)
+	}
+	ctx.Result.ToolPoison = append(ctx.Result.ToolPoison, CompiledToolPoisonRule{
+		Name:          namespacedID,
+		RuleID:        namespacedID,
+		Re:            compiled,
+		ScanField:     rule.Pattern.ScanField,
+		Bundle:        bundle.Name,
+		BundleVersion: bundle.Version,
+	})
+	loaded.ToolPoison++
+	return nil
+}
+
+// ReadBundleFile reads a bundle artifact with a stat-first size check.
+func ReadBundleFile(path string) ([]byte, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat bundle file: %w", err)

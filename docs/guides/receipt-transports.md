@@ -2,6 +2,8 @@
 
 Pipelock emits Ed25519-signed action receipts for enforcement decisions across proxy transports. Receipts are written to the flight recorder as `action_receipt` entries and linked into a tamper-evident hash chain via `chain_prev_hash` and `chain_seq`.
 
+For HTTP-shaped responses, `X-Pipelock-Receipt` optionally returns the proxy-minted `action_id` after the matching receipt has been recorded. A caller can retain that value beside its own request ID and later verify the signed receipt; the header alone is not proof. The header is available for blocks and for allow responses when `flight_recorder.require_receipts` records admission before egress. Best-effort allow responses intentionally remain uncorrelated until a pre-emission design is introduced.
+
 ## Transports and Event Kinds
 
 | Transport | Event Kind | Layer / Subsurface | Description |
@@ -9,7 +11,7 @@ Pipelock emits Ed25519-signed action receipts for enforcement decisions across p
 | `fetch` | URL block | scanner layer name | URL scan finding in enforce or escalated audit mode |
 | `fetch` | Redirect block | `redirect` | Cross-origin redirect blocked |
 | `fetch` | Response size | `response_size` or `budget` | Response exceeds config limit or byte budget |
-| `fetch` | Shield oversize | `shield_oversize` | Response exceeds browser shield size limit |
+| `fetch` | Shield oversize | `shield_oversize` | Shieldable response exceeded `browser_shield.max_shield_bytes`; pattern names the host, size, and remedies |
 | `fetch` | Media policy | `media_policy` | Blocked media type |
 | `fetch` | Response scan | `response_scan` | Prompt injection detected in response content |
 | `fetch` | Header DLP | `dlp_header` | Secret found in request headers |

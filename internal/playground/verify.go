@@ -32,6 +32,7 @@ type Check struct {
 // VerifyReport is the all-or-nothing result of VerifyRun.
 type VerifyReport struct {
 	OK            bool    `json:"ok"`
+	Mode          string  `json:"mode"`
 	Checks        []Check `json:"checks"`
 	ObservedCount int     `json:"observed_count"` // reported, NOT a pass/fail gate
 	RunNonce      string  `json:"run_nonce"`
@@ -44,6 +45,29 @@ type VerifyReport struct {
 	OrchestratorKey string `json:"orchestrator_key"`
 }
 
+// FailureSummary names the checks that failed and why. A seal failure that
+// reports only that something failed cannot be acted on: the report already
+// carries the reason, and discarding it turns a one-line diagnosis into a
+// guess. It returns "no failed checks" when nothing failed, so a caller cannot
+// print an empty reason and imply one.
+func (r VerifyReport) FailureSummary() string {
+	var failed []string
+	for _, c := range r.Checks {
+		if c.OK {
+			continue
+		}
+		if c.Reason == "" {
+			failed = append(failed, c.Name)
+			continue
+		}
+		failed = append(failed, c.Name+": "+c.Reason)
+	}
+	if len(failed) == 0 {
+		return "no failed checks"
+	}
+	return "failed checks: " + strings.Join(failed, "; ")
+}
+
 // Run directory layout (produced by the demo runner, consumed by VerifyRun):
 //
 //	<rundir>/
@@ -53,11 +77,14 @@ type VerifyReport struct {
 const (
 	packetSubdir               = "packet"
 	launchManifestFile         = "launch-manifest.json"
+	orchestratorDelegationFile = "orchestrator-delegation.json"
 	witnessFile                = "witness.json"
 	redWitnessFile             = "red-witness.json"
 	hostContainmentWitnessFile = "host-containment-witness.json"
 	verifyInstructionsFile     = "VERIFY.txt"
 	checkManifestSig           = "launch-manifest-signature"
+	checkDelegation            = "orchestrator-delegation"
+	checkReplayArchive         = "replay-archive-authorization"
 	checkPinnedPipelock        = "pinned-pipelock-key"
 	checkAuditPacket           = "audit-packet-chain"
 	checkPinnedCollector       = "pinned-collector-key"
@@ -80,6 +107,7 @@ const (
 // cannot silently produce OK=true.
 var requiredChecks = []string{
 	checkManifestSig,
+	checkDelegation,
 	checkPinnedPipelock,
 	checkAuditPacket,
 	checkPinnedCollector,
@@ -102,13 +130,15 @@ var containmentChecks = []string{
 // RunArtifacts is the in-memory form of a sealed playground run. It mirrors the
 // files inside a run directory and inside the downloadable tar.gz bundle.
 type RunArtifacts struct {
-	LaunchManifest         []byte
-	Witness                []byte
-	RedWitness             []byte
-	HostContainmentWitness []byte
-	PacketJSON             []byte
-	PacketEvidenceJSONL    []byte
-	PacketManifestJSON     []byte
+	LaunchManifest             []byte
+	OrchestratorDelegation     []byte
+	ReplayArchiveAuthorization []byte
+	Witness                    []byte
+	RedWitness                 []byte
+	HostContainmentWitness     []byte
+	PacketJSON                 []byte
+	PacketEvidenceJSONL        []byte
+	PacketManifestJSON         []byte
 }
 
 // VerifyPublishedBundleBytes verifies the raw playground bundle served by
@@ -124,6 +154,21 @@ func VerifyPublishedBundleBytes(bundle []byte) (VerifyReport, error) {
 			Reason: fmt.Sprintf("cannot read session bundle: %v", err),
 		})
 		return finalize(rep, requiredChecks), nil
+	}
+	// The browser verifier serves BOTH a live session bundle and the published
+	// archive, and they need different semantics: a live bundle has no archive
+	// authorization and must be verified strictly, while the published archive
+	// carries one and its delegation has aged out by design.
+	//
+	// Selecting on the authorization's PRESENCE does not let a bundle choose its
+	// own leniency. The authorization is a root signature over this run's exact
+	// manifest hash, delegation bytes, run nonce and image digest, so only the
+	// holder of the published root can produce one, and a transplanted or edited
+	// authorization fails its binding check. An attacker cannot mint leniency;
+	// they can at most present a genuine root-authorized run, which is not an
+	// attack. The strict path remains the default for anything without one.
+	if len(artifacts.ReplayArchiveAuthorization) != 0 {
+		return VerifyArchivedReplayArtifacts(artifacts, PublishedOrchestratorPubKeyHex)
 	}
 	return VerifyRunArtifacts(artifacts, PublishedOrchestratorPubKeyHex)
 }
@@ -182,6 +227,10 @@ func ExtractRunArtifactsFromBundle(bundle []byte) (RunArtifacts, error) {
 		switch name {
 		case launchManifestFile:
 			artifacts.LaunchManifest = data
+		case orchestratorDelegationFile:
+			artifacts.OrchestratorDelegation = data
+		case replayArchiveAuthorizationFile:
+			artifacts.ReplayArchiveAuthorization = data
 		case witnessFile:
 			artifacts.Witness = data
 		case redWitnessFile:
@@ -215,6 +264,8 @@ func bundleArtifactName(raw string, typeflag byte) (name string, retain bool, er
 	case verifyInstructionsFile:
 		return name, false, nil
 	case launchManifestFile,
+		orchestratorDelegationFile,
+		replayArchiveAuthorizationFile,
 		witnessFile,
 		redWitnessFile,
 		hostContainmentWitnessFile,
@@ -260,10 +311,27 @@ func cleanBundleMemberName(raw string) (string, error) {
 // OK = logical AND of all checks. Any single failure => OK=false with a
 // specific reason. Missing/malformed files fail closed (no panic).
 func VerifyRun(dir, orchestratorPubHex string) (VerifyReport, error) {
+	return verifyRun(dir, orchestratorPubHex, false)
+}
+
+// VerifyArchivedReplay verifies a root-authorized published replay. It is not
+// a general lenient mode: an expired delegation remains rejected unless the
+// exact run carries a valid ReplayArchiveAuthorization.
+func VerifyArchivedReplay(dir, orchestratorPubHex string) (VerifyReport, error) {
+	return verifyRun(dir, orchestratorPubHex, true)
+}
+
+func verifyRun(dir, orchestratorPubHex string, archive bool) (VerifyReport, error) {
 	cleanDir := filepath.Clean(dir)
 	var artifacts RunArtifacts
 	var err error
 	if artifacts.LaunchManifest, err = readRunArtifact(cleanDir, launchManifestFile); err != nil {
+		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
+	}
+	if artifacts.OrchestratorDelegation, err = readRunArtifact(cleanDir, orchestratorDelegationFile); err != nil {
+		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
+	}
+	if artifacts.ReplayArchiveAuthorization, err = readRunArtifact(cleanDir, replayArchiveAuthorizationFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
 	if artifacts.Witness, err = readRunArtifact(cleanDir, witnessFile); err != nil {
@@ -284,7 +352,7 @@ func VerifyRun(dir, orchestratorPubHex string) (VerifyReport, error) {
 	if artifacts.PacketManifestJSON, err = readRunArtifact(cleanDir, filepath.Join(packetSubdir, packetManifestFile)); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	return VerifyRunArtifacts(artifacts, orchestratorPubHex)
+	return verifyRunArtifacts(artifacts, orchestratorPubHex, archive)
 }
 
 func readRunArtifact(cleanDir, name string) ([]byte, error) {
@@ -302,11 +370,29 @@ func readRunArtifact(cleanDir, name string) ([]byte, error) {
 // playground demo run from in-memory bytes. This is the shared verifier used by
 // the browser/WASM path.
 func VerifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (VerifyReport, error) {
-	rep := VerifyReport{OrchestratorKey: orchestratorPubHex}
+	return verifyRunArtifacts(artifacts, orchestratorPubHex, false)
+}
+
+// VerifyArchivedReplayArtifacts verifies a root-authorized published replay
+// from in-memory artifacts. Browser and live-session callers use
+// VerifyRunArtifacts, which remains strict.
+func VerifyArchivedReplayArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (VerifyReport, error) {
+	return verifyRunArtifacts(artifacts, orchestratorPubHex, true)
+}
+
+func verifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string, archive bool) (VerifyReport, error) {
+	mode := "strict-live"
+	if archive {
+		mode = "published-replay-archive"
+	}
+	rep := VerifyReport{Mode: mode, OrchestratorKey: orchestratorPubHex}
 
 	// required is the base check set until the manifest reveals whether this was
 	// a contained run, at which point the containment checks are appended.
 	required := requiredChecks
+	if archive {
+		required = append(append([]string{}, requiredChecks...), checkReplayArchive)
+	}
 
 	// --- Load files (fail closed on missing/malformed) ---
 
@@ -333,7 +419,10 @@ func VerifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (Veri
 	// false to skip the checks, or to true on an uncontained run -- breaks the
 	// signature and fails step 1 below, so this can only fail closed.
 	if lm.Contained {
-		required = append(append([]string{}, requiredChecks...), containmentChecks...)
+		// Rebuild from the CURRENT required set, not from requiredChecks: the
+		// archive check was already appended above and must survive here, or a
+		// contained archive run loses it and finalize stops enforcing it.
+		required = append(append([]string{}, required...), containmentChecks...)
 	}
 
 	if len(artifacts.Witness) == 0 {
@@ -354,7 +443,7 @@ func VerifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (Veri
 		return finalize(rep, required), nil
 	}
 
-	// --- Step 1: Verify launch manifest signature under orchestrator key ---
+	// --- Step 1: Select and authenticate the launch-manifest signer ---
 
 	orchPub, err := hex.DecodeString(orchestratorPubHex)
 	if err != nil || len(orchPub) != ed25519.PublicKeySize {
@@ -365,11 +454,115 @@ func VerifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (Veri
 		})
 		return finalize(rep, required), nil
 	}
-	if !VerifyLaunchManifest(ed25519.PublicKey(orchPub), lm) {
+	manifestPub := ed25519.PublicKey(orchPub)
+	if len(artifacts.OrchestratorDelegation) == 0 {
+		if lm.DelegationID != "" || lm.ImageDigest != "" {
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkDelegation,
+				OK:     false,
+				Reason: "manifest claims delegated signing but orchestrator-delegation.json is missing",
+			})
+			return finalize(rep, required), nil
+		}
+		rep.Checks = append(rep.Checks, Check{
+			Name:   checkDelegation,
+			OK:     true,
+			Reason: "legacy direct-root manifest",
+		})
+		if archive {
+			// An archive authorization binds a delegation artifact, so a
+			// direct-root run cannot carry one and cannot be published as an
+			// archive. Fail closed rather than inheriting the strict-mode pass.
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkReplayArchive,
+				OK:     false,
+				Reason: "archive verification requires a root-signed replay archive authorization, which a direct-root run cannot carry",
+			})
+			return finalize(rep, required), nil
+		}
+	} else {
+		delegation, parseErr := ParseOrchestratorDelegation(artifacts.OrchestratorDelegation)
+		if parseErr != nil {
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkDelegation,
+				OK:     false,
+				Reason: fmt.Sprintf("invalid orchestrator delegation: %v", parseErr),
+			})
+			return finalize(rep, required), nil
+		}
+		want := DelegationExpectations{RunNonce: lm.RunNonce, ImageDigest: lm.ImageDigest}
+		if archive {
+			if len(artifacts.ReplayArchiveAuthorization) == 0 {
+				rep.Checks = append(rep.Checks, Check{
+					Name:   checkReplayArchive,
+					OK:     false,
+					Reason: "archive verification requires a root-signed replay archive authorization",
+				})
+				return finalize(rep, required), nil
+			}
+			authorization, authorizationErr := ParseReplayArchiveAuthorization(artifacts.ReplayArchiveAuthorization)
+			if authorizationErr != nil {
+				rep.Checks = append(rep.Checks, Check{
+					Name:   checkReplayArchive,
+					OK:     false,
+					Reason: fmt.Sprintf("invalid replay archive authorization: %v", authorizationErr),
+				})
+				return finalize(rep, required), nil
+			}
+			if authorizationErr := VerifyReplayArchiveAuthorization(ed25519.PublicKey(orchPub), authorization, lm, artifacts.OrchestratorDelegation); authorizationErr != nil {
+				rep.Checks = append(rep.Checks, Check{
+					Name:   checkReplayArchive,
+					OK:     false,
+					Reason: fmt.Sprintf("replay archive authorization verification failed: %v", authorizationErr),
+				})
+				return finalize(rep, required), nil
+			}
+			if verifyErr := verifyOrchestratorDelegationSignature(ed25519.PublicKey(orchPub), delegation, want); verifyErr != nil {
+				rep.Checks = append(rep.Checks, Check{
+					Name:   checkDelegation,
+					OK:     false,
+					Reason: fmt.Sprintf("orchestrator delegation verification failed: %v", verifyErr),
+				})
+				return finalize(rep, required), nil
+			}
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkReplayArchive,
+				OK:     true,
+				Reason: "root-authorized permanent replay; delegation time window intentionally not evaluated",
+			})
+		} else if verifyErr := VerifyOrchestratorDelegation(ed25519.PublicKey(orchPub), delegation, want); verifyErr != nil {
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkDelegation,
+				OK:     false,
+				Reason: fmt.Sprintf("orchestrator delegation verification failed: %v", verifyErr),
+			})
+			return finalize(rep, required), nil
+		}
+		if !DelegationBindsLaunchManifest(delegation, lm) {
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkDelegation,
+				OK:     false,
+				Reason: "orchestrator delegation does not bind the launch manifest",
+			})
+			return finalize(rep, required), nil
+		}
+		sessionPub, decodeErr := hex.DecodeString(delegation.SessionPublicKey)
+		if decodeErr != nil || len(sessionPub) != ed25519.PublicKeySize {
+			rep.Checks = append(rep.Checks, Check{
+				Name:   checkDelegation,
+				OK:     false,
+				Reason: "orchestrator delegation carries an invalid session public key",
+			})
+			return finalize(rep, required), nil
+		}
+		manifestPub = ed25519.PublicKey(sessionPub)
+		rep.Checks = append(rep.Checks, Check{Name: checkDelegation, OK: true})
+	}
+	if !VerifyLaunchManifest(manifestPub, lm) {
 		rep.Checks = append(rep.Checks, Check{
 			Name:   checkManifestSig,
 			OK:     false,
-			Reason: "launch manifest signature invalid under orchestrator key",
+			Reason: "launch manifest signature invalid under authenticated signing key",
 		})
 		return finalize(rep, required), nil
 	}
@@ -521,7 +714,7 @@ func VerifyRunArtifacts(artifacts RunArtifacts, orchestratorPubHex string) (Veri
 	// decision; this proves the kernel owner-match drop from the contained
 	// network position. Required only when the signed manifest says Contained.
 	if lm.Contained {
-		verifyHostContainmentBytes(artifacts.HostContainmentWitness, lm, orchestratorPubHex, &rep)
+		verifyHostContainmentBytes(artifacts.HostContainmentWitness, lm, hex.EncodeToString(manifestPub), &rep)
 	}
 
 	rep.ObservedCount = witness.ObservedCount

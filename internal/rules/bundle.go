@@ -8,31 +8,32 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/luckyPipewrench/pipelock/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
 // Bundle represents a parsed and validated rule bundle.
 type Bundle struct {
-	FormatVersion    int      `yaml:"format_version"`
-	Name             string   `yaml:"name"`
-	Version          string   `yaml:"version"`
-	Author           string   `yaml:"author"`
-	Description      string   `yaml:"description"`
-	Homepage         string   `yaml:"homepage"`
-	MinPipelock      string   `yaml:"min_pipelock"`
-	License          string   `yaml:"license"`
-	Tier             string   `yaml:"tier"`              // standard, community, pro (v2+)
-	MonotonicVersion uint64   `yaml:"monotonic_version"` // rollback-prevention counter (v2+)
-	PublishedAt      string   `yaml:"published_at"`      // RFC 3339 timestamp (v2+)
-	ExpiresAt        string   `yaml:"expires_at"`        // RFC 3339 timestamp (v2+)
-	RequiredFeatures []string `yaml:"required_features"` // engine features needed (v2+, enforced at load time)
-	KeyID            string   `yaml:"key_id"`            // signing key fingerprint (v2+)
-	Rules            []Rule   `yaml:"rules"`
+	FormatVersion         int      `yaml:"format_version"`
+	Name                  string   `yaml:"name"`
+	Version               string   `yaml:"version"`
+	Author                string   `yaml:"author"`
+	Description           string   `yaml:"description"`
+	Homepage              string   `yaml:"homepage"`
+	MinPipelock           string   `yaml:"min_pipelock"`
+	TestedThroughPipelock string   `yaml:"tested_through_pipelock"`
+	License               string   `yaml:"license"`
+	Tier                  string   `yaml:"tier"`              // standard, community, pro (v2+)
+	MonotonicVersion      uint64   `yaml:"monotonic_version"` // rollback-prevention counter (v2+)
+	PublishedAt           string   `yaml:"published_at"`      // RFC 3339 timestamp (v2+)
+	ExpiresAt             string   `yaml:"expires_at"`        // RFC 3339 timestamp (v2+)
+	RequiredFeatures      []string `yaml:"required_features"` // engine features needed (v2+, enforced at load time)
+	KeyID                 string   `yaml:"key_id"`            // signing key fingerprint (v2+)
+	Rules                 []Rule   `yaml:"rules"`
 }
 
 // Rule represents a single detection rule within a bundle.
@@ -123,6 +124,8 @@ var KnownFeatures = map[string]bool{
 // lowercase alphanumeric + underscores.
 var featureNameRegex = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
+var strictSemverRegex = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-(?:[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+
 // CheckRequiredFeatures verifies that every feature in required is well-formed
 // and is a known engine feature. Returns an error naming the first invalid or
 // unknown feature.
@@ -164,12 +167,6 @@ var bundleNameRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
 var ruleIDRegex = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,94}[a-z0-9]$`)
 
 // Valid enum sets for quick membership checks.
-var validRuleTypes = map[string]bool{
-	RuleTypeDLP:        true,
-	RuleTypeInjection:  true,
-	RuleTypeToolPoison: true,
-}
-
 var validStatuses = map[string]bool{
 	StatusExperimental: true,
 	StatusStable:       true,
@@ -187,11 +184,6 @@ var validConfidences = map[string]bool{
 	confidenceHigh:   true,
 	confidenceMedium: true,
 	confidenceLow:    true,
-}
-
-var validScanFields = map[string]bool{
-	scanFieldDescription: true,
-	scanFieldName:        true,
 }
 
 // ParseBundle unmarshals YAML data into a Bundle and validates it.
@@ -238,6 +230,12 @@ func (b *Bundle) Validate() error {
 
 	if b.Description == "" {
 		return fmt.Errorf("validate bundle: description must not be empty")
+	}
+
+	if b.TestedThroughPipelock != "" {
+		if _, err := parseStrictSemverVersion(b.TestedThroughPipelock); err != nil {
+			return fmt.Errorf("validate bundle: invalid tested_through_pipelock %q: %w", b.TestedThroughPipelock, err)
+		}
 	}
 
 	// V2+ fields are required when format_version >= 2.
@@ -310,7 +308,8 @@ func validateRule(r *Rule, seen map[string]bool) error {
 	}
 	seen[r.ID] = true
 
-	if !validRuleTypes[r.Type] {
+	definition, ok := ruleTypeDefinitionFor(r.Type)
+	if !ok {
 		return fmt.Errorf("invalid type %q for rule %q", r.Type, r.ID)
 	}
 
@@ -334,7 +333,7 @@ func validateRule(r *Rule, seen map[string]bool) error {
 		return fmt.Errorf("invalid confidence %q for rule %q", r.Confidence, r.ID)
 	}
 
-	if err := validatePattern(&r.Pattern, r.Type, r.ID); err != nil {
+	if err := validatePattern(&r.Pattern, definition, r.ID); err != nil {
 		return err
 	}
 
@@ -342,7 +341,7 @@ func validateRule(r *Rule, seen map[string]bool) error {
 }
 
 // validatePattern validates a rule's pattern fields based on rule type.
-func validatePattern(p *RulePattern, ruleType, ruleID string) error {
+func validatePattern(p *RulePattern, definition ruleTypeDefinition, ruleID string) error {
 	if p.Regex == "" {
 		return fmt.Errorf("regex must not be empty for rule %q", ruleID)
 	}
@@ -356,22 +355,19 @@ func validatePattern(p *RulePattern, ruleType, ruleID string) error {
 	}
 
 	if p.Validator != "" {
-		if ruleType != RuleTypeDLP {
+		if len(definition.ValidatorValues) == 0 {
 			return fmt.Errorf("validator is only valid for %s rules (rule %q)", RuleTypeDLP, ruleID)
 		}
-		switch p.Validator {
-		case config.ValidatorLuhn, config.ValidatorMod97, config.ValidatorABA, config.ValidatorWIF:
-		default:
+		if !slices.Contains(definition.ValidatorValues, p.Validator) {
 			return fmt.Errorf("invalid validator %q for rule %q", p.Validator, ruleID)
 		}
 	}
 
 	// scan_field validation for tool-poison rules.
-	if ruleType == RuleTypeToolPoison {
+	if len(definition.ScanFieldValues) > 0 {
 		if p.ScanField == "" {
-			// Default to "description" if empty.
-			p.ScanField = scanFieldDescription
-		} else if !validScanFields[p.ScanField] {
+			p.ScanField = definition.DefaultScanField
+		} else if !slices.Contains(definition.ScanFieldValues, p.ScanField) {
 			return fmt.Errorf("invalid scan_field %q for rule %q (must be %q or %q)", p.ScanField, ruleID, scanFieldDescription, scanFieldName)
 		}
 	} else if p.ScanField != "" {
@@ -411,13 +407,27 @@ func NamespacedID(bundleName, ruleID string) string {
 // ErrUnverifiableVersion reports that the running build does not carry a
 // released version, so a bundle's min_pipelock requirement could not be checked
 // either way. It is deliberately distinct from a requirement that was checked
-// and genuinely not met: the runtime load path refuses both, but the operator
-// CLI can downgrade only this one to a warning, because at install time the
-// operator is present to read it. A requirement that IS met or genuinely unmet
-// never produces this error.
+// and genuinely not met: callers load and warn only for this availability case.
+// A requirement that IS met or genuinely unmet never produces this error.
 var ErrUnverifiableVersion = errors.New("check min pipelock")
 
+// CheckMinPipelock keeps the contract every caller outside the loader relied on before the
+// warn-and-load change: an unprovable running version is ACCEPTED when allowUnversioned is
+// true and REFUSED otherwise. A genuinely unmet or malformed requirement always refuses. The
+// parameter was briefly ignored, which made fleet policy delivery refuse a development
+// follower that used to be accepted; the wrapper restores that behavior exactly.
 func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) error {
+	err := CheckMinPipelockVerdict(minVersion, currentVersion)
+	if err != nil && allowUnversioned && errors.Is(err, ErrUnverifiableVersion) {
+		return nil
+	}
+	return err
+}
+
+// CheckMinPipelockVerdict reports the raw verdict. An unprovable running version returns an
+// error wrapping ErrUnverifiableVersion so the caller can choose between warn-and-load and
+// refusal; the rule-bundle loader is the caller that makes that choice from configuration.
+func CheckMinPipelockVerdict(minVersion, currentVersion string) error {
 	if minVersion == "" {
 		return nil
 	}
@@ -437,11 +447,10 @@ func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) 
 
 	if isDevelopmentCurrentVersion(effectiveVersion) {
 		// A source build carries no release stamp, so the requirement cannot
-		// be verified. Refuse by default rather than loading rules whose
-		// prerequisites are unchecked, and name the way out.
-		if allowUnversioned {
-			return nil
-		}
+		// be verified. Keep the actionable refusal text that predated the
+		// warn-and-load loader path: non-loader callers expose this error to
+		// their operators, while the loader turns this sentinel into a warning
+		// when its setting allows the bundle.
 		return fmt.Errorf(
 			"%w: this build does not report a released version (%q), so the bundle requirement min_pipelock %q cannot be verified; install a released binary, or set rules.allow_unversioned_bundle_load: true to load it unverified",
 			ErrUnverifiableVersion, currentVersion, minVersion)
@@ -463,6 +472,34 @@ func CheckMinPipelock(minVersion, currentVersion string, allowUnversioned bool) 
 	}
 
 	return nil
+}
+
+// TestedThroughPipelockWarning reports when a released Pipelock binary is
+// newer than the bundle's advisory tested ceiling. It never rejects a bundle:
+// min_pipelock remains the fail-closed compatibility requirement.
+func TestedThroughPipelockWarning(testedThrough, currentVersion string) (string, error) {
+	if testedThrough == "" {
+		return "", nil
+	}
+
+	ceiling, err := parseStrictSemverVersion(testedThrough)
+	if err != nil {
+		return "", fmt.Errorf("check tested through pipelock: invalid tested_through_pipelock %q: %w", testedThrough, err)
+	}
+
+	effectiveVersion := stripDirtyMarker(currentVersion)
+	if isDevelopmentCurrentVersion(effectiveVersion) {
+		return "", nil
+	}
+	current, err := parseTestedThroughCurrentVersion(effectiveVersion)
+	if err != nil {
+		return "", nil
+	}
+	if compareStrictSemverVersion(current, ceiling) <= 0 {
+		return "", nil
+	}
+
+	return fmt.Sprintf("bundle tested through Pipelock %q, but running %q; tested_through_pipelock is advisory", testedThrough, currentVersion), nil
 }
 
 type semverVersion struct {
@@ -515,6 +552,41 @@ func parseSemverVersion(s string) (semverVersion, error) {
 	}
 
 	return semverVersion{major: major, minor: minor, patch: patch, prerelease: prerelease}, nil
+}
+
+func parseStrictSemverVersion(s string) (strictSemverVersion, error) {
+	return parseStrictSemverParts(s)
+}
+
+type strictSemverVersion struct {
+	major      string
+	minor      string
+	patch      string
+	prerelease string
+}
+
+func parseTestedThroughCurrentVersion(s string) (strictSemverVersion, error) {
+	return parseStrictSemverParts(strings.TrimPrefix(s, "v"))
+}
+
+func parseStrictSemverParts(s string) (strictSemverVersion, error) {
+	if !strictSemverRegex.MatchString(s) {
+		return strictSemverVersion{}, fmt.Errorf("must be SemVer 2.0.0")
+	}
+	releaseAndPrerelease := strings.SplitN(strings.SplitN(s, "+", 2)[0], "-", 2)
+	if len(releaseAndPrerelease) == 2 {
+		for _, identifier := range strings.Split(releaseAndPrerelease[1], ".") {
+			if len(identifier) > 1 && identifier[0] == '0' && isDigits(identifier) {
+				return strictSemverVersion{}, fmt.Errorf("numeric prerelease identifier %q must not contain leading zeroes", identifier)
+			}
+		}
+	}
+	release := strings.Split(releaseAndPrerelease[0], ".")
+	prerelease := ""
+	if len(releaseAndPrerelease) == 2 {
+		prerelease = releaseAndPrerelease[1]
+	}
+	return strictSemverVersion{major: release[0], minor: release[1], patch: release[2], prerelease: prerelease}, nil
 }
 
 // stripDirtyMarker removes a trailing git-describe dirty marker so the rest of
@@ -651,6 +723,54 @@ func comparePrerelease(a, b string) int {
 		}
 	}
 	return cmpInt(len(aParts), len(bParts))
+}
+
+func compareStrictSemverVersion(a, b strictSemverVersion) int {
+	for _, versions := range [][2]string{{a.major, b.major}, {a.minor, b.minor}, {a.patch, b.patch}} {
+		if cmp := compareDecimalStrings(versions[0], versions[1]); cmp != 0 {
+			return cmp
+		}
+	}
+	if a.prerelease == b.prerelease {
+		return 0
+	}
+	if a.prerelease == "" {
+		return 1
+	}
+	if b.prerelease == "" {
+		return -1
+	}
+	return compareStrictPrerelease(a.prerelease, b.prerelease)
+}
+
+func compareStrictPrerelease(a, b string) int {
+	aParts := strings.Split(a, ".")
+	bParts := strings.Split(b, ".")
+	for i := 0; i < len(aParts) && i < len(bParts); i++ {
+		if aParts[i] == bParts[i] {
+			continue
+		}
+		aNumeric := isDigits(aParts[i])
+		bNumeric := isDigits(bParts[i])
+		switch {
+		case aNumeric && bNumeric:
+			return compareDecimalStrings(aParts[i], bParts[i])
+		case aNumeric:
+			return -1
+		case bNumeric:
+			return 1
+		default:
+			return strings.Compare(aParts[i], bParts[i])
+		}
+	}
+	return cmpInt(len(aParts), len(bParts))
+}
+
+func compareDecimalStrings(a, b string) int {
+	if len(a) != len(b) {
+		return cmpInt(len(a), len(b))
+	}
+	return strings.Compare(a, b)
 }
 
 // compareSemver returns -1 if a < b, 0 if equal, 1 if a > b.

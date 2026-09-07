@@ -20,11 +20,14 @@ Pipelock blocks the post-compromise steps of this chain: tool policy blocks dang
 
 ```bash
 # From source (Go 1.25+)
-go install github.com/luckyPipewrench/pipelock/cmd/pipelock@latest
+git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+make -C pipelock install
 
-# Or download binary
-curl -fsSL https://github.com/luckyPipewrench/pipelock/releases/latest/download/pipelock_linux_amd64.tar.gz | tar xz
-sudo mv pipelock /usr/local/bin/
+# Or download the v3.5.0 Linux amd64 archive
+gh release download v3.5.0 --repo luckyPipewrench/pipelock --pattern pipelock_3.5.0_linux_amd64.tar.gz
+gh attestation verify pipelock_3.5.0_linux_amd64.tar.gz --owner luckyPipewrench
+tar xzf pipelock_3.5.0_linux_amd64.tar.gz
+sudo install -m 0755 pipelock /usr/local/bin/pipelock
 
 # Or Homebrew (macOS)
 brew install luckyPipewrench/tap/pipelock
@@ -192,7 +195,7 @@ spec:
     spec:
       initContainers:
         - name: pipelock-init
-          image: ghcr.io/luckypipewrench/pipelock-init:latest
+          image: ghcr.io/luckypipewrench/pipelock-init:3.5.0
           command: ["cp", "/pipelock", "/shared-bin/pipelock"]
           volumeMounts:
             - name: shared-bin
@@ -213,7 +216,7 @@ spec:
               readOnly: true
 
         - name: pipelock
-          image: ghcr.io/luckypipewrench/pipelock:latest
+          image: ghcr.io/luckypipewrench/pipelock:3.5.0
           args: ["run", "--listen", "0.0.0.0:8888"]
           ports:
             - containerPort: 8888
@@ -317,11 +320,11 @@ curl http://localhost:3000/mcp
 
 ### DLP false positives
 
-If pipelock blocks legitimate traffic containing strings that match DLP patterns, add suppression rules to your config:
+If pipelock blocks legitimate traffic containing strings that match a non-core DLP pattern, add an exact-name suppression rule to your config. Core DLP names cannot be suppressed and require a pattern precision fix:
 
 ```yaml
 suppress:
-  - rule: "dlp_*"
+  - rule: "Internal Provider API Key"
     path: "*.example.com"
     reason: "Known safe endpoint"
 ```

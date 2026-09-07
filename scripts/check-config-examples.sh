@@ -69,17 +69,19 @@ fi
 # Fixture a real recorder signing key. Without this the check is CIRCULAR: a snippet
 # that correctly sets signing_key_path names a file this host does not have, gets
 # skipped as environment-dependent, and is never booted — so the policy would not
-# exercise the very examples it exists to protect. A signing key is trivially
-# fixture-creatable (init generates one), so it must be fixtured, not skipped. Skips
-# are reserved for dependencies that cannot reasonably be created here (a real signed
-# license, an operator's CA). `init` writes keys/ next to the config it generates.
-FIXTURE_KEY=""
-if "$BIN" init --output "$WORK/keygen/pipelock.yaml" --skip-canary --skip-validate >/dev/null 2>&1 \
-    && [ -s "$WORK/keygen/keys/flight-recorder-signing.key" ]; then
-    FIXTURE_KEY="$WORK/keygen/keys/flight-recorder-signing.key"
-else
-    echo "config-examples: WARNING - could not fixture a recorder signing key;" >&2
-    echo "  snippets naming signing_key_path will be skipped instead of booted." >&2
+# exercise the very examples it exists to protect. Generate only the required key
+# through its dedicated shipped lifecycle command. `init` performs unrelated host
+# setup after writing the key, so using its overall exit status makes this gate skip
+# recorder examples when that later setup is unavailable.
+FIXTURE_KEY="$WORK/keygen/flight-recorder-signing.key"
+mkdir -p "$(dirname "$FIXTURE_KEY")"
+KEYGEN_OUT="$WORK/recorder-key-generate.txt"
+if ! HOME="$PROBE_HOME" "$BIN" signing key generate \
+    --purpose receipt-signing --out "$FIXTURE_KEY" >"$KEYGEN_OUT" 2>&1 \
+    || [ ! -s "$FIXTURE_KEY" ]; then
+    echo "config-examples: could not fixture a recorder signing key" >&2
+    grep -vE '^[[:space:]]*$' "$KEYGEN_OUT" | tail -3 >&2 || true
+    exit 1
 fi
 
 # Top-level keys of config.Config. A yaml block is a pipelock config only if every
@@ -133,6 +135,7 @@ fragment_expected_error() {
     case "$1" in
         mcp-session-binding) echo "mcp_session_binding.enabled requires mcp_tool_scanning.enabled" ;;
         adaptive-enforcement) echo "adaptive_enforcement.enabled requires session_profiling.enabled" ;;
+        mcp-drift-reset-authority) echo "listener drift reset authority public key" ;;
         license-path-precedence) echo "unmarshal errors" ;;
         license-complete-reference | license-container-layout | license-activation) echo "license" ;;
         trusted-rule-key) echo "public_key must be exactly 64 hex chars" ;;
@@ -161,6 +164,15 @@ environment_failure_reason() {
     if grep -qE '\.(example|invalid|test)(\.[a-z]+)?\b' "$cfg" \
         && grep -qiE '(no such host|temporary failure in name resolution|name or service not known|network is unreachable|connection refused)' "$out"; then
         echo "placeholder destination is unavailable"
+        return
+    fi
+
+    # RFC 5737 documentation addresses are valid numeric examples but are not
+    # assigned to the CI host. Skip only when runtime reached the bind and the
+    # kernel refused that exact environmental precondition.
+    if grep -qE '^[[:space:]]*metrics_listen:[[:space:]]*["'"'"']?(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)' "$cfg" \
+        && grep -qiE 'metrics_listen bind .*cannot assign requested address' "$out"; then
+        echo "placeholder listener address is unavailable"
         return
     fi
 

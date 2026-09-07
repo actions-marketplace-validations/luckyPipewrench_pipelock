@@ -6,6 +6,7 @@ package broker
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -78,6 +80,8 @@ const (
 	vmReadyPollInterval = 500 * time.Millisecond
 )
 
+var verifySessionDelegation = playground.VerifySessionDelegation
+
 // ServerConfig configures the public playground broker HTTP front door.
 type ServerConfig struct {
 	// Leases owns VM lifecycle and the global machine concurrency cap. Required.
@@ -117,9 +121,22 @@ type ServerConfig struct {
 	PerCodeDailyBudget int
 	GlobalDailyBudget  int
 	// SessionEnv is layered into each per-VM lease along with the generated
-	// single-use VM invite code. It carries operator-provided per-session secret
-	// values such as PLAYGROUND_MODEL_KEY and PLAYGROUND_ORCHESTRATOR_KEY.
+	// single-use VM invite code. It may carry PLAYGROUND_MODEL_KEY. It must
+	// never carry the durable orchestrator private key.
 	SessionEnv map[string]string
+	// OrchestratorRoot is the broker-held durable signing root. When set, each
+	// session receives a short-lived delegated key instead of this value.
+	OrchestratorRoot ed25519.PrivateKey
+	// RequireDelegatedSigning makes a usable OrchestratorRoot mandatory. The
+	// broker CLI derives this from its existing production-secret requirement;
+	// local development can leave both disabled.
+	RequireDelegatedSigning bool
+	// ImageDigest is the immutable VM image bound into each session
+	// delegation. Required when OrchestratorRoot is set.
+	ImageDigest string
+	// SessionDelegationLifetime bounds minted session keys. Zero uses
+	// playground.DefaultSessionDelegationLifetime.
+	SessionDelegationLifetime time.Duration
 	// InternalPort is the VM server port. Zero uses 8080.
 	InternalPort int
 	// DeadlineGrace extends the VM-reported session expiry before the broker
@@ -157,6 +174,7 @@ type Server struct {
 	client   *http.Client
 
 	vmReadyTimeout time.Duration
+	signingReady   bool
 
 	killed atomic.Bool
 
@@ -311,6 +329,13 @@ type sessionRequest struct {
 	TurnstileToken string `json:"turnstile_token,omitempty"`
 }
 
+type vmSessionRequest struct {
+	Code                   string          `json:"code"`
+	RunNonce               string          `json:"run_nonce,omitempty"`
+	SessionSigningKey      string          `json:"session_signing_key,omitempty"`
+	OrchestratorDelegation json.RawMessage `json:"orchestrator_delegation,omitempty"`
+}
+
 type vmSessionResponse struct {
 	Token     string `json:"token"`
 	SessionID string `json:"session_id"`
@@ -347,6 +372,45 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 			return nil, fmt.Errorf("broker: %s must be >= 0", c.name)
 		}
 	}
+	// SessionEnv reaches every visitor VM. Keep an owned copy so a caller cannot
+	// add the durable root after this validation completes. Own the signing key
+	// for the same reason: callers must not be able to erase or replace it after
+	// the startup self-check reports success.
+	cfg.SessionEnv = maps.Clone(cfg.SessionEnv)
+	cfg.OrchestratorRoot = bytes.Clone(cfg.OrchestratorRoot)
+	for _, source := range []struct {
+		name string
+		env  map[string]string
+	}{
+		{name: "SessionEnv", env: cfg.SessionEnv},
+		{name: "LeaseConfig.BaseEnv", env: cfg.Leases.cfg.BaseEnv},
+	} {
+		if _, found := source.env["PLAYGROUND_ORCHESTRATOR_"+"KEY"]; found {
+			return nil, fmt.Errorf("broker: %s must not carry the durable orchestrator key", source.name)
+		}
+	}
+	if cfg.RequireDelegatedSigning && len(cfg.OrchestratorRoot) == 0 {
+		return nil, errors.New("broker: OrchestratorRoot is required when delegated signing is required")
+	}
+	signingVerified := false
+	if len(cfg.OrchestratorRoot) != 0 {
+		if _, err := playground.ParseOrchestratorPrivateKeyHex(hex.EncodeToString(cfg.OrchestratorRoot)); err != nil {
+			return nil, fmt.Errorf("broker: OrchestratorRoot: %w", err)
+		}
+		if cfg.ImageDigest == "" {
+			return nil, errors.New("broker: ImageDigest is required when OrchestratorRoot is set")
+		}
+		// Non-empty is not enough: only a canonical digest names an immutable
+		// image, and minting rejects anything else. Fail here instead of
+		// starting a broker whose every session dies at delegation time.
+		if err := playground.ValidateCanonicalImageDigest(cfg.ImageDigest); err != nil {
+			return nil, fmt.Errorf("broker: %w", err)
+		}
+		if err := checkDelegatedSigning(cfg.OrchestratorRoot, cfg.ImageDigest, cfg.SessionDelegationLifetime); err != nil {
+			return nil, err
+		}
+		signingVerified = true
+	}
 	if cfg.InternalPort == 0 {
 		cfg.InternalPort = defaultInternalPort
 	}
@@ -374,6 +438,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 		global:         livechat.NewDailyBudget(cfg.GlobalDailyBudget),
 		client:         client,
 		vmReadyTimeout: vmReadyTimeout,
+		signingReady:   signingVerified,
 		bundleCache:    newArtifactCache(artifactCacheTTL),
 		tokens:         make(map[string]*tokenLease),
 		bySess:         make(map[string]string),
@@ -381,6 +446,20 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	}
 	go s.reapLoop()
 	return s, nil
+}
+
+// checkDelegatedSigning exercises the complete visitor verification path before
+// the broker can accept traffic. Any mint or verification error refuses startup.
+func checkDelegatedSigning(root ed25519.PrivateKey, imageDigest string, lifetime time.Duration) error {
+	const nonce = "broker-startup-signing-self-check"
+	minted, err := playground.MintSessionDelegation(root, nonce, imageDigest, time.Now().UTC(), lifetime)
+	if err != nil {
+		return fmt.Errorf("broker: signing self-check mint: %w", err)
+	}
+	if err := verifySessionDelegation(minted.PrivateKey, minted.Delegation, nonce); err != nil {
+		return fmt.Errorf("broker: signing self-check verify against published identity: %w", err)
+	}
+	return nil
 }
 
 // Handler returns the broker's public /api/live/* routes.
@@ -467,6 +546,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// body, not the status line.
 	writeBrokerJSON(w, http.StatusOK, map[string]any{
 		"ok":                         s.cfg.Gate.Open() && s.global.Open() && !s.killed.Load(),
+		"signing_ready":              s.signingReady,
+		"published_signing_root":     playground.PublishedOrchestratorPubKeyHex,
 		"provider_ok":                ph.OK,
 		"provider_state":             string(ph.State),
 		"provider_failures":          ph.ConsecutiveFailures,
@@ -648,7 +729,7 @@ func (s *Server) handleSession(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	resp, expiresAt, err := s.createVMSession(r.Context(), lease, vmCode)
+	resp, expiresAt, err := s.createVMSession(r.Context(), lease, vmCode, sessionKey)
 	if err != nil {
 		s.cfg.Leases.Release(context.WithoutCancel(r.Context()), sessionKey)
 		undo()
@@ -1018,12 +1099,25 @@ func (s *Server) fetchVMArtifact(ctx context.Context, lease *Lease, vmToken, osP
 	}, nil
 }
 
-func (s *Server) createVMSession(ctx context.Context, lease *Lease, code string) (vmSessionResponse, time.Time, error) {
+func (s *Server) createVMSession(ctx context.Context, lease *Lease, code, runNonce string) (vmSessionResponse, time.Time, error) {
 	target, err := s.targetURL(lease, livechat.RouteSession)
 	if err != nil {
 		return vmSessionResponse{}, time.Time{}, err
 	}
-	reqBody, err := json.Marshal(sessionRequest{Code: code})
+	req := vmSessionRequest{Code: code, RunNonce: runNonce}
+	if len(s.cfg.OrchestratorRoot) != 0 {
+		minted, mintErr := playground.MintSessionDelegation(s.cfg.OrchestratorRoot, runNonce, s.cfg.ImageDigest, time.Now().UTC(), s.cfg.SessionDelegationLifetime)
+		if mintErr != nil {
+			return vmSessionResponse{}, time.Time{}, fmt.Errorf("broker: mint session delegation: %w", mintErr)
+		}
+		delBytes, marshalErr := json.Marshal(minted.Delegation)
+		if marshalErr != nil {
+			return vmSessionResponse{}, time.Time{}, fmt.Errorf("broker: marshal session delegation: %w", marshalErr)
+		}
+		req.SessionSigningKey = hex.EncodeToString(minted.PrivateKey)
+		req.OrchestratorDelegation = delBytes
+	}
+	reqBody, err := json.Marshal(req)
 	if err != nil {
 		return vmSessionResponse{}, time.Time{}, fmt.Errorf("broker: marshal vm session request: %w", err)
 	}

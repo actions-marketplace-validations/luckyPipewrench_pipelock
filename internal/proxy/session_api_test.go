@@ -715,6 +715,7 @@ func TestSessionAPI_HandleReset_ClearsCEEState(t *testing.T) {
 	et.Record(key, []byte("high-entropy-payload-for-testing"))
 	fb.Append(key, []byte("fragment-data"))
 	fb.Append(key+"|keys", []byte("keys-data"))
+	fb.AppendPathSegments(key+"|path", [][]byte{[]byte("upload"), []byte("path-data")})
 
 	if et.CurrentUsage(key) == 0 {
 		t.Fatal("expected non-zero entropy before reset")
@@ -748,6 +749,12 @@ func TestSessionAPI_HandleReset_ClearsCEEState(t *testing.T) {
 	// Entropy should be cleared.
 	if et.CurrentUsage(key) != 0 {
 		t.Error("entropy should be cleared after reset")
+	}
+
+	// Every fragment stream should be cleared, not just the base key: state
+	// left on any one of them survives an operator reset.
+	if got := fb.TotalBufferBytes(); got != 0 {
+		t.Errorf("fragment buffer holds %d bytes after reset, want every stream cleared", got)
 	}
 
 	var resp struct {
@@ -795,9 +802,9 @@ func TestSessionAPI_ResetUnderConcurrentTraffic(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	done := make(chan struct{})
+	done := make(chan time.Time, 1)
 	go func() {
-		defer close(done)
+		defer func() { done <- time.Now() }()
 
 		var wg sync.WaitGroup
 
@@ -843,11 +850,20 @@ func TestSessionAPI_ResetUnderConcurrentTraffic(t *testing.T) {
 		wg.Wait()
 	}()
 
+	var completedAt time.Time
 	select {
-	case <-done:
-		// Success - completed without deadlock.
+	case completedAt = <-done:
 	case <-ctx.Done():
-		t.Fatal("deadlock detected: test did not complete within timeout")
+		// The receiver may resume after both channels became ready.
+		select {
+		case completedAt = <-done:
+		default:
+			t.Fatal("concurrent traffic did not complete before the watchdog expired")
+		}
+	}
+	deadline, _ := ctx.Deadline()
+	if !completedAt.Before(deadline) {
+		t.Fatal("concurrent traffic ended after the watchdog expired")
 	}
 }
 

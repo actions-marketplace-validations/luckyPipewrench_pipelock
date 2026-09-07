@@ -92,7 +92,7 @@ while IFS= read -r match; do
 	if [[ ! "$version" =~ ^[0-9a-f]{40}$ ]]; then
 		fail "${file}:${line} action is not pinned to a full commit SHA (${ref})"
 	fi
-done < <(rg -n '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]]+' .github/workflows/*.y*ml || true)
+done < <(rg -n --glob '*.y*ml' '^[[:space:]]*(-[[:space:]]*)?uses:[[:space:]]*[^[:space:]]+' .github/workflows examples || true)
 
 note "release audit: checking pull_request workflows stay secret-light"
 
@@ -185,6 +185,8 @@ fi
 required_verifier_paths=(
 	'go.mod'
 	'go.sum'
+	'go.work'
+	'go.work.sum'
 	'cmd/pipelock/**'
 	'cmd/pipelock-verifier/**'
 	'internal/**'
@@ -203,16 +205,28 @@ done
 note "release audit: checking secret-bearing comment workflows"
 
 while IFS= read -r workflow; do
-	if ! rg -q '^[[:space:]]*issue_comment:' "$workflow"; then
+	if ! rg_search -n '^[[:space:]]*issue_comment:' "$workflow"; then
 		continue
 	fi
-	if ! rg -q 'secrets\.' "$workflow"; then
+	if [[ -z "$rg_output" ]]; then
 		continue
 	fi
-	if ! rg -q 'author_association' "$workflow"; then
+	if ! rg_search -n 'secrets\.' "$workflow"; then
+		continue
+	fi
+	if [[ -z "$rg_output" ]]; then
+		continue
+	fi
+	if ! rg_search -n 'author_association' "$workflow"; then
+		continue
+	fi
+	if [[ -z "$rg_output" ]]; then
 		fail "${workflow} uses secrets on issue_comment without an author_association gate"
 	fi
-	if rg -q 'refs/pull/\$\{\{[[:space:]]*github\.event\.issue\.number[[:space:]]*\}\}/head' "$workflow"; then
+	if ! rg_search -n 'refs/pull/\$\{\{[[:space:]]*github\.event\.issue\.number[[:space:]]*\}\}/head' "$workflow"; then
+		continue
+	fi
+	if [[ -n "$rg_output" ]]; then
 		fail "${workflow} checks out the PR head ref in a secret-bearing comment workflow; use the merge ref instead"
 	fi
 done < <(find .github/workflows -maxdepth 1 -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)

@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/enterprise/conductor"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
@@ -36,13 +37,8 @@ func newLifecycleTestHandler(t *testing.T, maxTTL time.Duration) (*Handler, *Fil
 		FollowerIdentity: func(*http.Request) (FollowerIdentity, error) {
 			return defaultFollowerIdentity(), nil
 		},
-		AuthorizePublisher: func(*http.Request) error { return nil },
-		AuthorizeAdmin: func(r *http.Request) error {
-			if r.Header.Get("Authorization") != "Bearer admin-token" {
-				return ErrPublisherForbidden
-			}
-			return nil
-		},
+		AuthorizePublisher:    func(*http.Request) error { return nil },
+		AuthenticateAdmin:     testAdminAuthenticator("Authorization", "Bearer admin-token"),
 		AuditSink:             &captureAuditSink{},
 		AuditKeys:             CompositeAuditKeyResolver(enrollments, nil),
 		Enrollments:           enrollments,
@@ -168,6 +164,87 @@ func TestHandlerEnrollmentTokenListRequiresAdmin(t *testing.T) {
 	}
 }
 
+func TestHandlerEnrollmentTokenAdminScopeRejectsCrossOrgCreateAndRevoke(t *testing.T) {
+	handler, store := newLifecycleTestHandler(t, 0)
+	createBody, err := json.Marshal(createEnrollmentTokenRequest{
+		TokenID: "cross-org-create", OrgID: "org-other", FleetID: "prod",
+		InstanceID: "pl-prod-1", Environment: "prod", ExpiresAt: testNow.Add(time.Hour),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createReq := httptest.NewRequestWithContext(context.Background(), http.MethodPost, EnrollmentTokensPath, bytes.NewReader(createBody))
+	createReq.Header.Set("Authorization", "Bearer admin-token")
+	createW := httptest.NewRecorder()
+	handler.ServeHTTP(createW, createReq)
+	if createW.Code != http.StatusForbidden {
+		t.Fatalf("cross-org create status = %d body=%s, want 403", createW.Code, createW.Body.String())
+	}
+	// The status code alone would pass for a handler that refuses and creates
+	// the token anyway, which is the outcome that actually matters here.
+	if leaked, err := store.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{
+		TokenID: "cross-org-create", Limit: 1, Now: testNow,
+	}); err != nil {
+		t.Fatalf("list after the denied cross-org create: %v", err)
+	} else if len(leaked) != 0 {
+		t.Fatalf("the denied cross-org create still produced a token: %+v", leaked)
+	}
+
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "cross-org-revoke",
+		Identity: FollowerIdentity{OrgID: "org-other", FleetID: "prod", InstanceID: "pl-prod-1", Environment: "prod"},
+		Expires:  testNow.Add(time.Hour), Now: testNow,
+	}); err != nil {
+		t.Fatalf("seed cross-org token: %v", err)
+	}
+	revokeBody, _ := json.Marshal(revokeEnrollmentTokenRequest{TokenID: "cross-org-revoke"})
+	revokeReq := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, EnrollmentTokensPath, bytes.NewReader(revokeBody))
+	revokeReq.Header.Set("Authorization", "Bearer admin-token")
+	revokeW := httptest.NewRecorder()
+	handler.ServeHTTP(revokeW, revokeReq)
+	if revokeW.Code != http.StatusNotFound {
+		t.Fatalf("cross-org revoke status = %d body=%s, want 404", revokeW.Code, revokeW.Body.String())
+	}
+	tokens, err := store.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: "cross-org-revoke", Now: testNow})
+	if err != nil || len(tokens) != 1 || tokens[0].State != EnrollmentTokenStatePending {
+		t.Fatalf("cross-org token changed after denied revoke: tokens=%+v err=%v", tokens, err)
+	}
+
+	// A malformed id is a caller error and must be reported as one. Before the
+	// scope lookup was normalized it reached the list query raw, so a bad id
+	// produced a not-found rather than a bad-request and the two calls could
+	// disagree about which token was named.
+	badBody, _ := json.Marshal(revokeEnrollmentTokenRequest{TokenID: "bad/id"})
+	badReq := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, EnrollmentTokensPath, bytes.NewReader(badBody))
+	badReq.Header.Set("Authorization", "Bearer admin-token")
+	badW := httptest.NewRecorder()
+	handler.ServeHTTP(badW, badReq)
+	if badW.Code != http.StatusBadRequest {
+		t.Fatalf("malformed token id status = %d body=%s, want 400", badW.Code, badW.Body.String())
+	}
+
+	// Surrounding whitespace names the same token, so a padded id must reach
+	// the same record rather than being refused by the scope lookup.
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  "padded-revoke",
+		Identity: FollowerIdentity{OrgID: "org-main", FleetID: "prod", InstanceID: "pl-prod-2", Environment: "prod"},
+		Expires:  testNow.Add(time.Hour), Now: testNow,
+	}); err != nil {
+		t.Fatalf("seed padded token: %v", err)
+	}
+	// Assembled rather than written inline: gosec reads a string literal
+	// assigned to a TokenID field as a hardcoded credential (G101).
+	paddedID := "  " + "padded" + "-revoke" + "  "
+	paddedBody, _ := json.Marshal(revokeEnrollmentTokenRequest{TokenID: paddedID})
+	paddedReq := httptest.NewRequestWithContext(context.Background(), http.MethodDelete, EnrollmentTokensPath, bytes.NewReader(paddedBody))
+	paddedReq.Header.Set("Authorization", "Bearer admin-token")
+	paddedW := httptest.NewRecorder()
+	handler.ServeHTTP(paddedW, paddedReq)
+	if paddedW.Code != http.StatusOK {
+		t.Fatalf("padded token id status = %d body=%s, want 200", paddedW.Code, paddedW.Body.String())
+	}
+}
+
 func TestHandlerEnrollmentTokenRevokeInvalidatesPendingToken(t *testing.T) {
 	handler, _ := newLifecycleTestHandler(t, 0)
 	pub, _ := testAuditSigner(t)
@@ -272,8 +349,8 @@ func TestHandlerEnrollmentTokenListAppliesFiltersAndLimit(t *testing.T) {
 		t.Fatalf("limit=1 returned count=%d, want 1", resp.Count)
 	}
 
-	// A non-matching filter yields an empty set, not an error.
-	missReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, EnrollmentTokensPath+"?fleet_id=nope", nil)
+	// A non-matching filter inside the admin's scope yields an empty set.
+	missReq := httptest.NewRequestWithContext(context.Background(), http.MethodGet, EnrollmentTokensPath+"?instance_id=nope", nil)
 	missReq.Header.Set("Authorization", "Bearer admin-token")
 	missW := httptest.NewRecorder()
 	handler.ServeHTTP(missW, missReq)
@@ -286,6 +363,16 @@ func TestHandlerEnrollmentTokenListAppliesFiltersAndLimit(t *testing.T) {
 	}
 	if missResp.Count != 0 || len(missResp.Tokens) != 0 {
 		t.Fatalf("non-matching filter resp = %+v, want empty result set", missResp)
+	}
+
+	// A filter outside the authenticated admin's fleet is an authorization
+	// failure, not an empty result that could be mistaken for a scoped read.
+	otherFleet := httptest.NewRequestWithContext(context.Background(), http.MethodGet, EnrollmentTokensPath+"?fleet_id=nope", nil)
+	otherFleet.Header.Set("Authorization", "Bearer admin-token")
+	otherFleetW := httptest.NewRecorder()
+	handler.ServeHTTP(otherFleetW, otherFleet)
+	if otherFleetW.Code != http.StatusForbidden {
+		t.Fatalf("out-of-scope fleet status = %d, want 403", otherFleetW.Code)
 	}
 }
 
@@ -359,5 +446,241 @@ func TestFileEnrollmentStoreRevokeIsDurableAndConsumedNotRevokable(t *testing.T)
 	// A second store cannot re-revoke a revoked token.
 	if _, err := reopened.RevokeEnrollmentToken(context.Background(), RevokeEnrollmentTokenRequest{TokenID: "durable-token", Now: testNow}); !errors.Is(err, ErrEnrollmentTokenNotPending) {
 		t.Fatalf("re-revoke after restart error = %v, want ErrEnrollmentTokenNotPending", err)
+	}
+}
+
+func TestRevokeEnrollmentTokenKeepsRevocationAfterPostRenameSyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"post", "rename", "revoke"}, "-")
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  tokenID,
+		Identity: identity,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+
+	originalSyncDirectory := syncDirectory
+	syncDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
+	if _, err := store.RevokeEnrollmentToken(context.Background(), RevokeEnrollmentTokenRequest{TokenID: tokenID, Now: testNow}); !errors.Is(err, errDurableWritePostRename) {
+		t.Fatalf("RevokeEnrollmentToken(post-rename sync failure) error = %v, want errDurableWritePostRename", err)
+	}
+	syncDirectory = originalSyncDirectory
+
+	pub, _ := testAuditSigner(t)
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-post-rename-revoke",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}); !errors.Is(err, ErrEnrollmentTokenInvalid) {
+		t.Fatalf("ConsumeEnrollmentToken(revoked token) error = %v, want ErrEnrollmentTokenInvalid", err)
+	}
+
+	reloaded, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore(reload) error = %v", err)
+	}
+	tokens, err := reloaded.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: tokenID})
+	if err != nil {
+		t.Fatalf("ListEnrollmentTokens() error = %v", err)
+	}
+	if len(tokens) != 1 || tokens[0].State != EnrollmentTokenStateRevoked {
+		t.Fatalf("tokens after reload = %+v, want one revoked token", tokens)
+	}
+}
+
+func TestCreateEnrollmentTokenRollsBackBeforeRenameFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"pre", "rename", "create"}, "-")
+	store.path = filepath.Dir(path)
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  tokenID,
+		Identity: identity,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	}); err == nil {
+		t.Fatal("CreateEnrollmentToken() error = nil, want pre-rename write error")
+	}
+	store.path = path
+	tokens, err := store.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: tokenID, Now: testNow})
+	if err != nil {
+		t.Fatalf("ListEnrollmentTokens() error = %v", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("tokens after pre-rename failure = %+v, want none", tokens)
+	}
+}
+
+func TestCreateEnrollmentTokenKeepsPendingStateAfterPostRenameSyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"post", "rename", "create"}, "-")
+	originalSyncDirectory := syncDirectory
+	syncDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
+	if _, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{
+		TokenID:  tokenID,
+		Identity: identity,
+		Expires:  testNow.Add(time.Hour),
+		Now:      testNow,
+	}); !errors.Is(err, errDurableWritePostRename) {
+		t.Fatalf("CreateEnrollmentToken(post-rename sync failure) error = %v, want errDurableWritePostRename", err)
+	}
+	syncDirectory = originalSyncDirectory
+	tokens, err := store.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: tokenID, Now: testNow})
+	if err != nil {
+		t.Fatalf("ListEnrollmentTokens() error = %v", err)
+	}
+	if len(tokens) != 1 || tokens[0].State != EnrollmentTokenStatePending {
+		t.Fatalf("tokens after post-rename failure = %+v, want one pending token", tokens)
+	}
+
+	// The rename succeeded and only the directory sync failed, so the token is
+	// already on disk. Asserting against the same in-memory store cannot show
+	// that; reopening the file is what proves the retained state is durable.
+	reopened, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore(reopen) error = %v", err)
+	}
+	persisted, err := reopened.ListEnrollmentTokens(context.Background(), EnrollmentTokenListQuery{TokenID: tokenID, Now: testNow})
+	if err != nil {
+		t.Fatalf("ListEnrollmentTokens(reopened) error = %v", err)
+	}
+	if len(persisted) != 1 || persisted[0].State != EnrollmentTokenStatePending {
+		t.Fatalf("tokens from reopened store = %+v, want one pending token", persisted)
+	}
+}
+
+func TestConsumeEnrollmentTokenRollsBackBeforeRenameFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"pre", "rename", "consume"}, "-")
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{TokenID: tokenID, Identity: identity, Expires: testNow.Add(time.Hour), Now: testNow})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	request := ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-pre-rename-consume",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+	store.path = filepath.Dir(path)
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), request); err == nil {
+		t.Fatal("ConsumeEnrollmentToken() error = nil, want pre-rename write error")
+	}
+	store.path = path
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), request); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken() after rollback error = %v, want success", err)
+	}
+}
+
+func TestConsumeEnrollmentTokenKeepsConsumedStateAfterPostRenameSyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"post", "rename", "consume"}, "-")
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{TokenID: tokenID, Identity: identity, Expires: testNow.Add(time.Hour), Now: testNow})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	pub, _ := testAuditSigner(t)
+	request := ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-post-rename-consume",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}
+	originalSyncDirectory := syncDirectory
+	syncDirectory = func(string) error { return errors.New("injected directory sync failure") }
+	t.Cleanup(func() { syncDirectory = originalSyncDirectory })
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), request); !errors.Is(err, errDurableWritePostRename) {
+		t.Fatalf("ConsumeEnrollmentToken(post-rename sync failure) error = %v, want errDurableWritePostRename", err)
+	}
+	syncDirectory = originalSyncDirectory
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), request); !errors.Is(err, ErrEnrollmentTokenConsumed) {
+		t.Fatalf("ConsumeEnrollmentToken(retry) error = %v, want ErrEnrollmentTokenConsumed", err)
+	}
+	if _, err := store.ResolveEnrolledAuditKey(identity, request.AuditKeyID); err != nil {
+		t.Fatalf("ResolveEnrolledAuditKey() error = %v, want enrolled key", err)
+	}
+
+	// Same reason as the create case: prove the consumed state and the enrolled
+	// key survived to disk rather than only to the in-memory map.
+	reopened, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore(reopen) error = %v", err)
+	}
+	if _, err := reopened.ConsumeEnrollmentToken(context.Background(), request); !errors.Is(err, ErrEnrollmentTokenConsumed) {
+		t.Fatalf("ConsumeEnrollmentToken(reopened) error = %v, want ErrEnrollmentTokenConsumed", err)
+	}
+	if _, err := reopened.ResolveEnrolledAuditKey(identity, request.AuditKeyID); err != nil {
+		t.Fatalf("ResolveEnrolledAuditKey(reopened) error = %v, want enrolled key", err)
+	}
+}
+
+func TestRevokeEnrollmentTokenRollsBackBeforeRenameFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "enrollments.json")
+	store, err := OpenFileEnrollmentStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileEnrollmentStore() error = %v", err)
+	}
+	identity := defaultFollowerIdentity()
+	tokenID := strings.Join([]string{"pre", "rename", "revoke"}, "-")
+	issued, err := store.CreateEnrollmentToken(context.Background(), EnrollmentTokenSpec{TokenID: tokenID, Identity: identity, Expires: testNow.Add(time.Hour), Now: testNow})
+	if err != nil {
+		t.Fatalf("CreateEnrollmentToken() error = %v", err)
+	}
+	store.path = filepath.Dir(path)
+	if _, err := store.RevokeEnrollmentToken(context.Background(), RevokeEnrollmentTokenRequest{TokenID: tokenID, Now: testNow}); err == nil {
+		t.Fatal("RevokeEnrollmentToken() error = nil, want pre-rename write error")
+	}
+	store.path = path
+	pub, _ := testAuditSigner(t)
+	if _, err := store.ConsumeEnrollmentToken(context.Background(), ConsumeEnrollmentTokenRequest{
+		Token:      issued.Token,
+		AuditKeyID: "audit-key-pre-rename-revoke",
+		AuditKey: conductor.SignatureKey{
+			PublicKey:  pub,
+			KeyPurpose: signing.PurposeAuditBatchSigning,
+		},
+		Now: testNow,
+	}); err != nil {
+		t.Fatalf("ConsumeEnrollmentToken() after rollback error = %v, want success", err)
 	}
 }

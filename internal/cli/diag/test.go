@@ -105,6 +105,7 @@ Examples:
   pipelock test --config pipelock.yaml                   # validate a specific config
   pipelock test --json --fail-on-gap --config my.yaml    # CI gate (recommended)
   pipelock test --category dlp,entropy                   # run specific categories`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, cfgLabel, err := loadTestConfig(configFile)
 			if err != nil {
@@ -119,6 +120,9 @@ Examples:
 			bundleResult := rules.MergeIntoConfig(cfg, cliutil.Version)
 			for _, e := range bundleResult.Errors {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: bundle %s: %s\n", e.Name, e.Reason)
+			}
+			for _, w := range bundleResult.Warnings {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: %s\n", w)
 			}
 			extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
 

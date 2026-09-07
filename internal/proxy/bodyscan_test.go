@@ -55,8 +55,52 @@ func fakeAPIKey() string {
 	return "AKIA" + "IOSFODNN7EXAMPLE"
 }
 
+func TestScanRequestBodyCanceledScanIsNotInjection(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sc, err := scanner.New(testScannerConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(sc.Close)
+	body, result := scanRequestBody(ctx, BodyScanRequest{
+		Body:        strings.NewReader(`{"message":"ordinary content"}`),
+		ContentType: "application/json", MaxBytes: 1024, Scanner: sc,
+		Action: config.ActionWarn,
+	})
+	if result.Clean || result.Action != config.ActionBlock || !isFailClosedBodyResult(result, body) {
+		t.Fatalf("incomplete scan must block without replayable bytes: %+v", result)
+	}
+	if len(result.InjectionMatches) != 0 || !strings.Contains(result.Reason, "scan failed") {
+		t.Fatalf("incomplete scan misclassified: %+v", result)
+	}
+}
+
 func fakeGitHubToken() string {
 	return "ghp_" + "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl"
+}
+
+// highEntropyFiller deterministically generates n characters that read like
+// real base64url ciphertext (near-uniform symbol distribution, Shannon
+// entropy in the high 5-bits/char range) instead of a repeated or
+// structured filler. isProviderOpaqueCiphertext requires filler this shape
+// to qualify for the provider-opaque DLP downgrade - a strings.Repeat
+// filler no longer qualifies once the entropy floor is enforced, because it
+// is exactly the shape a real secret padded out to the length floor would
+// take. xorshift64 is deterministic (fixed seed) so these fixtures never
+// flake, and its output measured well clear of the 5.3 bits/char floor
+// (5.7-5.9 across the sizes these tests use).
+func highEntropyFiller(n int) string {
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	state := uint64(0x9E3779B97F4A7C15)
+	b := make([]byte, n)
+	for i := range b {
+		state ^= state << 13
+		state ^= state >> 7
+		state ^= state << 17
+		b[i] = alphabet[state%uint64(len(alphabet))]
+	}
+	return string(b)
 }
 
 const testBodyDLPPatternName = "Request Body Test Secret"
@@ -1135,7 +1179,7 @@ func TestScanRequestBody_DLPHonorsScopedSuppress(t *testing.T) {
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 
-	body := `{"input": "` + fakeAPIKey() + `"}`
+	body := `{"input": "` + fakeAnthropicKey() + `"}`
 	_, result := scanRequestBody(context.Background(), BodyScanRequest{
 		Body:        strings.NewReader(body),
 		ContentType: contentTypeJSON,
@@ -1144,7 +1188,7 @@ func TestScanRequestBody_DLPHonorsScopedSuppress(t *testing.T) {
 		Target:      "https://chatgpt.com/backend-api/codex/responses",
 		Suppress: []config.SuppressEntry{
 			{
-				Rule:   "AWS Access ID",
+				Rule:   "Anthropic API Key",
 				Path:   "*chatgpt.com*",
 				Reason: "test canary suppression",
 			},
@@ -1155,12 +1199,155 @@ func TestScanRequestBody_DLPHonorsScopedSuppress(t *testing.T) {
 	}
 }
 
+func TestScanRequestBody_CoreDLPIgnoresInjectedSuppress(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	body := `{"input": "` + fakeAPIKey() + `"}`
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:        strings.NewReader(body),
+		ContentType: contentTypeJSON,
+		MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:     sc,
+		Target:      "https://api.vendor.example/v1",
+		Suppress: []config.SuppressEntry{
+			{Rule: "AWS Access ID", Path: "*", Reason: "injected after validation"},
+		},
+	})
+	if result.Clean {
+		t.Fatal("wildcard suppression silenced core DLP in request body")
+	}
+	if got := result.DLPMatches[0].PatternName; got != "AWS Access ID" {
+		t.Fatalf("pattern = %q, want AWS Access ID", got)
+	}
+}
+
+func TestScanRequestBody_EmbeddedSigV4URLNeedsNoCoreSuppression(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	key := fakeAPIKey()
+	q := url.Values{}
+	q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+	q.Set("X-Amz-Credential", key+"/20260831/us-east-1/s3/aws4_request")
+	q.Set("X-Amz-Date", "20260831T120000Z")
+	q.Set("X-Amz-Expires", "3600")
+	q.Set("X-Amz-Signature", strings.Repeat("a", 64))
+	q.Set("X-Amz-SignedHeaders", "host")
+	presignedURL := "https://uploads.s3.amazonaws.com/object?" + q.Encode()
+	route := config.RequestBodySigV4CredentialRoute{
+		Host:         "api.vendor.example",
+		Path:         "/v1/graphql",
+		ContentTypes: []string{contentTypeJSON},
+		Methods:      []string{http.MethodPost},
+		Reason:       "attachment registration",
+		Owner:        "platform",
+		Expires:      "2099-12-31",
+	}
+
+	for _, tc := range []struct {
+		name        string
+		body        string
+		scheme      string
+		method      string
+		contentType string
+		host        string
+		path        string
+		expires     string
+		wantClean   bool
+	}{
+		{
+			name: "authorized attachment URL", body: `{"query":"mutation($url:String!){registerAttachment(url:$url)}","variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "https", method: http.MethodPost, contentType: contentTypeJSON, host: route.Host, path: route.Path, expires: route.Expires, wantClean: true,
+		},
+		{
+			name: "separate key beside attachment URL", body: `{"variables":{"url":"` + presignedURL + `","other":"` + key + `"}}`,
+			scheme: "https", method: http.MethodPost, contentType: contentTypeJSON, host: route.Host, path: route.Path, expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "unauthorized destination", body: `{"variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "https", method: http.MethodPost, contentType: contentTypeJSON, host: "collector.example", path: route.Path, expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "plain HTTP", body: `{"variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "http", method: http.MethodPost, contentType: contentTypeJSON, host: route.Host, path: route.Path, expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "wrong method", body: `{"variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "https", method: http.MethodPut, contentType: contentTypeJSON, host: route.Host, path: route.Path, expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "wrong media type", body: `url=` + presignedURL,
+			scheme: "https", method: http.MethodPost, contentType: "text/plain", host: route.Host, path: route.Path, expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "wrong path", body: `{"variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "https", method: http.MethodPost, contentType: contentTypeJSON, host: route.Host, path: "/v1/other", expires: route.Expires, wantClean: false,
+		},
+		{
+			name: "expired route", body: `{"variables":{"url":"` + presignedURL + `"}}`,
+			scheme: "https", method: http.MethodPost, contentType: contentTypeJSON, host: route.Host, path: route.Path, expires: "2020-01-01", wantClean: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeForCase := route
+			routeForCase.Expires = tc.expires
+			_, result := scanRequestBody(context.Background(), BodyScanRequest{
+				Body:                  strings.NewReader(tc.body),
+				Scheme:                tc.scheme,
+				Method:                tc.method,
+				ContentType:           tc.contentType,
+				MaxBytes:              cfg.RequestBodyScanning.MaxBodyBytes,
+				Scanner:               sc,
+				Host:                  tc.host,
+				Path:                  tc.path,
+				EntropyRoutePath:      tc.path,
+				Target:                tc.scheme + "://" + tc.host + tc.path,
+				SigV4CredentialRoutes: []config.RequestBodySigV4CredentialRoute{routeForCase},
+			})
+			if result.Clean != tc.wantClean {
+				t.Fatalf("Clean = %v, want %v; matches=%+v", result.Clean, tc.wantClean, result.DLPMatches)
+			}
+			if tc.wantClean {
+				if len(result.DLPMatches) != 0 {
+					t.Fatalf("DLPMatches = %v, want none", dlpMatchNames(result.DLPMatches))
+				}
+				return
+			}
+			if !hasDLPMatchName(result.DLPMatches, "AWS Access ID") {
+				t.Fatalf("DLPMatches = %v, want AWS Access ID", dlpMatchNames(result.DLPMatches))
+			}
+		})
+	}
+}
+
+func TestScanRequestBody_DefaultProviderSuppressionRemainsAvailable(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	body := `{"input": "` + fakeAnthropicKey() + `"}`
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:        strings.NewReader(body),
+		ContentType: contentTypeJSON,
+		MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:     sc,
+		Target:      "https://api.anthropic.com/v1/messages",
+		Suppress:    cfg.Suppress,
+	})
+	if !result.Clean {
+		t.Fatalf("default provider suppression should remain available, got %+v", result.DLPMatches)
+	}
+}
+
 func TestScanRequestBody_DLPPartialSuppressKeepsOtherMatches(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 
-	body := `{"aws": "` + fakeAPIKey() + `", "gh": "` + fakeGitHubToken() + `"}`
+	body := `{"anthropic": "` + fakeAnthropicKey() + `", "openai": "sk-proj-` + strings.Repeat("A", 40) + `"}`
 	_, result := scanRequestBody(context.Background(), BodyScanRequest{
 		Body:        strings.NewReader(body),
 		ContentType: contentTypeJSON,
@@ -1169,17 +1356,17 @@ func TestScanRequestBody_DLPPartialSuppressKeepsOtherMatches(t *testing.T) {
 		Target:      "https://chatgpt.com/backend-api/codex/responses",
 		Suppress: []config.SuppressEntry{
 			{
-				Rule:   "AWS Access ID",
+				Rule:   "Anthropic API Key",
 				Path:   "*chatgpt.com*",
 				Reason: "test canary suppression",
 			},
 		},
 	})
 	if result.Clean {
-		t.Fatal("expected unsuppressed GitHub token to remain a DLP finding")
+		t.Fatal("expected unsuppressed OpenAI key to remain a DLP finding")
 	}
-	if got := result.DLPMatches[0].PatternName; got != "GitHub Token" {
-		t.Fatalf("pattern = %q, want GitHub Token", got)
+	if got := result.DLPMatches[0].PatternName; got != "OpenAI API Key" {
+		t.Fatalf("pattern = %q, want OpenAI API Key", got)
 	}
 }
 
@@ -1419,13 +1606,13 @@ func TestScanRequestBody_JSONImageDataURLWithoutImageMagicStillScansPayloadText(
 	}
 }
 
-func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstringWarns(t *testing.T) {
+func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstringBlocks(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 
 	token := fakeGitHubToken()
-	ciphertext := strings.Repeat("A", 260) + "." + token + "." + strings.Repeat("B", 260)
+	ciphertext := highEntropyFiller(260) + "." + token + "." + highEntropyFiller(260)
 	body := `{
 		"input": [{
 			"role": "assistant",
@@ -1443,13 +1630,14 @@ func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstring
 		Path:                         testTrustedProviderPath,
 		MaxBytes:                     cfg.RequestBodyScanning.MaxBodyBytes,
 		Scanner:                      sc,
+		Action:                       cfg.RequestBodyScanning.Action,
 		TrustedProviderOpaqueRequest: testTrustedProviderOpaqueRequest,
 	})
 	if result.Clean {
-		t.Fatal("expected embedded token-shaped substring in opaque provider field to stay visible as warn")
+		t.Fatal("expected embedded token-shaped substring in opaque provider field to stay visible")
 	}
-	if result.Action != config.ActionWarn {
-		t.Fatalf("expected warn action for provider opaque field, got action=%q matches=%v reason=%q", result.Action, result.DLPMatches, result.Reason)
+	if result.Action != config.ActionBlock {
+		t.Fatalf("expected block action for unverified provider opaque field, got action=%q matches=%v reason=%q", result.Action, result.DLPMatches, result.Reason)
 	}
 	if len(result.DLPMatches) == 0 {
 		t.Fatal("expected provider opaque field DLP matches to remain visible")
@@ -1462,8 +1650,8 @@ func TestScanRequestBody_ModelProviderOpaqueReasoningFieldEmbeddedTokenSubstring
 			t.Fatalf("provider opaque provenance must not reuse scanner warn state: %+v", match)
 		}
 	}
-	if shouldHardBlockBodyCriticalDLP(result, testTrustedProviderHost, cfg) {
-		t.Fatal("provider opaque field warn-only match must not hard-block")
+	if !shouldHardBlockBodyCriticalDLP(result, testTrustedProviderHost, cfg) {
+		t.Fatal("provider opaque field has no local authenticity proof and must hard-block")
 	}
 }
 
@@ -1534,7 +1722,7 @@ func TestScanRequestBody_ProviderTopLevelOpaqueFieldNameDoesNotBypassDLP(t *test
 }
 
 func TestExtractBodyTextForDLP_ProviderOpaqueReasoningFieldSeparated(t *testing.T) {
-	ciphertext := strings.Repeat("A", 260) + "." + fakeGitHubToken() + "." + strings.Repeat("B", 260)
+	ciphertext := highEntropyFiller(260) + "." + fakeGitHubToken() + "." + highEntropyFiller(260)
 	body := []byte(`{"input":[{"content":[{"type":"reasoning","encrypted_content":"` + ciphertext + `"}]}]}`)
 
 	extracted := extractBodyTextForDLP(body, BodyScanRequest{
@@ -1583,7 +1771,7 @@ func TestExtractBodyTextForDLP_ProviderOpaqueWrongValueShapeScansNormally(t *tes
 	}
 }
 
-func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
+func TestScanRequestBody_ProviderOpaqueProvenanceNeverDowngradesDLP(t *testing.T) {
 	cfg := testScannerConfig()
 
 	opaqueValue := func(totalBytes int) string {
@@ -1592,7 +1780,12 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 		if totalBytes < len(suffix) {
 			t.Fatalf("test ciphertext length %d is smaller than suffix %d", totalBytes, len(suffix))
 		}
-		value := strings.Repeat("A", totalBytes-len(suffix)) + suffix
+		// highEntropyFiller, not strings.Repeat: the padding must read like
+		// genuine ciphertext to exercise the length/path/host gates in
+		// isolation from the entropy floor now enforced in
+		// isProviderOpaqueCiphertext (a repeated-character filler would
+		// fail that floor regardless of length, host, or path).
+		value := highEntropyFiller(totalBytes-len(suffix)) + suffix
 		if len(value) != totalBytes {
 			t.Fatalf("ciphertext length = %d, want %d", len(value), totalBytes)
 		}
@@ -1605,7 +1798,7 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 		path           string
 		valueBytes     int
 		useDefaultGate bool
-		wantWarn       bool
+		wantOpaque     bool
 	}{
 		{
 			name:       "trusted host non-allowlisted path blocks",
@@ -1620,11 +1813,11 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			valueBytes: providerOpaqueCiphertextMinBytes - 1,
 		},
 		{
-			name:       "256 byte value warns",
+			name:       "256 byte value keeps provenance and blocks",
 			host:       testTrustedProviderHost,
 			path:       testTrustedProviderPath,
 			valueBytes: providerOpaqueCiphertextMinBytes,
-			wantWarn:   true,
+			wantOpaque: true,
 		},
 		{
 			name:           "nil gate uses production allowlist",
@@ -1632,7 +1825,7 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			path:           "/v1/responses",
 			valueBytes:     providerOpaqueCiphertextMinBytes,
 			useDefaultGate: true,
-			wantWarn:       true,
+			wantOpaque:     true,
 		},
 		{
 			name:           "nil gate rejects sibling endpoint",
@@ -1667,16 +1860,72 @@ func TestScanRequestBody_ProviderOpaqueDowngradeGates(t *testing.T) {
 			if result.Clean {
 				t.Fatal("expected GitHub token finding")
 			}
-			if tt.wantWarn {
-				if result.Action != config.ActionWarn {
-					t.Fatalf("Action = %q, want warn; matches=%+v", result.Action, result.DLPMatches)
-				}
+			if result.Action != config.ActionBlock {
+				t.Fatalf("Action = %q, want block; matches=%+v", result.Action, result.DLPMatches)
+			}
+			if tt.wantOpaque {
 				if len(result.DLPMatches) == 0 || !result.DLPMatches[0].ProviderOpaque {
 					t.Fatalf("matches = %+v, want provider-opaque provenance", result.DLPMatches)
+				}
+				if !shouldHardBlockBodyCriticalDLP(result, tt.host, cfg) {
+					t.Fatal("unverified provider-opaque critical match must hard-block")
 				}
 				return
 			}
 			assertBodyDLPBlocksWithoutProviderOpaque(t, result, tt.name)
+		})
+	}
+}
+
+func TestProviderOpaqueRequestDLPConfiguredActions(t *testing.T) {
+	tests := []struct {
+		name           string
+		patternName    string
+		defaultAction  string
+		patternActions map[string]string
+		wantAction     string
+		wantHardBlock  bool
+	}{
+		{
+			name:          "default warn remains visible but critical core blocks",
+			patternName:   "GitHub Token",
+			defaultAction: config.ActionWarn,
+			wantAction:    config.ActionWarn,
+			wantHardBlock: true,
+		},
+		{
+			name:           "core pattern override cannot weaken block",
+			patternName:    "GitHub Token",
+			defaultAction:  config.ActionBlock,
+			patternActions: map[string]string{"GitHub Token": config.ActionWarn},
+			wantAction:     config.ActionBlock,
+			wantHardBlock:  true,
+		},
+		{
+			name:           "configured non-core warning remains operator controlled",
+			patternName:    testBodyDLPPatternName,
+			defaultAction:  config.ActionBlock,
+			patternActions: map[string]string{testBodyDLPPatternName: config.ActionWarn},
+			wantAction:     config.ActionWarn,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testScannerConfig()
+			cfg.RequestBodyScanning.Action = tt.defaultAction
+			cfg.RequestBodyScanning.PatternActions = tt.patternActions
+			matches := []scanner.TextDLPMatch{{
+				PatternName:    tt.patternName,
+				Severity:       config.SeverityCritical,
+				ProviderOpaque: true,
+			}}
+			if got := requestBodyDLPAction(matches, tt.defaultAction, tt.patternActions); got != tt.wantAction {
+				t.Fatalf("requestBodyDLPAction = %q, want %q", got, tt.wantAction)
+			}
+			if got := shouldHardBlockRequestDLP(matches, cfg); got != tt.wantHardBlock {
+				t.Fatalf("shouldHardBlockRequestDLP = %v, want %v", got, tt.wantHardBlock)
+			}
 		})
 	}
 }
@@ -1788,12 +2037,66 @@ func TestScanRequestBody_JSONRootValidationFailClosed(t *testing.T) {
 	}
 }
 
+// TestScanRequestBody_LowEntropyPaddedSecretDoesNotGetProviderOpaqueDowngrade
+// reproduces the fail-open carve-out where a real credential, padded with a
+// repeated character out to the provider-opaque length floor and placed in
+// the exact trusted host/path/field-path shape, got the same warn-only
+// downgrade as genuine provider ciphertext - and so forwarded a critical
+// secret unblocked. The padding here is deliberately low-effort (a single
+// repeated character), which is exactly the shape a real secret padded out
+// to the length floor would take and exactly what
+// providerOpaqueCiphertextMinEntropy's doc comment measured. It must now
+// fail closed as an ordinary critical DLP match, not warn.
+func TestScanRequestBody_LowEntropyPaddedSecretDoesNotGetProviderOpaqueDowngrade(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	token := fakeGitHubToken()
+	suffix := "." + token + "."
+	paddedSecret := strings.Repeat("A", providerOpaqueCiphertextMinBytes-len(suffix)) + suffix
+	if len(paddedSecret) != providerOpaqueCiphertextMinBytes {
+		t.Fatalf("test fixture length = %d, want %d", len(paddedSecret), providerOpaqueCiphertextMinBytes)
+	}
+	body := `{
+		"input": [{
+			"role": "assistant",
+			"content": [{
+				"type": "reasoning",
+				"encrypted_content": "` + paddedSecret + `"
+			}]
+		}]
+	}`
+
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:                         strings.NewReader(body),
+		ContentType:                  "application/json",
+		Host:                         testTrustedProviderHost,
+		Path:                         testTrustedProviderPath,
+		MaxBytes:                     cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:                      sc,
+		Action:                       cfg.RequestBodyScanning.Action,
+		TrustedProviderOpaqueRequest: testTrustedProviderOpaqueRequest,
+	})
+	if result.Clean {
+		t.Fatal("expected token-shaped match inside padded low-entropy value")
+	}
+	if result.Action != config.ActionBlock {
+		t.Fatalf("Action = %q, want %q (low-entropy padding must not qualify for the provider-opaque downgrade); matches=%+v reason=%q",
+			result.Action, config.ActionBlock, result.DLPMatches, result.Reason)
+	}
+	assertBodyDLPBlocksWithoutProviderOpaque(t, result, "low-entropy padded secret in trusted field shape")
+	if !shouldHardBlockBodyCriticalDLP(result, testTrustedProviderHost, cfg) {
+		t.Fatal("low-entropy padded critical secret must hard-block, matching a critical match with no trusted-ciphertext evidence")
+	}
+}
+
 func TestScanRequestBody_ProviderOpaqueAndNormalDLPBlockPrecedence(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
 
-	ciphertext := strings.Repeat("A", 260) + "." + fakeGitHubToken() + "." + strings.Repeat("B", 260)
+	ciphertext := highEntropyFiller(260) + "." + fakeGitHubToken() + "." + highEntropyFiller(260)
 	body := `{
 		"input": [{
 			"content": [{
@@ -2090,7 +2393,7 @@ func TestScanRequestBody_MultipartText(t *testing.T) {
 	}
 }
 
-func TestScanRequestBody_MultipartBinarySkipped(t *testing.T) {
+func TestScanRequestBody_MultipartBinaryBodyScanned(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
 	defer sc.Close()
@@ -2099,22 +2402,28 @@ func TestScanRequestBody_MultipartBinarySkipped(t *testing.T) {
 	body := "--" + boundary + "\r\n" +
 		"Content-Disposition: form-data; name=\"file\"; filename=\"image.png\"\r\n" +
 		"Content-Type: image/png\r\n\r\n" +
-		"\x89PNG\r\n\x1a\n" + "\r\n" +
+		string(buildMinimalValidPNG()) + fakeAPIKey() + "\r\n" +
 		"--" + boundary + "--\r\n"
 
-	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+	req := BodyScanRequest{
 		Body:        strings.NewReader(body),
 		ContentType: "multipart/form-data; boundary=" + boundary,
 		MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
 		Scanner:     sc,
-	})
-	if !result.Clean {
-		t.Fatal("binary multipart part should be skipped")
+		Action:      cfg.RequestBodyScanning.Action,
+	}
+	applyContentEntropyConfig(&req, cfg)
+	_, result := scanRequestBody(context.Background(), req)
+	if result.Clean {
+		t.Fatal("expected DLP match in binary multipart body")
+	}
+	if !hasDLPMatchName(result.DLPMatches, "AWS Access ID") {
+		t.Fatalf("DLPMatches = %v, want AWS Access ID", dlpMatchNames(result.DLPMatches))
 	}
 }
 
 // TestScanRequestBody_MultipartBinaryMetadataExfil verifies that secrets in
-// binary part metadata (filename) are detected even when the binary body is skipped.
+// binary part metadata (filename) are detected independently of body scanning.
 func TestScanRequestBody_MultipartBinaryMetadataExfil(t *testing.T) {
 	cfg := testScannerConfig()
 	sc := scanner.MustNew(cfg)
@@ -2327,7 +2636,7 @@ func TestScanRequestHeaders_SplitSecretRepeatedValues(t *testing.T) {
 func TestScanRequestHeadersForTarget_SuppressedValueDoesNotMaskLaterUnsuppressedValue(t *testing.T) {
 	cfg := testScannerConfig()
 	cfg.Suppress = []config.SuppressEntry{{
-		Rule:   "AWS Access ID",
+		Rule:   "Anthropic API Key",
 		Path:   "https://api.example.com/*",
 		Reason: "allow scoped provider credential",
 	}}
@@ -2335,15 +2644,131 @@ func TestScanRequestHeadersForTarget_SuppressedValueDoesNotMaskLaterUnsuppressed
 	defer sc.Close()
 
 	headers := http.Header{}
-	headers.Add("Authorization", "Bearer "+fakeAPIKey())
 	headers.Add("Authorization", "Bearer "+fakeAnthropicKey())
+	headers.Add("Authorization", "Bearer sk-proj-"+strings.Repeat("A", 40))
 
 	result := scanRequestHeadersForTarget(context.Background(), headers, cfg, sc, "https://api.example.com/v1/messages")
 	if result == nil || result.Clean {
 		t.Fatal("expected unsuppressed DLP match after suppressed header value")
 	}
-	if got := result.DLPMatches[0].PatternName; got != "Anthropic API Key" {
-		t.Fatalf("pattern = %q, want Anthropic API Key", got)
+	if got := result.DLPMatches[0].PatternName; got != "OpenAI API Key" {
+		t.Fatalf("pattern = %q, want OpenAI API Key", got)
+	}
+}
+
+func TestScanBodyTextsForDLP_DeduplicatesDroppedMatches(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	key := fakeAnthropicKey()
+	var dropped []scanner.TextDLPMatch
+	matches := scanBodyTextsForDLP(
+		context.Background(),
+		sc,
+		[]string{key},
+		"https://api.vendor.example/v1/messages",
+		[]config.SuppressEntry{{Rule: "Anthropic API Key", Path: "https://api.vendor.example/*", Reason: "test"}},
+		nil,
+		false,
+		func(match scanner.TextDLPMatch, reason string) {
+			if reason != "suppressed" {
+				t.Fatalf("drop reason = %q, want suppressed", reason)
+			}
+			dropped = append(dropped, match)
+		},
+	)
+	if len(matches) != 0 {
+		t.Fatalf("enforceable matches = %+v, want none", matches)
+	}
+	if len(dropped) != 1 {
+		t.Fatalf("dropped callbacks = %d, want 1 logical finding: %+v", len(dropped), dropped)
+	}
+}
+
+func TestRecordUniqueBodyDLPDrops_PreservesMatchVariants(t *testing.T) {
+	dropped := []droppedBodyDLPMatch{
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: ""}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "base64"}, reason: "suppressed"},
+	}
+	var got []scanner.TextDLPMatch
+	recordUniqueBodyDLPDrops(dropped, func(match scanner.TextDLPMatch, _ string) {
+		got = append(got, match)
+	})
+	if len(got) != 2 {
+		t.Fatalf("dropped callbacks = %d, want raw and encoded variants", len(got))
+	}
+	encoded := map[string]bool{}
+	for _, match := range got {
+		encoded[match.Encoded] = true
+	}
+	if !encoded[""] || !encoded["base64"] {
+		t.Fatalf("encoded variants = %v, want raw and base64", encoded)
+	}
+}
+
+func TestRecordUniqueHeaderDLPDrops_NormalizesJoinedWhitespaceOnly(t *testing.T) {
+	dropped := []droppedBodyDLPMatch{
+		{match: scanner.TextDLPMatch{PatternName: "API Key"}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "whitespace"}, reason: "suppressed"},
+		{match: scanner.TextDLPMatch{PatternName: "API Key", Encoded: "base64"}, reason: "suppressed"},
+	}
+	var got []scanner.TextDLPMatch
+	recordUniqueHeaderDLPDrops(dropped, func(match scanner.TextDLPMatch, _ string) {
+		got = append(got, match)
+	})
+	if len(got) != 2 || got[0].Encoded != "" || got[1].Encoded != "base64" {
+		t.Fatalf("header variants = %+v, want raw and base64", got)
+	}
+}
+
+func TestScanRequestHeadersForTargetWithDropped_ReportsSuppressedMatch(t *testing.T) {
+	cfg := testScannerConfig()
+	cfg.Suppress = []config.SuppressEntry{{Rule: "Anthropic API Key", Path: "https://api.vendor.example/*", Reason: "test"}}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	headers := http.Header{
+		"Authorization": []string{"Bearer " + fakeAnthropicKey(), "ordinary value"},
+	}
+	var dropped []scanner.TextDLPMatch
+	result := scanRequestHeadersForTargetWithDropped(
+		context.Background(),
+		headers,
+		cfg,
+		sc,
+		"https://api.vendor.example/v1/messages",
+		func(match scanner.TextDLPMatch, reason string) {
+			if reason != "suppressed" {
+				t.Fatalf("drop reason = %q, want suppressed", reason)
+			}
+			dropped = append(dropped, match)
+		},
+	)
+	if result != nil && !result.Clean {
+		t.Fatalf("suppressed header remained enforceable: %+v", result.DLPMatches)
+	}
+	if len(dropped) != 1 {
+		t.Fatalf("dropped callbacks = %d, want 1 logical finding: %+v", len(dropped), dropped)
+	}
+}
+
+func TestScanRequestHeadersForTarget_CoreDLPIgnoresInjectedSuppress(t *testing.T) {
+	cfg := testScannerConfig()
+	cfg.Suppress = []config.SuppressEntry{
+		{Rule: "AWS Access ID", Path: "*", Reason: "injected after validation"},
+	}
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	headers := http.Header{}
+	headers.Set("Authorization", "Bearer "+fakeAPIKey())
+	result := scanRequestHeadersForTarget(context.Background(), headers, cfg, sc, "https://api.vendor.example/v1")
+	if result == nil || result.Clean {
+		t.Fatal("wildcard suppression silenced core DLP in request header")
+	}
+	if got := result.DLPMatches[0].PatternName; got != "AWS Access ID" {
+		t.Fatalf("pattern = %q, want AWS Access ID", got)
 	}
 }
 
@@ -2887,7 +3312,7 @@ func TestForwardProxy_HeaderScan_SuppressedCriticalHeaderAllowed(t *testing.T) {
 		cfg.RequestBodyScanning.ScanHeaders = true
 		cfg.RequestBodyScanning.MaxBodyBytes = 1024 * 1024
 		cfg.Suppress = []config.SuppressEntry{{
-			Rule:   "AWS Access ID",
+			Rule:   "Anthropic API Key",
 			Path:   upstream.URL + "/*",
 			Reason: "trusted destination auth header",
 		}}
@@ -2898,7 +3323,7 @@ func TestForwardProxy_HeaderScan_SuppressedCriticalHeaderAllowed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+fakeAPIKey())
+	req.Header.Set("Authorization", "Bearer "+fakeAnthropicKey())
 
 	client := &http.Client{
 		Transport: &http.Transport{
@@ -3401,37 +3826,6 @@ func TestScanRequestBody_MultipartTooManyParts(t *testing.T) {
 	}
 	if result.Action != config.ActionBlock {
 		t.Fatalf("expected block action for multipart limit, got %q", result.Action)
-	}
-}
-
-// --- isBinaryContentType unit tests ---
-
-func TestIsBinaryContentType(t *testing.T) {
-	tests := []struct {
-		ct     string
-		binary bool
-	}{
-		{"", false},
-		{"text/plain", false},
-		{"text/html", false},
-		{"application/json", false},
-		{"application/xml", false},
-		{"application/octet-stream", false}, // fallback raw scan, not skipped
-		{"image/png", true},
-		{"image/jpeg", true},
-		{"image/gif", true},
-		{"audio/mpeg", true},
-		{"audio/ogg", true},
-		{"video/mp4", true},
-		{"video/webm", true},
-		{"application/pdf", false},
-	}
-	for _, tt := range tests {
-		t.Run(tt.ct, func(t *testing.T) {
-			if got := isBinaryContentType(tt.ct); got != tt.binary {
-				t.Errorf("isBinaryContentType(%q) = %v, want %v", tt.ct, got, tt.binary)
-			}
-		})
 	}
 }
 

@@ -30,11 +30,16 @@ import (
 // allow the stream to continue.
 var ErrA2AStreamFinding = errors.New("a2a stream finding")
 
+// ErrCardBaselineCapacity reports that a card baseline cannot accept a new
+// card without losing another trusted baseline.
+var ErrCardBaselineCapacity = errors.New("agent card baseline capacity exhausted")
+
 // A2AScanResult describes the outcome of scanning A2A protocol traffic.
 type A2AScanResult struct {
 	Clean          bool
 	Action         string
 	Reason         string
+	ScanError      string
 	URLFindings    []scanner.Result        // SSRF/URL scanner findings
 	DLPFindings    []scanner.TextDLPMatch  // DLP pattern matches
 	InjectFindings []scanner.ResponseMatch // injection pattern matches
@@ -72,6 +77,9 @@ func ScanA2AResponseBody(ctx context.Context, body []byte, sc *scanner.Scanner, 
 
 // scanA2ABody is the shared implementation for request and response scanning.
 func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *config.A2AScanning, entropyOpts *A2AContentEntropyOptions) A2AScanResult {
+	if err := ctx.Err(); err != nil {
+		return A2AScanResult{Action: config.ActionBlock, ScanError: err.Error(), Reason: "a2a: response scan incomplete: " + err.Error()}
+	}
 	result := A2AScanResult{Clean: true}
 	budgetExceeded := false
 	var entropyTexts []string
@@ -118,6 +126,8 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 
 		select {
 		case <-ctx.Done():
+			result.Clean = false
+			result.ScanError = ctx.Err().Error()
 			return
 		default:
 		}
@@ -141,6 +151,11 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 			}
 			// Injection scanning
 			injectResult := sc.ScanResponse(ctx, value)
+			if injectResult.Failed() {
+				result.Clean = false
+				result.ScanError = injectResult.ScanError
+				return
+			}
 			if !injectResult.Clean {
 				result.Clean = false
 				result.InjectFindings = append(result.InjectFindings, injectResult.Matches...)
@@ -231,12 +246,21 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 		}
 	}
 
+	if err := ctx.Err(); err != nil {
+		result.Clean = false
+		result.ScanError = err.Error()
+	}
 	if !result.Clean {
-		result.Action = action
-		if result.Action == "" {
-			result.Action = defaultFindingAction
+		if result.ScanError != "" {
+			result.Action = config.ActionBlock
+			result.Reason = "a2a: response scan incomplete: " + result.ScanError
+		} else {
+			result.Action = action
+			if result.Action == "" {
+				result.Action = defaultFindingAction
+			}
+			result.Reason = buildA2AReason(result)
 		}
-		result.Reason = buildA2AReason(result)
 	}
 
 	return result
@@ -315,7 +339,8 @@ type cardEntry struct {
 }
 
 // CardBaseline tracks Agent Card hashes by origin, for drift detection.
-// Thread-safe, LRU eviction at maxSize.
+// Thread-safe. A trusted baseline is a security ledger, not a disposable
+// cache: capacity preserves existing entries and refuses a new one.
 type CardBaseline struct {
 	mu      sync.Mutex
 	entries map[cardCacheKey]*cardEntry
@@ -335,38 +360,43 @@ func NewCardBaseline(maxSize int) *CardBaseline {
 }
 
 // Check compares a card hash against the baseline for the given key.
-// Returns (driftDetected, isFirstSeen). First-seen cards are accepted (TOFU).
-func (cb *CardBaseline) Check(key cardCacheKey, hash string, skillNames []string) (bool, bool) {
+// Returns (driftDetected, isFirstSeen, capacityExceeded). First-seen cards
+// are accepted only when the baseline has room to preserve them (TOFU).
+func (cb *CardBaseline) Check(key cardCacheKey, hash string, skillNames []string) (bool, bool, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	existing, ok := cb.entries[key]
 	if !ok {
+		if len(cb.entries) >= cb.maxSize {
+			return false, false, true
+		}
 		// First-seen: store baseline (TOFU).
-		cb.evictIfFull()
 		cb.entries[key] = &cardEntry{hash: hash, skillNames: skillNames}
 		cb.touchLocked(key)
-		return false, true
+		return false, true, false
 	}
 
 	// Update LRU position.
 	cb.touchLocked(key)
 
 	if existing.hash == hash {
-		return false, false
+		return false, false, false
 	}
 
 	// Drift detected - do NOT auto-promote the baseline. The existing
 	// baseline is preserved so repeated fetches of a drifted card
 	// continue to report drift until explicitly reset. Operators must
 	// call ResetBaseline to accept the new card.
-	return true, false
+	return true, false, false
 }
 
 // ResetBaseline explicitly updates the stored baseline for a key.
 // Use after reviewing and accepting a drifted Agent Card. This is the
-// only path that promotes a new hash; Check never auto-promotes.
-func (cb *CardBaseline) ResetBaseline(key cardCacheKey, hash string, skillNames []string) {
+// only path that promotes a new hash; Check never auto-promotes. Resetting a
+// missing entry at capacity is refused so an operator action cannot discard a
+// different trusted baseline.
+func (cb *CardBaseline) ResetBaseline(key cardCacheKey, hash string, skillNames []string) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
@@ -375,13 +405,16 @@ func (cb *CardBaseline) ResetBaseline(key cardCacheKey, hash string, skillNames 
 		existing.hash = hash
 		existing.skillNames = skillNames
 		cb.touchLocked(key)
-		return
+		return nil
 	}
 
-	// Key not present (evicted or never seen): insert as new baseline.
-	cb.evictIfFull()
+	if len(cb.entries) >= cb.maxSize {
+		return ErrCardBaselineCapacity
+	}
+	// Key not present: insert as a reviewed baseline.
 	cb.entries[key] = &cardEntry{hash: hash, skillNames: skillNames}
 	cb.touchLocked(key)
+	return nil
 }
 
 // touchLocked moves a key to the end of the LRU order. Must hold mu.
@@ -396,18 +429,6 @@ func (cb *CardBaseline) touchLocked(key cardCacheKey) {
 	cb.order = append(cb.order, key)
 }
 
-// evictIfFull removes the least-recently-used entry if at capacity. Must hold mu.
-func (cb *CardBaseline) evictIfFull() {
-	if len(cb.entries) < cb.maxSize {
-		return
-	}
-	if len(cb.order) > 0 {
-		oldest := cb.order[0]
-		cb.order = cb.order[1:]
-		delete(cb.entries, oldest)
-	}
-}
-
 // AgentCardScanResult describes the outcome of scanning an Agent Card.
 type AgentCardScanResult struct {
 	Clean         bool
@@ -415,7 +436,10 @@ type AgentCardScanResult struct {
 	Reason        string
 	DriftDetected bool
 	FirstSeen     bool
-	Findings      A2AScanResult // field-level scan findings
+	// BaselineCapacityExceeded reports that this card could not be safely
+	// verified without replacing a different trusted baseline.
+	BaselineCapacityExceeded bool
+	Findings                 A2AScanResult // field-level scan findings
 
 	// SignatureVerified is true when the card carried a signature that verified
 	// against a trusted key scoped to the card's origin. SignatureKeyID is the
@@ -470,9 +494,15 @@ func ScanAgentCard(ctx context.Context, body []byte, sc *scanner.Scanner, baseli
 		for _, s := range card.Skills {
 			skillNames = append(skillNames, s.Name)
 		}
-		drift, firstSeen := baseline.Check(key, hash, skillNames)
+		drift, firstSeen, capacityExceeded := baseline.Check(key, hash, skillNames)
 		result.DriftDetected = drift
 		result.FirstSeen = firstSeen
+		result.BaselineCapacityExceeded = capacityExceeded
+		if capacityExceeded {
+			result.Clean = false
+			result.Action = config.ActionBlock
+			result.Reason = "a2a: Agent Card baseline capacity exhausted; card cannot be safely verified"
+		}
 		if drift {
 			result.Clean = false
 			if result.Action == "" {
@@ -532,9 +562,7 @@ func applyCardSignatureVerification(result *AgentCardScanResult, body []byte, ke
 type ContextTracker struct {
 	mu       sync.Mutex
 	contexts map[string]*contextSession
-	taskMap  map[string]string   // taskID → contextID
-	evicted  map[string]struct{} // IDs that were evicted (taint on re-entry)
-	order    []string            // LRU order of context IDs
+	taskMap  map[string]string // taskID → contextID
 	cfg      *config.A2AScanning
 }
 
@@ -549,7 +577,6 @@ func NewContextTracker(cfg *config.A2AScanning) *ContextTracker {
 	return &ContextTracker{
 		contexts: make(map[string]*contextSession),
 		taskMap:  make(map[string]string),
-		evicted:  make(map[string]struct{}),
 		cfg:      cfg,
 	}
 }
@@ -563,7 +590,17 @@ func (ct *ContextTracker) TrackAndScan(ctx context.Context, contextID, taskID st
 
 	ct.mu.Lock()
 	canonicalID := ct.resolveContextLocked(contextID, taskID)
-	sess := ct.getOrCreateLocked(canonicalID)
+	if taskID != "" {
+		if _, known := ct.taskMap[taskID]; !known && len(ct.taskMap) >= ct.maxContextsLocked() {
+			ct.mu.Unlock()
+			return true, "a2a: task alias capacity exceeded"
+		}
+	}
+	sess, admitted := ct.getOrCreateLocked(canonicalID)
+	if !admitted {
+		ct.mu.Unlock()
+		return true, "a2a: context capacity exceeded"
+	}
 
 	// Track task → context mapping.
 	if taskID != "" {
@@ -595,10 +632,16 @@ func (ct *ContextTracker) TrackAndScan(ctx context.Context, contextID, taskID st
 	joined := strings.Join(accumulated, " ")
 	concatResult := sc.ScanResponse(ctx, joined)
 	if !concatResult.Clean {
+		if concatResult.Failed() {
+			return true, "a2a: response scan incomplete: " + concatResult.ScanError
+		}
 		// Check if any individual text also triggers.
 		individualHit := false
 		for _, t := range texts {
 			r := sc.ScanResponse(ctx, t)
+			if r.Failed() {
+				return true, "a2a: response scan incomplete: " + r.ScanError
+			}
 			if !r.Clean {
 				individualHit = true
 				break
@@ -632,47 +675,28 @@ func (ct *ContextTracker) resolveContextLocked(contextID, taskID string) string 
 }
 
 // getOrCreateLocked gets or creates a context session. Must hold ct.mu.
-func (ct *ContextTracker) getOrCreateLocked(id string) *contextSession {
+func (ct *ContextTracker) getOrCreateLocked(id string) (*contextSession, bool) {
 	sess, ok := ct.contexts[id]
 	if ok {
-		ct.touchOrderLocked(id)
-		return sess
+		return sess, true
 	}
 
-	// Evict if at capacity.
-	maxCtx := ct.cfg.MaxContexts
-	if maxCtx <= 0 {
-		maxCtx = 1000
-	}
-	for len(ct.contexts) >= maxCtx && len(ct.order) > 0 {
-		oldest := ct.order[0]
-		ct.order = ct.order[1:]
-		delete(ct.contexts, oldest)
-		ct.evicted[oldest] = struct{}{} // track for re-entry tainting
+	// Existing context state is security evidence. Admission pressure must not
+	// discard it and let an old identifier re-enter as a fresh session.
+	if len(ct.contexts) >= ct.maxContextsLocked() {
+		return nil, false
 	}
 
 	sess = &contextSession{}
-	// Taint only if this specific context was previously evicted.
-	// First-seen contexts at capacity are NOT tainted.
-	if _, wasEvicted := ct.evicted[id]; wasEvicted {
-		sess.tainted = true
-		delete(ct.evicted, id)
-	}
 	ct.contexts[id] = sess
-	ct.order = append(ct.order, id)
-
-	return sess
+	return sess, true
 }
 
-// touchOrderLocked moves a context to the end of the LRU order. Must hold ct.mu.
-func (ct *ContextTracker) touchOrderLocked(id string) {
-	for i, k := range ct.order {
-		if k == id {
-			ct.order = append(ct.order[:i], ct.order[i+1:]...)
-			break
-		}
+func (ct *ContextTracker) maxContextsLocked() int {
+	if ct.cfg.MaxContexts > 0 {
+		return ct.cfg.MaxContexts
 	}
-	ct.order = append(ct.order, id)
+	return 1000
 }
 
 // --- SSE Stream Scanning ---
@@ -719,6 +743,9 @@ func ScanA2AStream(ctx context.Context, body io.Reader, w io.Writer, flusher htt
 		// Field-walk the event data payload.
 		eventResult := scanA2ABody(ctx, event, sc, cfg, nil)
 		if !eventResult.Clean {
+			if eventResult.ScanError != "" {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, eventResult.ScanError)
+			}
 			return fmt.Errorf("%w: %s", ErrA2AStreamFinding, eventResult.Reason)
 		}
 
@@ -729,6 +756,9 @@ func ScanA2AStream(ctx context.Context, body io.Reader, w io.Writer, flusher htt
 		// external review finding #2 on the generic SSE path.
 		canonical := canonicalSSEEventText(event, reader)
 		if injResult := sc.ScanResponse(ctx, canonical); !injResult.Clean {
+			if injResult.Failed() {
+				return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, injResult.ScanError)
+			}
 			return fmt.Errorf("%w: injection in sse metadata: %s",
 				ErrA2AStreamFinding, sseInjectionNames(injResult.Matches))
 		}
@@ -748,6 +778,9 @@ func ScanA2AStream(ctx context.Context, body io.Reader, w io.Writer, flusher htt
 			combined := injectionTail + " " + currentText
 			tailResult := sc.ScanResponse(ctx, combined)
 			if !tailResult.Clean {
+				if tailResult.Failed() {
+					return fmt.Errorf("%w: response scan incomplete: %s", ErrSSEStreamScanError, tailResult.ScanError)
+				}
 				return fmt.Errorf("%w: cross-event injection detected", ErrA2AStreamFinding)
 			}
 		}

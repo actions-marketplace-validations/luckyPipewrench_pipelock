@@ -71,6 +71,7 @@ Use a narrow `code` profile for developer traffic and add broader `business` pro
 - Non-JSON HTTP bodies and complete non-JSON WebSocket messages are blocked unless the destination host is on `allowlist_unparseable` or the request matches `allowlist_unparseable_routes`.
 - Outbound WebSocket fragments are blocked while redaction is enabled because partial JSON messages cannot be rewritten safely.
 - Malformed JSON, numeric scalars containing secrets, key-collision rewrites, or redaction limits being exceeded all block the request instead of forwarding partially transformed data.
+- An MCP `tools/call` whose `params.arguments` is a string, array, number, or boolean is blocked. The redactor walks object members, so it cannot mask a secret carried directly in that value. Absent and `null` arguments are forwarded unchanged, because they carry no content to rewrite.
 
 `allowlist_unparseable` accepts bare lowercase hostnames only. Do not include schemes, paths, or ports. Use it sparingly for trusted endpoints that legitimately require non-JSON request formats.
 
@@ -107,4 +108,8 @@ The receipt never stores the original plaintext. If nothing was rewritten, the `
 
 Hash classes require a self-labeled prefix before redaction. A value such as `sha256:<64 hex chars>` or `sha-256=<64 hex chars>` is treated as a hash, but a bare 64-character hex string is left alone so opaque OAuth client secrets and session tokens are not corrupted in transit.
 
-AWS SigV4 pre-signed URLs keep the access-key ID inside a structurally valid `X-Amz-Credential` parameter unchanged. That key ID is the public half of the signed URL; redacting it breaks the upstream request while adding no secrecy. The same access-key shape is still redacted everywhere else, including bare text and non-SigV4 query parameters.
+AWS SigV4 pre-signed URLs keep the access-key ID inside a structurally valid `X-Amz-Credential` parameter unchanged. That key ID is the public half of the signed URL; redacting it breaks the upstream request while adding no secrecy. A bare `AKIA` or `ASIA` key ID outside that credential scope is still redacted, including in plain text and in non-SigV4 query parameters.
+
+Only `AKIA` (long-term) and `ASIA` (temporary STS) values are rewritten to a placeholder. The other identifiers sharing the same 20-character shape are IAM resource IDs rather than credentials: `AIDA` for a user, `AROA` for a role, `AGPA` for a group, and the reserved `AIPA`, `ANPA`, and `ANVA` prefixes. Replacing one of those corrupts a legitimate request without concealing a secret, so the redactor leaves them alone.
+
+They remain detected. `AWS Access ID` is one of the immutable core DLP patterns, which run regardless of `dlp` configuration and consult no per-pattern or per-host exemption. So on a host you have listed in `request_body_scanning.trusted_hosts` for redact-and-forward, a request body carrying an IAM resource ID is now denied instead of being forwarded with a placeholder. Neither `suppress` nor `dlp.patterns[].exempt_domains` changes that; both are inert against a core pattern. If an agent legitimately needs to send role or user IDs to such a host, keep them out of the request body, or accept the visibility cost of adding the host to `tls_interception.passthrough_domains`, which stops Pipelock from inspecting that connection at all.

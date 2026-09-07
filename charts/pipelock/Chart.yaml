@@ -6,8 +6,8 @@ type: application
 # gate enforces that both equal the release tag. The chart publishes to an
 # OCI registry under this version as the tag, so a version that did not move
 # every release would overwrite the previously published chart in place.
-version: 3.3.0
-appVersion: "3.3.0"
+version: 3.5.0
+appVersion: "3.5.0"
 home: https://pipelab.org
 sources:
   - https://github.com/luckyPipewrench/pipelock
@@ -37,16 +37,20 @@ annotations:
       url: https://pipelab.org/learn/
     - name: Release notes
       url: https://github.com/luckyPipewrench/pipelock/releases
-    - name: Audit Packet verifier
+    - name: Receipt verifier (Python)
       url: https://github.com/luckyPipewrench/pipelock-verify-python
   artifacthub.io/changes: |
     - kind: changed
-      description: Pipelock appVersion 3.3.0. Denial-of-wallet budgets are keyed by subject, MCP denial-of-wallet settings follow hot reload, and unversioned rule bundles degrade visibly instead of loading implicitly.
+      description: Pipelock appVersion 3.5.0. External authority propagation, native AEL evidence, and the code-checked capability manifest make trust and support claims explicit.
     - kind: added
-      description: Opaque high-entropy egress detection, safety-reclassification response detection, receipt-chain auto-anchoring, audit-sink health metrics, and HTTP/OCSF output.
+      description: Route-scoped entropy warnings, license and rules-compatibility warnings, and detection for current GitHub installation and Azure SAS token formats.
     - kind: added
-      description: Encrypted Conductor durable audit queues with Helm keyring mounts and audit-queue-key lifecycle commands.
+      description: Offline recorder compaction, legacy recorder-epoch inventory, and an exported rules reader-schema contract.
     - kind: fixed
-      description: Audit Packet verification requires external trust anchors, full evidence directories no longer stop receipt emission, and Conductor leaders survive policy-hash-moving upgrades.
+      description: File, skill, MCP, WebSocket, redirect, and generic response paths cover previously missed content and refuse unsafe handling where their contracts require it.
     - kind: fixed
-      description: Opaque CONNECT can require TLS with SNI, local integrity state has explicit permission policies, matched credentials are redacted from core audit events, and containment reinstall waits for readiness.
+      description: Response prefiltering preserves required literals across regex alternation branches and always evaluates patterns without a proven anchor.
+    - kind: fixed
+      description: Request trailers, cross-authority body replays, nested MCP media, strict state-token reloads, and pinned receipt signer identities now fail closed.
+    - kind: fixed
+      description: Description-scoped bundle rules honor their field contract while built-in MCP scanning continues to cover every agent-visible field.

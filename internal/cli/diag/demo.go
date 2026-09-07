@@ -62,6 +62,7 @@ disk so a third party can verify it offline with
 "pipelock verify-receipt <file> --key <key>".
 
 Use --interactive for live demos (pauses between scenarios).`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			color := !noColor && cliutil.UseColor()
 			return runDemo(cmd, interactive, color, receiptsDir)
@@ -89,6 +90,9 @@ func runDemo(cmd *cobra.Command, interactive, color bool, receiptsDir string) er
 	if len(bundleResult.Errors) > 0 {
 		first := bundleResult.Errors[0]
 		return fmt.Errorf("merging community rules: bundle %s: %s", first.Name, first.Reason)
+	}
+	for _, w := range bundleResult.Warnings {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: warning: %s\n", w)
 	}
 	extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
 

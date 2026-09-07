@@ -18,7 +18,6 @@ import (
 	"html/template"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,7 +39,7 @@ const (
 	// (assets/pipelock-favicon.svg): a 64x64 dark rounded tile with the teal
 	// padlock, matching the project site favicon. The prior 400x480 full
 	// wordmark logo rendered as an unreadable blob at browser-tab size.
-	dashboardFaviconSVGBase64 = `PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NCA2NCIgZmlsbD0ibm9uZSI+CiAgPHJlY3Qgd2lkdGg9IjY0IiBoZWlnaHQ9IjY0IiByeD0iMTIiIGZpbGw9IiMwYTBhMGYiLz4KICA8IS0tIFNoYWNrbGUgLS0+CiAgPHBhdGggZD0iTTIyIDMwIEwyMiAyMCBDMjIgMTMgMjcgOSAzMiA5IEMzNyA5IDQyIDEzIDQyIDIwIEw0MiAzMCIKICAgICAgICBzdHJva2U9IiMwMGZmYzgiIHN0cm9rZS13aWR0aD0iNSIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBmaWxsPSJub25lIi8+CiAgPCEtLSBMb2NrIGJvZHkgLS0+CiAgPHJlY3QgeD0iMTYiIHk9IjI5IiB3aWR0aD0iMzIiIGhlaWdodD0iMjQiIHJ4PSI0IiBmaWxsPSIjMWExYTJlIiBzdHJva2U9IiMwMGZmYzgiIHN0cm9rZS13aWR0aD0iMS41Ii8+CiAgPCEtLSBLZXlob2xlIC0tPgogIDxjaXJjbGUgY3g9IjMyIiBjeT0iMzkiIHI9IjMuNSIgZmlsbD0iIzAwZmZjOCIvPgogIDxyZWN0IHg9IjMxIiB5PSI0MSIgd2lkdGg9IjIiIGhlaWdodD0iNSIgcng9IjEiIGZpbGw9IiMwMGZmYzgiLz4KPC9zdmc+Cg==`
+	dashboardFaviconSVGBase64 = `PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgdmlld0JveD0iMCAwIDY0IDY0IiByb2xlPSJpbWciIGFyaWEtbGFiZWw9IlBpcGVsb2NrIGZhdmljb24iPgogIDxyZWN0IHdpZHRoPSI2NCIgaGVpZ2h0PSI2NCIgcng9IjEyIiBmaWxsPSIjMGUwZTExIi8+PGcgdHJhbnNmb3JtPSJ0cmFuc2xhdGUoOCA4KSBzY2FsZSguMikiPiAgPGcgYXJpYS1sYWJlbD0iUGlwZWxvY2sgbG9jayBtYXJrIj4KICAgIDxwYXRoIGQ9Ik03MiAxMTJWNjhDNzIgMzUgOTMgMTggMTIwIDE4UzE2OCAzNSAxNjggNjhWMTEyIiBmaWxsPSJub25lIiBzdHJva2U9IiMwMGU1YTAiIHN0cm9rZS13aWR0aD0iMjIiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgogICAgPHJlY3QgeD0iNDYiIHk9IjEwNCIgd2lkdGg9IjE0OCIgaGVpZ2h0PSIxMTAiIHJ4PSIxNCIgZmlsbD0iIzBlMGUxMSIgc3Ryb2tlPSIjMDBlNWEwIiBzdHJva2Utd2lkdGg9IjMiLz4KICAgIDxyZWN0IHg9IjU1IiB5PSIxMTMiIHdpZHRoPSIxMzAiIGhlaWdodD0iOTIiIHJ4PSI5IiBmaWxsPSJub25lIiBzdHJva2U9IiMwMGU1YTAiIHN0cm9rZS1vcGFjaXR5PSIwLjE4Ii8+CiAgICA8Y2lyY2xlIGN4PSIxMjAiIGN5PSIxNTAiIHI9IjEzIiBmaWxsPSIjMDBlNWEwIi8+PGNpcmNsZSBjeD0iMTIwIiBjeT0iMTUwIiByPSI2IiBmaWxsPSIjMDkwOTBiIi8+CiAgICA8cGF0aCBkPSJNMTE2IDE1OGg4djI0YTQgNCAwIDAgMS04IDB6IiBmaWxsPSIjMDBlNWEwIi8+CiAgPC9nPjwvZz4KPC9zdmc+Cg==`
 	dashboardFaviconDataURL   = "data:image/svg+xml;base64," + dashboardFaviconSVGBase64
 )
 
@@ -515,7 +514,7 @@ func sessionFromRequest(r *http.Request) string {
 		return "-"
 	}
 	// Trim to the session ID for the audit field. The investigator path is
-	// /session/<id>/receipt/<seq>, so cut at the first "/" to log <id>
+	// /session/<id>/receipt/<action-id>, so cut at the first "/" to log <id>
 	// rather than the full sub-path.
 	rest := strings.TrimPrefix(r.URL.Path, "/session/")
 	if i := strings.IndexByte(rest, '/'); i >= 0 {
@@ -912,7 +911,7 @@ type agentsPageData struct {
 type investigatorPageData struct {
 	Nav         NavContext
 	SessionID   string
-	Seq         uint64
+	Seq         string
 	Explanation evidenceview.DecisionExplanation
 	RawAllowed  bool
 }
@@ -1187,7 +1186,7 @@ func (d *dashboardHandler) handleSession(w http.ResponseWriter, r *http.Request)
 		http.NotFound(w, r)
 		return
 	}
-	// Handle /session/<id>/receipt/<seq> — the investigator route.
+	// Handle /session/<id>/receipt/<action-id> — the investigator route.
 	if strings.Contains(rest, "/") {
 		d.handleSessionReceipt(w, r, rest)
 		return
@@ -1202,7 +1201,7 @@ func (d *dashboardHandler) handleSession(w http.ResponseWriter, r *http.Request)
 }
 
 func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.Request, rest string) {
-	// Expected: <sessionID>/receipt/<seq>
+	// Expected: <sessionID>/receipt/<action-id>
 	parts := strings.SplitN(rest, "/", 3)
 	if len(parts) != 3 || parts[1] != "receipt" || parts[0] == "" || parts[2] == "" {
 		http.NotFound(w, r)
@@ -1214,12 +1213,8 @@ func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.R
 		http.NotFound(w, r)
 		return
 	}
-	seq, err := strconv.ParseUint(parts[2], 10, 64)
-	if err != nil {
-		http.NotFound(w, r)
-		return
-	}
-	explanation, found, err := d.model.ReceiptDetail(sessionID, seq)
+	actionID := parts[2]
+	explanation, found, err := d.model.ReceiptDetail(sessionID, actionID)
 	if err != nil {
 		http.Error(w, "could not read receipt detail", http.StatusInternalServerError)
 		return
@@ -1235,7 +1230,7 @@ func (d *dashboardHandler) handleSessionReceipt(w http.ResponseWriter, r *http.R
 	data := investigatorPageData{
 		Nav:         navFromContext(r),
 		SessionID:   sessionID,
-		Seq:         seq,
+		Seq:         explanation.ChainSeq.Detail,
 		Explanation: explanation,
 		RawAllowed:  raw,
 	}

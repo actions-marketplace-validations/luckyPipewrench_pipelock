@@ -206,11 +206,11 @@ func LoadConfig() (*Config, error) {
 		if product.ProductID == "" {
 			return nil, fmt.Errorf("SUBSCRIPTION_PRODUCTS contains an empty product ID")
 		}
-		// enterprise_eval and trial are one-time purchases handled by the order
+		// enterprise_eval and the trial tiers are one-time purchases handled by the order
 		// path with its own allowlist, so they never belong here. assess is a
 		// live recurring product and must be allowlistable, or an Assess
 		// customer can never be mapped once enforcement is on.
-		if !validTiers[product.Tier] || product.Tier == tierEnterpriseEval || product.Tier == tierTrial {
+		if !validTiers[product.Tier] || product.Tier == tierEnterpriseEval || product.Tier == tierEnterpriseTrial || product.Tier == tierTrial {
 			return nil, fmt.Errorf("SUBSCRIPTION_PRODUCTS product %s has invalid subscription tier %q", product.ProductID, product.Tier)
 		}
 		if product.Interval == "" {
@@ -234,11 +234,13 @@ func LoadConfig() (*Config, error) {
 		if product.ProductID == "" {
 			return nil, fmt.Errorf("ORDER_PRODUCTS contains an empty product ID")
 		}
-		if !validTiers[product.Tier] || product.Tier != tierTrial {
+		if !validTiers[product.Tier] || (product.Tier != tierTrial && product.Tier != tierEnterpriseTrial) {
 			return nil, fmt.Errorf("ORDER_PRODUCTS product %s has invalid one-time tier %q", product.ProductID, product.Tier)
 		}
-		if product.AmountCents <= 0 {
-			return nil, fmt.Errorf("ORDER_PRODUCTS product %s must set positive amount_cents", product.ProductID)
+		// Trial products are deliberately allowed to be zero-dollar orders, so
+		// only negative amounts are invalid here.
+		if product.AmountCents < 0 {
+			return nil, fmt.Errorf("ORDER_PRODUCTS product %s must set a non-negative amount_cents", product.ProductID)
 		}
 		if product.Currency == "" {
 			return nil, fmt.Errorf("ORDER_PRODUCTS product %s must set currency", product.ProductID)

@@ -19,6 +19,8 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -153,9 +155,264 @@ func validateUnscannablePassthrough(entries []UnscannablePassthroughEntry) error
 	return nil
 }
 
+func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
+	if len(cfg.ContentEntropyWarnRoutes) == 0 {
+		return nil
+	}
+	if !cfg.Enabled || !cfg.ContentEntropyEnabled || cfg.ContentEntropyAction != ActionBlock {
+		return fmt.Errorf("request_body_scanning.content_entropy_warn_routes requires enabled request body scanning with content entropy action block")
+	}
+
+	for i := range cfg.ContentEntropyWarnRoutes {
+		entry := &cfg.ContentEntropyWarnRoutes[i]
+		field := fmt.Sprintf("request_body_scanning.content_entropy_warn_routes[%d]", i)
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards", field)
+		}
+		entry.Host = host[0]
+
+		path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
+		if !ok {
+			return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+		}
+		entry.Path = path
+
+		if len(entry.ContentTypes) == 0 {
+			return fmt.Errorf("%s.content_types must contain at least one non-textual media type", field)
+		}
+		for j, raw := range entry.ContentTypes {
+			mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(strings.ToLower(raw)))
+			if err != nil || mediaType == "" {
+				return fmt.Errorf("%s.content_types[%d] %q is invalid", field, j, raw)
+			}
+			if isTextualUnscannablePassthroughType(mediaType) {
+				return fmt.Errorf("%s.content_types[%d] %q is textual/scannable and cannot downgrade entropy enforcement", field, j, raw)
+			}
+			entry.ContentTypes[j] = mediaType
+		}
+
+		for j, raw := range entry.Methods {
+			method := strings.ToUpper(strings.TrimSpace(raw))
+			if !validHTTPMethod(method) {
+				return fmt.Errorf("%s.methods[%d] %q is not a supported HTTP method", field, j, raw)
+			}
+			entry.Methods[j] = method
+		}
+
+		entry.Reason = strings.TrimSpace(entry.Reason)
+		entry.Owner = strings.TrimSpace(entry.Owner)
+		for _, textField := range []struct {
+			name  string
+			value string
+			max   int
+		}{{"reason", entry.Reason, 200}, {"owner", entry.Owner, 100}} {
+			if textField.value == "" {
+				return fmt.Errorf("%s.%s is required", field, textField.name)
+			}
+			if len(textField.value) > textField.max {
+				return fmt.Errorf("%s.%s must be %d characters or fewer", field, textField.name, textField.max)
+			}
+			if strings.IndexFunc(textField.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, textField.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		expires, err := time.Parse("2006-01-02", entry.Expires)
+		if err != nil {
+			return fmt.Errorf("%s.expires %q must be YYYY-MM-DD: %w", field, entry.Expires, err)
+		}
+		if expires.Before(todayUTC()) {
+			return fmt.Errorf("%s.expires %q is already expired", field, entry.Expires)
+		}
+
+		slices.Sort(entry.ContentTypes)
+		entry.ContentTypes = slices.Compact(entry.ContentTypes)
+		slices.Sort(entry.Methods)
+		entry.Methods = slices.Compact(entry.Methods)
+		for j := range i {
+			previous := cfg.ContentEntropyWarnRoutes[j]
+			methodsOverlap := len(previous.Methods) == 0 || len(entry.Methods) == 0 || sortedStringsOverlap(previous.Methods, entry.Methods)
+			if previous.Host == entry.Host && previous.Path == entry.Path && methodsOverlap && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
+				return fmt.Errorf("%s overlaps content_entropy_warn_routes[%d]; exact route exceptions must have one unambiguous owner and reason", field, j)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRequestBodySigV4CredentialRoutes(cfg *RequestBodyScanning) error {
+	if len(cfg.SigV4CredentialRoutes) == 0 {
+		return nil
+	}
+	if !cfg.Enabled {
+		return fmt.Errorf("request_body_scanning.sigv4_credential_routes requires enabled request body scanning")
+	}
+
+	for i := range cfg.SigV4CredentialRoutes {
+		entry := &cfg.SigV4CredentialRoutes[i]
+		field := fmt.Sprintf("request_body_scanning.sigv4_credential_routes[%d]", i)
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards", field)
+		}
+		entry.Host = host[0]
+
+		path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
+		if !ok {
+			return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+		}
+		entry.Path = path
+
+		if len(entry.ContentTypes) == 0 {
+			return fmt.Errorf("%s.content_types must contain at least one media type", field)
+		}
+		for j, raw := range entry.ContentTypes {
+			mediaType, _, err := mime.ParseMediaType(strings.TrimSpace(strings.ToLower(raw)))
+			if err != nil || mediaType == "" {
+				return fmt.Errorf("%s.content_types[%d] %q is invalid", field, j, raw)
+			}
+			entry.ContentTypes[j] = mediaType
+		}
+
+		if len(entry.Methods) == 0 {
+			return fmt.Errorf("%s.methods must contain at least one HTTP method", field)
+		}
+		for j, raw := range entry.Methods {
+			method := strings.ToUpper(strings.TrimSpace(raw))
+			if !validHTTPMethod(method) {
+				return fmt.Errorf("%s.methods[%d] %q is not a supported HTTP method", field, j, raw)
+			}
+			entry.Methods[j] = method
+		}
+
+		entry.Reason = strings.TrimSpace(entry.Reason)
+		entry.Owner = strings.TrimSpace(entry.Owner)
+		for _, textField := range []struct {
+			name  string
+			value string
+			max   int
+		}{{"reason", entry.Reason, 200}, {"owner", entry.Owner, 100}} {
+			if textField.value == "" {
+				return fmt.Errorf("%s.%s is required", field, textField.name)
+			}
+			if len(textField.value) > textField.max {
+				return fmt.Errorf("%s.%s must be %d characters or fewer", field, textField.name, textField.max)
+			}
+			if strings.IndexFunc(textField.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, textField.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		expires, err := time.Parse("2006-01-02", entry.Expires)
+		if err != nil {
+			return fmt.Errorf("%s.expires %q must be YYYY-MM-DD: %w", field, entry.Expires, err)
+		}
+		if expires.Before(todayUTC()) {
+			return fmt.Errorf("%s.expires %q is already expired", field, entry.Expires)
+		}
+
+		slices.Sort(entry.ContentTypes)
+		entry.ContentTypes = slices.Compact(entry.ContentTypes)
+		slices.Sort(entry.Methods)
+		entry.Methods = slices.Compact(entry.Methods)
+		for j := range i {
+			previous := cfg.SigV4CredentialRoutes[j]
+			if previous.Host == entry.Host && previous.Path == entry.Path &&
+				sortedStringsOverlap(previous.Methods, entry.Methods) && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
+				return fmt.Errorf("%s overlaps sigv4_credential_routes[%d]; exact route exceptions must have one unambiguous owner and reason", field, j)
+			}
+		}
+	}
+	return nil
+}
+
+func sortedStringsOverlap(left, right []string) bool {
+	for i, j := 0, 0; i < len(left) && j < len(right); {
+		switch {
+		case left[i] == right[j]:
+			return true
+		case left[i] < right[j]:
+			i++
+		default:
+			j++
+		}
+	}
+	return false
+}
+
 func todayUTC() time.Time {
 	y, m, d := time.Now().UTC().Date()
 	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// Integer duration bounds leave room for runtime consumers that add a fixed
+// grace period or multiply the configured interval. Each bound is still more
+// than 97 years, so rejecting larger values cannot affect a useful timeout.
+const (
+	maxConfigDurationSeconds = int64((1<<63 - 1) / time.Second / 3)
+	maxConfigDurationMinutes = int64((1<<63 - 1) / time.Minute / 3)
+	maxConfigDurationDays    = int64((1<<63 - 1) / (24 * time.Hour) / 3)
+)
+
+type integerDurationBound struct {
+	name  string
+	value int
+	max   int64
+}
+
+func (c *Config) validateIntegerDurationBounds() error {
+	fields := []integerDurationBound{
+		{name: "conductor.created_skew_seconds", value: c.Conductor.CreatedSkewSeconds, max: maxConfigDurationSeconds},
+		{name: "mcp_input_scanning.response_timeout_seconds", value: c.MCPInputScanning.ResponseTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "fetch_proxy.timeout_seconds", value: c.FetchProxy.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "response_scanning.ask_timeout_seconds", value: c.ResponseScanning.AskTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "forward_proxy.max_tunnel_seconds", value: c.ForwardProxy.MaxTunnelSeconds, max: maxConfigDurationSeconds},
+		{name: "forward_proxy.idle_timeout_seconds", value: c.ForwardProxy.IdleTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "websocket_proxy.max_connection_seconds", value: c.WebSocketProxy.MaxConnectionSeconds, max: maxConfigDurationSeconds},
+		{name: "websocket_proxy.idle_timeout_seconds", value: c.WebSocketProxy.IdleTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "reverse_proxy.request_timeout_seconds", value: c.ReverseProxy.RequestTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "defer.timeout_seconds", value: c.Defer.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "session_profiling.cleanup_interval_seconds", value: c.SessionProfiling.CleanupIntervalSeconds, max: maxConfigDurationSeconds},
+		{name: "adaptive_enforcement.level_duration_seconds", value: c.AdaptiveEnforcement.LevelDurationSeconds, max: maxConfigDurationSeconds},
+		{name: "adaptive_enforcement.deescalation_check_seconds", value: c.AdaptiveEnforcement.DeescalationCheckSeconds, max: maxConfigDurationSeconds},
+		{name: "health_watchdog.interval_seconds", value: c.HealthWatchdog.IntervalSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.otlp.timeout_seconds", value: c.Emit.OTLP.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.forwarder.timeout_seconds", value: c.Emit.Forwarder.TimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "emit.webhook.timeout_seconds", value: c.Emit.Webhook.TimeoutSecs, max: maxConfigDurationSeconds},
+		{name: "tool_chain_detection.window_seconds", value: c.ToolChainDetection.WindowSeconds, max: maxConfigDurationSeconds},
+		{name: "mediation_envelope.created_skew_seconds", value: c.MediationEnvelope.CreatedSkewSeconds, max: maxConfigDurationSeconds},
+		{name: "airlock.timers.drain_timeout_seconds", value: c.Airlock.Timers.DrainTimeoutSeconds, max: maxConfigDurationSeconds},
+		{name: "session_profiling.window_minutes", value: c.SessionProfiling.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "session_profiling.session_ttl_minutes", value: c.SessionProfiling.SessionTTLMinutes, max: maxConfigDurationMinutes},
+		{name: "cross_request_detection.entropy_budget.window_minutes", value: c.CrossRequestDetection.EntropyBudget.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "cross_request_detection.fragment_reassembly.window_minutes", value: c.CrossRequestDetection.FragmentReassembly.WindowMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.soft_minutes", value: c.Airlock.Timers.SoftMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.hard_minutes", value: c.Airlock.Timers.HardMinutes, max: maxConfigDurationMinutes},
+		{name: "airlock.timers.drain_minutes", value: c.Airlock.Timers.DrainMinutes, max: maxConfigDurationMinutes},
+		{name: "flight_recorder.retention_days", value: c.FlightRecorder.RetentionDays, max: maxConfigDurationDays},
+	}
+	for agentName, profile := range c.Agents {
+		fields = append(fields,
+			integerDurationBound{name: fmt.Sprintf("agents.%s.budget.window_minutes", agentName), value: profile.Budget.WindowMinutes, max: maxConfigDurationMinutes},
+			integerDurationBound{name: fmt.Sprintf("agents.%s.budget.max_wall_clock_minutes", agentName), value: profile.Budget.MaxWallClockMinutes, max: maxConfigDurationMinutes},
+		)
+	}
+	sort.Slice(fields, func(i, j int) bool { return fields[i].name < fields[j].name })
+	for _, field := range fields {
+		if int64(field.value) > field.max {
+			return fmt.Errorf("%s is too large: must be at most %d", field.name, field.max)
+		}
+	}
+	return nil
 }
 
 func isTextualUnscannablePassthroughType(mediaType string) bool {
@@ -202,6 +459,9 @@ func (c *Config) Validate() error {
 // callers can surface every advisory emitted before the failing validator.
 func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 	var warnings []Warning
+	if err := c.validateIntegerDurationBounds(); err != nil {
+		return warnings, err
+	}
 	if err := c.validateMode(); err != nil {
 		return warnings, err
 	}
@@ -257,6 +517,18 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 	}
 	if err := c.validateRequestBodyScanning(); err != nil {
 		return warnings, err
+	}
+	if len(c.RequestBodyScanning.SigV4CredentialRoutes) > 0 {
+		warnings = append(warnings, Warning{
+			Field:   "request_body_scanning.sigv4_credential_routes",
+			Message: fmt.Sprintf("%d exact HTTPS route(s) allow request bodies to carry structurally valid SigV4 presigned URLs; all malformed, bare, and out-of-route credentials remain blocked", len(c.RequestBodyScanning.SigV4CredentialRoutes)),
+		})
+	}
+	if len(c.RequestBodyScanning.ContentEntropyWarnRoutes) > 0 {
+		warnings = append(warnings, Warning{
+			Field:   "request_body_scanning.content_entropy_warn_routes",
+			Message: fmt.Sprintf("%d exact HTTPS route(s) downgrade request-body entropy findings from block to warn; DLP, injection, address, size, and redirect controls remain enforced", len(c.RequestBodyScanning.ContentEntropyWarnRoutes)),
+		})
 	}
 	if err := c.validateRequestPolicy(&warnings); err != nil {
 		return warnings, err
@@ -857,6 +1129,13 @@ func (c *Config) validateDLPPatternConfig() error {
 		if err := ValidateTrustedDomains(p.ExemptDomains, fmt.Sprintf("DLP pattern %q exempt_domains", p.Name)); err != nil {
 			return err
 		}
+		// The immutable floor ignores exemptions, so a pattern that reuses a
+		// core name with exempt_domains would document an allowance the scanner
+		// never grants. Refuse it at load and reload instead of shipping a knob
+		// that silently does nothing for that credential class.
+		if len(p.ExemptDomains) > 0 && IsCoreDLPPatternName(p.Name) {
+			return fmt.Errorf("DLP pattern %q is a core safety-floor pattern and cannot set exempt_domains; core credential classes are blocked on every destination", p.Name)
+		}
 	}
 
 	if err := validateCanaryTokens(c); err != nil {
@@ -1160,6 +1439,9 @@ func (c *Config) validateResponseScanning(warnings *[]Warning) error {
 			return fmt.Errorf("response_scanning.unscannable_passthrough[%d].host %q must match response_scanning.size_exempt_domains", i, entry.Host)
 		}
 	}
+	if err := validateAuthenticatedArtifacts(c.ResponseScanning.AuthenticatedArtifacts); err != nil {
+		return err
+	}
 	if !c.ResponseScanning.Enabled && len(c.ResponseScanning.ExemptDomains) > 0 {
 		*warnings = append(*warnings, Warning{
 			Field:   "response_scanning.exempt_domains",
@@ -1208,6 +1490,37 @@ func (c *Config) validateResponseScanning(warnings *[]Warning) error {
 	return nil
 }
 
+func validateAuthenticatedArtifacts(entries []AuthenticatedArtifactEntry) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		field := fmt.Sprintf("response_scanning.authenticated_artifacts[%d]", i)
+		host, err := normalizeQueryEntropyParamHost(entry.Host)
+		if err != nil {
+			return fmt.Errorf("%s.host must be one exact registrable DNS host: %w", field, err)
+		}
+		pathValue, err := normalizeQueryEntropyParamPath(entry.Path)
+		if err != nil {
+			return fmt.Errorf("%s.path must be one canonical non-root path: %w", field, err)
+		}
+		if !authenticatedArtifactBundleNameRE.MatchString(entry.BundleName) {
+			return fmt.Errorf("%s.bundle_name must be 3-64 lowercase alphanumeric characters or hyphens without edge hyphens", field)
+		}
+		entry.Host, entry.Path = host, pathValue
+		key := entry.Host + "\x00" + entry.Path
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("%s duplicates an earlier authenticated artifact", field)
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+// Keep this syntax identical to the authoritative bundle-name contract in
+// internal/rules. Config cannot import that package because rules imports
+// config, so an external-package parity test pins the contract boundaries.
+var authenticatedArtifactBundleNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$`)
+
 func hostMatchesResponseSizeExemptDomain(host string, domains []string) bool {
 	return hostMatchesPassthrough(host, domains)
 }
@@ -1235,6 +1548,7 @@ func (c *Config) validateMCPInputScanning() error {
 }
 
 func (c *Config) validateMCPToolScanning() error {
+	c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = nil
 	// Validate MCP tool scanning config
 	if c.MCPToolScanning.Enabled {
 		switch c.MCPToolScanning.Action {
@@ -1243,6 +1557,25 @@ func (c *Config) validateMCPToolScanning() error {
 		default:
 			return fmt.Errorf("invalid mcp_tool_scanning action %q: must be warn or block", c.MCPToolScanning.Action)
 		}
+	}
+	resetFile := c.MCPToolScanning.ListenerDriftResetFile
+	resetKey := c.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile
+	resetTarget := c.MCPToolScanning.ListenerDriftResetTarget
+	if resetFile == "" && (resetKey != "" || resetTarget != "") {
+		return errors.New("mcp_tool_scanning listener drift reset authority requires listener_drift_reset_file")
+	}
+	if resetFile != "" {
+		if resetKey == "" || resetTarget == "" {
+			return errors.New("mcp_tool_scanning listener drift reset requires listener_drift_reset_authority_public_key_file and listener_drift_reset_target")
+		}
+		publicKey, err := signing.LoadPublicKey(resetKey)
+		if err != nil {
+			return fmt.Errorf("load mcp_tool_scanning listener drift reset authority public key: %w", err)
+		}
+		if strings.TrimSpace(resetTarget) == "" || len(resetTarget) > 512 || strings.ContainsAny(resetTarget, "\r\n\x00") {
+			return errors.New("invalid mcp_tool_scanning listener_drift_reset_target")
+		}
+		c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), publicKey...)
 	}
 	return nil
 }
@@ -1736,7 +2069,14 @@ func validHTTPMethod(m string) bool {
 		// The HTTP QUERY method (draft-ietf-httpbis-safe-method-w-body) is a
 		// safe method that carries a request body; recognize it so operators
 		// can write request_policy rules that target QUERY requests.
-		methodQuery:
+		methodQuery,
+		// State-changing WebDAV methods (RFC 4918), used by package-registry
+		// publish and relocate flows. Needed so a fetch-only registry recipe
+		// can name them in request_policy without failing validation. LOCK and
+		// UNLOCK belong here for the same reason the others do: both write
+		// server state, so a recipe that cannot name them cannot refuse them.
+		// PROPFIND is deliberately absent, being a read.
+		"MKCOL", "MOVE", "COPY", "PROPPATCH", "LOCK", "UNLOCK":
 		return true
 	default:
 		return false
@@ -2171,6 +2511,14 @@ func validOptionalCardOriginPort(hostport, port string) bool {
 }
 
 func (c *Config) validateRequestBodyScanning() error {
+	if err := validateRequestBodySigV4CredentialRoutes(&c.RequestBodyScanning); err != nil {
+		return err
+	}
+	// Validated whether or not request-body scanning is enabled, so a dormant
+	// bad entry cannot activate silently when scanning is switched on.
+	if err := ValidateTrustedDomains(c.RequestBodyScanning.TrustedHosts, "request_body_scanning.trusted_hosts"); err != nil {
+		return err
+	}
 	knownPatterns := c.effectiveBodyDLPPatternNames()
 	disabledPatterns := make(map[string]struct{}, len(c.RequestBodyScanning.DisablePatterns))
 	for i, pattern := range c.RequestBodyScanning.DisablePatterns {
@@ -2244,6 +2592,9 @@ func (c *Config) validateRequestBodyScanning() error {
 		return fmt.Errorf("request_body_scanning.content_entropy_min_length must be non-negative")
 	}
 	if err := validateHostnamePatternList("request_body_scanning.content_entropy_exclusions", c.RequestBodyScanning.ContentEntropyExclusions); err != nil {
+		return err
+	}
+	if err := validateRequestBodyEntropyWarnRoutes(&c.RequestBodyScanning); err != nil {
 		return err
 	}
 	if !c.RequestBodyScanning.Enabled {
@@ -2565,6 +2916,12 @@ func (c *Config) validateSuppress() error {
 		if s.Rule == "" {
 			return fmt.Errorf("suppress entry %d missing required field \"rule\"", i)
 		}
+		if IsCoreDLPPatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: dlp.patterns[].exempt_domains applies only to configurable URL DLP patterns, so fix this core pattern's precision", i, s.Rule)
+		}
+		if IsCoreResponsePatternName(s.Rule) {
+			return fmt.Errorf("suppress entry %d rule %q targets a core floor pattern; core floor patterns cannot be suppressed: tighten the response pattern to fix the false positive", i, s.Rule)
+		}
 		if s.Path == "" {
 			return fmt.Errorf("suppress entry %d (%s) missing required field \"path\"", i, s.Rule)
 		}
@@ -2577,6 +2934,13 @@ func (c *Config) validateSuppress() error {
 		}
 	}
 	return nil
+}
+
+// ValidateSuppressions validates the suppression surface independently of the
+// full config. Runtime boundaries use it when callers provide an in-memory
+// config that did not pass through Load.
+func (c *Config) ValidateSuppressions() error {
+	return c.validateSuppress()
 }
 
 func (c *Config) validateKillSwitch() error {
@@ -3207,6 +3571,12 @@ func (c *Config) validateReverseProxy() error {
 	if c.ReverseProxy.Listen == "" {
 		return fmt.Errorf("reverse_proxy.listen is required when reverse_proxy is enabled")
 	}
+	if c.ReverseProxy.MaxInflightScanBytes <= 0 {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be positive when reverse_proxy is enabled")
+	}
+	if c.RequestBodyScanning.Enabled && c.ReverseProxy.MaxInflightScanBytes < c.RequestBodyScanning.MaxBodyBytes {
+		return fmt.Errorf("reverse_proxy.max_inflight_scan_bytes must be >= request_body_scanning.max_body_bytes when request body scanning is enabled")
+	}
 	return c.validateReverseProxyProfile(u)
 }
 
@@ -3371,6 +3741,24 @@ func (c *Config) validateSandbox() error {
 	if c.Sandbox.BestEffort && c.Sandbox.Strict {
 		return fmt.Errorf("sandbox: best_effort and strict are mutually exclusive")
 	}
+	if c.Sandbox.BestEffort {
+		if strings.TrimSpace(c.Sandbox.BestEffortReason) == "" {
+			return errors.New("sandbox: best_effort_reason is required when best_effort is true")
+		}
+		if strings.TrimSpace(c.Sandbox.BestEffortExpiry) == "" {
+			return errors.New("sandbox: best_effort_expiry is required when best_effort is true")
+		}
+		if _, err := time.ParseDuration(c.Sandbox.BestEffortExpiry); err == nil {
+			return errors.New("sandbox: best_effort_expiry in configuration must be an RFC3339 timestamp; durations are command-line only")
+		}
+		expiresAt, timestampErr := time.Parse(time.RFC3339, c.Sandbox.BestEffortExpiry)
+		if timestampErr != nil {
+			return errors.New("sandbox: best_effort_expiry must be an RFC3339 timestamp")
+		}
+		if !expiresAt.After(time.Now()) {
+			return errors.New("sandbox: best_effort_expiry has expired")
+		}
+	}
 
 	// Sandbox: validate filesystem paths even when disabled (CLI can override enabled).
 	if c.Sandbox.FS != nil {
@@ -3389,18 +3777,33 @@ func (c *Config) validateSandbox() error {
 }
 
 func (c *Config) validateFlightRecorder(warnings *[]Warning) error {
+	c.FlightRecorder.PostureSignerPublicKey = nil
 	if err := c.validateFlightRecorderAnchor(warnings); err != nil {
 		return err
 	}
-	if c.FlightRecorder.RequireReceipts {
+	if c.FlightRecorder.RequireReceipts || c.FlightRecorder.RequireContainmentEvidence {
+		requirement := "flight_recorder.require_receipts"
+		if c.FlightRecorder.RequireContainmentEvidence {
+			requirement = "flight_recorder.require_containment_evidence"
+		}
 		switch {
 		case !c.FlightRecorder.Enabled:
-			return fmt.Errorf("flight_recorder.require_receipts requires flight_recorder.enabled")
+			return fmt.Errorf("%s requires flight_recorder.enabled", requirement)
 		case c.FlightRecorder.Dir == "":
-			return fmt.Errorf("flight_recorder.require_receipts requires flight_recorder.dir")
+			return fmt.Errorf("%s requires flight_recorder.dir", requirement)
 		case c.FlightRecorder.SigningKeyPath == "":
-			return fmt.Errorf("flight_recorder.require_receipts requires flight_recorder.signing_key_path")
+			return fmt.Errorf("%s requires flight_recorder.signing_key_path", requirement)
 		}
+	}
+	if c.FlightRecorder.RequireContainmentEvidence {
+		if strings.TrimSpace(c.FlightRecorder.PostureSignerKey) == "" {
+			return errors.New("flight_recorder.require_containment_evidence requires flight_recorder.posture_signer_key")
+		}
+		publicKey, err := signing.LoadPublicKey(c.FlightRecorder.PostureSignerKey)
+		if err != nil {
+			return fmt.Errorf("load flight_recorder.posture_signer_key: %w", err)
+		}
+		c.FlightRecorder.PostureSignerPublicKey = append([]byte(nil), publicKey...)
 	}
 	if !c.FlightRecorder.Enabled {
 		return nil

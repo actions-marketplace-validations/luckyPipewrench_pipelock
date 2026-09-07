@@ -7,11 +7,220 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.5.0] - 2026-08-31
+
+### Breaking Changes / Upgrade Notes
+
+- **npm lifecycle scripts are disabled by default in contained environments.** Commands that require dependency install scripts must use the documented explicit override.
+- **Emit configuration changes now require a restart.** Reloads leave the active emitter unchanged and report the ignored change.
+- **Provider-key detection now requires a valid leading boundary.** This removes false positives and accidental redaction of ordinary prose; keys glued directly to a preceding key-alphabet character are no longer matched.
+- **Immutable core DLP and response floors can no longer be suppressed.** Existing suppressions naming those protected patterns must be removed or replaced with the documented scoped alternatives.
+- **Invalid duration values that overflow internal conversion are rejected during configuration validation.**
+- **Unsafe request trailers and opaque MCP arguments are now rejected.** Populated HTTP trailers that cannot be scanned and MCP tool arguments that redaction cannot safely inspect fail closed.
+
 ### Added
 
+- **External authority propagation at forwarding gates**, including audit, emission, WebSocket, and MCP paths.
+- **Offline recorder compaction and legacy recorder-epoch inventory** with bounded reads and integrity-preserving publication.
+- **Native AEL evidence emission** for session lifecycle and activity records.
+- **License-expiry warnings** and **rules-bundle compatibility warnings** in operator status surfaces.
+- **A code-checked capability manifest** that reports the supported capabilities from attached implementation.
+- **Route-scoped entropy warnings** for selected request paths.
+- **Detection and redaction for current GitHub installation-token and Azure SAS token formats.**
+- **An exported rules reader-schema contract** with atomic bundle loading and status publication.
+
+### Changed
+
+- Canary matching now uses bounded recursive decoding across whole-text and segmented views.
+- Shielded large-response handling is consistent across forward and reverse proxy paths and records the configured cap and remedy.
+- Audit, evidence, and dashboard surfaces distinguish recorded agent labels from identities established by trusted provenance.
+- AEL liveness evidence begins with an immediate heartbeat so short sessions can satisfy the declared cadence.
+- Conductor follower state uses signed applied-state heartbeats with bounded negotiation retry.
+- Verified PNG and JPEG bodies bypass text prompt scanning while readable metadata and malformed or non-image bodies remain scanned.
+- DLP prefiltering uses proven required literals to reduce unnecessary pattern work while retaining an always-run path for patterns whose anchors cannot be proven.
+- MCP tool-definition scanning avoids reprocessing duplicate input-schema text while retaining one scan of every agent-visible field.
+
+### Fixed
+
+- URL paths now participate in cross-request exfiltration detection.
+- Skill and file scanning discovers extensionless references, scans text before classifying binary content, and prevents symlink or path-replacement escapes from presenting as clean.
+- MCP setup and generated wrappers verify executable identity and proxy invocation rather than trusting self-written markers.
+- MCP tool arguments that redaction cannot safely inspect now fail closed.
+- Generic non-media responses and WebSocket control payloads are scanned, with taint attribution preserved across frames.
+- A2A Agent Card controls run on forwarded MCP responses.
+- Redirect policy and official rules-registry origin checks remain enforced across repeated fetch, update, and sink paths.
+- Conductor audit/admin operations are organization-scoped, including removed-follower handling.
+- Unreadable posture evidence warns without taking down receipt-enabled startup.
+- Files already present in newly created file-sentry directories are scanned without blocking event processing.
+- Response prefiltering preserves required literals across regex alternation branches, keeping candidate selection deterministic and never skipping patterns without a proven anchor.
+- HTTP request trailers fail closed when they cannot be scanned; forwarded hosts follow the admitted URL, and scanned bodies are not replayed across authority-changing redirects.
+- MCP media policy scans and safely rewrites nested `resource.blob` payloads.
+- Strict reloads cannot remove an active MCP listener state-token requirement.
+- Pinned EvidenceReceipt verification requires `signer_key_id` to match the pinned public key across the bundled verifiers.
+- Description-scoped bundle rules match only tool and input-schema descriptions, including Hyper-Schema link descriptions, while built-in scanning retains broader field coverage.
+
+## [3.4.0] - 2026-08-20
+
+### Breaking Changes / Upgrade Notes
+
+- **Three `airlock.triggers` fields are now rejected at config load.** `on_severity`,
+  `anomaly_count` and `anomaly_window_minutes` parsed and validated in 3.3.0 while never
+  being read by any code, so setting them changed nothing and said nothing. Loading a
+  config that still carries any of them now fails with the replacement named. Airlock
+  fires from `on_elevated`, `on_high` and `on_critical`; remove the three old keys and
+  set those instead. A silently inert knob is worse than a rejected one, which is why
+  this refuses rather than warning.
+- **A reasoning trust class can no longer weaken a stricter response action.** An MCP
+  server marked `trust: reasoning` maps to `warn`, but Pipelock now applies whichever of
+  that mapping and `response_scanning.action` is stricter. An operator running `block`,
+  `ask` or `strip` with a reasoning server configured was getting warn-and-forward for
+  that server; those responses now take the section action. A trust class can tighten the
+  enclosing action and can no longer relax it. If you relied on the old behaviour, set
+  `response_scanning.action: warn` explicitly rather than expecting the server entry to
+  override a stricter setting.
+- **`pipelock git scan-diff` has a three-value exit contract.** `0` means the diff was
+  scanned and is clean, `1` means secrets were found, and `2` means no verified result
+  was produced, covering unreadable or unparseable input and configuration, encoding or
+  report-writing failures. A caller that treats every non-zero status as "secrets found"
+  will report leaks that were never detected. CI steps keying on this should distinguish
+  1 from 2.
+- **The container image asserts its Go toolchain and fails the build on a mismatch.**
+  The base image tag, its digest and the expected version are changed together; a base
+  that drifts stops the build rather than producing an image whose Go version nothing
+  states.
+- **Release publication now requires a verified release manifest.** Tagging halts before
+  publication until `release.json.sig` is signed and uploaded, so a release cannot leave
+  draft with an unverified manifest.
+- **Reverse-proxy request bodies declaring an image, audio or video type are now
+  scanned.** They were skipped, so a secret placed after a genuine media signature left
+  the network unexamined. Media is now subject to the same request-body policy as
+  everything else, and a body above `request_body_scanning.max_body_bytes` returns 413
+  rather than streaming through unscanned. An operator who legitimately posts uploads
+  larger than the 5 MiB default through the reverse proxy must raise that cap or route
+  those uploads around it. This does not detect a secret embedded inside a valid image.
+- **Evidence provenance transforms move to a second profile.** Two registered operations
+  changed the bytes they strip, so the profile describing them was superseded rather than
+  edited: `evidence-provenance-transform-v1` keeps its bytes, its digest and its original
+  semantics, and a v2 profile describes the current behaviour. A receipt selects its
+  profile by exact digest and an unknown digest is rejected before any operation runs,
+  never falling back. A verifier that predates v2 will refuse a v2 proof rather than
+  replay it incorrectly, so publish verifier support before relying on v2 receipts.
+
+### Added
+
+- Guard manifests gain filesystem and command-execution enforcement, declared path types
+  that refuse credential paths, and path-decision explanations.
+- `pipelock contain upgrade`, a containment-aware upgrade command that re-pins integrity.
+- Commitment keys gain a durable operator-owned keyring with recorded lifecycle
+  operations.
+- Exact protocol, host and port guard grants, on a transport-neutral destination
+  evaluator that unifies alternative IP literal handling.
+- Assessments are signed, gating content rather than integrity.
+- Conductor reports fleet and evidence convergence as four denominators, and exposes
+  build information in its metrics.
+- The Helm chart publishes as an OCI artifact.
+- An explicit applicability vocabulary for verification status, separating a check that
+  cannot apply from one that applies and has no measurement.
+- `reverse_proxy.max_inflight_scan_bytes`, a per-instance budget for request bodies held
+  while being inspected. A request that cannot reserve capacity is refused before its body
+  is read, so scanning media cannot be turned into a way to exhaust memory. It defaults to
+  64 MiB, which admits twelve concurrent uploads at the default body cap.
 - Recorder readers accept the v3 outer-chain namespace fields
   `chain_kind` and `writer_instance_id`. The recorder continues to emit v2
   entries during the compatibility window.
+
+### Changed
+
+- Human-readable CLI results go to stdout and diagnostics to stderr, so a caller can pipe
+  one without the other. `pipelock version > file` and `pipelock generate docker-compose >
+  docker-compose.yml` produce their content rather than an empty file.
+- A command group rejects a subcommand it does not have instead of printing help and
+  reporting success. A setup step whose subcommand name is wrong now fails, where it
+  previously looked like it had run.
+- `pipelock explain` discloses every enabled control an allowed verdict did not evaluate.
+  It does not fetch the URL or resolve DNS, so response scanning, request body scanning
+  and the SSRF layer can still block a request the explanation allowed.
+- `pipelock doctor` reports action divergence under its own check name.
+- Configuration warns when a sub-detector action is weaker than its section, and ranks
+  every enforcement action when combining findings.
+- The developer environment reaches a sandboxed process over a pipe rather than the
+  command line, keeping values out of `/proc/<pid>/cmdline`.
+- Release verification binds to one tag predicate and an exact identity, so the readiness
+  gate and the publication path agree on what a product tag is.
+
+### Fixed
+
+- MCP proxies exit when their spawning session dies, and WebSocket and sandbox proxy
+  sessions are bound to their spawner.
+- MCP capacity bounds fail closed and require signed resets. Reaching a bound refuses
+  rather than evicting live state, which would make a prior request replayable.
+- Listener state is bound to authenticated principals, and the listener state token
+  defaults off.
+- Tool definition drift is blocked on introduced content, `tools/list` is scanned for
+  HTTP listener clients without a session token, and fragmented tool arguments are
+  reassembled for cross-request detection.
+- The scanner detects external data transfer directives.
+- Local authority grants are canonicalized with JCS, so a re-encoded grant is not
+  interchangeable with the signed one.
+- Evidence provenance commitments are unambiguous, and the provenance profile describes
+  the scanner transforms that actually run.
+- Encoded credentials split by an unlisted character are matched again. Normalization
+  named the characters it removed, so a value broken up by anything absent from that list
+  either survived unchanged or aborted normalization entirely, and reached DLP in a form
+  it could not match. Each transform now keeps only the bytes valid for its alphabet and
+  treats everything else as noise, which closes the rule over the alphabet rather than
+  over a list. Known environment and file secrets written as hex are matched through the
+  same set, where a separate smaller list had been maintained alongside it.
+- A credential spread across more than four query values is assembled before matching.
+- The kill switch denies proxied requests whatever destination path they carry. Its
+  endpoint exemptions keep Pipelock's own operational endpoints answering while traffic is
+  denied, but they compared the request path without first establishing that the request
+  was addressed to Pipelock, and a forward-proxy request carries the destination's path.
+  Exemptions now sit behind a single check consulted ahead of all of them, so one added
+  later inherits it. The IP allowlist still applies to proxied traffic, because it keys on
+  the client address rather than a path the client chooses. Upgrade if you treat the kill
+  switch as an absolute stop.
+- URL DLP joins the path and the query when matching credential patterns. Targets were
+  built from each side of the separator with nothing joining them, so a credential divided
+  across that boundary matched no target: neither half satisfies a pattern alone, and the
+  whole-URL view cannot bridge the separator because it falls outside every credential
+  pattern's character class. The seam is now its own target, in the shared helper both the
+  configured scanner and the core floor use, so the core copy cannot shadow the fix. The
+  path side is decoded to a fixpoint first, because `url.Parse` decodes a path once while
+  the query values were already decoded repeatedly, and a multi-escaped prefix survived
+  that asymmetry.
+- The provider-opaque request-body carve-out requires the body to measure as ciphertext.
+  A long opaque field previously qualified on length alone, so padded content skipped
+  inspection.
+- The Go, Rust and TypeScript provenance implementations agree with the profile they
+  claim to follow, and with the Python one, which was the only implementation still
+  matching the published description. The shared conformance corpus gains vectors that
+  distinguish the two rule sets; its previous vectors used only characters both rules
+  strip, so it could not have detected the disagreement.
+- Recorder evidence is preserved under concurrent writers, and anchor bundle and marker
+  state are fsynced before success is reported.
+- Metrics stop reporting a self-awarded evidence assurance level and cap the current
+  level at the honestly-earned ceiling.
+- Signing publishes agent key pairs as a transaction, and CLI, license and integrity
+  commands refuse an output path that names the signing key they just used.
+- The commitment keyring refuses content that fails its own check, so an altered or
+  truncated backup is not adopted.
+- `contain` verifies the deployed binary against the integrity pin and the running
+  service image, validates managed configuration on upgrade, and constrains metrics
+  exposure to loopback or a declared, expiring, source-scoped exception.
+- The proxy preserves detection state across reload, gates receipt headers on successful
+  recording, and binds the SSRF dial snapshot to the CONNECT port.
+- `scan-diff` accepts whole-file deletion hunks, which previously failed the scan and,
+  through fail-on-findings, CI.
+- A second release no longer overwrites the published Helm chart.
+- The sandbox preserves capacity on busy hosts and treats its network lifecycle as a
+  fail-closed required service.
+- `pipelock quickstart` prints a walkthrough a reader can run. It creates the config its
+  later steps use, instead of naming one that ships only in a source checkout, and writes
+  each step in the syntax of the platform it is printed on.
+- Integration guides and the README no longer show commands that cannot run: a flag that
+  does not exist on `run` or `mcp proxy`, config paths present only in a source checkout,
+  and an evidence-viewer invocation pointed at a directory it cannot read.
 
 ## [3.3.0] - 2026-07-30
 

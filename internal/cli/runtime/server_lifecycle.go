@@ -34,9 +34,45 @@ import (
 
 var newFileSentryWatcher = filesentry.NewWatcher
 
-func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel context.CancelFunc) (func(), error) {
+// fileSentryRuntimeFailure preserves the first asynchronous watcher failure
+// until its owner has completed graceful shutdown. A file sentry backend error
+// is a fail-closed runtime failure; cancellation is only the mechanism used to
+// drain listeners and child processes safely.
+type fileSentryRuntimeFailure struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (f *fileSentryRuntimeFailure) set(err error) {
+	if err == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err == nil {
+		f.err = err
+	}
+}
+
+func (f *fileSentryRuntimeFailure) get() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
+}
+
+func validateServerFileSentry(cfg *config.Config) error {
+	if cfg != nil && cfg.FileSentry.Enabled && cfg.FileSentry.Action == config.ActionBlock {
+		return errors.New("file_sentry.action: block requires subprocess MCP mode (pipelock mcp proxy -- COMMAND); pipelock run has no child process to cancel")
+	}
+	return nil
+}
+
+func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel context.CancelFunc) (func() error, error) {
+	if err := validateServerFileSentry(cfg); err != nil {
+		return nil, err
+	}
 	if cfg == nil || !cfg.FileSentry.Enabled {
-		return func() {}, nil
+		return func() error { return nil }, nil
 	}
 
 	onErr := func(err error) {
@@ -58,7 +94,7 @@ func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel
 		_ = watcher.Close()
 		if cfg.FileSentry.BestEffort && !fileSentryArmErrorMustFailClosed(err) {
 			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: file sentry failed to arm watches (best_effort: continuing without file monitoring): %v\n", err)
-			return func() {}, nil
+			return func() error { return nil }, nil
 		}
 		return nil, fmt.Errorf("file sentry failed to arm watches (feature is enabled): %w", err)
 	}
@@ -75,9 +111,13 @@ func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel
 		Cancel:    cancel,
 	})
 
+	var failure fileSentryRuntimeFailure
+	watcherDone := make(chan struct{})
 	go func() {
+		defer close(watcherDone)
 		if err := watcher.Start(ctx); err != nil {
 			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: file sentry fatal: %v — cancelling runtime\n", err)
+			failure.set(err)
 			cancel()
 		}
 	}()
@@ -87,9 +127,18 @@ func (s *Server) startFileSentry(ctx context.Context, cfg *config.Config, cancel
 	// roots would invent an inaccurate count.
 	reportFileSentryCoverage(s.opts.Stderr, len(cfg.FileSentry.WatchPaths), cfg.FileSentry.Action, watcher.DegradedPathCount())
 
-	return func() {
-		_ = watcher.Close()
-		waitConsumer()
+	var stopOnce sync.Once
+	var stopErr error
+	return func() error {
+		stopOnce.Do(func() {
+			_ = watcher.Close()
+			<-watcherDone
+			waitConsumer()
+			if err := failure.get(); err != nil {
+				stopErr = fmt.Errorf("file sentry runtime failed: %w", err)
+			}
+		})
+		return stopErr
 	}, nil
 }
 
@@ -245,7 +294,7 @@ func killSwitchAPITokenConfigured(cfg *config.Config) bool {
 // proxy. Start blocks until ctx is cancelled or the proxy returns an
 // error, then drains listener error channels, closes owned resources, and
 // returns.
-func (s *Server) Start(ctx context.Context) error {
+func (s *Server) Start(ctx context.Context) (startErr error) {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancelMu.Lock()
 	s.internalCancel = cancel
@@ -387,7 +436,9 @@ func (s *Server) Start(ctx context.Context) error {
 	if fsErr != nil {
 		return fsErr
 	}
-	defer stopFileSentry()
+	defer func() {
+		startErr = preferFileSentryRuntimeError(startErr, stopFileSentry())
+	}()
 
 	// Pre-bind the fetch listener so the startup summary reports the real
 	// OS-chosen address when the configured port is ephemeral (":0"), instead
@@ -416,7 +467,9 @@ func (s *Server) Start(ctx context.Context) error {
 	_, _ = fmt.Fprintf(s.opts.Stderr, "  Listen: %s\n", boundFetchAddr)
 	_, _ = fmt.Fprintf(s.opts.Stderr, "  Fetch:  http://%s/fetch?url=<url>\n", boundFetchAddr)
 	_, _ = fmt.Fprintf(s.opts.Stderr, "  Health: http://%s/health\n", boundFetchAddr)
-	if cfg.MetricsListen != "" {
+	if s.metricsDisabled {
+		_, _ = fmt.Fprintln(s.opts.Stderr, "  Stats:  disabled (containment managed-config drift)")
+	} else if cfg.MetricsListen != "" {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "  Stats:  http://%s/stats (separate port)\n", cfg.MetricsListen)
 	} else {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "  Stats:  http://%s/stats\n", boundFetchAddr)
@@ -441,7 +494,7 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 	if s.opts.ConfigFile != "" {
-		_, _ = fmt.Fprintf(s.opts.Stderr, "  Config: %s (hot-reload enabled%s)\n", s.opts.ConfigFile, ReloadSignalHint())
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  Config: %s (hot-reload enabled%s; rejected security downgrades require restart)\n", s.opts.ConfigFile, ReloadSignalHint())
 	}
 	if s.hasMCPListen {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "  MCP:    http://%s -> %s\n", s.opts.MCPListen, s.opts.MCPUpstream)
@@ -678,10 +731,15 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	var metricsErr chan error
-	if cfg.MetricsListen != "" {
+	if cfg.MetricsListen != "" && !s.metricsDisabled {
 		metricsMux := http.NewServeMux()
-		metricsMux.Handle("/metrics", s.metrics.PrometheusHandler())
-		metricsMux.HandleFunc("/stats", s.metrics.StatsHandler())
+		if s.containmentManaged {
+			metricsMux.Handle("/metrics", containmentMetricsHandler(s.proxy.CurrentConfig, s.containmentMetricsDenied.Load, s.reportContainmentMetricsRequestDenied, s.metrics.PrometheusHandler()))
+			metricsMux.Handle("/stats", containmentLoopbackHandler(s.reportContainmentMetricsRequestDenied, s.metrics.StatsHandler()))
+		} else {
+			metricsMux.Handle("/metrics", s.metrics.PrometheusHandler())
+			metricsMux.HandleFunc("/stats", s.metrics.StatsHandler())
+		}
 
 		metricsLn, lnErr := (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.MetricsListen)
 		if lnErr != nil {
@@ -691,6 +749,7 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 			return err
 		}
+		s.proxy.UpdateMetricsDialTargetFromBoundAddr(metricsLn.Addr().String())
 		metricsSrv := newHTTPServer(metricsMux)
 		lifecycleWG.Add(1)
 		go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
@@ -780,21 +839,20 @@ func (s *Server) Start(ctx context.Context) error {
 		// when the operator did not configure them; the effective cfg
 		// already reflects those defaults.
 		mcpToolBaseline := tools.NewToolBaseline()
-		// mcpDriftEdge detects detect_drift false→true transitions for
-		// the server-level tool baseline shared across stdio / WS / forward
-		// MCP sessions. On false→true reload, ResetDriftState clears stale
-		// drift hashes so a subsequent session does not evaluate post-flip
-		// tools/list against pre-disable ground truth. See proxy_http.go
-		// for the equivalent detector on the per-listener baseline.
-		var mcpDriftEdge tools.DetectDriftRisingEdge
 		mcpScannerFn := func() *scanner.Scanner { return s.proxy.ScannerPtr().Load() }
 		mcpInputCfgFn := func() *mcp.InputScanConfig { return buildMCPInputCfg(s.proxy.CurrentConfig()) }
+		var mcpToolCfgMu sync.Mutex
+		var cachedMCPToolSource *config.Config
+		var cachedMCPToolCfg *tools.ToolScanConfig
 		mcpToolCfgFn := func() *tools.ToolScanConfig {
-			cfg := buildMCPToolCfg(s.proxy.CurrentConfig(), s.currentMCPToolExtraPoison(), mcpToolBaseline)
-			if cfg != nil && mcpDriftEdge.Observe(cfg.DetectDrift) {
-				mcpToolBaseline.ResetDriftState()
+			current := s.proxy.CurrentConfig()
+			mcpToolCfgMu.Lock()
+			defer mcpToolCfgMu.Unlock()
+			if current != cachedMCPToolSource {
+				cachedMCPToolCfg = buildMCPToolCfg(current, s.currentMCPToolExtraPoison(), mcpToolBaseline)
+				cachedMCPToolSource = current
 			}
-			return cfg
+			return cachedMCPToolCfg
 		}
 		mcpRedirectRTFn := func() *mcp.RedirectRuntime {
 			c := s.proxy.CurrentConfig()
@@ -923,7 +981,7 @@ func (s *Server) Start(ctx context.Context) error {
 			return trust
 		}
 		mcpResponseActionFn := func() string {
-			return config.MCPResponseActionForTrust(mcpResponseTrustFn())
+			return s.proxy.CurrentConfig().MCPResponseActionForServer(s.opts.MCPServerName)
 		}
 		mcpTaintTrustedFn := func() bool {
 			c := s.proxy.CurrentConfig()
@@ -945,46 +1003,55 @@ func (s *Server) Start(ctx context.Context) error {
 				ListenerBearerToken:          s.mcpListenerBearerToken,
 				ListenerAllowedOrigins:       s.opts.MCPAllowedOrigins,
 				ListenerAllowUnauthenticated: s.opts.MCPAllowUnauthenticated,
-				ScannerFn:                    mcpScannerFn,
-				Approver:                     mcpApprover,
-				InputCfgFn:                   mcpInputCfgFn,
-				RequestBodyFn:                mcpRequestBodyFn,
-				ToolCfgFn:                    mcpToolCfgFn,
-				PolicyCfgFn:                  s.currentToolPolicyCfg,
-				KillSwitch:                   s.killswitch,
-				ChainMatcherFn:               s.currentMCPChainMatcher,
-				AuditLogger:                  s.logger,
-				CEEFn:                        s.currentMCPCEE,
-				Store:                        mcpStore,
-				BaselineFn:                   s.proxy.SessionBaselineChecker,
-				AdaptiveCfgFn:                mcpAdaptiveFn,
-				AirlockCfgFn:                 mcpAirlockFn,
-				Metrics:                      s.metrics,
-				RedirectRTFn:                 mcpRedirectRTFn,
-				CaptureObs:                   mcpCaptureObs,
-				ConfigHashFn:                 mcpConfigHashFn,
-				Profile:                      edition.ProfileDefault,
-				AddressProtectionAgent:       edition.ProfileDefault,
-				ProvenanceCfgFn:              mcpProvenanceCfgFn,
-				ReceiptEmitterFn:             s.liveReceiptEmitter,
-				RequireReceiptsFn:            mcpRequireReceiptsFn,
-				V2ReceiptEmitterFn:           s.liveV2ReceiptEmitter,
-				PolicyHashFn:                 mcpConfigHashFn,
-				EnvelopeEmitterFn:            s.liveEnvelopeEmitter,
-				RedactionCfgFn:               mcpRedactionCfgFn,
-				TaintCfgFn:                   mcpTaintCfgFn,
-				TaintTrustedSourceFn:         mcpTaintTrustedFn,
-				A2ACfgFn:                     mcpA2ACfgFn,
-				MediaPolicyFn:                mcpMediaPolicyFn,
-				ServerName:                   s.opts.MCPServerName,
-				SuppressFn:                   mcpResponseSuppressFn,
-				ResponseTrustClassFn:         mcpResponseTrustFn,
-				ResponseActionOverrideFn:     mcpResponseActionFn,
-				ToolFreezer:                  s.proxy.FrozenTools(),
-				FrozenToolStableKey:          s.opts.MCPUpstream,
-				ContractLoaderPtr:            s.proxy.ContractLoaderPtr(),
-				ContractAgent:                edition.ProfileDefault,
-				DialContext:                  mcp.NewMetadataSafeDialContext(mcpScannerFn),
+				ListenerStateTokenRequiredFn: func() *bool {
+					c := s.proxy.CurrentConfig()
+					if c == nil {
+						return nil
+					}
+					return c.MCPSessionBinding.ListenerRequireStateToken
+				},
+				ScannerFn:                mcpScannerFn,
+				Approver:                 mcpApprover,
+				InputCfgFn:               mcpInputCfgFn,
+				RequestBodyFn:            mcpRequestBodyFn,
+				ToolCfgFn:                mcpToolCfgFn,
+				PolicyCfgFn:              s.currentToolPolicyCfg,
+				KillSwitch:               s.killswitch,
+				ChainMatcherFn:           s.currentMCPChainMatcher,
+				AuditLogger:              s.logger,
+				CEEFn:                    s.currentMCPCEE,
+				Store:                    mcpStore,
+				BaselineFn:               s.proxy.SessionBaselineChecker,
+				AdaptiveCfgFn:            mcpAdaptiveFn,
+				AirlockCfgFn:             mcpAirlockFn,
+				Metrics:                  s.metrics,
+				RedirectRTFn:             mcpRedirectRTFn,
+				CaptureObs:               mcpCaptureObs,
+				ConfigHashFn:             mcpConfigHashFn,
+				Profile:                  edition.ProfileDefault,
+				AddressProtectionAgent:   edition.ProfileDefault,
+				ProvenanceCfgFn:          mcpProvenanceCfgFn,
+				ReceiptEmitterFn:         s.liveReceiptEmitter,
+				RequireReceiptsFn:        mcpRequireReceiptsFn,
+				V2ReceiptEmitterFn:       s.liveV2ReceiptEmitter,
+				PolicyHashFn:             mcpConfigHashFn,
+				EnvelopeEmitterFn:        s.liveEnvelopeEmitter,
+				RedactionCfgFn:           mcpRedactionCfgFn,
+				TaintCfgFn:               mcpTaintCfgFn,
+				TaintTrustedSourceFn:     mcpTaintTrustedFn,
+				A2ACfgFn:                 mcpA2ACfgFn,
+				CardBaseline:             mcp.NewCardBaseline(1000),
+				A2ACardURL:               s.opts.MCPUpstream,
+				MediaPolicyFn:            mcpMediaPolicyFn,
+				ServerName:               s.opts.MCPServerName,
+				SuppressFn:               mcpResponseSuppressFn,
+				ResponseTrustClassFn:     mcpResponseTrustFn,
+				ResponseActionOverrideFn: mcpResponseActionFn,
+				ToolFreezer:              s.proxy.FrozenTools(),
+				FrozenToolStableKey:      s.opts.MCPUpstream,
+				ContractLoaderPtr:        s.proxy.ContractLoaderPtr(),
+				ContractAgent:            edition.ProfileDefault,
+				DialContext:              mcp.NewMetadataSafeDialContext(mcpScannerFn),
 			}
 			applyMCPDoWOpts(&listenerOpts, mcpDoWWiring, true)
 			if s.opts.MCPAuthTokenFile != "" {
@@ -1016,6 +1083,7 @@ func (s *Server) Start(ctx context.Context) error {
 		rpHandler.SetReceiptEmitter(s.proxy.ReceiptEmitterPtr())
 		rpHandler.SetV2ReceiptEmitter(s.proxy.V2EmitterPtr())
 		rpHandler.SetContractLoader(s.proxy.ContractLoaderPtr())
+		s.proxy.BindReverseProxyIdentity(rpHandler)
 		rpHandler.SetReloadLock(s.proxy.ReloadLock())
 		rpHandler.SetRequestPolicyFn(s.proxy.ApplyRequestPolicy)
 		rpHandler.SetRequestPolicyPrepareFn(s.proxy.PrepareRequestPolicyBody)
@@ -1197,6 +1265,10 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 	}
 
+	if err := stopFileSentry(); err != nil {
+		return err
+	}
+
 	if heartbeatErr := getRequiredHeartbeatErr(); heartbeatErr != nil {
 		return heartbeatErr
 	}
@@ -1204,6 +1276,13 @@ func (s *Server) Start(ctx context.Context) error {
 	s.logger.LogShutdown("signal received")
 	_, _ = fmt.Fprintln(s.opts.Stderr, "\nPipelock stopped.")
 	return nil
+}
+
+func preferFileSentryRuntimeError(startErr, fileSentryErr error) error {
+	if fileSentryErr != nil && (startErr == nil || errors.Is(startErr, context.Canceled)) {
+		return fileSentryErr
+	}
+	return startErr
 }
 
 // mcpAirlockConfigFor returns the live airlock configuration the MCP listener

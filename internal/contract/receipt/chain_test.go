@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/contract/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 )
 
 const (
@@ -86,10 +88,11 @@ func signReceipt(t *testing.T, r receipt.EvidenceReceipt, priv ed25519.PrivateKe
 // by priv under the test signer id.
 func buildChain(t *testing.T, priv ed25519.PrivateKey, n int) []receipt.EvidenceReceipt {
 	t.Helper()
+	signerID := hex.EncodeToString(priv.Public().(ed25519.PublicKey))
 	var chain []receipt.EvidenceReceipt
 	prev := receipt.GenesisHash
 	for i := 0; i < n; i++ {
-		r := signReceipt(t, unsignedReceipt(t, testSignerID, uint64(i), prev), priv)
+		r := signReceipt(t, unsignedReceipt(t, signerID, uint64(i), prev), priv)
 		h, err := receipt.ReceiptHash(r)
 		if err != nil {
 			t.Fatalf("hash receipt %d: %v", i, err)
@@ -98,6 +101,175 @@ func buildChain(t *testing.T, priv ed25519.PrivateKey, n int) []receipt.Evidence
 		prev = h
 	}
 	return chain
+}
+
+func TestPinnedStreamingVerifierFailsClosedAndLatches(t *testing.T) {
+	priv, pub := testKey(t, 9)
+	marshal := func(t *testing.T, r receipt.EvidenceReceipt) []byte {
+		t.Helper()
+		data, err := json.Marshal(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
+	}
+	t.Run("constructor rejects invalid keys", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			key  ed25519.PublicKey
+		}{
+			{name: "empty"},
+			{name: "short", key: ed25519.PublicKey{1}},
+			{name: "long", key: make(ed25519.PublicKey, ed25519.PublicKeySize+1)},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				if _, err := receipt.NewPinnedStreamingVerifier(tc.key); err == nil {
+					t.Fatal("invalid pinned key accepted")
+				}
+			})
+		}
+	})
+	t.Run("valid chain reaches a signed head", func(t *testing.T) {
+		v, err := receipt.NewPinnedStreamingVerifier(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		chain := buildChain(t, priv, 2)
+		for _, r := range chain {
+			if err := v.AddRaw(marshal(t, r)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		result := v.Finish()
+		if !result.Valid || !result.SignaturesVerified || result.ReceiptCount != 2 {
+			t.Fatalf("result=%+v", result)
+		}
+	})
+	t.Run("invalid input latches independently", func(t *testing.T) {
+		badSignature := unsignedReceipt(t, receipt.SignerKeyID(pub), 0, receipt.GenesisHash)
+		badSignature = signReceipt(t, badSignature, priv)
+		badSignature.Actor = "tampered"
+		valid := buildChain(t, priv, 1)[0]
+		for _, tc := range []struct {
+			name string
+			raw  []byte
+			want string
+		}{
+			{name: "empty", raw: []byte{}, want: "decode"},
+			{name: "malformed", raw: []byte("[]"), want: "decode"},
+			{name: "signature", raw: marshal(t, badSignature), want: "signature"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				v, err := receipt.NewPinnedStreamingVerifier(pub)
+				if err != nil {
+					t.Fatal(err)
+				}
+				firstErr := v.AddRaw(tc.raw)
+				if firstErr == nil || !strings.Contains(firstErr.Error(), tc.want) {
+					t.Fatalf("first AddRaw error = %v, want %q", firstErr, tc.want)
+				}
+				if err := v.AddRaw(marshal(t, valid)); err == nil || err.Error() != firstErr.Error() {
+					t.Fatalf("latched AddRaw error = %v, want original %v", err, firstErr)
+				}
+				if got := v.Finish(); got.Valid || got.Error != firstErr.Error() {
+					t.Fatalf("latched Finish = %+v, want error %q", got, firstErr)
+				}
+			})
+		}
+	})
+	t.Run("empty verifier is not proof", func(t *testing.T) {
+		v, err := receipt.NewPinnedStreamingVerifier(pub)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := v.Finish(); got.Valid || got.Error != "empty chain" {
+			t.Fatalf("empty Finish=%+v", got)
+		}
+	})
+	t.Run("signature signer and chain disagreement deny", func(t *testing.T) {
+		v, _ := receipt.NewPinnedStreamingVerifier(pub)
+		badSig := unsignedReceipt(t, receipt.SignerKeyID(pub), 0, receipt.GenesisHash)
+		badSig = signReceipt(t, badSig, priv)
+		badSig.Actor = "tampered"
+		if err := v.AddRaw(marshal(t, badSig)); err == nil || !strings.Contains(err.Error(), "signature") {
+			t.Fatalf("signature error=%v", err)
+		}
+		v, _ = receipt.NewPinnedStreamingVerifier(pub)
+		first := buildChain(t, priv, 1)[0]
+		if err := v.AddRaw(marshal(t, first)); err != nil {
+			t.Fatal(err)
+		}
+		prev, err := receipt.ReceiptHash(first)
+		if err != nil {
+			t.Fatal(err)
+		}
+		other := signReceipt(t, unsignedReceipt(t, "other-signer", 1, prev), priv)
+		if err := v.AddRaw(marshal(t, other)); err == nil || !strings.Contains(err.Error(), "signer_key_id") {
+			t.Fatalf("signer error=%v", err)
+		}
+		v, _ = receipt.NewPinnedStreamingVerifier(pub)
+		wrongSeq := signReceipt(t, unsignedReceipt(t, receipt.SignerKeyID(pub), 1, receipt.GenesisHash), priv)
+		if err := v.AddRaw(marshal(t, wrongSeq)); err == nil || !strings.Contains(err.Error(), "sequence") {
+			t.Fatalf("sequence error=%v", err)
+		}
+	})
+}
+
+func TestExtractEvidenceReceiptsFromEntriesUsesWireDetailAndRejectsUnknown(t *testing.T) {
+	priv, _ := testKey(t, 10)
+	valid := signReceipt(t, unsignedReceipt(t, testSignerID, 0, receipt.GenesisHash), priv)
+	raw, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := []recorder.Entry{
+		{Type: "decision"},
+		{Type: receipt.EvidenceEntryType, RawDetail: raw, Detail: map[string]string{"wrong": "shape"}},
+		{Type: receipt.EvidenceEntryType, Detail: valid},
+	}
+	got, err := receipt.ExtractEvidenceReceiptsFromEntries(entries)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("extract entries=%d err=%v", len(got), err)
+	}
+	if _, err := receipt.ExtractEvidenceReceiptsFromEntries([]recorder.Entry{{Type: "unknown"}}); err == nil || !strings.Contains(err.Error(), "unexpected recorder entry type") {
+		t.Fatalf("unknown entry error=%v", err)
+	}
+	if _, err := receipt.ExtractEvidenceReceiptsFromEntries([]recorder.Entry{{Type: receipt.EvidenceEntryType, Detail: math.Inf(1)}}); err == nil || !strings.Contains(err.Error(), "marshal evidence detail") {
+		t.Fatalf("unmarshalable detail error=%v", err)
+	}
+	if _, err := receipt.ExtractEvidenceReceiptsFromEntries([]recorder.Entry{{Type: receipt.EvidenceEntryType}}); err == nil || !strings.Contains(err.Error(), "empty detail") {
+		t.Fatalf("empty detail error=%v", err)
+	}
+	if _, err := receipt.ExtractEvidenceReceiptsFromEntries([]recorder.Entry{{Type: receipt.EvidenceEntryType, RawDetail: []byte("[]")}}); err == nil || !strings.Contains(err.Error(), "decode evidence receipt") {
+		t.Fatalf("decode detail error=%v", err)
+	}
+}
+
+func TestEvidenceDetailFailuresPreserveExtractorContext(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		detail     string
+		wantDetail string
+	}{
+		{name: "empty", detail: "null", wantDetail: "evidence entry has empty detail"},
+		{name: "malformed", detail: "[]", wantDetail: "decode evidence receipt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := recorder.Entry{Type: receipt.EvidenceEntryType, RawDetail: []byte(tc.detail)}
+			if _, err := receipt.ExtractEvidenceReceiptsFromEntries([]recorder.Entry{entry}); err == nil || !strings.Contains(err.Error(), "parsed recorder entry 1: "+tc.wantDetail) {
+				t.Fatalf("parsed extraction error = %v", err)
+			}
+
+			path := filepath.Join(t.TempDir(), "evidence.jsonl")
+			line := `{"type":"evidence_receipt","detail":` + tc.detail + "}\n"
+			if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
+				t.Fatalf("write evidence file: %v", err)
+			}
+			if _, err := receipt.ExtractEvidenceReceipts(path); err == nil || !strings.Contains(err.Error(), path+" line 1: "+tc.wantDetail) {
+				t.Fatalf("raw extraction error = %v", err)
+			}
+		})
+	}
 }
 
 func testKey(t *testing.T, seedByte byte) (ed25519.PrivateKey, ed25519.PublicKey) {
@@ -124,8 +296,8 @@ func TestVerifyChain_ValidPinnedKey(t *testing.T) {
 	if res.ReceiptCount != 3 || res.FinalSeq != 2 {
 		t.Errorf("count=%d finalSeq=%d, want 3/2", res.ReceiptCount, res.FinalSeq)
 	}
-	if res.SignerKeyID != testSignerID {
-		t.Errorf("signer=%q, want %q", res.SignerKeyID, testSignerID)
+	if res.SignerKeyID != receipt.SignerKeyID(pub) {
+		t.Errorf("signer=%q, want %q", res.SignerKeyID, receipt.SignerKeyID(pub))
 	}
 }
 

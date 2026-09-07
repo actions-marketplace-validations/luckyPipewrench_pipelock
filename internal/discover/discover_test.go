@@ -5,6 +5,7 @@ package discover
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,85 @@ func TestConfigPathsNotEmpty(t *testing.T) {
 	paths := configPaths("/fake/home")
 	if len(paths) == 0 {
 		t.Fatal("configPaths returned empty slice")
+	}
+}
+
+func TestDiscoverContinueYAMLAndStandaloneBlocks(t *testing.T) {
+	home := t.TempDir()
+	continueDir := filepath.Join(home, ".continue")
+	blocks := filepath.Join(continueDir, "mcpServers")
+	if err := os.MkdirAll(blocks, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	config := "mcpServers:\n  - name: global\n    command: node\n    args: [server.js]\n"
+	if err := os.WriteFile(filepath.Join(continueDir, "config.yaml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	block := "name: block\nversion: 0.0.1\nschema: v1\nmcpServers:\n  - name: remote\n    type: streamable-http\n    url: https://api.vendor.example/mcp\n"
+	if err := os.WriteFile(filepath.Join(blocks, "remote.yml"), []byte(block), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Discover(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Summary.TotalServers != 2 {
+		t.Fatalf("servers = %#v", report.Servers)
+	}
+	for _, server := range report.Servers {
+		if server.Client != "continue" || server.Transport == TransportUnknown {
+			t.Fatalf("unexpected Continue server: %#v", server)
+		}
+	}
+}
+
+func TestIsContinueConfigExtension(t *testing.T) {
+	for _, tt := range []struct {
+		ext  string
+		want bool
+	}{
+		{ext: ".yaml", want: true},
+		{ext: ".yml", want: true},
+		{ext: ".json", want: false},
+	} {
+		t.Run(tt.ext, func(t *testing.T) {
+			if got := IsContinueConfigExtension(tt.ext); got != tt.want {
+				t.Fatalf("IsContinueConfigExtension(%q) = %t, want %t", tt.ext, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConfigPathsClaudeDesktopPlatforms(t *testing.T) {
+	home := t.TempDir()
+	for _, tt := range []struct {
+		goos string
+		dirs []string
+	}{
+		{goos: "linux", dirs: []string{filepath.Join(home, ".config", "Claude")}},
+		{goos: osDarwin, dirs: []string{filepath.Join(home, "Library", "Application Support", "Claude")}},
+		{goos: osWindows, dirs: []string{
+			filepath.Join(home, "AppData", "Roaming", "Claude"),
+			filepath.Join(home, "AppData", "Local", "Packages", "Claude_pzs8sxrjxfjjc", "LocalCache", "Roaming", "Claude"),
+		}},
+	} {
+		t.Run(tt.goos, func(t *testing.T) {
+			var paths []string
+			for _, cp := range configPathsForOS(home, tt.goos) {
+				if cp.Client == clientClaudeDesktop {
+					paths = append(paths, cp.Path)
+				}
+			}
+			if len(paths) != len(tt.dirs) {
+				t.Fatalf("paths = %v, want %d Claude configs", paths, len(tt.dirs))
+			}
+			for i, dir := range tt.dirs {
+				want := filepath.Join(dir, "claude_desktop_config.json")
+				if paths[i] != want {
+					t.Errorf("path %d = %q, want %q", i, paths[i], want)
+				}
+			}
+		})
 	}
 }
 
@@ -155,12 +235,16 @@ func TestConfigPathsVSCodeUsesServersKey(t *testing.T) {
 
 func TestDiscoverWithTestFixtures(t *testing.T) {
 	home := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
 
 	// Create a Claude Code config with one wrapped and one bare server
-	content := `{"mcpServers":{
-		"brain":{"command":"pipelock","args":["mcp","proxy","--","node","brain.js"]},
+	content := fmt.Sprintf(`{"mcpServers":{
+		"brain":{"command":%q,"args":["mcp","proxy","--","node","brain.js"]},
 		"raw":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/tmp"]}
-	}}`
+	}}`, self)
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -295,12 +379,15 @@ func TestDiscoverFindsZedAllChannels(t *testing.T) {
 // TestDiscoverZedWrappedShowsProtected covers the case where Zed's
 // settings.json carries a pipelock-wrapped context_server entry: discover
 // must classify it as ProtectedPipelock, matching what it does for other
-// IDEs that share the same wrap shape (command=pipelock, args contain mcp
-// and proxy).
+// IDEs that share the same wrap shape and current-executable identity check.
 func TestDiscoverZedWrappedShowsProtected(t *testing.T) {
 	home := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
 
-	wrapped := `{"context_servers":{"filesystem":{"type":"stdio","command":"pipelock","args":["mcp","proxy","--config","/etc/pipelock/pipelock.yaml","--","npx","-y","@modelcontextprotocol/server-filesystem","/tmp"]}}}`
+	wrapped := fmt.Sprintf(`{"context_servers":{"filesystem":{"type":"stdio","command":%q,"args":["mcp","proxy","--config","/etc/pipelock/pipelock.yaml","--","npx","-y","@modelcontextprotocol/server-filesystem","/tmp"]}}}`, self)
 	zedPath := filepath.Join(home, ".config", clientZed, "settings.json")
 	if err := os.MkdirAll(filepath.Dir(zedPath), 0o750); err != nil {
 		t.Fatal(err)
@@ -606,13 +693,17 @@ func TestBuildSummaryAllStates(t *testing.T) {
 
 func TestDiscoverSortRiskThenName(t *testing.T) {
 	home := t.TempDir()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
 
-	content := `{"mcpServers":{
+	content := fmt.Sprintf(`{"mcpServers":{
 		"memory":{"command":"npx","args":["-y","@modelcontextprotocol/server-memory"]},
 		"zz-database":{"command":"npx","args":["-y","@modelcontextprotocol/server-postgres"]},
 		"aa-filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"]},
-		"wrapped":{"command":"pipelock","args":["mcp","proxy","--","node","s.js"]}
-	}}`
+		"wrapped":{"command":%q,"args":["mcp","proxy","--","node","s.js"]}
+	}}`, self)
 	if err := os.WriteFile(filepath.Join(home, ".claude.json"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}

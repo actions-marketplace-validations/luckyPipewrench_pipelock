@@ -327,7 +327,7 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return out
 
 
-# AF-37 receipt-chain mode: the known non-receipt operational entry types that
+# Receipt-chain mode: the known non-receipt operational entry types that
 # extraction legitimately skips. Any entry whose type is outside the union of
 # the receipt types and this set is REJECTED (fail-closed) rather than silently
 # skipped, so a file mixing a valid chain with an unknown record type cannot be
@@ -455,7 +455,7 @@ def load_evidence_chain(path: str | Path) -> list[dict[str, Any]]:
             raise ReceiptError(f"line {index}: recorder entry must be an object")
         entry_type = entry.get("type")
         if entry_type not in {ACTION_ENTRY_TYPE, EVIDENCE_ENTRY_TYPE}:
-            # AF-37: skip only the known operational entry types; a type outside
+            # Skip only the known operational entry types; a type outside
             # the recorder taxonomy fails closed rather than being silently
             # dropped from a "valid receipt subsequence".
             if entry_type in _SKIPPABLE_ENTRY_TYPES:
@@ -1032,7 +1032,9 @@ def verify_evidence_receipt(
 ) -> None:
     normalize_evidence_receipt(receipt)
     signature = _require_object(receipt.get("signature"), "signature")
-    _require_string(signature.get("signer_key_id"), "signature.signer_key_id")
+    signer_key_id = _require_string(
+        signature.get("signer_key_id"), "signature.signer_key_id"
+    )
     key_hex = expected_key_hex.lower()
     if not key_hex:
         raise ReceiptError("EvidenceReceipt v2 verification requires --key")
@@ -1049,6 +1051,8 @@ def verify_evidence_receipt(
         public_key.verify(sig, _evidence_preimage(receipt))
     except InvalidSignature as exc:
         raise ReceiptError("signature verification failed") from exc
+    if signer_key_id != key_hex:
+        raise ReceiptError("signature.signer_key_id does not match pinned public key")
 
 
 def verify_action_receipt(receipt: dict[str, Any], expected_key_hex: str = "") -> None:

@@ -24,6 +24,58 @@ func TestDefaultDLPPatternsMatchDefaults(t *testing.T) {
 	}
 }
 
+func TestMarkBuiltInCredentialURLWhitespaceGrammar(t *testing.T) {
+	patterns := DefaultDLPPatterns()
+	var credentialIndex int
+	for i := range patterns {
+		if patterns[i].CredentialURLWhitespaceGrammar {
+			credentialIndex = i
+			break
+		}
+	}
+	patterns[credentialIndex].CredentialURLWhitespaceGrammar = false
+	markBuiltInCredentialURLWhitespaceGrammar(patterns)
+	if !patterns[credentialIndex].CredentialURLWhitespaceGrammar {
+		t.Fatal("canonical Credential in URL pattern lost built-in runtime provenance")
+	}
+
+	patterns[credentialIndex].Regex += "(?:changed)"
+	markBuiltInCredentialURLWhitespaceGrammar(patterns)
+	if patterns[credentialIndex].CredentialURLWhitespaceGrammar {
+		t.Fatal("customized Credential in URL pattern received built-in runtime provenance")
+	}
+}
+
+func TestDefaultDLPPatternsMatchIssuerBackedDecodedFormats(t *testing.T) {
+	t.Parallel()
+	githubJWTHeader := strings.Join([]string{"ghs_", "eyJ", "hbG", "ciOi", "JFUz", "I1Ni", "J9."}, "")
+
+	tests := []struct {
+		name  string
+		value string
+	}{
+		{
+			name: "GitHub Token",
+			value: githubJWTHeader +
+				strings.Repeat("A", 48) + "." + strings.Repeat("B", 48) + "-_",
+		},
+		{
+			name:  "Azure SAS Token",
+			value: "sig=" + strings.Repeat("A", 43) + "=",
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			re := regexp.MustCompile(mustDLPPatternRegex(t, test.name))
+			if got := re.FindString(test.value + "&next=1"); got != test.value {
+				t.Fatalf("%s pattern matched %q, want exact credential %q", test.name, got, test.value)
+			}
+		})
+	}
+}
+
 func TestDefaultDLPPatternsReturnsDeepCopy(t *testing.T) {
 	t.Parallel()
 
@@ -41,6 +93,48 @@ func TestDefaultDLPPatternsReturnsDeepCopy(t *testing.T) {
 	if second[0].ExemptDomains[0] == "mutated.example" {
 		t.Fatal("exempt_domains mutation leaked into canonical registry")
 	}
+}
+
+func TestProviderKeyPatternsRejectProsePrefixes(t *testing.T) {
+	t.Parallel()
+
+	type providerPattern struct {
+		name   string
+		prefix string
+	}
+	patterns := []providerPattern{
+		{name: "Anthropic API Key", prefix: "ant-"},
+		{name: "OpenAI API Key", prefix: "proj-"},
+		{name: "OpenAI Service Key", prefix: "svcacct-"},
+	}
+	prosePrefixes := []string{"desk", "kiosk", "risk", "task"}
+
+	for _, pattern := range patterns {
+		pattern := pattern
+		t.Run(pattern.name, func(t *testing.T) {
+			t.Parallel()
+			re := regexpMustCompile(t, mustDLPPatternRegex(t, pattern.name))
+			key := "sk-" + pattern.prefix + strings.Repeat("A", 20)
+			if !re.MatchString(key) {
+				t.Fatalf("real-shaped key %q no longer matches", key)
+			}
+			for _, prosePrefix := range prosePrefixes {
+				prose := prosePrefix + "-" + pattern.prefix + strings.Repeat("a", 20)
+				if re.MatchString(prose) {
+					t.Fatalf("ordinary prose %q matched", prose)
+				}
+			}
+		})
+	}
+}
+
+func mustDLPPatternRegex(t *testing.T, name string) string {
+	t.Helper()
+	pattern, ok := dlpPatternByName(DefaultDLPPatterns(), name)
+	if !ok {
+		t.Fatalf("default DLP pattern %q not found", name)
+	}
+	return pattern.Regex
 }
 
 func TestPresetDLPPatternsProfiles(t *testing.T) {
@@ -154,13 +248,21 @@ func TestDefaultDLPPatternsRedactionMirrorCoverage(t *testing.T) {
 
 	matcher := redact.NewDefaultMatcher()
 	tests := []struct {
-		name  string
-		value string
-		class redact.Class
+		name    string
+		variant string
+		value   string
+		class   redact.Class
+		exact   bool
 	}{
 		{name: "Anthropic API Key", value: "sk-" + "ant-" + strings.Repeat("A", 20), class: redact.ClassAnthropicKey},
 		{name: "OpenAI API Key", value: "sk-" + "proj-" + strings.Repeat("A", 20), class: redact.ClassOpenAIAPIKey},
 		{name: "OpenAI Service Key", value: "sk-" + "svcacct-" + strings.Repeat("A", 20), class: redact.ClassOpenAIAPIKey},
+		// Underscore suffixes: the scanner and redactor alphabets must agree.
+		// A scanner class narrower than the redactor is a fail-open, because the
+		// value is rewritten in a JSON body but sails through URL and text DLP.
+		{name: "Anthropic API Key", variant: " underscore", value: "sk-" + "ant-" + strings.Repeat("A", 10) + "_" + strings.Repeat("B", 10), class: redact.ClassAnthropicKey},
+		{name: "OpenAI API Key", variant: " underscore", value: "sk-" + "proj-" + strings.Repeat("A", 10) + "_" + strings.Repeat("B", 10), class: redact.ClassOpenAIAPIKey},
+		{name: "OpenAI Service Key", variant: " underscore", value: "sk-" + "svcacct-" + strings.Repeat("A", 10) + "_" + strings.Repeat("B", 10), class: redact.ClassOpenAIAPIKey},
 		{name: "Fireworks API Key", value: "fw_" + strings.Repeat("A", 22), class: redact.ClassFireworksAPIKey},
 		{name: "LLM Router API Key", value: "sk-" + "or-v1-" + strings.Repeat("a", 20), class: redact.ClassAIProviderKey},
 		{name: "Answer Engine API Key", value: "pplx-" + strings.Repeat("A", 20), class: redact.ClassAIProviderKey},
@@ -174,7 +276,8 @@ func TestDefaultDLPPatternsRedactionMirrorCoverage(t *testing.T) {
 		{name: "AWS Access ID", value: "AKIA" + strings.Repeat("A", 16), class: redact.ClassAWSAccessKey},
 		{name: "AWS Secret Key", value: "aws_secret_access_key = " + strings.Repeat("A", 40), class: redact.ClassAWSSecretKey},
 		{name: "Azure Storage Account Key", value: "AccountKey=" + strings.Repeat("A", 86) + "==", class: redact.ClassAzureStorageKey},
-		{name: "Azure SAS Token", value: "sig=" + strings.Repeat("A", 43) + "%3d", class: redact.ClassAzureSAS},
+		{name: "Azure SAS Token", value: "sig=" + strings.Repeat("A", 43) + "%3d", class: redact.ClassAzureSAS, exact: true},
+		{name: "Azure SAS Token", variant: " decoded", value: "sig=" + strings.Repeat("A", 43) + "=", class: redact.ClassAzureSAS, exact: true},
 		{name: "Slack Token", value: "xoxb-" + strings.Repeat("A", 15), class: redact.ClassSlackToken},
 		{name: "Hugging Face Token", value: "hf_" + strings.Repeat("A", 34), class: redact.ClassHuggingFaceToken},
 		{name: "Databricks Token", value: "dapi" + strings.Repeat("a", 32), class: redact.ClassDatabricksPAT},
@@ -197,7 +300,7 @@ func TestDefaultDLPPatternsRedactionMirrorCoverage(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.name+tt.variant, func(t *testing.T) {
 			t.Parallel()
 
 			pattern, ok := dlpPatternByName(DefaultDLPPatterns(), tt.name)
@@ -207,12 +310,16 @@ func TestDefaultDLPPatternsRedactionMirrorCoverage(t *testing.T) {
 			if !regexpMustCompile(t, pattern.Regex).MatchString(tt.value) {
 				t.Fatalf("sample %q no longer matches canonical DLP regex %q", tt.value, pattern.Regex)
 			}
-			for _, match := range matcher.Scan(tt.value) {
-				if match.Class == tt.class && strings.Contains(tt.value, match.Original) {
+			input := tt.value
+			if tt.exact {
+				input += "&next=1"
+			}
+			for _, match := range matcher.Scan(input) {
+				if match.Class == tt.class && (!tt.exact || match.Original == tt.value) {
 					return
 				}
 			}
-			t.Fatalf("redaction mirror did not classify %q as %s; matches=%+v", tt.name, tt.class, matcher.Scan(tt.value))
+			t.Fatalf("redaction mirror did not classify %q as exact %s span; matches=%+v", tt.name, tt.class, matcher.Scan(input))
 		})
 	}
 }
@@ -422,6 +529,7 @@ func scrubPatternRuntimeFields(patterns []DLPPattern) []DLPPattern {
 	out := cloneDLPPatterns(patterns)
 	for i := range out {
 		out[i].Compiled = false
+		out[i].CredentialURLWhitespaceGrammar = false
 		out[i].Bundle = ""
 		out[i].BundleVersion = ""
 	}

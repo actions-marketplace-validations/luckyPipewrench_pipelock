@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/enterprise/dashboard"
+	"github.com/luckyPipewrench/pipelock/internal/emit"
 )
 
 const (
@@ -596,6 +597,12 @@ func TestDashboardRequestAuthorization_AuthAuditInfoTokenMethodsAndFailures(t *t
 	}
 }
 
+func TestDashboardBearerAttemptedNilRequest(t *testing.T) {
+	if dashboardBearerAttempted(nil) {
+		t.Fatal("nil request reported a bearer credential attempt")
+	}
+}
+
 func TestDashboardCredentialAttemptedNilRequest(t *testing.T) {
 	if dashboardCredentialAttempted(nil) {
 		t.Fatal("nil request reported a credential attempt")
@@ -708,6 +715,87 @@ func TestDashboardOIDC_AuditRecordsPrincipalAndDeniedOIDCFailure(t *testing.T) {
 		if !strings.Contains(log, want) {
 			t.Fatalf("denied audit log missing %q: %s", want, log)
 		}
+	}
+}
+
+func TestDashboardOIDC_AuthenticationEventAttributesFailureMode(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	provider := newOIDCTestProvider(t)
+	oidc := newOIDCTestAuthenticator(t, provider, now)
+	authorization := newDashboardRequestAuthorization("operator-token", "", oidc)
+	validToken := provider.token(t, provider.validClaims(now))
+	invalidLastByte := "x"
+	if strings.HasSuffix(validToken, invalidLastByte) {
+		invalidLastByte = "y"
+	}
+	invalidToken := validToken[:len(validToken)-1] + invalidLastByte
+
+	tests := []struct {
+		name         string
+		setHeaders   func(http.Header)
+		wantStatus   int
+		wantAuthMode string
+	}{
+		{name: "no credential", wantStatus: http.StatusUnauthorized, wantAuthMode: "none"},
+		{name: "basic credential", setHeaders: func(h http.Header) { h.Set("Authorization", "Basic dXNlcjp3cm9uZy10b2tlbg==") }, wantStatus: http.StatusUnauthorized, wantAuthMode: "operator_token"},
+		{name: "empty bearer", setHeaders: func(h http.Header) { h.Set("Authorization", "Bearer") }, wantStatus: http.StatusUnauthorized, wantAuthMode: "oidc"},
+		{name: "bearer neither configured token nor oidc token", setHeaders: func(h http.Header) { h.Set("Authorization", "Bearer not-a-jwt") }, wantStatus: http.StatusUnauthorized, wantAuthMode: "oidc"},
+		{name: "token-shaped oidc value with invalid signature", setHeaders: func(h http.Header) { h.Set("Authorization", "Bearer "+invalidToken) }, wantStatus: http.StatusUnauthorized, wantAuthMode: "oidc"},
+		{name: "basic header before bearer header", setHeaders: func(h http.Header) {
+			h.Add("Authorization", "Basic dXNlcjp3cm9uZy10b2tlbg==")
+			h.Add("Authorization", "Bearer not-a-jwt")
+		}, wantStatus: http.StatusUnauthorized, wantAuthMode: "none"},
+		{name: "bearer header before basic header", setHeaders: func(h http.Header) {
+			h.Add("Authorization", "Bearer not-a-jwt")
+			h.Add("Authorization", "Basic dXNlcjp3cm9uZy10b2tlbg==")
+		}, wantStatus: http.StatusUnauthorized, wantAuthMode: "none"},
+		{name: "valid oidc credential", setHeaders: func(h http.Header) { h.Set("Authorization", "Bearer "+validToken) }, wantStatus: http.StatusNoContent},
+		{name: "valid oidc credential with second authorization header", setHeaders: func(h http.Header) {
+			h.Add("Authorization", "Bearer "+validToken)
+			h.Add("Authorization", "Basic dXNlcjp3cm9uZy10b2tlbg==")
+		}, wantStatus: http.StatusUnauthorized, wantAuthMode: "none"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sink := &dashboardAuthEventSink{events: make(chan emit.Event, 1)}
+			handler := oidc.middleware(dashboardAuthHandler(
+				authorization.authenticated,
+				nil,
+				nil,
+				emit.NewEmitter("dashboard-test", sink),
+				authorization.failedAuthMode,
+				http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) }),
+			))
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://dashboard.example/", nil)
+			if tt.setHeaders != nil {
+				tt.setHeaders(req.Header)
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
+			}
+			if tt.wantAuthMode == "" {
+				select {
+				case event := <-sink.events:
+					t.Fatalf("successful OIDC request emitted failure event: %+v", event)
+				default:
+				}
+				return
+			}
+			select {
+			case event := <-sink.events:
+				if event.Type != emit.EventDashboardAuthFailed {
+					t.Errorf("event type = %q, want %q", event.Type, emit.EventDashboardAuthFailed)
+				}
+				if event.Fields["auth_mode"] != tt.wantAuthMode {
+					t.Errorf("auth_mode = %v, want %q", event.Fields["auth_mode"], tt.wantAuthMode)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timed out waiting for authentication event")
+			}
+		})
 	}
 }
 
@@ -1312,7 +1400,7 @@ func TestDashboardOIDC_RunServeCompositionUsesMappedRoutePermissions(t *testing.
 		AuthorizeRaw:        dashboardAuthorizeFunc(rawAuthorized),
 		AuditWriter:         &audit,
 	})
-	handler := auth.middleware(dashboardAuthHandler(metaAuthorized, authorization.authAuditInfo, &audit, inner))
+	handler := auth.middleware(dashboardAuthHandler(metaAuthorized, authorization.authAuditInfo, &audit, nil, nil, inner))
 
 	rr := httptest.NewRecorder()
 	handler.ServeHTTP(rr, requestWithBearer(t, p.token(t, p.validClaims(now))))

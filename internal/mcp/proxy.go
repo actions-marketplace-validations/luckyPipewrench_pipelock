@@ -4,6 +4,7 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -73,6 +74,24 @@ func (sw *syncWriter) WriteMessage(msg []byte) error {
 		return fmt.Errorf("writing message: %w", err)
 	}
 	return nil
+}
+
+// drainStderr waits for the wrapped process's stderr copier without allowing
+// an escaped descendant holding the write end to keep RunProxy alive. Closing
+// the read end releases io.Copy on timeout and also releases the descriptor
+// after a normal drain.
+func drainStderr(stderrDone <-chan struct{}, serverErr io.Closer, grace time.Duration) bool {
+	if grace <= 0 {
+		grace = defaultParentExitGrace
+	}
+	select {
+	case <-stderrDone:
+		_ = serverErr.Close()
+		return true
+	case <-time.After(grace):
+		_ = serverErr.Close()
+		return false
+	}
 }
 
 func emitPendingTimeoutResponses(writer transport.MessageWriter, logW io.Writer, tracker *RequestTracker, opts MCPProxyOpts) {
@@ -186,6 +205,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			if wsutil.IsExpectedCloseErr(err) {
 				break
 			}
+			if opts.sessionExit.inProgress() && isSessionExitCloseErr(err) {
+				break
+			}
 			// Upstream response timeout: return the sentinel so the owning
 			// transport tears down the hung upstream and decides the failure
 			// scope. Returning (not break) is load-bearing: a clean-EOF break
@@ -234,18 +256,21 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			metrics:    m,
 		}, opts.warnContext()))
 
-		// Operator-triggered local reset: when the adaptive reset file appears
-		// (owner-only, owned by the proxy user) clear this session's adaptive
-		// escalation so an airlocked stdio session recovers without a restart.
-		// Invocation sessions are otherwise un-resettable, and stdio mounts no
-		// admin API. The file checks fail closed against an agent-planted file.
-		if resetFile != "" && rec != nil && consumeAdaptiveResetFile(resetFile, logW) {
+		// A signed operator delegation is the only path that clears a stdio
+		// airlock. A malformed, expired, replayed, or absent authority leaves
+		// the existing escalation in place.
+		if resetFile != "" && rec != nil && opts.AdaptiveResetAuthority != nil && opts.AdaptiveResetEpoch != nil {
 			if r, ok := rec.(adaptiveResetter); ok {
-				prevScore, prevLevel := r.Reset()
-				blockAll = false
-				_, _ = fmt.Fprintf(logW,
-					"pipelock: adaptive enforcement reset by operator (score %.1f to 0, level %s to normal)\n",
-					prevScore, session.EscalationLabel(prevLevel))
+				decision := consumeAdaptiveResetFile(resetFile, opts.AdaptiveResetAuthority, opts.AdaptiveResetEpoch, logW)
+				auditResetAuthorityDecision(opts.AuditLogger, opts.AdaptiveResetAuthority.Target(), decision)
+				recordResetAuthorityCapacity(m, decision)
+				if decision.Result == ResetAuthorityAccepted {
+					prevScore, prevLevel := r.Reset()
+					blockAll = false
+					_, _ = fmt.Fprintf(logW,
+						"pipelock: adaptive enforcement reset by operator (score %.1f to 0, level %s to normal)\n",
+						prevScore, session.EscalationLabel(prevLevel))
+				}
 			}
 		}
 
@@ -277,8 +302,10 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 
 		// MCP does not use JSON-RPC batch messages (top-level arrays).
 		// A batch from the server is either malformed or an attempt to
-		// bypass per-message ID validation. Fail closed.
-		if len(line) > 0 && line[0] == '[' {
+		// bypass per-message ID validation. Fail closed. Use the parsed
+		// frame: WebSocket and SSE can preserve leading whitespace that
+		// a raw first-byte check would miss.
+		if frame.IsBatch {
 			_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocked batch JSON-RPC message (not supported by MCP)\n", lineNum)
 			continue
 		}
@@ -293,9 +320,14 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// client request, no valid request ID exists to hijack.
 		var trackedOutcome TrackedRequestOutcome
 		var hasTrackedOutcome bool
+		var trackedMethod string
 		if tracker != nil && tracker.Seeded() && isResponse(line) {
 			rpcID := frame.ID
-			if canonicalID(rpcID) == "" && tracker.Strict() {
+			// Once a request has been tracked, every result/error envelope must
+			// carry an ID that can be consumed from the pending set. The unseeded
+			// check above retains the initialization-race exception for a server's
+			// parse error before the first client request is recorded.
+			if canonicalID(rpcID) == "" {
 				_, _ = fmt.Fprintf(logW, "pipelock: line %d: confused deputy: response has no correlatable ID\n", lineNum)
 				resp := blockResponseReason(nil, "response has no correlatable ID (confused deputy)")
 				if err := writer.WriteMessage(resp); err != nil {
@@ -306,6 +338,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			if rpcID != nil {
 				var valid bool
 				trackedOutcome, valid = tracker.Consume(rpcID)
+				if valid {
+					trackedMethod = trackedOutcome.Method
+				}
 				if !valid {
 					_, _ = fmt.Fprintf(logW, "pipelock: line %d: confused deputy: unsolicited response ID %s\n",
 						lineNum, string(rpcID))
@@ -328,6 +363,25 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				return
 			}
 			emitMCPOutcomeReceipt(receiptEmitter, v2ReceiptEmitter, logW, trackedOutcome.Receipt, status, int64(len(outbound)), reason)
+		}
+
+		blockScanError := func(scanError string) error {
+			_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, scanError)
+			if frame.ID == nil && frame.Method != "" {
+				return nil // Notifications have no request awaiting a response.
+			}
+			resp := blockResponseReason(frame.ID, "upstream response scan failed")
+			if err := writer.WriteMessage(resp); err != nil {
+				return fmt.Errorf("writing scan-error block response: %w", err)
+			}
+			emitTrackedOutcome("error", "response_scan_error", resp)
+			return nil
+		}
+		if err := opts.warnContext().Err(); err != nil {
+			if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
+				return foundInjection, writeErr
+			}
+			continue
 		}
 
 		mediaResult := applyMCPResponseMediaPolicy(line, mediaPolicy, opts.Transport)
@@ -427,37 +481,36 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// allowed through. A blocked tools/list must not become a trusted
 		// session-binding baseline merely because tool scanning runs before the
 		// response scanner.
-		commitToolInventory := func() {
+		var toolInventoryReservation *tools.ToolInventoryReservation
+		reserveToolInventory := func() error {
 			if !isToolsList || toolCfg == nil || toolCfg.Baseline == nil || len(toolResult.ToolNames) == 0 {
+				return nil
+			}
+			var err error
+			toolInventoryReservation, err = toolCfg.Baseline.ReserveToolInventory(toolResult.ToolNames, toolResult.ToolDefs)
+			return err
+		}
+		commitToolInventory := func() {
+			if toolInventoryReservation == nil {
 				return
 			}
-
+			added := toolInventoryReservation.Commit(toolResult.Clean)
 			decision := ""
-			if !toolCfg.Baseline.HasBaseline() {
-				// An MCP tools/list inventory is not an A2A capability source;
-				// SetKnownTools leaves the A2A method inventory untouched.
-				toolCfg.Baseline.SetKnownTools(toolResult.ToolNames)
-			} else {
-				added := toolCfg.Baseline.CheckNewTools(toolResult.ToolNames)
-				for _, name := range added {
-					_, _ = fmt.Fprintf(logW, "pipelock: tool %q added post-baseline\n", name)
-				}
-				if len(added) > 0 {
-					decision = config.ActionBlock
-				} else {
-					decision = config.ActionAllow
-				}
+			for _, name := range added {
+				_, _ = fmt.Fprintf(logW, "pipelock: tool %q added post-baseline\n", name)
 			}
-			// Header bindings are security state for the exact accepted tool
-			// definitions, just like the inventory. Commit them only after the
-			// tools/list response survives poisoning, DLP, provenance, and output.
-			if toolResult.Clean {
-				toolCfg.Baseline.SetToolHeaderBindings(toolResult.ToolDefs)
-			} else {
-				toolCfg.Baseline.ClearToolHeaderBindings(toolResult.ToolDefs)
+			if len(added) > 0 {
+				decision = config.ActionBlock
+			} else if toolCfg.Baseline.HasBaseline() {
+				decision = config.ActionAllow
 			}
 			if !toolInventoryResolved {
 				resolveToolInventory(decision)
+			}
+		}
+		releaseToolInventory := func() {
+			if toolInventoryReservation != nil {
+				toolInventoryReservation.Release()
 			}
 		}
 		// toolPoisonDetected tracks whether a tool-poisoning finding was raised
@@ -467,6 +520,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		toolPoisonDetected := false
 		if toolCfg != nil {
 			toolResult = tools.ScanTools(line, sc, toolCfg)
+			if err := opts.warnContext().Err(); err != nil {
+				if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
+					return foundInjection, writeErr
+				}
+				continue
+			}
 			isToolsList = toolResult.IsToolsList
 			// Provenance: verify tool signatures BEFORE updating session binding
 			// baseline. A blocked tools/list must not seed known tools.
@@ -507,7 +566,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			if toolResult.IsToolsList {
 				toolCaptureAction := config.ActionAllow
 				if !toolResult.Clean {
-					if toolCfg.Action != "" {
+					if toolResult.ResourceLimit != "" {
+						toolCaptureAction = config.ActionBlock
+					} else if toolCfg.Action != "" {
 						toolCaptureAction = toolCfg.Action
 					} else {
 						toolCaptureAction = config.ActionBlock
@@ -544,6 +605,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 
 				originalToolAction := toolCfg.Action
 				toolAction := originalToolAction
+				if toolResult.ResourceLimit != "" {
+					// A capacity result means the response cannot become a complete
+					// security baseline. Policy warn/strip would forward an
+					// uninspectable definition, so this outcome is always a block.
+					toolAction = config.ActionBlock
+				}
 				// Escalation upgrade for tool poison detection.
 				if rec != nil {
 					toolAction = decide.UpgradeAction(toolAction, rec.EscalationLevel(), adaptiveCfg)
@@ -560,7 +627,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				if toolAction == config.ActionBlock {
 					_ = emitMCPToolScanReceipt(receiptEmitter, v2ReceiptEmitter, logW, opts, toolResult, config.ActionBlock)
 					blockReason := "tool poisoning detected in tools/list"
-					if toolScanHasDrift(toolResult) && toolCfg.DriftRemediation != "" {
+					if toolResult.ResourceLimit != "" {
+						blockReason = "tools/list cannot be safely inspected: " + toolResult.ResourceLimit
+						if m != nil {
+							m.RecordBlocked("mcp", toolResult.ResourceLimit, 0, "")
+						}
+					} else if toolScanHasDrift(toolResult) && toolCfg.DriftRemediation != "" {
 						blockReason = "tool definition drift detected; " + toolCfg.DriftRemediation
 					}
 					if opts.AuditLogger != nil {
@@ -612,9 +684,23 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// Still scan the error field: injection could hide in non-tool fields.
 		var verdict jsonrpc.ScanVerdict
 		if isToolsList {
-			verdict = scanToolsListNonToolFields(line, sc, respScanOpts)
+			verdict = scanToolsListNonToolFieldsContext(opts.warnContext(), line, sc, respScanOpts)
 		} else {
-			verdict = ScanResponseOpts(line, sc, respScanOpts)
+			a2aOpts := opts.a2aResponseOpts(respScanOpts)
+			a2aOpts.Method = trackedMethod
+			verdict = ScanResponseA2A(line, sc, a2aOpts)
+		}
+
+		// The transport context owns cancellation even for legacy scanners that
+		// do not accept it. Never forward a result after its request was canceled.
+		if err := opts.warnContext().Err(); err != nil {
+			verdict = jsonrpc.ScanVerdict{ID: extractRPCID(line), Action: config.ActionBlock, Error: "response scan failed: " + err.Error()}
+		}
+		if verdict.Error != "" && verdict.Action == config.ActionBlock {
+			if err := blockScanError(verdict.Error); err != nil {
+				return foundInjection, err
+			}
+			continue
 		}
 
 		if verdict.Clean {
@@ -630,7 +716,16 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					metrics:    m,
 				}, opts.warnContext()))
 			}
+			if err := reserveToolInventory(); err != nil {
+				resolveToolInventory(config.ActionBlock)
+				foundInjection = true
+				if writeErr := blockToolInventoryCapacity(writer, logW, opts, lineNum, toolResult.RPCID, emitTrackedOutcome); writeErr != nil {
+					return foundInjection, writeErr
+				}
+				continue
+			}
 			if err := writer.WriteMessage(line); err != nil {
+				releaseToolInventory()
 				return foundInjection, fmt.Errorf("writing line: %w", err)
 			}
 			commitToolInventory()
@@ -828,7 +923,17 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		if effectiveAction != config.ActionWarn && effectiveAction != config.ActionAllow {
 			resolveToolInventory(config.ActionBlock)
 		}
+		if effectiveAction == config.ActionWarn || effectiveAction == config.ActionAllow {
+			if err := reserveToolInventory(); err != nil {
+				resolveToolInventory(config.ActionBlock)
+				if writeErr := blockToolInventoryCapacity(writer, logW, opts, lineNum, toolResult.RPCID, emitTrackedOutcome); writeErr != nil {
+					return foundInjection, writeErr
+				}
+				continue
+			}
+		}
 		if err := writer.WriteMessage(outbound); err != nil {
+			releaseToolInventory()
 			return foundInjection, fmt.Errorf("%s: %w", writeContext, err)
 		}
 		if effectiveAction == config.ActionWarn || effectiveAction == config.ActionAllow {
@@ -900,18 +1005,22 @@ func emitMCPToolScanReceipt(
 	}
 	requestID := canonicalID(result.RPCID)
 	pattern := "tool_poisoning"
-	for _, match := range result.Matches {
-		if len(match.ToolPoison) > 0 {
-			pattern = match.ToolPoison[0]
-			break
-		}
-		if match.DriftDetected {
-			pattern = "tool_definition_drift"
-			break
-		}
-		if len(match.Injection) > 0 {
-			pattern = match.Injection[0].PatternName
-			break
+	if result.ResourceLimit != "" {
+		pattern = result.ResourceLimit
+	} else {
+		for _, match := range result.Matches {
+			if len(match.ToolPoison) > 0 {
+				pattern = match.ToolPoison[0]
+				break
+			}
+			if match.DriftDetected {
+				pattern = "tool_definition_drift"
+				break
+			}
+			if len(match.Injection) > 0 {
+				pattern = match.Injection[0].PatternName
+				break
+			}
 		}
 	}
 	_, err := EmitMCPDecision(emitter, v2Emitter, nil, MCPDecision{
@@ -1072,6 +1181,35 @@ func blockResponseReason(id json.RawMessage, reason string) []byte {
 	return data
 }
 
+func blockToolInventoryCapacity(
+	writer transport.MessageWriter,
+	logW io.Writer,
+	opts MCPProxyOpts,
+	lineNum int,
+	rpcID json.RawMessage,
+	emitTrackedOutcome func(string, string, []byte),
+) error {
+	const reason = "tool_inventory_capacity"
+	blockReason := "tools/list cannot be safely inspected: " + reason
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, blockReason)
+	if opts.AuditLogger != nil {
+		opts.AuditLogger.LogBlocked(
+			mustMCPAuditContext(opts.AuditLogger, "MCP", "tools/list"),
+			"tool_scanning",
+			blockReason,
+		)
+	}
+	if opts.Metrics != nil {
+		opts.Metrics.RecordBlocked("mcp", reason, 0, "")
+	}
+	resp := blockResponseReason(rpcID, blockReason)
+	if err := writer.WriteMessage(resp); err != nil {
+		return fmt.Errorf("writing inventory-capacity block: %w", err)
+	}
+	emitTrackedOutcome("error", reason, resp)
+	return nil
+}
+
 // blockMediaPolicyResponse generates a JSON-RPC 2.0 error for media policy
 // violations. Uses error code -32002 (implementation-defined) with the specific
 // block reason so operators see a distinct media-policy denial, not the generic
@@ -1126,12 +1264,13 @@ func stripResponse(line []byte, sc *scanner.Scanner) ([]byte, error) {
 }
 
 func stripResponseDepth(line []byte, sc *scanner.Scanner, depth int) ([]byte, error) {
-	// Handle batch responses (JSON array).
-	if len(line) > 0 && line[0] == '[' {
+	// Handle batch responses (JSON array). Trim so a leading-whitespace
+	// array is classified the same way ParseMCPFrame sets IsBatch.
+	if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '[' {
 		if depth >= maxStripDepth {
 			return nil, fmt.Errorf("batch nesting too deep (max %d)", maxStripDepth)
 		}
-		return stripBatchDepth(line, sc, depth+1)
+		return stripBatchDepth(trimmed, sc, depth+1)
 	}
 
 	var rpc stripRPCResponse
@@ -1269,6 +1408,10 @@ type InputScanConfig struct {
 // starts and its PID is registered with the lineage tracker; callers use
 // this to start the file sentry event loop after attribution is ready.
 func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW io.Writer, command []string, opts MCPProxyOpts, extraEnv ...string) error {
+	// Capture before integrity preparation, pipe setup, and child startup to
+	// narrow the time later startup work can hide a parent death. A launcher can
+	// still die before this first syscall; PPID watching cannot close that race.
+	startupParentWatch := parentWatchOpts{startPPID: os.Getppid()}
 	var cmd *exec.Cmd
 	var prepared *integrity.PreparedCommand
 	if icfg := opts.IntegrityCfg; icfg != nil && icfg.Enabled {
@@ -1312,6 +1455,9 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	if opts.ContractServer == "" {
 		opts.ContractServer = mcpContractServerFromCommand(command)
 	}
+	if opts.AuthorityDestination == "" {
+		opts.AuthorityDestination = opts.ContractServer
+	}
 
 	// Per-invocation adaptive enforcement recorder. Nil when Store is nil
 	// (adaptive enforcement disabled), so all downstream callers are nil-safe.
@@ -1342,7 +1488,16 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		return fmt.Errorf("creating stdout pipe: %w", err)
 	}
 
-	cmd.Stderr = safeLogW
+	// Own the stderr pipe rather than assigning cmd.Stderr directly. The
+	// os/exec convenience path waits for its private copier inside cmd.Wait;
+	// a descendant that escapes the child group while holding stderr open
+	// would therefore make the adopted-descendant sweep unreachable. Owning
+	// the read end lets session teardown release it before Wait.
+	serverErr, serverErrW, err := os.Pipe()
+	if err != nil {
+		return fmt.Errorf("creating stderr pipe: %w", err)
+	}
+	cmd.Stderr = serverErrW
 
 	// Put the child in its own process group so pipelock can tear down
 	// any grandchildren the MCP server spawned when the child exits.
@@ -1373,7 +1528,7 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	// spawn. Non-fatal on error - the later pgid-kill backstop still
 	// handles the common case.
 	if srErr := enableSubreaper(); srErr != nil {
-		_, _ = fmt.Fprintf(logW, "pipelock: warning: PR_SET_CHILD_SUBREAPER failed, grandchild subtree teardown will be incomplete: %v\n", srErr)
+		_, _ = fmt.Fprintf(logW, "pipelock: warning: session descendant cleanup degraded: PR_SET_CHILD_SUBREAPER failed (%v). Detached descendants can survive session exit and can block proxy shutdown by retaining inherited I/O.\n", srErr)
 	}
 
 	// Enable subreaper before starting the child so we adopt orphaned
@@ -1392,9 +1547,27 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		}
 	}
 
+	// Start and claim as one step, so no sweep can see this child before its
+	// owner has registered it. The reaper started further down registers the
+	// same claim; the registry counts, so both releases are safe. Without this
+	// the window between fork and that reaper start is wide, and a concurrent
+	// session's sweep can reap this child and take the exit status Wait needs.
+	unlockStart := lockChildStart()
 	if err := cmd.Start(); err != nil {
+		unlockStart()
+		_ = serverErr.Close()
+		_ = serverErrW.Close()
 		return fmt.Errorf("starting MCP server %q: %w", command[0], err)
 	}
+	releaseChild := protectDirectChild(cmd.Process.Pid)
+	unlockStart()
+	defer releaseChild()
+	_ = serverErrW.Close()
+	stderrDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(safeLogW, serverErr)
+		close(stderrDone)
+	}()
 	if prepared != nil {
 		startedPreparation := prepared
 		prepared = nil
@@ -1403,15 +1576,21 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		}
 	}
 
-	// Capture the child's process group ID immediately after Start,
-	// before cmd.Wait has any chance to reap and before cmd.Process.Pid
-	// can go stale. Setpgid=true above guarantees pgid==pid at spawn
-	// time on unix; captureChildPgid returns that value (verified via
-	// Getpgid) so we can keep signaling the original group even after
-	// the leader is reaped and the kernel is free to recycle its PID.
-	// On Windows the helper returns 0 and the signal helpers below all
-	// no-op, matching the no-op setupChildProcessGroup call above.
+	// Capture the child's process group ID immediately after Start, while
+	// the direct child is known live. Setpgid=true above guarantees pgid==pid
+	// at spawn time on Unix. This is only safe to signal before cmd.Wait
+	// begins: once Wait can reap the group leader, the numeric group ID can be
+	// recycled and must never be signalled again. On Windows the helper returns
+	// 0 and the signal helpers below all no-op, matching the no-op
+	// setupChildProcessGroup call above.
 	childPgid := captureChildPgid(cmd.Process.Pid)
+	processExit := &processExitHandoff{}
+	killDirectChild := func() bool {
+		if cmd.Process == nil {
+			return false
+		}
+		return cmd.Process.Kill() == nil
+	}
 
 	// Drain adopted-descendant zombies live, while the direct child is
 	// still running. Without this, long-running MCP wraps (e.g. a code-assistant
@@ -1445,11 +1624,88 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	go func() {
 		select {
 		case <-ctx.Done():
-			signalProcessGroupTerm(childPgid)
+			processExit.terminate(func() { signalProcessGroupTerm(childPgid) }, killDirectChild)
 		case <-pgidDone:
 		}
 	}()
 	defer close(pgidDone)
+
+	// Session-bound exit. A stdio proxy is owned by the interactive agent
+	// session that spawned it: when that session dies, this process and the
+	// MCP server it fronts have no reason to exist, but nothing in the
+	// lifetime handling above notices. Pdeathsig and the subreaper bit are
+	// both armed on the CHILD and answer "what happens when pipelock dies";
+	// neither answers "what happens when pipelock's own parent dies". The
+	// client stdin reader hitting EOF closes the wrapped server's stdin, and
+	// for a server that ignores stdin close that is not a shutdown at all -
+	// cmd.Wait pins forever and the whole tree leaks for days while still
+	// holding config, compiled pattern sets and credential-bearing children.
+	//
+	// The teardown ordering below is a drain, not a kill: stop intake, let
+	// in-flight responses finish, and only escalate to the process-tree
+	// teardown for a server that will not leave on its own.
+	//
+	// This is defense in depth for an unclean harness exit. A harness-owned
+	// lifetime primitive is needed to cover the remaining launch window and
+	// descendants that create new process groups.
+	waitDone := make(chan struct{})
+	sessionExit := &sessionExitState{}
+	sessionCtx, sessionStop := context.WithCancel(ctx)
+	defer sessionStop()
+	// The parent PID is captured at function entry to narrow the startup
+	// window, but a launcher that dies before that first syscall remains an
+	// inherent PPID-watch limitation. A harness-owned owner pipe or cgroup is
+	// needed to close that earlier race.
+	sessionOpts := startupParentWatch
+	sessionGrace := defaultParentExitGrace
+	if h := opts.sessionExitForTest; h != nil {
+		sessionOpts = h.watch
+		if h.grace > 0 {
+			sessionGrace = h.grace
+		}
+	}
+	if sessionOpts.startPPID > orphanedPPID {
+		go runSessionBoundExit(sessionCtx, sessionOpts, sessionExitActions{
+			onSessionExit: sessionExit.begin,
+			stopIntake: func() {
+				if c, ok := clientIn.(io.Closer); ok {
+					_ = c.Close()
+				}
+			},
+			closeServerStdin: func() { _ = serverIn.Close() },
+			// Tear down the whole process group, not just the direct child.
+			//
+			// Killing only cmd.Process is not enough and deadlocks: any
+			// sibling the server spawned inherited the stdout pipe, so the
+			// write end stays open after the direct child dies and the
+			// response reader blocks forever on a pipe that will never close.
+			// That reader has to return before cmd.Wait can, and the post-Wait
+			// teardown is what would have killed the pipe holders - so the
+			// shutdown waits on itself and the tree leaks exactly as it did
+			// before this watcher existed. Signaling the group first releases
+			// the descriptor and lets Wait return, after which the normal
+			// teardown reaps detached and adopted descendants the group kill
+			// could not reach.
+			terminateTree: func() bool {
+				// Close response descriptors before either branch. A descendant
+				// can retain stdout or stderr after the direct child exits, and
+				// these closes release forwarding without relying on a numeric
+				// process-group signal.
+				_ = serverOut.Close()
+				_ = serverErr.Close()
+				return processExit.terminate(func() {
+					// A descendant can escape the child group with setsid while
+					// retaining stdout. Close the read ends first to release
+					// ForwardScanned while process-group teardown is in flight.
+					terminateProcessGroup(childPgid)
+					_ = killDirectChild()
+				}, killDirectChild)
+			},
+			waitDone: waitDone,
+			grace:    sessionGrace,
+			logW:     safeLogW,
+		})
+	}
 
 	// Signal that the child is started and PID is tracked. The file sentry
 	// event loop starts here so attribution is ready before classifying writes.
@@ -1500,12 +1756,12 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	inputOpts := opts
 	inputOpts.Rec = rec
 	inputOpts.WarnContext = ctx
+	inputOpts.sessionExit = sessionExit
 
 	// Forward client input to server stdin (with optional input scanning).
-	var wg sync.WaitGroup
-	wg.Add(1)
+	inputDone := make(chan struct{})
 	go func() {
-		defer wg.Done()
+		defer close(inputDone)
 		defer serverIn.Close() //nolint:errcheck // best-effort close on stdin forward
 		inputCfg := opts.inputCfg()
 		if inputCfg != nil && inputCfg.Enabled {
@@ -1536,10 +1792,9 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 
 	// Drain blocked request channel and write error responses to client.
 	// Runs in a separate goroutine so ForwardScanned can proceed concurrently.
-	var wgBlocked sync.WaitGroup
-	wgBlocked.Add(1)
+	blockedDone := make(chan struct{})
 	go func() {
-		defer wgBlocked.Done()
+		defer close(blockedDone)
 		for blocked := range blockedCh {
 			if blocked.IsNotification {
 				// Notifications have no ID - silently drop (no error response per JSON-RPC spec).
@@ -1564,9 +1819,18 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	// request but never replies fails closed instead of hanging the agent.
 	serverReader := opts.withResponseTimeout(transport.NewStdioReader(serverOut))
 
-	fwdOpts := inputOpts
+	fwdOpts := opts
+	fwdOpts.Rec = rec
+	fwdOpts.WarnContext = ctx
+	// Session teardown closes serverOut to release a descendant holding the
+	// pipe. ForwardScanned must see that ownership marker so os.ErrClosed is a
+	// clean shutdown instead of an upstream scanner error.
+	fwdOpts.sessionExit = sessionExit
 	fwdOpts.ToolCfg = fwdToolCfg // session-specific baseline
 	fwdOpts.ToolCfgFn = nil
+	if opts.outputForwardStartedForTest != nil {
+		opts.outputForwardStartedForTest()
+	}
 	_, scanErr := ForwardScanned(serverReader, safeClientOut, safeLogW, tracker, fwdOpts)
 	timedOut := errors.Is(scanErr, transport.ErrResponseTimeout)
 
@@ -1584,37 +1848,57 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		_ = cmd.Process.Kill()
 	}
 
-	// Wait for subprocess to exit.
-	waitErr := cmd.Wait()
-
-	// After the direct child exits, tear down everything it spawned.
-	// Three layers of cleanup that together cover fast common-case
-	// grandchildren (same pgid), detached orphans (double-fork or
-	// setsid), and long-running cooperative descendants that ignore
-	// SIGTERM:
+	// A numeric process-group teardown is deliberately NOT performed here.
 	//
-	//   1. SIGTERM the original pgid so well-behaved descendants still
-	//      in the child's process group exit cleanly on a trap.
-	//   2. 100ms grace, then SIGKILL the pgid for anything that ignored
-	//      SIGTERM (the pre-tag gate harness grandchild did exactly this).
-	//   3. killAdoptedDescendants sweeps /proc for processes whose PPID
+	// Moving it before Wait was tried, to keep the group identifier tied to a
+	// live child so it could not have been recycled. It is wrong: reaching this
+	// point is the ORDINARY exit path, and terminateProcessGroup signals the
+	// group and then escalates to SIGKILL, so every clean shutdown would kill a
+	// server that was still finishing. Reproduced by a sibling proxy test that
+	// passes alone and fails once the package runs together.
+	//
+	// After Wait is also unavailable: the kernel may reuse the group id as soon
+	// as the leader is reaped, so a late signal can land on an unrelated group.
+	//
+	// That leaves parentage-based cleanup, which needs no numeric identifier.
+	// It is complete on Linux whenever the subreaper is active, and its absence
+	// on other platforms is a real limitation rather than something this
+	// signal could safely close.
+
+	// cmd.Wait permanently retires raw numeric process identifiers from the
+	// handoff. A concurrent session or context teardown can still use the Go
+	// process handle for the direct child, but can never signal its PID or PGID.
+	waitErr := processExit.wait(cmd.Wait)
+	// Release the session watcher's drain wait. A server that exited on its
+	// own after stdin close must not sit through the remaining grace window
+	// before the teardown below claims ownership.
+	close(waitDone)
+
+	// After the direct child exits, sweep any descendants it spawned that the
+	// Linux subreaper adopted after an escape from the original process group.
+	//
+	// killAdoptedDescendants sweeps /proc for processes whose PPID
 	//      is now pipelock's own PID - any grandchild that escaped the
 	//      original pgid via setsid/double-fork should have reparented
 	//      to us once PR_SET_CHILD_SUBREAPER fired above. SIGKILL is
 	//      best-effort; ESRCH/EPERM are non-fatal.
-	// Use the pgid captured at Start rather than re-reading
-	// cmd.Process.Pid here. After cmd.Wait returns, cmd.Process.Pid
-	// refers to a reaped pid the kernel is free to recycle - signaling
-	// the negated pid at that point risks hitting an unrelated process
-	// that was assigned the same pgid. childPgid was locked in before
-	// Wait could reap the leader, so it remains the stable identifier
-	// for the process group we created. terminateProcessGroup runs the
-	// SIGTERM + 100ms grace + SIGKILL sequence; on Windows the helper
-	// no-ops because pgid is 0 there.
-	terminateProcessGroup(childPgid)
-	// Sweep orphans the pgid kill couldn't reach. Safe even on
-	// non-Linux builds - the stub is a no-op there.
+	// Numeric process-group cleanup is deliberately absent here: Wait may
+	// already have recycled the group leader's identifier. On Linux, the
+	// subreaper sweep handles descendants without that raw-ID hazard; on other
+	// platforms descendants outside the direct child's lifetime boundary need a
+	// harness-owned containment primitive.
 	killAdoptedDescendants()
+	// A detached descendant can retain stderr after the direct child exits.
+	// Bound the drain so an escaped writer cannot hold the proxy open forever.
+	if !drainStderr(stderrDone, serverErr, sessionGrace) {
+		// Bounded, because reaching this line means the stderr copy is already
+		// stuck. That copy holds the shared writer's lock while it blocks, and
+		// closing the read end cannot interrupt a write already in progress, so
+		// a synchronous diagnostic here would wait on the same lock and stop
+		// teardown from ever completing - failing in exactly the situation it
+		// exists to report.
+		logAsync(safeLogW, "pipelock: timed out draining MCP subprocess stderr after child exit\n")
+	}
 
 	if timedOut {
 		// Closing a closable clientIn above wakes the usual CLI/pipe readers.
@@ -1624,8 +1908,8 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 		defer drainCancel()
 		done := make(chan struct{})
 		go func() {
-			wg.Wait()
-			wgBlocked.Wait()
+			<-inputDone
+			<-blockedDone
 			close(done)
 		}()
 		select {
@@ -1634,12 +1918,26 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: timed out waiting for MCP input drain after upstream response timeout\n")
 		}
 		emitPendingTimeoutResponses(safeClientOut, safeLogW, tracker, fwdOpts)
+	} else if sessionExit.inProgress() {
+		// An arbitrary io.Reader cannot be interrupted by closing the client
+		// side. Once session teardown has killed the server, do not let one
+		// such reader keep the proxy alive indefinitely.
+		select {
+		case <-inputDone:
+			<-blockedDone
+		case <-time.After(sessionGrace):
+			_, _ = fmt.Fprintf(safeLogW, "pipelock: timed out waiting for MCP input drain after session teardown\n")
+		}
+		// Name the actual cause. Reusing "upstream_closed" here would attribute
+		// a session teardown to the server having closed the connection, so the
+		// receipt would record the wrong reason for an aborted request.
+		emitPendingIncompleteOutcomes(safeLogW, tracker, fwdOpts, "session_exit")
 	} else {
 		// Wait for stdin goroutine to finish (server exit closes pipe, unblocking scanner).
-		wg.Wait()
+		<-inputDone
 
 		// Wait for blocked channel drain to complete.
-		wgBlocked.Wait()
+		<-blockedDone
 		emitPendingIncompleteOutcomes(safeLogW, tracker, fwdOpts, "upstream_closed")
 	}
 
