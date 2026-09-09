@@ -143,22 +143,25 @@ fetch_proxy:
 | `max_response_mb` | `10` | Max response body size |
 | `user_agent` | `Pipelock Fetch/1.0` | User-Agent header sent upstream |
 | `monitoring.max_url_length` | `2048` | URLs longer than this are blocked |
-| `monitoring.entropy_threshold` | `4.5` | Shannon entropy threshold for path segments |
+| `monitoring.entropy_threshold` | `4.5` | Shannon entropy threshold for path segments. A configured value must be greater than 0; omit the field to take the default. No upper bound is enforced. |
 | `monitoring.max_requests_per_minute` | `60` | Per-domain rate limit |
 | `monitoring.max_data_per_minute` | `0` | Per-domain byte budget (0 = disabled) |
 | `monitoring.blocklist` | 6 domains | Blocked exfiltration targets |
 | `monitoring.subdomain_entropy_exclusions` | `files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com` | Domains excluded from subdomain and path entropy checks; override to replace defaults, or set an empty list to disable exclusions entirely (query entropy still checked) |
 | `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query parameter values as destinations |
 | `monitoring.query_entropy_exclusions` | `[]` | Host-wide query-string entropy exclusions for hosts whose query values are broadly opaque by contract |
+| `monitoring.path_entropy_exclusions` | `[]` | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply |
 | `monitoring.query_entropy_param_exclusions` | `[]` | Exact HTTPS endpoint+parameter query-value entropy exclusions; DLP, SSRF, query-key entropy, adjacent parameters, path/subdomain entropy, rate limits, and data budgets still apply |
 
 **Entropy guidance:**
 - English text: 3.5-4.0 bits/char
 - Hex/commit hashes: ~4.0
-- Base64-encoded data: 4.0-4.5
-- Random/encrypted: 5.5-8.0
+- Measured base64url resource identifiers: 4.93-5.43
+- Random/encrypted: ~7.5-8.0
 
-The default threshold (4.5) allows commit hashes and base64-encoded filenames while flagging encrypted blobs. Lower it (3.5) for strict mode. Raise it (5.0) for development environments where base64 URLs are common.
+A configured `entropy_threshold` must be greater than 0. Setting it to 0 or a negative value is REFUSED at load rather than silently replaced by the default, because an operator who writes 0 usually means "turn this off" and would otherwise get a fully enabled gate at 4.5 while believing it was disabled. To run without the path-entropy gate, exempt the routes you mean with `path_entropy_exclusions` or `subdomain_entropy_exclusions` instead. Omitting the field takes the default.
+
+The default threshold (4.5) allows typical commit hashes while flagging encrypted blobs. Vendor resource identifiers in URL paths commonly exceed that threshold (the measured base64url range above) and are blocked. Lower it (3.5) for strict mode. For known API routes, prefer a narrow `request_policy` path rule over raising the global threshold.
 
 **Subdomain entropy exclusions** skip subdomain and path entropy checks for specific domains, but query parameter entropy is still checked. Defaults cover package/object hosts that use hash-like routing paths (`files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com`). This is also useful for APIs that embed tokens in URL paths (e.g., Telegram bot API). Supports wildcard matching (`*.example.com`).
 
@@ -168,6 +171,27 @@ fetch_proxy:
     subdomain_entropy_exclusions:
       - "api.telegram.org"
 ```
+
+**Path entropy exclusions** skip only the URL-path entropy gate for one host plus one literal path prefix. Subdomain entropy, query entropy, query-key entropy, DLP, SSRF, rate limits and data budgets all still apply to the same request.
+
+Reach for this instead of `subdomain_entropy_exclusions` when a path false positive is the problem. That list is host-wide AND governs both the path and subdomain gates, so using it to fix a path block silently gives up subdomain-entropy detection for that host as well.
+
+A `request_policy` route also suppresses path entropy, on exactly the paths it names, whenever it declares both an explicit host and path constraints. That is the right tool when you already govern the host's paths, because the exemption then follows rules you are enforcing anyway. Use `path_entropy_exclusions` when you want the one route quiet without adopting that enforcement rail.
+
+```yaml
+fetch_proxy:
+  monitoring:
+    path_entropy_exclusions:
+      - host: docs.vendor.example      # exact host, or *.vendor.example
+        path_prefix: /document/d/      # literal prefix of the normalized path
+        reason: service-issued document identifier
+        owner: platform
+        expires: 2027-01-01            # optional, YYYY-MM-DD
+```
+
+An entry asserts that on that exact route the opaque segment is a service-issued resource identifier. It is a policy assertion rather than a classifier, and it does not make the route safe: before exempting one, confirm an agent cannot place a chosen opaque segment there and later read that value back, because such a route can carry data out. `https` only, and an entry with no host, no path prefix, or the bare root prefix `/` is refused at load rather than treated as a wildcard, because each of those three would exempt far more than one route. The prefix must be a canonical path: an encoded slash or backslash, a query or fragment delimiter in either literal or percent-encoded form, a wildcard, a dot segment, and a traversal segment are all refused. Matching compares the prefix against the request's escaped path, so a request that spells the route differently, such as `/document%2Fd/`, is a different route and stays subject to path entropy. **End `path_prefix` with `/` when you mean one path segment.** The prefix is matched literally, so `/document/d` also exempts `/document/de`, `/document/detail`, and every other path starting with those characters, while `/document/d/` does not. Dropping one character widens the exemption. `reason`, `owner` and `expires` are governance metadata. Editing any of them does not change the policy hash a receipt carries. Nothing revokes an entry when its `expires` date passes; `pipelock doctor` reports the expired, unowned, unexplained and inert entries so a standing exemption gets revisited instead of quietly outliving its reason.
+
+This ships empty. A vendor route enters the shipped defaults only with that vendor's own published route contract behind it.
 
 **Query entropy parameter exclusions** skip only the raw query-value entropy gate for one exact HTTPS endpoint and one exact parameter key. Subdomain entropy, path entropy, query-key entropy, adjacent parameters, DLP, SSRF, rate limits, and data budgets still apply. Use this first when a structured query language or endpoint contract creates a false positive in one parameter.
 

@@ -240,8 +240,9 @@ type Scanner struct {
 	subdomainExclusions        []string // domains excluded from subdomain entropy checks
 	queryExclusions            []string // domains excluded from query parameter entropy checks (S3 pre-signed URLs, etc.)
 	queryParamExclusions       map[queryEntropyParamExclusionKey]struct{}
-	scanNestedURLs             bool          // fetch_proxy.monitoring.scan_nested_urls; nil/true = enabled
-	nestedURLResolveBudget     time.Duration // shared deadline for all nested lookups in one request
+	pathEntropyExclusions      []pathEntropyExclusion // host+path-prefix exemptions for the PATH entropy gate only
+	scanNestedURLs             bool                   // fetch_proxy.monitoring.scan_nested_urls; nil/true = enabled
+	nestedURLResolveBudget     time.Duration          // shared deadline for all nested lookups in one request
 	// pathEntropyExempt suppresses the path-entropy gate on paths the operator
 	// already governs with a request_policy route (explicit host + path
 	// constraints). A nil or disabled matcher keeps path entropy fully active.
@@ -401,6 +402,7 @@ func NewWithOptions(cfg *config.Config, opts Options) (*Scanner, error) {
 		subdomainExclusions:       cfg.FetchProxy.Monitoring.SubdomainEntropyExclusions,
 		queryExclusions:           cfg.FetchProxy.Monitoring.QueryEntropyExclusions,
 		queryParamExclusions:      buildQueryEntropyParamExclusions(cfg.FetchProxy.Monitoring.QueryEntropyParamExclusions),
+		pathEntropyExclusions:     buildPathEntropyExclusions(cfg.FetchProxy.Monitoring.PathEntropyExclusions),
 		scanNestedURLs:            cfg.FetchProxy.Monitoring.ScanNestedURLsEnabled(),
 		nestedURLResolveBudget:    defaultNestedURLResolveBudget,
 		pathEntropyExempt:         buildPathEntropyExempt(cfg),
@@ -3522,7 +3524,8 @@ func (s *Scanner) checkEntropy(parsed *url.URL) Result {
 	// operator inspects by rule, and it false-positives on legitimate
 	// high-entropy REST resource ids. This is path-only: it never affects
 	// query entropy (below), subdomain entropy, DLP, or SSRF.
-	routeExemptPath := s.pathEntropyExempt.PathEntropyExempt(hostname, parsed.Path)
+	routeExemptPath := s.pathEntropyExempt.PathEntropyExempt(hostname, parsed.Path) ||
+		s.isPathEntropyExcluded(parsed)
 
 	// Check path segments (skipped for excluded domains).
 	if !excludedPath && !routeExemptPath {
@@ -3648,6 +3651,109 @@ type queryEntropyParamExclusionKey struct {
 	host   string
 	path   string
 	param  string
+}
+
+// pathEntropyExclusion is a compiled path-entropy exemption. Kept as a slice
+// rather than a map because the path is matched as a PREFIX, not by equality,
+// and these lists are short enough that a linear scan is cheaper than any
+// index that could answer a prefix question.
+type pathEntropyExclusion struct {
+	scheme     string
+	host       string
+	pathPrefix string
+}
+
+func buildPathEntropyExclusions(entries []config.PathEntropyExclusion) []pathEntropyExclusion {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]pathEntropyExclusion, 0, len(entries))
+	for _, entry := range entries {
+		// An entry with no host or no prefix would match every path on every
+		// host, which is a host-wide exemption wearing a scoped name. Drop it
+		// here as well as rejecting it in validation, so a config that somehow
+		// reaches the scanner cannot silently disable the gate.
+		// Normalize the host BEFORE testing it, not after. Checking the raw
+		// value first let "." survive as non-empty and then normalize to "",
+		// which the predicate now also rejects; doing both means neither the
+		// order here nor the predicate alone is load-bearing.
+		host := config.NormalizeHostPattern(entry.Host)
+		prefix := strings.TrimSpace(entry.PathPrefix)
+		if host == "" || prefix == "" {
+			continue
+		}
+		// A bare / prefix exempts every path on the host, which is the same
+		// over-broad exemption in a different spelling, so it is dropped for the
+		// same reason. Validation rejects it, but this defense exists precisely
+		// for a Config that reached the scanner without it, and it was
+		// previously incomplete: it caught the empty spellings and not this one.
+		if prefix == "/" {
+			continue
+		}
+		// The host pattern gets the SAME breadth test validation applies, from
+		// the same predicate rather than a copy of it. Without this the builder
+		// installed "*.com", which MatchDomain matches against every .com host,
+		// so a route prefix could exempt requests far outside the intended
+		// domain. Porting three of validation's four over-broad spellings and
+		// missing this one is what made a second round of this finding
+		// necessary; calling the predicate removes the chance of a third.
+		if config.HostPatternBreadthError(host) != nil {
+			continue
+		}
+		scheme := strings.ToLower(strings.TrimSpace(entry.Scheme))
+		if scheme == "" {
+			scheme = config.QueryEntropyParamDefaultScheme
+		}
+		// An exemption never covers cleartext. Validation refuses a non-https
+		// scheme; dropping it here too means an unvalidated Config cannot
+		// install one.
+		if scheme != config.QueryEntropyParamDefaultScheme {
+			continue
+		}
+		out = append(out, pathEntropyExclusion{
+			scheme:     scheme,
+			host:       host,
+			pathPrefix: prefix,
+		})
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// isPathEntropyExcluded reports whether this exact scheme, host and path prefix
+// is exempt from the PATH entropy gate. It deliberately answers nothing about
+// subdomain entropy, query entropy, DLP or SSRF, which continue to run.
+//
+// The comparison uses EscapedPath rather than Path, and that choice is the
+// difference between a narrow exemption and a bypass. url.Parse DECODES
+// percent-escapes into Path, so `/document%2Fd/<blob>` arrives as the decoded
+// `/document/d/<blob>` and matches an exemption written for `/document/d/`,
+// even though the origin server sees a single `document/d` segment and a
+// route the operator never exempted. Matching the escaped spelling keeps the
+// exemption pinned to the literal route in the config. Validation refuses an
+// encoded separator in a prefix, so a configured prefix and an escaped path
+// are compared in the same alphabet.
+func (s *Scanner) isPathEntropyExcluded(parsed *url.URL) bool {
+	if len(s.pathEntropyExclusions) == 0 || parsed == nil {
+		return false
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	host := parsed.Hostname()
+	path := parsed.EscapedPath()
+	for _, ex := range s.pathEntropyExclusions {
+		if ex.scheme != scheme {
+			continue
+		}
+		if !MatchDomain(host, ex.host) {
+			continue
+		}
+		if strings.HasPrefix(path, ex.pathPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func buildQueryEntropyParamExclusions(entries []config.QueryEntropyParamExclusion) map[queryEntropyParamExclusionKey]struct{} {
@@ -3943,7 +4049,8 @@ func isReadableLowerWord(part string) bool {
 }
 
 // ShannonEntropy calculates the Shannon entropy of a string in bits per character.
-// English text: ~3.5-4.0, base64: ~5.5-6.0, hex: ~4.0, encrypted: ~7.5-8.0.
+// English text: ~3.5-4.0, measured base64url resource identifiers: ~4.93-5.43,
+// hex: ~4.0, encrypted: ~7.5-8.0.
 func ShannonEntropy(s string) float64 {
 	if len(s) == 0 {
 		return 0

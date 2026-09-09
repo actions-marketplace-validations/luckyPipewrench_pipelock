@@ -47,10 +47,15 @@ import (
 // for error messages (e.g. "trusted_domains" or "agent \"foo\" trusted_domains").
 func ValidateTrustedDomains(domains []string, label string) error {
 	for i, raw := range domains {
-		// Normalize early: lowercase, trim whitespace and trailing DNS dot.
-		// Trailing dot must be stripped before breadth check so *.com. doesn't
-		// pass as having a subdomain level.
-		d := strings.TrimSuffix(strings.TrimSpace(strings.ToLower(raw)), ".")
+		// Normalize early through the shared normalizer, which strips EVERY
+		// trailing dot. The old local TrimSuffix removed one, so "*.com.."
+		// was accepted and rewritten IN PLACE to "*.com.", and MatchDomain
+		// then strips that last dot and matches every .com host. The raw
+		// two-dot form matches nothing, so half-normalizing it here is what
+		// made it dangerous. This list exempts hosts from the SSRF internal-IP
+		// check, which is why it gets the same normalizer as everything else
+		// rather than its own copy of the rule.
+		d := NormalizeHostPattern(raw)
 		if d == "" {
 			return fmt.Errorf("%s[%d] is empty", label, i)
 		}
@@ -1171,6 +1176,9 @@ func (c *Config) validateFetchProxy() error {
 	if err := validateHostnamePatternList("query_entropy_exclusions", c.FetchProxy.Monitoring.QueryEntropyExclusions); err != nil {
 		return err
 	}
+	if err := validatePathEntropyExclusions(c.FetchProxy.Monitoring.PathEntropyExclusions); err != nil {
+		return err
+	}
 	if err := validateQueryEntropyParamExclusions(c.FetchProxy.Monitoring.QueryEntropyParamExclusions); err != nil {
 		return err
 	}
@@ -1190,21 +1198,151 @@ func validateHostnamePatternList(field string, entries []string) error {
 		// Normalize the trailing dot BEFORE the breadth check so a
 		// trailing-dot input like "*.com." cannot pass as "*.com." and then
 		// normalize down to the over-broad "*.com".
-		d := strings.TrimSuffix(strings.TrimSpace(strings.ToLower(raw)), ".")
+		d := NormalizeHostPattern(raw)
 		if d == "" {
 			return fmt.Errorf("%s[%d] is empty", field, i)
 		}
-		if strings.Contains(d, "://") || strings.Contains(d, "/") || strings.Contains(d, ":") {
-			return fmt.Errorf("%s[%d] %q: use a hostname pattern, not a URL or host:port", field, i, raw)
-		}
-		if strings.HasPrefix(d, "*.") {
-			if strings.Count(d[2:], ".") < 1 {
-				return fmt.Errorf("%s[%d] %q: wildcard must target a concrete domain like *.example.com", field, i, raw)
-			}
-		} else if strings.ContainsAny(d, "*?[]") {
-			return fmt.Errorf("%s[%d] %q: only exact hosts and *.example.com wildcards are supported", field, i, raw)
+		if err := HostPatternBreadthError(d); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, raw, err)
 		}
 		entries[i] = d
+	}
+	return nil
+}
+
+// NormalizeHostPattern lowercases a host pattern and strips surrounding space
+// and EVERY trailing DNS dot. The dots must go BEFORE any breadth check, or
+// "*.com." passes the check and then normalizes down to the over-broad
+// "*.com".
+//
+// TrimRight rather than TrimSuffix, and that is the whole point: TrimSuffix
+// removes ONE dot, so "*.com.." became "*.com.", whose breadth test counts the
+// remaining dot as a domain label and accepts it. Runtime matching then strips
+// that dot and matched every .com host. Repeated trailing dots are the same
+// host by DNS rules, so collapsing them all is the correct reading and not a
+// special case for one input.
+func NormalizeHostPattern(raw string) string {
+	return strings.TrimRight(strings.TrimSpace(strings.ToLower(raw)), ".")
+}
+
+// HostPatternBreadthError reports why a normalized host pattern is too broad or
+// malformed to use as a scoped match, or nil when it is acceptable. It returns
+// the reason without a field prefix so both config validation and a runtime
+// compiler can use one predicate.
+//
+// This is exported because the scanner needs the SAME answer at the point of
+// use. A Config can reach the scanner without having been validated, and a
+// runtime compiler that re-implements a subset of these rules drifts from them:
+// the path-entropy builder did exactly that, dropping an empty host, a bare
+// root prefix and a cleartext scheme while still installing "*.com", which
+// MatchDomain then matched against every .com host. One predicate, two callers.
+//
+// Known limitation, pre-existing and shared with every caller of this rule: the
+// breadth test counts dots rather than consulting a public-suffix list, so
+// "*.co.uk" is accepted and is over-broad in reality. Fixing that changes
+// behavior for trusted_domains and the other host lists too, so it is not done
+// here.
+func HostPatternBreadthError(normalized string) error {
+	// Empty is rejected HERE so the predicate does not depend on its caller
+	// having checked emptiness first. A caller that tested the raw value and
+	// then normalized would otherwise pass "." through as "", and a predicate
+	// whose safety depends on call order is a predicate that will be called in
+	// the wrong order.
+	if normalized == "" {
+		return errors.New("host pattern is empty")
+	}
+	if strings.Contains(normalized, "://") || strings.Contains(normalized, "/") || strings.Contains(normalized, ":") {
+		return errors.New("use a hostname pattern, not a URL or host:port")
+	}
+	if strings.HasPrefix(normalized, "*.") {
+		if strings.Count(normalized[2:], ".") < 1 {
+			return errors.New("wildcard must target a concrete domain like *.example.com")
+		}
+		return nil
+	}
+	if strings.ContainsAny(normalized, "*?[]") {
+		return errors.New("only exact hosts and *.example.com wildcards are supported")
+	}
+	return nil
+}
+
+// validatePathEntropyExclusions rejects an entry that would widen the path
+// entropy exemption beyond one route. An empty host or an empty path prefix
+// makes the entry match everything, which is a host-wide (or global) exemption
+// wearing a scoped name, and the operator would not see that from the YAML.
+func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
+	seen := make(map[string]struct{}, len(entries))
+	for i := range entries {
+		field := fmt.Sprintf("fetch_proxy.monitoring.path_entropy_exclusions[%d]", i)
+		entry := &entries[i]
+
+		scheme := strings.TrimSpace(strings.ToLower(entry.Scheme))
+		if scheme == "" {
+			scheme = QueryEntropyParamDefaultScheme
+		}
+		if scheme != schemeHTTPS {
+			return fmt.Errorf("%s.scheme %q must be https", field, entry.Scheme)
+		}
+
+		// One normalizer, so this cannot accidentally trim a second dot that
+		// validateHostnamePatternList also trims. That double-trim is what made
+		// validation reject "*.com.." while the single-normalizing runtime
+		// builder accepted it: the two paths disagreed by an implementation
+		// detail rather than by intent.
+		host := NormalizeHostPattern(entry.Host)
+		if host == "" {
+			return fmt.Errorf("%s.host is required; an entry without a host would exempt every host", field)
+		}
+		hosts := []string{host}
+		if err := validateHostnamePatternList(field+".host", hosts); err != nil {
+			return err
+		}
+		host = hosts[0]
+
+		prefix := strings.TrimSpace(entry.PathPrefix)
+		if prefix == "" {
+			return fmt.Errorf("%s.path_prefix is required; an entry without a prefix would exempt every path on the host", field)
+		}
+		if !strings.HasPrefix(prefix, "/") {
+			return fmt.Errorf("%s.path_prefix %q must start with /", field, entry.PathPrefix)
+		}
+		if prefix == "/" {
+			return fmt.Errorf("%s.path_prefix %q exempts every path on the host; use subdomain_entropy_exclusions deliberately if that is the intent", field, entry.PathPrefix)
+		}
+		if strings.Contains(prefix, "://") {
+			return fmt.Errorf("%s.path_prefix %q must be a path, not a URL", field, entry.PathPrefix)
+		}
+		// Reuse the sibling exemption's path normalizer rather than repeating a
+		// weaker check beside it. It refuses an encoded slash or backslash, a
+		// query or fragment delimiter, a wildcard, a control character, a dot
+		// segment, and any non-canonical escape spelling. Those all matter here
+		// because the scanner compares a prefix against the request's ESCAPED
+		// path: a prefix carrying %2f could never match a canonical request, so
+		// accepting one would hand the operator a silently inert exemption.
+		// The trailing slash is trimmed first because it is load-bearing for
+		// prefix matching (it stops /document/de matching /document/d) while
+		// path.Clean treats it as non-canonical and would reject it.
+		if _, err := normalizeQueryEntropyParamPath(strings.TrimSuffix(prefix, "/")); err != nil {
+			return fmt.Errorf("%s.path_prefix %q is not a canonical path: %w", field, entry.PathPrefix, err)
+		}
+
+		expires := strings.TrimSpace(entry.Expires)
+		if expires != "" {
+			if _, err := time.Parse("2006-01-02", expires); err != nil {
+				return fmt.Errorf("%s.expires %q must be YYYY-MM-DD: %w", field, entry.Expires, err)
+			}
+		}
+
+		key := scheme + "|" + host + "|" + prefix
+		if _, dup := seen[key]; dup {
+			return fmt.Errorf("%s duplicates an earlier entry for %s%s", field, host, prefix)
+		}
+		seen[key] = struct{}{}
+
+		entry.Scheme = scheme
+		entry.Host = host
+		entry.PathPrefix = prefix
+		entry.Expires = expires
 	}
 	return nil
 }
@@ -1268,7 +1406,7 @@ func normalizeQueryEntropyParamHost(raw string) (string, error) {
 	}) >= 0 {
 		return "", errors.New("host must not contain spaces or control characters")
 	}
-	host := strings.TrimSuffix(strings.ToLower(raw), ".")
+	host := NormalizeHostPattern(raw)
 	if host == "" {
 		return "", errors.New("host is required")
 	}
@@ -1354,8 +1492,14 @@ func normalizeQueryEntropyParamPath(raw string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("path escapes must be valid: %w", err)
 	}
-	if strings.ContainsAny(decoded, "*\\;") || strings.IndexFunc(decoded, unicode.IsControl) >= 0 {
-		return "", errors.New("decoded path must not contain wildcard, backslash, path-parameter, or control characters")
+	// The raw check above rejects a literal ? or #; this rejects their encoded
+	// forms, which reach here decoded. Omitting them let `/document%3Fprivate`
+	// through: it passed as a canonical escaped path, so a configured exemption
+	// could hinge on a character that a path parser may treat as the start of a
+	// query or fragment. Where two parsers disagree about where the path ends,
+	// an exemption means two different things, so refuse the spelling instead.
+	if strings.ContainsAny(decoded, "?#*\\;") || strings.IndexFunc(decoded, unicode.IsControl) >= 0 {
+		return "", errors.New("decoded path must not contain query, fragment, wildcard, backslash, path-parameter, or control characters")
 	}
 	if decoded == "/" || path.Clean(decoded) != decoded {
 		return "", errors.New("path must be canonical and must not contain traversal")
