@@ -4,19 +4,17 @@
 package mcp
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -51,7 +49,7 @@ func NewCEEDeps(ceeCfg config.CrossRequestDetection, m *metrics.Metrics) *CEEDep
 		runtime.tracker = scanner.NewEntropyTracker(ceeCfg.EntropyBudget.BitsPerWindow, ceeCfg.EntropyBudget.WindowMinutes*60)
 	}
 	if ceeCfg.Enabled && ceeCfg.FragmentReassembly.Enabled {
-		runtime.buffer = scanner.NewFragmentBuffer(ceeCfg.FragmentReassembly.MaxBufferBytes, 10000, ceeCfg.FragmentReassembly.WindowMinutes*60)
+		runtime.buffer = scanner.NewFragmentBuffer(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.ResolvedMaxSessions(), ceeCfg.FragmentReassembly.WindowMinutes*60)
 	}
 	return &CEEDeps{
 		runtime: runtime,
@@ -83,9 +81,9 @@ func (cee *CEEDeps) Reconfigure(ceeCfg config.CrossRequestDetection, m *metrics.
 	}
 	if ceeCfg.Enabled && ceeCfg.FragmentReassembly.Enabled {
 		if runtime.buffer == nil {
-			runtime.buffer = scanner.NewFragmentBuffer(ceeCfg.FragmentReassembly.MaxBufferBytes, 10000, ceeCfg.FragmentReassembly.WindowMinutes*60)
+			runtime.buffer = scanner.NewFragmentBuffer(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.ResolvedMaxSessions(), ceeCfg.FragmentReassembly.WindowMinutes*60)
 		} else {
-			runtime.buffer.UpdateConfig(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.WindowMinutes*60)
+			runtime.buffer.UpdateConfig(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.ResolvedMaxSessions(), ceeCfg.FragmentReassembly.WindowMinutes*60)
 		}
 	} else {
 		if runtime.buffer != nil {
@@ -140,15 +138,15 @@ const (
 	// mcpCEEArgumentMaxDepth bounds recursive token walking independently from
 	// encoding/json's object decoding depth limit, which Decoder.Token does not
 	// apply.
-	mcpCEEArgumentMaxDepth = 64
+	mcpCEEArgumentMaxDepth = extract.DefaultJSONLeafMaxDepth
 
 	// mcpCEEArgumentMaxStreams limits FragmentBuffer sessions created by one
 	// tools/call frame. An overflow falls back to the complete raw frame.
-	mcpCEEArgumentMaxStreams = 128
+	mcpCEEArgumentMaxStreams = extract.DefaultJSONLeafMaxStreams
 
 	// mcpCEEArgumentMaxPathBytes bounds one escaped JSON argument path and the
 	// cumulative allocation used by recursive descent.
-	mcpCEEArgumentMaxPathBytes = 512
+	mcpCEEArgumentMaxPathBytes = extract.DefaultJSONLeafMaxPathBytes
 
 	// mcpCEEArgumentMaxStreamKeyBytes also bounds the complete tool-qualified
 	// stream key when an attacker supplies an unusually long tool identity.
@@ -194,14 +192,19 @@ func mcpCEEFragmentPayloads(frame MCPFrame) map[string][]byte {
 	if !ok {
 		return map[string][]byte{"": frame.Raw}
 	}
-	decoder := json.NewDecoder(bytes.NewReader(frame.Args))
-	decoder.UseNumber()
-	payloads := make(map[string][]byte)
-	if !appendMCPCEEArgumentText(decoder, payloads, toolPrefix, []byte("$"), 0) || len(payloads) == 0 {
+	argumentPayloads, complete := extract.JSONLeafPayloads(frame.Args, extract.JSONLeafLimits{
+		MaxDepth: mcpCEEArgumentMaxDepth, MaxStreams: mcpCEEArgumentMaxStreams, MaxPathBytes: mcpCEEArgumentMaxPathBytes,
+	})
+	if !complete {
 		return map[string][]byte{"": frame.Raw}
 	}
-	if _, err := decoder.Token(); err != io.EOF {
-		return map[string][]byte{"": frame.Raw}
+	payloads := make(map[string][]byte, len(argumentPayloads)+1)
+	for path, value := range argumentPayloads {
+		stream := toolPrefix + mcpCEEArgumentStreamSuffix + path
+		if len(stream) > mcpCEEArgumentMaxStreamKeyBytes {
+			return map[string][]byte{"": frame.Raw}
+		}
+		payloads[stream] = value
 	}
 	if toolStream, value, ok := mcpCEEUnambiguousToolValue(toolPrefix, payloads); ok {
 		if len(payloads) >= mcpCEEArgumentMaxStreams {
@@ -252,101 +255,6 @@ func mcpCEEUnambiguousToolValue(toolPrefix string, payloads map[string][]byte) (
 // into data values: a server receives alpha and progress as distinct arguments.
 // The mutable path buffer avoids allocating a new cumulative path at each
 // nested object key or array element.
-func appendMCPCEEArgumentText(decoder *json.Decoder, payloads map[string][]byte, toolPrefix string, path []byte, depth int) bool {
-	if depth > mcpCEEArgumentMaxDepth {
-		return false
-	}
-	token, err := decoder.Token()
-	if err != nil {
-		return false
-	}
-	switch value := token.(type) {
-	case json.Delim:
-		switch value {
-		case '{':
-			for decoder.More() {
-				key, err := decoder.Token()
-				if err != nil {
-					return false
-				}
-				keyString, ok := key.(string)
-				if !ok {
-					return false
-				}
-				pathLen := len(path)
-				path, ok = mcpCEEAppendPathPart(path, keyString)
-				if !ok || !appendMCPCEEArgumentText(decoder, payloads, toolPrefix, path, depth+1) {
-					return false
-				}
-				path = path[:pathLen]
-			}
-			end, err := decoder.Token()
-			return err == nil && end == json.Delim('}')
-		default:
-			// json.Decoder only yields '{' or '[' as an opening delimiter.
-			// A different delimiter reaches the same fail-closed end-token check.
-			for index := 0; decoder.More(); index++ {
-				pathLen := len(path)
-				var ok bool
-				path, ok = mcpCEEAppendPathPart(path, strconv.Itoa(index))
-				if !ok || !appendMCPCEEArgumentText(decoder, payloads, toolPrefix, path, depth+1) {
-					return false
-				}
-				path = path[:pathLen]
-			}
-			end, err := decoder.Token()
-			return err == nil && end == json.Delim(']')
-		}
-	case nil:
-		return true
-	case string:
-		return mcpCEEAppendArgumentPayload(payloads, toolPrefix, path, value)
-	case json.Number:
-		return mcpCEEAppendArgumentPayload(payloads, toolPrefix, path, value.String())
-	case bool:
-		return mcpCEEAppendArgumentPayload(payloads, toolPrefix, path, strconv.FormatBool(value))
-	default:
-		return false
-	}
-}
-
-func mcpCEEAppendPathPart(path []byte, part string) ([]byte, bool) {
-	pathBytes := len(path) + 1
-	for i := 0; i < len(part); i++ {
-		pathBytes++
-		if part[i] == '~' || part[i] == '/' {
-			pathBytes++
-		}
-	}
-	if pathBytes > mcpCEEArgumentMaxPathBytes {
-		return nil, false
-	}
-	path = append(path, '/')
-	for i := 0; i < len(part); i++ {
-		switch part[i] {
-		case '~':
-			path = append(path, '~', '0')
-		case '/':
-			path = append(path, '~', '1')
-		default:
-			path = append(path, part[i])
-		}
-	}
-	return path, true
-}
-
-func mcpCEEAppendArgumentPayload(payloads map[string][]byte, toolPrefix string, path []byte, value string) bool {
-	stream := toolPrefix + mcpCEEArgumentStreamSuffix + string(path)
-	if len(stream) > mcpCEEArgumentMaxStreamKeyBytes {
-		return false
-	}
-	if _, exists := payloads[stream]; !exists && len(payloads) >= mcpCEEArgumentMaxStreams {
-		return false
-	}
-	payloads[stream] = append(payloads[stream], value...)
-	return true
-}
-
 func mcpCEEPathEscape(part string) string {
 	return mcpCEEPathEscaper.Replace(part)
 }
@@ -437,9 +345,41 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				continue
 			}
 			fragmentKey := mcpCEEFragmentSessionKey(opts.sessionKey, path)
+			// Every stream this frame opens belongs to one logical identity and
+			// shares that identity's single ledger slot. Charging the ledger per
+			// stream made an ordinary one-argument call cost two slots, so a
+			// small max_sessions denied a first call outright, and let one
+			// client's streams crowd out unrelated clients.
+			owner := opts.sessionKey
+			if owner == "" {
+				owner = fragmentKey
+			}
 			// Capacity exhaustion always blocks, regardless of the configured
 			// cross-request action, because the request is no longer inspectable.
-			if appendResult := buffer.Append(fragmentKey, payload); appendResult.CapacityExceeded {
+			// Argument streams are the class whose cardinality the frame
+			// chooses, so they share one byte budget. The raw-frame fallback
+			// stream keeps its own cap: a session accumulates both over time,
+			// and a large raw frame sharing the budget would evict the small
+			// argument evidence a split secret is reassembled from.
+			budgetGroup := fragmentKey
+			if path != "" {
+				budgetGroup = owner + mcpCEEArgumentStreamSuffix
+			}
+			appendResult := buffer.AppendOwnedInGroup(owner, budgetGroup, fragmentKey, payload)
+			if appendResult.OwnerMismatch {
+				if m != nil {
+					m.RecordCrossRequestFragmentOwnerMismatch()
+				}
+				// Names no tunable: no configuration permits joining two
+				// identities' fragments.
+				reason := "cross-request fragment stream belongs to another identity; request cannot be safely inspected"
+				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
+				if opts.logger != nil {
+					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_owner_mismatch", reason)
+				}
+				return reason
+			}
+			if appendResult.CapacityExceeded {
 				if m != nil {
 					m.RecordCrossRequestFragmentCapacityExceeded()
 				}

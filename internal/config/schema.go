@@ -274,7 +274,9 @@ type Sandbox struct {
 	BestEffortReason string `yaml:"best_effort_reason" json:"-"`
 	// BestEffortExpiry bounds admission only: it never terminates an already
 	// running child, and each later launch must be authorized again. Configuration
-	// uses RFC3339 so mutable filesystem metadata cannot renew an authorization.
+	// uses RFC3339 so mutable filesystem metadata cannot renew an authorization,
+	// and it may lie at most MaxBestEffortConfigHorizon after validation time so
+	// one edit cannot authorize the override for a year.
 	BestEffortExpiry string             `yaml:"best_effort_expiry" json:"-"`
 	Workspace        string             `yaml:"workspace"` // agent working dir; resolved to absolute at startup
 	FS               *SandboxFilesystem `yaml:"filesystem"`
@@ -285,11 +287,18 @@ type Sandbox struct {
 // Scoped to mcp proxy --agent and agent listeners. pipelock sandbox
 // CLI does not support per-agent resolution.
 type AgentSandboxOverride struct {
-	Enabled    *bool              `yaml:"enabled,omitempty"`
-	Strict     *bool              `yaml:"strict,omitempty"`
-	BestEffort *bool              `yaml:"best_effort,omitempty"`
-	Workspace  string             `yaml:"workspace,omitempty"`
-	FS         *SandboxFilesystem `yaml:"filesystem,omitempty"`
+	Enabled    *bool `yaml:"enabled,omitempty"`
+	Strict     *bool `yaml:"strict,omitempty"`
+	BestEffort *bool `yaml:"best_effort,omitempty"`
+	// BestEffortReason and BestEffortExpiry carry the same authorization the
+	// top-level sandbox block requires. A profile that enables best_effort
+	// must supply both here; it never inherits them from the top level, so
+	// one profile's override cannot ride on another authorization's reason
+	// and expiry. The same RFC3339 and horizon rules apply.
+	BestEffortReason string             `yaml:"best_effort_reason,omitempty" json:"-"`
+	BestEffortExpiry string             `yaml:"best_effort_expiry,omitempty" json:"-"`
+	Workspace        string             `yaml:"workspace,omitempty"`
+	FS               *SandboxFilesystem `yaml:"filesystem,omitempty"`
 }
 
 // SandboxFilesystem overrides the default Landlock policy. If nil, the
@@ -1379,7 +1388,27 @@ type CrossRequestEntropyBudget struct {
 type CrossRequestFragments struct {
 	Enabled        bool `yaml:"enabled"`
 	MaxBufferBytes int  `yaml:"max_buffer_bytes"` // per-session rolling buffer cap
-	WindowMinutes  int  `yaml:"window_minutes"`   // fragment retention window (independent of entropy budget)
+	// MaxSessions bounds how many sessions may hold fragment evidence. A
+	// POINTER so an omitted value (nil, take the default) is distinguishable
+	// from an explicit one. Normalization used to coerce any non-positive value
+	// to the default, which silently accepted an operator's `max_sessions: 0`
+	// and made the validation rule unreachable through Load.
+	MaxSessions   *int `yaml:"max_sessions"`
+	WindowMinutes int  `yaml:"window_minutes"` // fragment retention window (independent of entropy budget)
+}
+
+const DefaultCrossRequestFragmentMaxSessions = 10000
+
+// ResolvedMaxSessions returns the session ledger bound this configuration
+// actually runs with. Both transports build their own fragment buffer, and each
+// carried its own copy of this defaulting rule, so the two could drift while
+// nothing failed. Validation rejects an explicit non-positive value, so a
+// non-nil pointer here is always usable.
+func (f CrossRequestFragments) ResolvedMaxSessions() int {
+	if f.MaxSessions != nil && *f.MaxSessions > 0 {
+		return *f.MaxSessions
+	}
+	return DefaultCrossRequestFragmentMaxSessions
 }
 
 // KillSwitch configures the emergency deny-all kill switch.

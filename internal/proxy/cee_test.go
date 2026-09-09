@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -174,6 +176,344 @@ func TestExtractOutboundPayload_NilBody(t *testing.T) {
 	payload := extractOutboundPayload(r)
 	if len(payload) != 0 {
 		t.Errorf("expected empty payload for nil body, got %q", string(payload))
+	}
+}
+
+// testCEEPartitionKey stands in for the buffer-lifetime root secret. A real
+// caller reads it from the live FragmentBuffer; the value only has to be
+// stable within one test, because the bucket map is keyed, not public.
+var testCEEPartitionKey = []byte("cee-partition-root-key-for-tests")
+
+// A leaf must never be omitted, and the reason a body was not fully
+// partitioned must reach the operator. The failure direction that matters is
+// the one this replaced: returning no buckets left the body on the raw
+// concatenated stream only, which cannot rejoin a split separated by
+// unrelated padding, so a one-byte suffix disabled the whole control.
+func TestJSONBodyFragmentPayloadsUseFixedStableBuckets(t *testing.T) {
+	secret := testCEEAWSKeyPrefix + testCEEAWSKeySuffix
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		wantValues  []string
+		wantNil     bool
+		wantReason  string
+	}{
+		{
+			name: "valid JSON partitions leaf", contentType: "application/json",
+			body: `{"messages":[{"content":"value"}]}`, wantValues: []string{"value"},
+		},
+		{
+			name: "every leaf remains represented above the former stream ceiling", contentType: "application/json",
+			body: forwardCEEJSONWithManyLeaves("first", "last"), wantValues: []string{"first", "last"},
+		},
+		{
+			// The cheapest omission trigger found on this branch: one trailing
+			// non-whitespace byte. The parsed leaf is kept and the shortfall is
+			// reported rather than the whole body silently falling back to raw.
+			name: "a trailing byte keeps the parsed leaf", contentType: "application/json",
+			body: `{"a":"` + secret + `"} x`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			name: "a second top-level value keeps the parsed leaf", contentType: "application/json",
+			body: `{"a":"` + secret + `"}{}`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			name: "a truncated document keeps what parsed", contentType: "application/json",
+			body: `{"keep":"` + secret + `","drop":"`, wantValues: []string{secret}, wantReason: ceeJSONPartitionReasonIncomplete,
+		},
+		{
+			// Nothing parsed, so there is genuinely nothing to retain. This is
+			// the only shape whose empty result is honest, and it still reports.
+			name: "an unparseable document salvages nothing and says so", contentType: "application/json",
+			body: `{"unterminated"`, wantNil: true, wantReason: ceeJSONPartitionReasonMalformed,
+		},
+		{
+			// Not a fallback: JSON partitioning does not claim to cover other
+			// media types, so there is no shortfall to report.
+			name: "non JSON reports no shortfall", contentType: "text/plain",
+			body: `{"content":"` + secret + `"}`, wantNil: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, reason := jsonBodyFragmentPayloads(tt.contentType, []byte(tt.body), "session", testCEEPartitionKey)
+			if reason != tt.wantReason {
+				t.Fatalf("reason = %q, want %q", reason, tt.wantReason)
+			}
+			if tt.wantNil {
+				if got != nil {
+					t.Fatalf("payloads = %#v, want no partitions", got)
+				}
+				return
+			}
+			var values strings.Builder
+			for _, value := range got {
+				values.Write(value)
+			}
+			for _, want := range tt.wantValues {
+				if !strings.Contains(values.String(), want) {
+					t.Fatalf("bucket payloads = %#v, missing %q", got, want)
+				}
+			}
+		})
+	}
+}
+
+// Without a key there is no safe bucket map, and the public-digest fallback
+// this replaced was grindable offline in a few thousand candidates. The
+// caller must therefore learn that the body was not partitioned rather than
+// receive buckets it would treat as complete inspection.
+func TestJSONBodyFragmentPayloadsRefuseToPartitionUnkeyed(t *testing.T) {
+	body := []byte(`{"a":"` + testCEEAWSKeyPrefix + testCEEAWSKeySuffix + `"}`)
+
+	keyed, reason := jsonBodyFragmentPayloads("application/json", body, "session", testCEEPartitionKey)
+	if len(keyed) == 0 || reason != "" {
+		t.Fatalf("keyed control = (%#v, %q), want partitions and no shortfall", keyed, reason)
+	}
+
+	for _, key := range [][]byte{nil, {}} {
+		got, reason := jsonBodyFragmentPayloads("application/json", body, "session", key)
+		if got != nil {
+			t.Fatalf("unkeyed payloads = %#v, want no partitions", got)
+		}
+		if reason != ceeJSONPartitionReasonUnkeyed {
+			t.Fatalf("unkeyed reason = %q, want %q", reason, ceeJSONPartitionReasonUnkeyed)
+		}
+	}
+}
+
+// The bucket map is per session, so a path an attacker ground into a chosen
+// bucket under one session identity does not land in that bucket under
+// another. Same path, same session is still stable, which is the only
+// property cross-request reassembly actually needs.
+func TestJSONBodyFragmentPayloadsBucketMapIsPerSession(t *testing.T) {
+	body := []byte(`{"a":"value"}`)
+
+	first, _ := jsonBodyFragmentPayloads("application/json", body, "session-a", testCEEPartitionKey)
+	repeat, _ := jsonBodyFragmentPayloads("application/json", body, "session-a", testCEEPartitionKey)
+	other, _ := jsonBodyFragmentPayloads("application/json", body, "session-b", testCEEPartitionKey)
+
+	bucketOf := func(payloads map[string][]byte) string {
+		for bucket := range payloads {
+			return bucket
+		}
+		return ""
+	}
+	if bucketOf(first) == "" || bucketOf(first) != bucketOf(repeat) {
+		t.Fatalf("same session buckets = %q and %q, want one stable bucket", bucketOf(first), bucketOf(repeat))
+	}
+	if bucketOf(other) == bucketOf(first) {
+		t.Fatalf("session-b reused session-a's bucket %q; a ground path would carry across identities", bucketOf(first))
+	}
+}
+
+func TestResetCEEStateClearsJSONBodyStreams(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 10, 60)
+	sessionKey := CeeSessionKey(testCEEAgent, testCEEClientIP)
+	buckets, _ := jsonBodyFragmentPayloads("application/json", []byte(`{"messages":[{"content":"value"}]}`), sessionKey, testCEEPartitionKey)
+	if len(buckets) != 1 {
+		t.Fatalf("bucket count = %d, want 1", len(buckets))
+	}
+	var bucket string
+	for bucket = range buckets {
+	}
+	bodyKey := ceeJSONBodyFragmentSessionKey(sessionKey, bucket)
+
+	if result := fb.Append(bodyKey, []byte(testCEEAWSKeyPrefix)); result.CapacityExceeded {
+		t.Fatal("first body fragment exceeded capacity")
+	}
+	if result := fb.Append(bodyKey, []byte(testCEEAWSKeySuffix)); result.CapacityExceeded {
+		t.Fatal("second body fragment exceeded capacity")
+	}
+	if matches := fb.ScanForSecrets(t.Context(), bodyKey, sc); len(matches) == 0 {
+		t.Fatal("control did not reassemble the JSON body stream")
+	}
+
+	if result := fb.Append(bodyKey, []byte(testCEEAWSKeyPrefix)); result.CapacityExceeded {
+		t.Fatal("post-control first fragment exceeded capacity")
+	}
+	ResetCEEState(testCEEAgent, testCEEClientIP, nil, fb)
+	if result := fb.Append(bodyKey, []byte(testCEEAWSKeySuffix)); result.CapacityExceeded {
+		t.Fatal("post-reset second fragment exceeded capacity")
+	}
+	if matches := fb.ScanForSecrets(t.Context(), bodyKey, sc); len(matches) != 0 {
+		t.Fatalf("reset retained JSON body fragments: %#v", matches)
+	}
+}
+
+// The ownership guard's failure direction, at the gate rather than the buffer.
+// A stream that already holds another identity's evidence cannot accept this
+// request's fragment, and the request must be reported as uninspected instead
+// of being scanned against a blend of two clients' data. Unreachable through
+// production keys, which embed the session key, so it is driven here by
+// seeding the exact key the gate will use under a different owner.
+func TestCEEFragmentOwnerMismatchFailsClosed(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	maxSessions := 10
+	cfg.CrossRequestDetection.FragmentReassembly.MaxSessions = &maxSessions
+	cfg.ApplyDefaults()
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 10, 300)
+	t.Cleanup(fb.Close)
+	logger := audit.NewNop()
+	m := metrics.New()
+
+	const sessionKey = "victim-session"
+	admit := func() ceeResult {
+		return ceeAdmit(t.Context(), ceeAdmitOptions{
+			SessionKey: sessionKey, Outbound: []byte("ordinary"),
+			TargetURL: "http://api.vendor.example", Config: cfg.CrossRequestDetection,
+			Fragments: fb, Scanner: sc, Logger: logger, Metrics: m,
+		})
+	}
+
+	// Control: the same call is admitted when the stream is unclaimed, so a
+	// block below is attributable to ownership and not to the setup.
+	if control := admit(); control.Blocked {
+		t.Fatalf("unclaimed stream = %+v, want admission", control)
+	}
+
+	fb.Close()
+	if seeded := fb.AppendOwned("another-identity", sessionKey, []byte("foreign")); seeded.OwnerMismatch || seeded.CapacityExceeded {
+		t.Fatalf("seeding a foreign-owned stream = %+v, want admission", seeded)
+	}
+	result := admit()
+	if !result.Blocked {
+		t.Fatalf("foreign-owned stream = %+v, want fail-closed block", result)
+	}
+	if !strings.Contains(result.Reason, "belongs to another identity") {
+		t.Fatalf("reason = %q, want it to name the ownership conflict", result.Reason)
+	}
+	// The remedy must not point at a tunable: no configuration permits blending
+	// two identities' fragments, so naming one would teach the operator that
+	// policy changed when nothing did.
+	if strings.Contains(result.Reason, "max_sessions") {
+		t.Fatalf("reason = %q, must not name a control that cannot fix this", result.Reason)
+	}
+	// The counter is the operator's only signal that this happened, so the block
+	// and the record are asserted together. Their MCP twin asserts the same
+	// thing; a signal proven on one transport and not the other is how a gap
+	// survives a review.
+	if got := testutil.ToFloat64(m.CrossRequestFragmentOwnerMismatch); got != 1 {
+		t.Fatalf("owner mismatch counter = %v, want 1; the block is invisible to an operator without it", got)
+	}
+}
+
+func TestCEEFragmentGlobalCapacityFailsClosed(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.Action = config.ActionBlock
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = false
+	cfg.CrossRequestDetection.FragmentReassembly.Enabled = true
+	cfg.CrossRequestDetection.FragmentReassembly.MaxBufferBytes = 1024
+	ledgerSlots := 3
+	cfg.CrossRequestDetection.FragmentReassembly.MaxSessions = &ledgerSlots
+	cfg.ApplyDefaults()
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	fb := scanner.NewFragmentBuffer(1024, 3, 300)
+	t.Cleanup(fb.Close)
+	logger := audit.NewNop()
+	m := metrics.New()
+
+	admit := func(sessionKey string, buckets map[string][]byte) ceeResult {
+		return ceeAdmit(t.Context(), ceeAdmitOptions{
+			SessionKey: sessionKey, Outbound: []byte("ordinary"), BodyFragmentPayloads: buckets,
+			TargetURL: "http://api.vendor.example", Config: cfg.CrossRequestDetection,
+			Fragments: fb, Scanner: sc, Logger: logger, Metrics: m,
+		})
+	}
+
+	// One identity holding many bucket streams must NOT exhaust the ledger.
+	// This is the availability finding this branch exists to fix: charging the
+	// ledger per stream let one client take 4,099 of 10,000 slots, so about
+	// three clients denied everyone else a fragment stream.
+	crowded := admit("client-a", map[string][]byte{
+		"$/a": []byte("ordinary"), "$/b": []byte("ordinary"), "$/c": []byte("ordinary"),
+		"$/d": []byte("ordinary"), "$/e": []byte("ordinary"),
+	})
+	if crowded.Blocked {
+		t.Fatalf("one identity with five bucket streams = %+v, want admission on a single ledger slot", crowded)
+	}
+
+	// The ledger still bounds IDENTITIES, and exhausting it fails closed for a
+	// new one rather than skipping inspection. A skip was the bypass a previous
+	// round introduced here, so the direction is the whole point.
+	for _, session := range []string{"client-b", "client-c"} {
+		if result := admit(session, map[string][]byte{"$/a": []byte("ordinary")}); result.Blocked {
+			t.Fatalf("identity %q = %+v, want admission below the identity cap", session, result)
+		}
+	}
+	overflow := admit("client-d", map[string][]byte{"$/a": []byte("ordinary")})
+	if !overflow.Blocked {
+		t.Fatalf("new identity beyond the ledger = %+v, want fail-closed block", overflow)
+	}
+}
+
+func BenchmarkExtractOutboundPayloadsJSONFields(b *testing.B) {
+	padding := strings.Repeat("ordinary prose ", ceeForwardConversationPaddingBytes/len("ordinary prose "))
+	body := `{"messages":[{"role":"user","content":"fragment"}],"history":"` + padding + `"}`
+	b.ReportAllocs()
+	for b.Loop() {
+		req := &http.Request{
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			URL:           &url.URL{},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		payloads := extractOutboundPayloads(req, true, "session", testCEEPartitionKey)
+		if len(payloads.bodyFragmentPayloads) != 3 {
+			b.Fatalf("body field streams = %d, want 3", len(payloads.bodyFragmentPayloads))
+		}
+	}
+}
+
+func BenchmarkExtractOutboundPayloadsJSONFieldsDisabled(b *testing.B) {
+	padding := strings.Repeat("ordinary prose ", ceeForwardConversationPaddingBytes/len("ordinary prose "))
+	body := `{"messages":[{"role":"user","content":"fragment"}],"history":"` + padding + `"}`
+	b.ReportAllocs()
+	for b.Loop() {
+		req := &http.Request{
+			Header:        http.Header{"Content-Type": []string{"application/json"}},
+			URL:           &url.URL{},
+			Body:          io.NopCloser(strings.NewReader(body)),
+			ContentLength: int64(len(body)),
+		}
+		payloads := extractOutboundPayloads(req, false, "session", testCEEPartitionKey)
+		if len(payloads.bodyFragmentPayloads) != 0 {
+			b.Fatalf("disabled body field streams = %d, want 0", len(payloads.bodyFragmentPayloads))
+		}
+	}
+}
+
+func TestExtractOutboundPayloadsDisabledSkipsJSONPartitioning(t *testing.T) {
+	body := `{"messages":[{"content":"fragment"}]}`
+	req := &http.Request{
+		Header:        http.Header{"Content-Type": []string{"application/json"}},
+		URL:           &url.URL{},
+		Body:          io.NopCloser(strings.NewReader(body)),
+		ContentLength: int64(len(body)),
+	}
+	payloads := extractOutboundPayloads(req, false, "session", testCEEPartitionKey)
+	if len(payloads.bodyFragmentPayloads) != 0 {
+		t.Fatalf("disabled body field streams = %d, want 0", len(payloads.bodyFragmentPayloads))
+	}
+	if got := string(payloads.outbound); got != body {
+		t.Fatalf("disabled raw outbound = %q, want %q", got, body)
 	}
 }
 

@@ -1827,10 +1827,13 @@ Buffers outbound payloads (URLs, request bodies, MCP JSON-RPC payloads, WebSocke
 | Field | Default | Description |
 |-------|---------|-------------|
 | `fragment_reassembly.enabled` | `false` | Enable fragment reassembly |
-| `fragment_reassembly.max_buffer_bytes` | `65536` | Max buffer size per session (64 KB). Older fragments are evicted when exceeded. |
+| `fragment_reassembly.max_buffer_bytes` | `65536` | Max buffer size per stream class per session (64 KB). Older fragments are evicted when exceeded. |
+| `fragment_reassembly.max_sessions` | `10000` | Maximum sessions holding fragment evidence. Each transport keeps its own ledger of this size. Requests are denied when a ledger is full and the session is not already in it. |
 | `fragment_reassembly.window_minutes` | `5` | Fragment retention window in minutes. Fragments older than this are pruned. |
 
-**Memory:** Each tracked session uses up to `max_buffer_bytes`. With 10,000 concurrent sessions (hard cap), the worst-case memory is `max_buffer_bytes * 10000` (640 MB at defaults). Reduce `max_buffer_bytes` in memory-constrained environments.
+**Memory:** A session's evidence is grouped into stream classes, and each class retains at most `max_buffer_bytes`. A forward-proxy session has four: the raw body, the query-key stream, the path stream, and the JSON body buckets, which share one budget between them however many buckets a body occupies. So one session retains at most `4 * max_buffer_bytes`, and at the default caps the worst-case payload memory per transport ledger is `4 * 65536 * 10000` = 2,621,440,000 bytes (2.44 GiB, or 2.62 GB decimal). An MCP session has two classes, the raw frame and the argument streams.
+
+Partitioning a JSON body into buckets therefore does not widen this envelope: the buckets share one class budget rather than each taking `max_buffer_bytes`. Reduce either limit in memory-constrained environments. Reducing `max_sessions` refuses evidence for sessions not already in the ledger while retaining what is held, and because the ledger admits sessions rather than streams, a session that is already present is never refused for opening another stream.
 
 **Scope note:** Cross-request detection scans all outbound content visible to the proxy: URLs, request bodies, MCP JSON-RPC payloads, and WebSocket frames. CONNECT tunnels without TLS interception only expose the target hostname (entropy tracking only). Enable `tls_interception` for full cross-request coverage on tunneled traffic.
 
@@ -2293,6 +2296,25 @@ Resolution priority: listener binding > source CIDR > header > query param > `_d
 
 CIDRs must not overlap between different agents (containment and exact matches are both rejected). Overlapping CIDRs within the same agent are allowed.
 
+### Per-Agent Sandbox Override
+
+An agent profile may carry a `sandbox` block that overrides the top-level sandbox settings for that agent. Boolean fields left unset inherit the top-level value; filesystem paths are appended to the top-level policy.
+
+The expiry below is a template, not a ready-to-run value. Replace it before use with a future RFC3339 timestamp no more than 30 days away.
+
+```yaml pipelock-fragment
+# pipelock-fragment-id: agent-sandbox-best-effort
+agents:
+  ci-runner:
+    listeners: [":8891"]
+    sandbox:
+      best_effort: true
+      best_effort_reason: "runner image blocks user namespaces"
+      best_effort_expiry: "<replace with an RFC3339 timestamp within 30 days>"
+```
+
+A profile that sets `best_effort: true` must carry its own `best_effort_reason` and `best_effort_expiry`; it never inherits them from the top-level block, so one override cannot ride on an authorization written for a different scope. The same rules apply as at the top level: the expiry is an RFC3339 timestamp (durations are command-line only), it must be in the future, and it may lie at most 30 days after validation time. A profile that sets `best_effort: false` drops the top-level authorization for that agent. Supplying a reason or expiry without `best_effort: true` in the same profile is refused, so a profile cannot read as authorized while the override is off. Changing any of these fields on reload produces the same restart warning as the top-level sandbox block.
+
 ### The `_default` Profile
 
 If defined, `_default` applies to any request that does not match a named agent. Without `_default`, unmatched requests use the base config directly.
@@ -2613,7 +2635,7 @@ sandbox:
 | `enabled` | `false` | Enable sandbox containment |
 | `best_effort` | `false` | Temporary advisory override when a network namespace cannot be created. Requires `best_effort_reason` and `best_effort_expiry`. Direct egress may bypass Pipelock. |
 | `best_effort_reason` | `""` | Operator reason for the advisory network override. Required with `best_effort: true`. |
-| `best_effort_expiry` | `""` | Admission-time RFC3339 expiry for the advisory override. Command-line flags also accept a Go duration such as `30m`, but configuration requires RFC3339 so copied, touched, or rewritten files cannot renew an authorization through filesystem metadata. An expired override refuses that launch; it does not stop a child already running, and every later launch requires re-authorization. Required with `best_effort: true`. |
+| `best_effort_expiry` | `""` | Admission-time RFC3339 expiry for the advisory override. Command-line flags also accept a Go duration such as `30m`, but configuration requires RFC3339 so copied, touched, or rewritten files cannot renew an authorization through filesystem metadata. The timestamp may lie at most 30 days after the time the configuration is validated (startup or reload); a later timestamp is refused, so one edit cannot authorize the override for a year. An expired override refuses that launch; it does not stop a child already running, and every later launch requires re-authorization. Required with `best_effort: true`. |
 | `strict` | `false` | Error if any containment layer is unavailable. Mutually exclusive with `best_effort`. |
 | `workspace` | CWD | Agent working directory (resolved to absolute at startup) |
 | `filesystem.allow_read` | `[]` | Additional read-only filesystem paths |
