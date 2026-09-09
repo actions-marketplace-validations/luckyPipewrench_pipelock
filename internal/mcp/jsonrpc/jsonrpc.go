@@ -85,18 +85,36 @@ const (
 	ScanScopeResponseInjection = "response_injection"
 	// ScanScopeResponseDLP names the MCP response inbound text-DLP scanner.
 	ScanScopeResponseDLP = "response_dlp"
+	// ScanScopeToolScanning names the MCP tool-definition poisoning/drift
+	// scanner (internal/mcp/tools). It only applies to tools/list responses.
+	ScanScopeToolScanning = "tool_scanning"
 )
 
+// ToolFinding summarizes one tool-definition-scan finding for a single tool in
+// a tools/list response. It mirrors the subset of tools.ToolScanMatch a
+// diagnostic verdict needs; internal/mcp/jsonrpc cannot import
+// internal/mcp/tools directly (tools already imports jsonrpc).
+type ToolFinding struct {
+	ToolName   string                  `json:"tool_name"`
+	Matches    []scanner.ResponseMatch `json:"matches,omitempty"`
+	ToolPoison []string                `json:"tool_poison,omitempty"`
+}
+
 // ScanVerdict describes the outcome of scanning a single MCP response for MCP
-// response content. Clean means neither prompt-injection nor enforceable
-// inbound DLP was found in the scanned response text; it does not mean tool
-// policy or input scanning ran.
+// response content. Clean means every field family this verdict is
+// responsible for was inspected and none contained enforceable inbound DLP,
+// prompt injection, or tool-definition poisoning; it does not mean tool
+// policy or input scanning ran, since those require request-side context this
+// verdict never carries.
 //
-// Three states:
-//   - Clean:     Clean=true, Scanned names the response scopes.
-//   - Error:     Clean=false, Error set (parse/protocol failure). Not injection.
-//   - Finding:   Clean=false, Error empty, Matches and/or DLPMatches and
-//     Action set.
+// Four states:
+//   - Clean:     Clean=true, Scanned names the scopes that ran, Unscanned empty.
+//   - Error:     Clean=false, Error set (parse/protocol failure). Not a finding.
+//   - Unscanned: Clean=false, Unscanned names a field family deliberately not
+//     inspected (e.g. tool scanning disabled by config). Never true alongside
+//     Clean=true: an uninspected family can never be certified clean.
+//   - Finding:   Clean=false, Error empty, Matches and/or DLPMatches and/or
+//     ToolFindings and Action set.
 type ScanVerdict struct {
 	Line  int             `json:"line"`
 	ID    json.RawMessage `json:"id"`
@@ -111,7 +129,15 @@ type ScanVerdict struct {
 	// to the long-standing injection Matches field so existing JSON consumers
 	// retain their response-injection contract.
 	DLPMatches []scanner.TextDLPMatch `json:"dlp_matches,omitempty"`
-	Error      string                 `json:"error,omitempty"`
+	// ToolFindings contains tool-definition poisoning/drift findings when tool
+	// scanning ran against a tools/list response. Empty does not by itself
+	// mean tool scanning ran; check Unscanned for ScanScopeToolScanning.
+	ToolFindings []ToolFinding `json:"tool_findings,omitempty"`
+	// Unscanned names field families this verdict deliberately did not
+	// inspect. Non-empty Unscanned forces Clean=false: the verdict cannot
+	// certify content it never looked at.
+	Unscanned []string `json:"unscanned,omitempty"`
+	Error     string   `json:"error,omitempty"`
 }
 
 // ExtractStringsResult is the bounded recursive extraction result. Truncated is
@@ -133,6 +159,14 @@ type ExtractKeysResult struct {
 type TextResult struct {
 	Text      string
 	Truncated bool
+	// Numeric carries every numeric leaf of the result, in deterministic
+	// traversal order, joined by commas. It is a separate channel from Text
+	// on purpose: numbers never enter the prompt-injection or pattern-DLP
+	// cascade (a run of ordinary telemetry joined into one digit string is
+	// exactly the false-positive shape those scanners produce), but a value
+	// delivered entirely as numbers, such as a canary spelled out as decimal
+	// character codes, must still reach known-value matching.
+	Numeric string
 }
 
 // ExtractText extracts all text content from an MCP tool result.
@@ -153,11 +187,27 @@ func ExtractText(raw json.RawMessage) string {
 // ExtractTextResult extracts text content and reports uninspectable depth in
 // the complete JSON value.
 func ExtractTextResult(raw json.RawMessage) TextResult {
+	return extractTextResult(raw, true)
+}
+
+// ExtractTextOnlyResult is ExtractTextResult without the numeric channel. An
+// injection-only scan never consults numeric leaves, and a message may be
+// megabytes, so walking the document a second time to build a channel nobody
+// reads is pure cost.
+func ExtractTextOnlyResult(raw json.RawMessage) TextResult {
+	return extractTextResult(raw, false)
+}
+
+func extractTextResult(raw json.RawMessage, includeNumeric bool) TextResult {
 	if len(raw) == 0 || string(raw) == Null {
 		return TextResult{}
 	}
 	if jsonDepthTruncated(raw) {
 		return TextResult{Truncated: true}
+	}
+	var numeric string
+	if includeNumeric {
+		numeric = ExtractNumericLeaves(raw)
 	}
 
 	// Try standard ToolResult structure first.
@@ -207,17 +257,57 @@ func ExtractTextResult(raw json.RawMessage) TextResult {
 		// Always return after a successful ToolResult parse, even when
 		// texts is empty. Falling through to ExtractStringsFromJSON would
 		// feed base64 media in data/blob/raw fields into prompt scanning.
-		return TextResult{Text: strings.Join(texts, " ")}
+		return TextResult{Text: strings.Join(texts, " "), Numeric: numeric}
 	}
 
 	// Fallback: recursively extract all string values from arbitrary JSON.
 	// Catches non-standard result shapes (plain string, nested objects, etc).
 	extracted := ExtractStringsFromJSONResult(raw)
 	if len(extracted.Strings) > 0 {
-		return TextResult{Text: strings.Join(extracted.Strings, "\n"), Truncated: extracted.Truncated}
+		return TextResult{Text: strings.Join(extracted.Strings, "\n"), Truncated: extracted.Truncated, Numeric: numeric}
 	}
 
-	return TextResult{Truncated: extracted.Truncated}
+	return TextResult{Truncated: extracted.Truncated, Numeric: numeric}
+}
+
+// ExtractNumericLeaves returns every numeric leaf in raw, in the same
+// deterministic order the string extractors use (sorted object keys, array
+// order), joined by commas. Numbers keep their source spelling: a decoder
+// with UseNumber preserves large integers that float64 would round, and a
+// rounded digit string could never match the value it came from. Depth past
+// maxExtractDepth is skipped here because the caller has already failed
+// closed on truncation before asking for this channel.
+func ExtractNumericLeaves(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == Null {
+		return ""
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var parsed interface{}
+	if err := dec.Decode(&parsed); err != nil {
+		return ""
+	}
+	var leaves []string
+	var walk func(v interface{}, depth int)
+	walk = func(v interface{}, depth int) {
+		if depth > maxExtractDepth {
+			return
+		}
+		switch val := v.(type) {
+		case json.Number:
+			leaves = append(leaves, val.String())
+		case []interface{}:
+			for _, item := range val {
+				walk(item, depth+1)
+			}
+		case map[string]interface{}:
+			for _, key := range SortedKeys(val) {
+				walk(val[key], depth+1)
+			}
+		}
+	}
+	walk(parsed, 0)
+	return strings.Join(leaves, ",")
 }
 
 // ExtractVisibleStringsFromJSONResult extracts agent-visible JSON string
