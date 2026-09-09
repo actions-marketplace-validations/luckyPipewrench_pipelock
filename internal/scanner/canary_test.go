@@ -413,3 +413,161 @@ func BenchmarkScanCanaryText_NestedEncoded(b *testing.B) {
 		s.scanCanaryText(text)
 	}
 }
+
+// TestCanary_DecimalCharacterCodesAreDetected covers the last known-value
+// spelling the canary matcher lacked: the token written as decimal character
+// codes. Configured secrets already matched this way; the canary did not.
+func TestCanary_DecimalCharacterCodesAreDetected(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "comma", text: "payload: " + decimalCharacterCodes(canary, ",")},
+		{name: "space", text: "payload: " + decimalCharacterCodes(canary, " ")},
+		{name: "inside json array", text: `{"bytes":[` + decimalCharacterCodes(canary, ",") + `]}`},
+		// The spellings the wire actually carries. Encoding the token into one
+		// exact form and searching for it missed every one of these.
+		{name: "comma and space separators", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ", ")},
+		{name: "lower-cased token", text: "payload: " + decimalCharacterCodes(strings.ToLower(canary), ",")},
+		{name: "integral float codes", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ".0,") + ".0"},
+		{name: "exponent codes", text: "payload: " + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", "e0,") + "e0"},
+		{name: "newline separated", text: "payload:\n" + strings.ReplaceAll(decimalCharacterCodes(canary, ","), ",", ",\n")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean {
+				t.Fatal("canary spelled as decimal character codes must be detected")
+			}
+			match := result.Matches[0]
+			if match.PatternName != "Canary Token ("+testCanaryName+")" || match.Encoded != encodingDecimal {
+				t.Fatalf("match = (%q, %q), want canary with decimal encoding; matches=%+v", match.PatternName, match.Encoded, result.Matches)
+			}
+			if !match.Span().Valid() {
+				t.Fatalf("match must carry a valid span, got %+v", match.Span())
+			}
+		})
+	}
+
+	// Ordinary numeric data that happens to share a prefix of the code
+	// sequence must stay clean: only the whole value matches.
+	partial := decimalCharacterCodes(canary[:8], ",")
+	if result := s.ScanTextForDLP(context.Background(), "samples: "+partial+",255,0,0"); !result.Clean {
+		t.Fatalf("a partial code sequence must not match, got %+v", result.Matches)
+	}
+}
+
+// A decimal-code spelling wrapped in another encoding must still be found:
+// the known-value search runs on every decoded view, as token matching does.
+func TestCanary_DecimalCharacterCodesInsideEncodings(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	codes := decimalCharacterCodes(testCanaryValue(), ",")
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "url encoded commas", text: "payload=" + strings.ReplaceAll(codes, ",", "%2C")},
+		{name: "base64 wrapped", text: "blob: " + base64.StdEncoding.EncodeToString([]byte(codes))},
+		{name: "html entity commas", text: "payload: " + strings.ReplaceAll(codes, ",", "&#44;")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			if result.Clean {
+				t.Fatal("encoded decimal-code canary must be detected")
+			}
+			// The span's view label carries the transform chain that had to be
+			// peeled to reach the value, which is where this repository records
+			// provenance; the encoding field names the innermost spelling.
+			span := result.Matches[0].Span()
+			if !strings.Contains(span.ViewLabel, "decimal_decoded") {
+				t.Fatalf("view label = %q, want the decimal decode in the chain; matches=%+v", span.ViewLabel, result.Matches)
+			}
+			if result.Matches[0].Encoded != encodingDecimal {
+				t.Fatalf("match encoding = %q, want %q; matches=%+v", result.Matches[0].Encoded, encodingDecimal, result.Matches)
+			}
+		})
+	}
+}
+
+// A digit fused onto the front or back of a code run changes the character that
+// run spells, so the run no longer carries the canary as a WHOLE value.
+//
+// It may still carry most of it, and that is deliberate: 19 of these 20
+// characters in order is a partial disclosure of a planted token, which the
+// shipped partial-window matching exists to catch. An earlier version of this
+// test demanded no match at all and was wrong about which direction is safe.
+// What must never happen is a whole-value match on a run that does not spell
+// the value, or any canary match on ordinary numeric data.
+func TestCanary_DecimalCodesInsideLargerNumbers(t *testing.T) {
+	s := testCanaryScanner()
+	defer s.Close()
+
+	canary := testCanaryValue()
+	codes := decimalCharacterCodes(canary, ",")
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "leading digit", text: "value: 1" + codes},
+		{name: "trailing digit", text: "value: " + codes + "9"},
+		{name: "leading decimal point", text: "value: 1." + codes},
+		{name: "trailing decimal point", text: "value: " + codes + ".5"},
+		{name: "exponent marker", text: "value: 1e" + codes},
+		{name: "negative sign", text: "value: -" + codes},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") && m.PartialLen == 0 {
+					t.Fatalf("a run that does not spell the value must not match it whole, got %+v", m)
+				}
+			}
+		})
+	}
+
+	// Ordinary numeric data must produce nothing at all.
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "telemetry", text: "samples: 1,2,3,4,5,6,7,8,9,10,255,255,255,0,0,128"},
+		{name: "pixel data", text: "[12,45,200,255,12,45,200,255,12,45,200,255]"},
+	} {
+		t.Run("no_match_"+tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") {
+					t.Fatalf("ordinary numeric data must not match a canary, got %+v", m)
+				}
+			}
+		})
+	}
+
+	// Control: the whole value at real boundaries still matches as a whole.
+	for _, tt := range []struct {
+		name string
+		text string
+	}{
+		{name: "json array", text: `{"bytes":[` + codes + `]}`},
+		{name: "surrounded by spaces", text: "value: " + codes + " end"},
+		{name: "quoted", text: `"` + codes + `"`},
+	} {
+		t.Run("control_"+tt.name, func(t *testing.T) {
+			result := s.ScanTextForDLP(context.Background(), tt.text)
+			whole := false
+			for _, m := range result.Matches {
+				if strings.HasPrefix(m.PatternName, "Canary Token (") && m.PartialLen == 0 {
+					whole = true
+				}
+			}
+			if !whole {
+				t.Fatalf("the whole value at a real boundary must match whole, got %+v", result.Matches)
+			}
+		})
+	}
+}

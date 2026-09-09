@@ -85,12 +85,17 @@ func (s *Scanner) scanCanaryText(text string) []TextDLPMatch {
 
 	var matches []TextDLPMatch
 	matches = append(matches, s.matchCanaryTokens(cleaned, "", false, ViewDLPNormalized)...)
+	matches = append(matches, s.matchCanaryDecimalView(cleaned, ViewDLPNormalized)...)
 
 	if decoded := IterativeDecode(cleaned); decoded != cleaned {
-		matches = append(matches, s.matchCanaryTokens(decoded, "url", false, spanViewLabel("url_decoded", ViewDLPNormalized))...)
+		label := spanViewLabel("url_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(decoded, "url", false, label)...)
+		matches = append(matches, s.matchCanaryDecimalView(decoded, label)...)
 	}
 	if decoded := decodeHTMLEntities(cleaned); decoded != cleaned {
-		matches = append(matches, s.matchCanaryTokens(decoded, encodingHTML, false, spanViewLabel("html_decoded", ViewDLPNormalized))...)
+		label := spanViewLabel("html_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(decoded, encodingHTML, false, label)...)
+		matches = append(matches, s.matchCanaryDecimalView(decoded, label)...)
 	}
 	if strings.Contains(cleaned, ".") {
 		dotless := removeHostnameDots(cleaned)
@@ -110,7 +115,12 @@ func (s *Scanner) scanCanaryText(text string) []TextDLPMatch {
 	// and the candidates are already generated for DLP, so this adds substring
 	// checks rather than decode work.
 	for _, d := range decodeEncodingsRecursiveWithURL(cleaned) {
-		matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, spanViewLabel(d.encoding+"_decoded", ViewDLPNormalized))...)
+		label := spanViewLabel(d.encoding+"_decoded", ViewDLPNormalized)
+		matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, label)...)
+		// A decimal-code spelling can itself arrive wrapped in another
+		// encoding; the known-value search runs on every decoded view, not
+		// only the first, for the same reason ordinary token matching does.
+		matches = append(matches, s.matchCanaryDecimalView(d.text, label)...)
 	}
 
 	for _, view := range textDLPEncodingSegmentViews(cleaned) {
@@ -123,7 +133,9 @@ func (s *Scanner) scanCanaryText(text string) []TextDLPMatch {
 			// segment loops are separate call sites, so leaving this one
 			// single-pass would keep a query-value bypass open.
 			for _, d := range decodeEncodingsRecursiveWithURL(seg) {
-				matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, spanViewLabel(d.encoding+"_decoded", view.viewLabel))...)
+				label := spanViewLabel(d.encoding+"_decoded", view.viewLabel)
+				matches = append(matches, s.matchCanaryTokens(d.text, d.encoding, false, label)...)
+				matches = append(matches, s.matchCanaryDecimalView(d.text, label)...)
 			}
 			if collapsed := canonicalizeCanaryText(seg); collapsed != "" && collapsed != seg {
 				matches = append(matches, s.matchCanaryTokens(seg, "split", true, view.viewLabel)...)
@@ -204,4 +216,29 @@ func canonicalizeCanaryText(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// matchCanaryDecimalView runs the ORDINARY canary matcher over the text a
+// decimal character-code run spells. The earlier shape encoded each token into
+// one exact spelling and searched for that, which missed every variation the
+// wire actually carries: "65, 75" with comma-and-space separators, a
+// lower-cased token, and the integral float and exponent forms JSON permits.
+// Decoding once and reusing the existing matcher gets separator, case and
+// number-form handling from code that already had it, and leaves one place to
+// fix instead of four.
+//
+// This does NOT reopen the false-positive risk that made encode-and-search the
+// rule for pattern DLP. The decoded text is compared only against KNOWN values,
+// so it matches only when a numeric run literally spells a token the operator
+// planted; it never reaches the pattern set. The decoder's own run floor also
+// means ordinary short numeric telemetry decodes to nothing at all.
+func (s *Scanner) matchCanaryDecimalView(text, inputViewLabel string) []TextDLPMatch {
+	if len(s.canaryTokens) == 0 || text == "" {
+		return nil
+	}
+	decoded := decodeDecimalCharacterCodes(text)
+	if decoded == "" {
+		return nil
+	}
+	return s.matchCanaryTokens(decoded, encodingDecimal, false, spanViewLabel("decimal_decoded", inputViewLabel))
 }
