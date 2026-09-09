@@ -5,7 +5,6 @@ package mcp
 
 import (
 	"bytes"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -112,6 +113,38 @@ func TestCEEDepsReconfigure_RetiresAndRecreatesComponents(t *testing.T) {
 	}
 	if got := oldBuffer.TotalBufferBytes(); got != 0 {
 		t.Fatalf("retired fragment buffer retained %d bytes", got)
+	}
+}
+
+func TestCEEDepsFragmentMaxSessionsAppliesAtConstructionAndReload(t *testing.T) {
+	oneSession := 1
+	cfg := config.CrossRequestDetection{
+		Enabled: true,
+		FragmentReassembly: config.CrossRequestFragments{
+			Enabled: true, MaxBufferBytes: 128, MaxSessions: &oneSession, WindowMinutes: 5,
+		},
+	}
+	cee := NewCEEDeps(cfg, metrics.New())
+	_, buffer := cee.Components()
+	if buffer == nil {
+		t.Fatal("NewCEEDeps did not construct fragment buffer")
+	}
+	if result := buffer.Append("first", []byte("one")); result.CapacityExceeded {
+		t.Fatalf("first stream result = %+v, want admission", result)
+	}
+	if result := buffer.Append("second", []byte("two")); !result.CapacityExceeded {
+		t.Fatalf("second stream result = %+v, want configured capacity denial", result)
+	}
+
+	twoSessions := 2
+	cfg.FragmentReassembly.MaxSessions = &twoSessions
+	cee.Reconfigure(cfg, metrics.New())
+	_, reloaded := cee.Components()
+	if reloaded != buffer {
+		t.Fatal("reload replaced fragment buffer instead of applying configured capacity")
+	}
+	if result := reloaded.Append("second", []byte("two")); result.CapacityExceeded {
+		t.Fatalf("reloaded second stream result = %+v, want admission", result)
 	}
 }
 
@@ -485,41 +518,6 @@ func TestMCPCEEFragmentSessionKey(t *testing.T) {
 	}
 }
 
-func TestAppendMCPCEEArgumentText_RejectsMalformedNestedValues(t *testing.T) {
-	tests := []struct {
-		name   string
-		input  string
-		useNum bool
-	}{
-		{
-			name:   "malformed object key",
-			input:  `{"`,
-			useNum: true,
-		},
-		{
-			name:   "malformed array item",
-			input:  `["ok",`,
-			useNum: true,
-		},
-		{
-			name:   "number without UseNumber is an unexpected token type",
-			input:  `1`,
-			useNum: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			decoder := json.NewDecoder(strings.NewReader(tt.input))
-			if tt.useNum {
-				decoder.UseNumber()
-			}
-			if appendMCPCEEArgumentText(decoder, make(map[string][]byte), "@tool/integrity_checker", []byte("$"), 0) {
-				t.Fatal("appendMCPCEEArgumentText() = true, want false")
-			}
-		})
-	}
-}
-
 func TestMCPCEEFragmentPayloads_FallsBackToRawAtDepthLimit(t *testing.T) {
 	depth := mcpCEEArgumentMaxDepth + 1
 	frame := MCPFrame{
@@ -698,6 +696,67 @@ func TestCeeRecordMCP_DoesNotJoinSamePathValuesAcrossTools(t *testing.T) {
 	}
 	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf}); reason != "" {
 		t.Fatalf("different tool names unexpectedly joined: %s", reason)
+	}
+}
+
+// The ownership guard's failure direction on the MCP transport. A stream that
+// already holds another identity's evidence cannot accept this frame, and the
+// frame must be reported as uninspected rather than scanned against a blend of
+// two sessions' data. Production keys embed the session key, so the conflict is
+// seeded here by claiming the exact key this frame will use.
+func TestCeeRecordMCP_OwnerMismatchFailsClosed(t *testing.T) {
+	buffer := scanner.NewFragmentBuffer(1024, 10, testMCPWindowSecs)
+	t.Cleanup(buffer.Close)
+	cee := &CEEDeps{
+		Buffer: buffer,
+		Config: &config.CrossRequestDetection{
+			Action: config.ActionBlock,
+			FragmentReassembly: config.CrossRequestFragments{
+				Enabled:        true,
+				MaxBufferBytes: 1024,
+				WindowMinutes:  testMCPWindowSecs / 60,
+			},
+		},
+	}
+	sc := testMCPScanner()
+	t.Cleanup(sc.Close)
+	var logBuf bytes.Buffer
+
+	// A real metrics instance, because the counter IS the operator's only signal
+	// that a fragment was refused for ownership. With a nil Metrics the block
+	// still happens and nothing records it, so the test would pass while the
+	// signal was missing.
+	m := metrics.New()
+	cee.Metrics = m
+
+	frame := ParseMCPFrame([]byte(`{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///tmp/x"}}`))
+	record := func() string {
+		return ceeRecordMCP(ceeRecordMCPOptions{
+			sessionKey: testMCPSessionKey, entropyPayload: frame.Raw, frame: frame,
+			cee: cee, sc: sc, logW: &logBuf,
+		})
+	}
+
+	// Control: the same frame is admitted while the stream is unclaimed, so the
+	// block below is attributable to ownership rather than to the setup.
+	if reason := record(); reason != "" {
+		t.Fatalf("unclaimed stream = %q, want admission", reason)
+	}
+
+	buffer.Close()
+	fragmentKey := mcpCEEFragmentSessionKey(testMCPSessionKey, "")
+	if seeded := buffer.AppendOwned("another-session", fragmentKey, []byte("foreign")); seeded.OwnerMismatch {
+		t.Fatalf("seeding a foreign-owned stream = %+v, want admission", seeded)
+	}
+	reason := record()
+	if !strings.Contains(reason, "belongs to another identity") {
+		t.Fatalf("reason = %q, want a fail-closed ownership block", reason)
+	}
+	if strings.Contains(reason, "max_sessions") {
+		t.Fatalf("reason = %q, must not name a control that cannot fix this", reason)
+	}
+	if got := testutil.ToFloat64(m.CrossRequestFragmentOwnerMismatch); got != 1 {
+		t.Fatalf("owner mismatch counter = %v, want 1; the block is invisible to an operator without it", got)
 	}
 }
 

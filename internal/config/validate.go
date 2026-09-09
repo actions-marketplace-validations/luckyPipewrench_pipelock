@@ -2689,6 +2689,15 @@ func (c *Config) validateCrossRequestDetection(warnings *[]Warning) error {
 			if c.CrossRequestDetection.FragmentReassembly.WindowMinutes <= 0 {
 				return fmt.Errorf("cross_request_detection.fragment_reassembly.window_minutes must be > 0")
 			}
+			// The session ledger is the control the capacity block names, so a
+			// value that cannot hold a working set turns cross-request detection
+			// into blanket denial. An omitted value takes the default; an
+			// EXPLICIT non-positive one is an operator mistake and is refused
+			// rather than quietly replaced, which is what the sibling fields
+			// above do by coercion and what made this rule unreachable before.
+			if ms := c.CrossRequestDetection.FragmentReassembly.MaxSessions; ms != nil && *ms <= 0 {
+				return fmt.Errorf("cross_request_detection.fragment_reassembly.max_sessions must be > 0")
+			}
 		}
 	}
 

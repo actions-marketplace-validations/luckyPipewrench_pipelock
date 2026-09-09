@@ -156,11 +156,6 @@ const (
 	schemeHTTP  = "http"
 	schemeHTTPS = "https"
 
-	// maxCEESessions bounds memory used by fragment tracking across all sessions.
-	// 10,000 sessions at 64KB each = ~640MB worst case. In practice, most
-	// deployments have <100 concurrent sessions.
-	maxCEESessions = 10000
-
 	browserShieldLayer             = "browser_shield"
 	browserShieldPattern           = "browser_shield_rewrite"
 	browserShieldSeverity          = config.SeverityInfo
@@ -2206,11 +2201,11 @@ func (p *Proxy) prepareCEE(ceeCfg *config.CrossRequestDetection) {
 
 	if ceeCfg.Enabled && ceeCfg.FragmentReassembly.Enabled {
 		if fb := p.fragmentBufferPtr.Load(); fb != nil {
-			fb.UpdateConfig(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.WindowMinutes*60)
+			fb.UpdateConfig(ceeCfg.FragmentReassembly.MaxBufferBytes, ceeCfg.FragmentReassembly.ResolvedMaxSessions(), ceeCfg.FragmentReassembly.WindowMinutes*60)
 		} else {
 			p.fragmentBufferPtr.Store(scanner.NewFragmentBuffer(
 				ceeCfg.FragmentReassembly.MaxBufferBytes,
-				maxCEESessions,
+				ceeCfg.FragmentReassembly.ResolvedMaxSessions(),
 				ceeCfg.FragmentReassembly.WindowMinutes*60,
 			))
 		}
@@ -2253,15 +2248,17 @@ type ceeEntropySnapshot struct {
 }
 
 type ceeAdmitRequest struct {
-	SessionKey       string
-	Outbound         []byte
-	KeyPayload       []byte
-	PathPayload      *ceePathPayload
-	TargetURL        string
-	Agent            string
-	ClientIP         string
-	RequestID        string
-	IncludeFragments bool
+	SessionKey           string
+	Outbound             []byte
+	BodyFragmentPayloads map[string][]byte
+	PartitionReason      string
+	KeyPayload           []byte
+	PathPayload          *ceePathPayload
+	TargetURL            string
+	Agent                string
+	ClientIP             string
+	RequestID            string
+	IncludeFragments     bool
 }
 
 // admitCurrentCEE keeps the CEE policy snapshot and its mutable tracking
@@ -2290,7 +2287,7 @@ func (p *Proxy) admitCurrentCEE(ctx context.Context, req ceeAdmitRequest) ceeAdm
 	}
 	return ceeAdmission{
 		Result: ceeAdmit(ctx, ceeAdmitOptions{
-			SessionKey: req.SessionKey, Outbound: req.Outbound, KeyPayload: req.KeyPayload,
+			SessionKey: req.SessionKey, Outbound: req.Outbound, BodyFragmentPayloads: req.BodyFragmentPayloads, PartitionReason: req.PartitionReason, KeyPayload: req.KeyPayload,
 			PathPayload: req.PathPayload, TargetURL: req.TargetURL, Agent: req.Agent,
 			ClientIP: req.ClientIP, RequestID: req.RequestID, Config: ceeCfg,
 			Entropy: p.entropyTrackerPtr.Load(), Fragments: fb, Scanner: p.scannerPtr.Load(),
@@ -2405,7 +2402,7 @@ func (p *Proxy) buildCEE(ceeCfg *config.CrossRequestDetection) (*scanner.Entropy
 		if ceeCfg.FragmentReassembly.Enabled {
 			fb = scanner.NewFragmentBuffer(
 				ceeCfg.FragmentReassembly.MaxBufferBytes,
-				maxCEESessions,
+				ceeCfg.FragmentReassembly.ResolvedMaxSessions(),
 				ceeCfg.FragmentReassembly.WindowMinutes*60, // minutes to seconds
 			)
 		}

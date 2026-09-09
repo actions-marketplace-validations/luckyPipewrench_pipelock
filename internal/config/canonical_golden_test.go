@@ -360,7 +360,20 @@ const (
 	// Re-bumped for Credential in URL grammar: line-start assignments require
 	// adjacency around '=', while delimiter-led query parameters retain
 	// whitespace tolerance. This detection-relevant default changes policy.
-	goldenHashDefaults = "43c689f65d90d4cd7e6a90a298df97a6b4d01150066006d37e7e618d1f968063"
+	// Re-bumped for cross_request_detection.fragment_reassembly.max_sessions:
+	// this fail-closed evidence-capacity field changes whether cross-request
+	// detection can retain and inspect a new fragment stream, so mixed versions
+	// must not report the same policy identity.
+	// Re-bumped again when that field became a pointer so validation can tell an
+	// omitted value from an explicit one. This bump is a REPRESENTATION change
+	// rather than a semantics change, and it moves only the DISABLED default:
+	// while cross-request detection is off the field cannot affect a decision,
+	// so the canonical view now drops it instead of asserting a bound nothing
+	// consults. Where the feature IS enabled the view resolves the pointer to
+	// its effective value, so a config that omits the field and a config that
+	// sets it to the default keep one identity, and the three enabled goldens
+	// below did not move.
+	goldenHashDefaults = "77017505d2e86bb57cd2acf64087b87c7bbb087bf957b1457f0a67bb86e694f5"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -546,7 +559,10 @@ const (
 	// goldenHashDefaults above.
 	// Re-bumped for the Credential in URL grammar change above; the rich
 	// fixture inherits the built-in DLP patterns.
-	goldenHashRichConfig = "649c59d3cf9cb07e446c22dc88769316c6ea3ba3600659a669bb5ade43b7e7af"
+	// Re-bumped for fragment_reassembly.max_sessions: see goldenHashDefaults.
+	// The rich fixture sets cross-request detection, so a changed evidence
+	// capacity must produce a distinct policy identity here as well.
+	goldenHashRichConfig = "ee43de75debebd876bb0e5d8524524aa0bd6e100ae0547724f0814c3638a5f6b"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
