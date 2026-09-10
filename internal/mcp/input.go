@@ -175,6 +175,13 @@ type InputVerdict struct {
 	URLFindings     []scanner.Result         `json:"url_findings,omitempty"`
 	AddressFindings []addressprotect.Finding `json:"address_findings,omitempty"`
 	Error           string                   `json:"error,omitempty"`
+	// RedactedDLPOnly is true when the pre-redaction scan matched DLP
+	// patterns that argument redaction then scrubbed, and the post-redaction
+	// rescan was clean. The request forwards scrubbed, but the pre-redaction
+	// findings are retained here as the configured (warn) action so the match
+	// is still recorded rather than silently dropped. Mirrors the request-body
+	// floor's BodyScanResult.RedactedDLPOnly in internal/proxy/bodyscan.go.
+	RedactedDLPOnly bool `json:"redacted_dlp_only,omitempty"`
 }
 
 // BlockedRequest holds the ID and notification status of a blocked MCP request,
@@ -400,9 +407,10 @@ func ForwardScannedInput(
 			warnCtx.PolicyHash = policyHash
 		}
 		stdioInputCtx := scanner.WithDLPWarnContext(opts.warnContext(), warnCtx)
+		var preRedactionDLP []scanner.TextDLPMatch
 		if redactionCfg.Matcher != nil {
 			originalVerdict := scanRequestForAgent(stdioInputCtx, line, sc, action, onParseError, opts.addressProtectionAgent())
-			if !originalVerdict.Clean && originalVerdict.Error == "" && inputVerdictEffectiveAction(originalVerdict, action) == config.ActionBlock {
+			if !originalVerdict.Clean && originalVerdict.Error == "" && preRedactionBlock(originalVerdict, action) {
 				_, _ = fmt.Fprintf(logW, "pipelock: input line %d: blocked (%s)\n", lineNum, joinInputVerdictReasons(originalVerdict))
 				recordAdaptiveSignal(session.SignalBlock)
 				if pendingActionID != "" && receiptEmitter != nil {
@@ -432,6 +440,12 @@ func ForwardScannedInput(
 					ErrorData:      mcpBlockReasonData(mcpScannerBlockReason(originalVerdict, policy.Verdict{}, false)),
 				}
 				continue
+			}
+			// Not blocked before redaction: remember the pre-redaction DLP
+			// findings so evidence survives if redaction scrubs them and the
+			// post-redaction rescan is clean (see restoreRedactedDLPEvidence).
+			if originalVerdict.Error == "" {
+				preRedactionDLP = originalVerdict.Matches
 			}
 		}
 		rewrittenLine, redactionReport, redactErr := applyMCPToolCallRedactionWithConfig(line, redactionCfg)
@@ -483,7 +497,8 @@ func ForwardScannedInput(
 		// preserving per-gate block semantics and stdio's gate ordering
 		// (policy before DoW, two-phase binding around DoW, frozen tool
 		// between DoW and chain, taint last).
-		eval := EvaluateMCPInputGatesStdio(stdioInputCtx, frame, line, trimmedLine, bindingCfg, opts, action, onParseError)
+		scanEnabled := !opts.stdioInputScanDisabled
+		eval := evaluateMCPInputGatesStdio(stdioInputCtx, frame, line, trimmedLine, bindingCfg, opts, action, onParseError, scanEnabled)
 		// Cross-agent contamination escalation. Fired regardless of the gate
 		// outcome: the contaminated session already emitted across the agent
 		// boundary, so the adaptive signal must accumulate even when the call
@@ -492,6 +507,15 @@ func ForwardScannedInput(
 			recordAdaptiveSignal(session.SignalCrossAgentContamination)
 		}
 		verdict := eval.ContentVerdict
+		// Redaction evidence floor: if redaction scrubbed a pre-redaction DLP
+		// finding and the post-redaction rescan is clean, restore the finding
+		// as a warn so the request forwards scrubbed but the match is still
+		// recorded. Feeding it back into eval keeps the receipt attribution and
+		// the downstream reasons consistent with the restored verdict.
+		verdict = restoreRedactedDLPEvidence(verdict, preRedactionDLP, redactionReport, action)
+		if verdict.RedactedDLPOnly {
+			eval.ContentVerdict = verdict
+		}
 		policyVerdict := eval.PolicyVerdict
 		taintDecision := eval.TaintDecision
 		bindingAction := eval.BindingAction
@@ -1692,6 +1716,9 @@ func inputVerdictReasons(verdict InputVerdict) []string {
 	}
 	if verdict.Error != "" {
 		reasons = append(reasons, verdict.Error)
+	}
+	if verdict.RedactedDLPOnly {
+		reasons = append(reasons, redactedDLPMarker)
 	}
 	return reasons
 }

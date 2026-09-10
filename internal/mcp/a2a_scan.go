@@ -138,7 +138,7 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 			if !urlResult.Allowed {
 				result.Clean = false
 				result.URLFindings = append(result.URLFindings, urlResult)
-				if scanner.IsHostnameExfilResult(urlResult) {
+				if a2aURLResultForcesBlock(urlResult) {
 					action = config.StrongestAction(action, config.ActionBlock)
 				} else {
 					action = config.StrongestAction(action, defaultFindingAction)
@@ -166,7 +166,7 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 			if !dlpResult.Clean {
 				result.Clean = false
 				result.DLPFindings = append(result.DLPFindings, dlpResult.Matches...)
-				if scanner.ContainsHostnameExfilMatch(dlpResult.Matches) {
+				if a2aDLPForcesBlock(dlpResult.Matches) {
 					action = config.StrongestAction(action, config.ActionBlock)
 				} else {
 					action = config.StrongestAction(action, defaultFindingAction)
@@ -181,7 +181,7 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 			if !dlpResult.Clean {
 				result.Clean = false
 				result.DLPFindings = append(result.DLPFindings, dlpResult.Matches...)
-				if scanner.ContainsHostnameExfilMatch(dlpResult.Matches) {
+				if a2aDLPForcesBlock(dlpResult.Matches) {
 					action = config.StrongestAction(action, config.ActionBlock)
 				} else {
 					action = config.StrongestAction(action, defaultFindingAction)
@@ -219,9 +219,14 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 		action = config.StrongestAction(action, defaultFindingAction)
 	}
 
-	// Pass 2: raw DLP fallback for split-secret detection.
-	// Only runs when walker completed within budget.
-	if result.Clean && !budgetExceeded {
+	// Pass 2: raw DLP fallback for split-secret detection. It runs whenever the
+	// walker completed within budget, even when an earlier leaf already produced
+	// a finding: a core credential split across JSON values must still reach the
+	// immutable floor, and a prior non-core warn finding must not shadow it.
+	// When the result was already dirty, fold in every new match and deduplicate
+	// it against the per-leaf findings. Raw-pass evidence must not disappear just
+	// because an earlier leaf was already dirty.
+	if !budgetExceeded {
 		extracted := extract.AllStringsFromJSONResult(json.RawMessage(body))
 		if extracted.Truncated {
 			return A2AScanResult{
@@ -236,8 +241,8 @@ func scanA2ABody(ctx context.Context, body []byte, sc *scanner.Scanner, cfg *con
 			dlpResult := sc.ScanTextForDLP(ctx, joined)
 			if !dlpResult.Clean {
 				result.Clean = false
-				result.DLPFindings = append(result.DLPFindings, dlpResult.Matches...)
-				if scanner.ContainsHostnameExfilMatch(dlpResult.Matches) {
+				result.DLPFindings = appendUniqueA2ADLPFindings(result.DLPFindings, dlpResult.Matches)
+				if a2aDLPForcesBlock(dlpResult.Matches) {
 					action = config.StrongestAction(action, config.ActionBlock)
 				} else {
 					action = config.StrongestAction(action, defaultFindingAction)
@@ -273,6 +278,51 @@ func firstA2AContentEntropyOptions(opts []A2AContentEntropyOptions) *A2AContentE
 	return &opts[0]
 }
 
+// a2aDLPForcesBlock reports whether a set of DLP matches must hard-block the
+// A2A body regardless of the configured a2a_scanning.action. It elevates both
+// structural hostname-exfil matches and the immutable core credential floor,
+// so a core credential in an A2A body blocks even when body scanning is
+// disabled and the A2A branch alone carries the floor. Fail direction: a match
+// the core predicate cannot classify falls through to the configured action;
+// a positive core match only ever raises the action to block.
+func a2aDLPForcesBlock(matches []scanner.TextDLPMatch) bool {
+	return scanner.ContainsHostnameExfilMatch(matches) || scanner.ContainsCoreCriticalMatch(matches)
+}
+
+// appendUniqueA2ADLPFindings mirrors the scanner's match identity at the A2A
+// cross-pass boundary. The scanner deduplicates within one scan; A2A also has
+// to deduplicate across its per-leaf and joined-raw scans.
+func appendUniqueA2ADLPFindings(existing, incoming []scanner.TextDLPMatch) []scanner.TextDLPMatch {
+	type matchKey struct {
+		name    string
+		encoded string
+	}
+
+	seen := make(map[matchKey]struct{}, len(existing)+len(incoming))
+	result := make([]scanner.TextDLPMatch, 0, len(existing)+len(incoming))
+	for _, match := range append(existing, incoming...) {
+		key := matchKey{name: match.PatternName, encoded: match.Encoded}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		result = append(result, match)
+	}
+	return result
+}
+
+// a2aURLResultForcesBlock reports whether a blocked URL-leaf scan result must
+// hard-block the A2A body or header regardless of the configured
+// a2a_scanning.action. It is the URL analog of a2aDLPForcesBlock: a structural
+// hostname-exfil URL and the immutable core credential floor both elevate to
+// block, so a core credential carried inside a URL field (query, path) blocks
+// even under warn, matching the text-DLP leaves. Fail direction: a blocked URL
+// the predicate cannot classify as core or hostname-exfil keeps following the
+// configured action; a positive match only ever raises the action to block.
+func a2aURLResultForcesBlock(r scanner.Result) bool {
+	return scanner.IsHostnameExfilResult(r) || scanner.IsCoreCriticalResult(r)
+}
+
 func a2aDefaultAction(cfg *config.A2AScanning) string {
 	if cfg == nil || cfg.Action == "" {
 		return config.ActionWarn
@@ -294,6 +344,7 @@ func ScanA2AHeaders(ctx context.Context, headers http.Header, sc *scanner.Scanne
 	}
 
 	result := A2AScanResult{Clean: true}
+	forceBlock := false
 	for _, uri := range strings.Split(ext, ",") {
 		uri = strings.TrimSpace(uri)
 		if uri == "" {
@@ -303,11 +354,20 @@ func ScanA2AHeaders(ctx context.Context, headers http.Header, sc *scanner.Scanne
 		if !urlResult.Allowed {
 			result.Clean = false
 			result.URLFindings = append(result.URLFindings, urlResult)
+			// Immutable floor: a core credential or structural hostname-exfil
+			// carried in a header URI must hard-block regardless of the
+			// configured a2a_scanning.action, matching the body URL leaves.
+			if a2aURLResultForcesBlock(urlResult) {
+				forceBlock = true
+			}
 		}
 	}
 
 	if !result.Clean {
 		result.Action = cfg.Action
+		if forceBlock {
+			result.Action = config.ActionBlock
+		}
 		result.Reason = "a2a: A2A-Extensions header contains blocked URI"
 	}
 
