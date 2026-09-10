@@ -1803,6 +1803,48 @@ mode: audit
 	}
 }
 
+func TestLoad_EntropyThresholdExplicitNonPositiveRejected(t *testing.T) {
+	tests := []struct {
+		name      string
+		threshold string
+		wantErr   bool
+		want      float64
+	}{
+		{name: "omitted defaults", want: 4.5},
+		{name: "null defaults", threshold: "null", want: 4.5},
+		{name: "positive is preserved", threshold: "7.9", want: 7.9},
+		{name: "zero is rejected", threshold: "0", wantErr: true},
+		{name: "negative is rejected", threshold: "-1", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body := "version: 1\nmode: audit\n"
+			if tt.threshold != "" {
+				body += "fetch_proxy:\n  monitoring:\n    entropy_threshold: " + tt.threshold + "\n"
+			}
+			cfg, err := LoadBytes([]byte(body))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("LoadBytes succeeded, want non-positive threshold rejection")
+				}
+				for _, want := range []string{"fetch_proxy.monitoring.entropy_threshold", "omit it to use the default"} {
+					if !strings.Contains(err.Error(), want) {
+						t.Errorf("LoadBytes error = %q, want substring %q", err, want)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadBytes: %v", err)
+			}
+			if cfg.FetchProxy.Monitoring.EntropyThreshold != tt.want {
+				t.Errorf("EntropyThreshold = %v, want %v", cfg.FetchProxy.Monitoring.EntropyThreshold, tt.want)
+			}
+		})
+	}
+}
+
 func TestValidate_AllModes(t *testing.T) {
 	for _, mode := range []string{ModeStrict, ModeBalanced, ModeAudit} {
 		cfg := Defaults()
@@ -6989,7 +7031,7 @@ func TestValidate_SuppressValid(t *testing.T) {
 	cfg := Defaults()
 	cfg.Suppress = []SuppressEntry{
 		{Rule: "Credential in URL", Path: "app/models/client.rb", Reason: "Instance var, not a secret"},
-		{Rule: "Anthropic API Key", Path: "config/initializers/*.rb"},
+		{Rule: "JWT Token", Path: "config/initializers/*.rb"},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("valid suppress entries should validate: %v", err)
@@ -7074,7 +7116,7 @@ suppress:
   - rule: Credential in URL
     path: src/integrations/provider_client.rb
     reason: "Instance variable storing constructor param"
-  - rule: Anthropic API Key
+  - rule: JWT Token
     path: "config/initializers/*.rb"
     reason: "Initializers reference env var names"
 `
@@ -7091,9 +7133,9 @@ suppress:
 	if !IsSuppressed("Credential in URL", "src/integrations/provider_client.rb", cfg.Suppress) {
 		t.Fatal("expected loaded Credential in URL suppress entry to survive defaults")
 	}
-	reason, ok := SuppressedReason("Anthropic API Key", "config/initializers/provider.rb", cfg.Suppress)
+	reason, ok := SuppressedReason("JWT Token", "config/initializers/provider.rb", cfg.Suppress)
 	if !ok {
-		t.Fatal("expected loaded Anthropic API Key suppress entry to survive defaults")
+		t.Fatal("expected loaded JWT Token suppress entry to survive defaults")
 	}
 	if reason != "Initializers reference env var names" {
 		t.Errorf("expected loaded reason, got %q", reason)

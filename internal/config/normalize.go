@@ -209,6 +209,24 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 	setBoolDefault(conductor, "honor_remote_kill_switch", &cfg.Conductor.HonorRemoteKillSwitch)
 }
 
+// validateExplicitEntropyThreshold rejects a configured non-positive path
+// entropy threshold before ApplyDefaults can replace it with the default. An
+// omitted or null field still defaults to 4.5; only an explicit numeric value
+// is an operator choice that must fail loud rather than silently change.
+func validateExplicitEntropyThreshold(rawYAML []byte, cfg *Config) error {
+	var raw map[string]interface{}
+	if err := yaml.Unmarshal(rawYAML, &raw); err != nil {
+		return fmt.Errorf("parsing config for entropy threshold validation: %w", err)
+	}
+	fetchProxy, _ := raw["fetch_proxy"].(map[string]interface{})
+	monitoring, _ := fetchProxy["monitoring"].(map[string]interface{})
+	value, configured := monitoring["entropy_threshold"]
+	if !configured || value == nil || cfg.FetchProxy.Monitoring.EntropyThreshold > 0 {
+		return nil
+	}
+	return fmt.Errorf("fetch_proxy.monitoring.entropy_threshold must be greater than 0 when configured; omit it to use the default (4.5)")
+}
+
 // ApplyDefaults fills in zero-value fields with sensible defaults.
 func (c *Config) ApplyDefaults() {
 	normalizeLearn(&c.Learn)
@@ -290,7 +308,7 @@ func (c *Config) ApplyDefaults() {
 		Defaults().DLP.Patterns,
 	)
 	markBuiltInCredentialURLWhitespaceGrammar(c.DLP.Patterns)
-	c.Suppress = mergeDefaultSuppressions(c.Suppress, defaultProviderKeySuppressions())
+	markBuiltInCredentialAudienceHosts(c.DLP.Patterns)
 	// Always default OnParseError (fail-closed) regardless of enabled state,
 	// since validation checks it unconditionally.
 	if c.MCPInputScanning.OnParseError == "" {
@@ -891,29 +909,52 @@ func markBuiltInCredentialURLWhitespaceGrammar(patterns []DLPPattern) {
 	}
 }
 
-func mergeDefaultSuppressions(user, defaults []SuppressEntry) []SuppressEntry {
-	if len(defaults) == 0 {
-		return user
+// markBuiltInCredentialAudienceHosts restores the immutable audience property
+// for generated preset YAML. The field is excluded from YAML, so only an exact
+// copy of a shipped pattern receives it after default merging. A changed regex,
+// severity, validator, or widening operator exemption stays a normal blocking
+// pattern. A legacy exemption that is already a subset of the compiled
+// audience remains an audience-bound pattern; validation warns that the stale
+// stanza is ignored instead of making a shipped config fail on upgrade.
+func markBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
+	// Clear every candidate ONCE, before matching. A clone carries the audience
+	// field, so a pattern whose regex, severity or validator was customized
+	// would otherwise keep the built-in audience and earn an allow it no longer
+	// qualifies for. Fail closed: only a candidate that passes the identity
+	// checks below gets an audience back.
+	//
+	// This cannot move inside the loop over built-ins: that runs once per
+	// built-in pattern, so a later iteration would wipe the audience an earlier
+	// one had just assigned and every pattern but the last would lose it.
+	for i := range patterns {
+		patterns[i].CredentialAudienceHosts = nil
 	}
-	keyFor := func(e SuppressEntry) string {
-		return strings.ToLower(e.Rule) + "\x00" + strings.ToLower(e.Path)
-	}
-	seen := make(map[string]struct{}, len(defaults)+len(user))
-	merged := make([]SuppressEntry, 0, len(defaults)+len(user))
-	for _, e := range defaults {
-		key := keyFor(e)
-		seen[key] = struct{}{}
-		merged = append(merged, e)
-	}
-	for _, e := range user {
-		key := keyFor(e)
-		if _, ok := seen[key]; ok {
+	for _, builtIn := range defaultDLPPatternSet {
+		if len(builtIn.CredentialAudienceHosts) == 0 {
 			continue
 		}
-		seen[key] = struct{}{}
-		merged = append(merged, e)
+		for i := range patterns {
+			candidate := &patterns[i]
+			if candidate.Bundle != "" || candidate.Name != builtIn.Name ||
+				candidate.Regex != builtIn.Regex || candidate.Severity != builtIn.Severity ||
+				candidate.Validator != builtIn.Validator ||
+				!credentialAudienceExemptDomainsSubset(candidate.ExemptDomains, builtIn.CredentialAudienceHosts) {
+				continue
+			}
+			candidate.CredentialAudienceHosts = append([]string(nil), builtIn.CredentialAudienceHosts...)
+		}
 	}
-	return merged
+}
+
+func credentialAudienceExemptDomainsSubset(domains, audience []string) bool {
+	if len(domains) == 0 {
+		return true
+	}
+	normalized := append([]string(nil), domains...)
+	if err := ValidateTrustedDomains(normalized, "credential audience exempt_domains"); err != nil {
+		return false
+	}
+	return credentialAudienceDomainSubset(normalized, audience)
 }
 
 // mergeResponsePatterns merges default response scanning patterns with user-defined patterns.

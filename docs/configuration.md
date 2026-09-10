@@ -143,22 +143,25 @@ fetch_proxy:
 | `max_response_mb` | `10` | Max response body size |
 | `user_agent` | `Pipelock Fetch/1.0` | User-Agent header sent upstream |
 | `monitoring.max_url_length` | `2048` | URLs longer than this are blocked |
-| `monitoring.entropy_threshold` | `4.5` | Shannon entropy threshold for path segments |
+| `monitoring.entropy_threshold` | `4.5` | Shannon entropy threshold for path segments. A configured value must be greater than 0; omit the field to take the default. No upper bound is enforced. |
 | `monitoring.max_requests_per_minute` | `60` | Per-domain rate limit |
 | `monitoring.max_data_per_minute` | `0` | Per-domain byte budget (0 = disabled) |
 | `monitoring.blocklist` | 6 domains | Blocked exfiltration targets |
 | `monitoring.subdomain_entropy_exclusions` | `files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com` | Domains excluded from subdomain and path entropy checks; override to replace defaults, or set an empty list to disable exclusions entirely (query entropy still checked) |
 | `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query parameter values as destinations |
 | `monitoring.query_entropy_exclusions` | `[]` | Host-wide query-string entropy exclusions for hosts whose query values are broadly opaque by contract |
+| `monitoring.path_entropy_exclusions` | `[]` | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply |
 | `monitoring.query_entropy_param_exclusions` | `[]` | Exact HTTPS endpoint+parameter query-value entropy exclusions; DLP, SSRF, query-key entropy, adjacent parameters, path/subdomain entropy, rate limits, and data budgets still apply |
 
 **Entropy guidance:**
 - English text: 3.5-4.0 bits/char
 - Hex/commit hashes: ~4.0
-- Base64-encoded data: 4.0-4.5
-- Random/encrypted: 5.5-8.0
+- Measured base64url resource identifiers: 4.93-5.43
+- Random/encrypted: ~7.5-8.0
 
-The default threshold (4.5) allows commit hashes and base64-encoded filenames while flagging encrypted blobs. Lower it (3.5) for strict mode. Raise it (5.0) for development environments where base64 URLs are common.
+A configured `entropy_threshold` must be greater than 0. Setting it to 0 or a negative value is REFUSED at load rather than silently replaced by the default, because an operator who writes 0 usually means "turn this off" and would otherwise get a fully enabled gate at 4.5 while believing it was disabled. To run without the path-entropy gate, exempt the routes you mean with `path_entropy_exclusions` or `subdomain_entropy_exclusions` instead. Omitting the field takes the default.
+
+The default threshold (4.5) allows typical commit hashes while flagging encrypted blobs. Vendor resource identifiers in URL paths commonly exceed that threshold (the measured base64url range above) and are blocked. Lower it (3.5) for strict mode. For known API routes, prefer a narrow `request_policy` path rule over raising the global threshold.
 
 **Subdomain entropy exclusions** skip subdomain and path entropy checks for specific domains, but query parameter entropy is still checked. Defaults cover package/object hosts that use hash-like routing paths (`files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com`). This is also useful for APIs that embed tokens in URL paths (e.g., Telegram bot API). Supports wildcard matching (`*.example.com`).
 
@@ -168,6 +171,27 @@ fetch_proxy:
     subdomain_entropy_exclusions:
       - "api.telegram.org"
 ```
+
+**Path entropy exclusions** skip only the URL-path entropy gate for one host plus one literal path prefix. Subdomain entropy, query entropy, query-key entropy, DLP, SSRF, rate limits and data budgets all still apply to the same request.
+
+Reach for this instead of `subdomain_entropy_exclusions` when a path false positive is the problem. That list is host-wide AND governs both the path and subdomain gates, so using it to fix a path block silently gives up subdomain-entropy detection for that host as well.
+
+A `request_policy` route also suppresses path entropy, on exactly the paths it names, whenever it declares both an explicit host and path constraints. That is the right tool when you already govern the host's paths, because the exemption then follows rules you are enforcing anyway. Use `path_entropy_exclusions` when you want the one route quiet without adopting that enforcement rail.
+
+```yaml
+fetch_proxy:
+  monitoring:
+    path_entropy_exclusions:
+      - host: docs.vendor.example      # exact host, or *.vendor.example
+        path_prefix: /document/d/      # literal prefix of the normalized path
+        reason: service-issued document identifier
+        owner: platform
+        expires: 2027-01-01            # optional, YYYY-MM-DD
+```
+
+An entry asserts that on that exact route the opaque segment is a service-issued resource identifier. It is a policy assertion rather than a classifier, and it does not make the route safe: before exempting one, confirm an agent cannot place a chosen opaque segment there and later read that value back, because such a route can carry data out. `https` only, and an entry with no host, no path prefix, or the bare root prefix `/` is refused at load rather than treated as a wildcard, because each of those three would exempt far more than one route. The prefix must be a canonical path: an encoded slash or backslash, a query or fragment delimiter in either literal or percent-encoded form, a wildcard, a dot segment, and a traversal segment are all refused. Matching compares the prefix against the request's escaped path, so a request that spells the route differently, such as `/document%2Fd/`, is a different route and stays subject to path entropy. **End `path_prefix` with `/` when you mean one path segment.** The prefix is matched literally, so `/document/d` also exempts `/document/de`, `/document/detail`, and every other path starting with those characters, while `/document/d/` does not. Dropping one character widens the exemption. `reason`, `owner` and `expires` are governance metadata. Editing any of them does not change the policy hash a receipt carries. Nothing revokes an entry when its `expires` date passes; `pipelock doctor` reports the expired, unowned, unexplained and inert entries so a standing exemption gets revisited instead of quietly outliving its reason.
+
+This ships empty. A vendor route enters the shipped defaults only with that vendor's own published route contract behind it.
 
 **Query entropy parameter exclusions** skip only the raw query-value entropy gate for one exact HTTPS endpoint and one exact parameter key. Subdomain entropy, path entropy, query-key entropy, adjacent parameters, DLP, SSRF, rate limits, and data budgets still apply. Use this first when a structured query language or endpoint contract creates a false positive in one parameter.
 
@@ -359,7 +383,7 @@ request_body_scanning:
   enabled: true
   action: warn              # warn or block (no strip for bodies)
   pattern_actions:          # optional per-DLP-pattern body/header action override
-    Google API Key: warn
+    Twilio API Key: warn    # core DLP patterns cannot be downgraded here; a provider key with compiled audience hosts can be, with a warning
   disable_patterns: []      # optional exact DLP pattern names to skip on this surface
   max_body_bytes: 5242880   # 5MB; fail-closed above this
   scan_headers: true        # scan request headers for DLP
@@ -774,19 +798,21 @@ Use `exempt_domains` to skip a specific DLP pattern for specific destination dom
 
 This is useful for APIs that embed credentials in URL paths by design (e.g., Telegram bot API uses `/bot<token>/sendMessage`). The token should be allowed when talking to Telegram but blocked if it appears in requests to other domains.
 
-To exempt a built-in pattern, override it by name and add `exempt_domains`:
+Built-in provider-key patterns cannot use `exempt_domains` to create or extend an audience. A legacy entry that only repeats a compiled audience host still loads, produces a warning, and is ignored. Remove the stale entry when you update the config. Use `exempt_domains` only with a custom pattern:
 
 ```yaml
 dlp:
   patterns:
-    - name: "Anthropic API Key"    # same name as built-in — overrides it
-      regex: '(?:^|[^A-Za-z0-9_-])sk-ant-[a-zA-Z0-9\-_]{20,}'
+    - name: "Internal Provider API Key"
+      regex: '\bintprov_[A-Za-z0-9_-]{32,}\b'
       severity: critical
       exempt_domains:
-        - "*.anthropic.com"
+        - "api.provider.example"
 ```
 
-For built-in provider-key patterns, the default config already exempts the provider's own API host for URL DLP and adds matching `suppress` entries for request-body and request-header DLP. The same key is still blocked when sent to any other destination. See [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md) for included shapes, exclusions, and the custom provider-key path.
+Built-in provider-key patterns and the Discord bot-token pattern carry a compiled, immutable credential-audience host set. When one of those credentials is sent to its declared API authority, URL, request-body, request-header, and outbound WebSocket-frame DLP allow that one match and record `dlp_credential_audience_allow`; the counter is `pipelock_dlp_credential_audience_allows_total{pattern,surface}`. The same credential stays blocked for every other destination, including lookalike hosts. The set itself is not YAML configuration: it cannot be extended or cleared. The ordinary operator controls still apply to these patterns, so `suppress`, `disable_patterns`, and a `warn` action all continue to work and each one warns at config load, naming the entry and the audience it widens. That is a deliberate choice: refusing the config instead would stop a previously valid deployment from starting on upgrade. MCP input remains blocked because it has no verified upstream authority. See [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md) for included shapes, exclusions, and the custom provider-key path.
+
+Top-level `suppress`, `request_body_scanning.disable_patterns`, and a `warn` entry in `request_body_scanning.pattern_actions` remain operator controls and DO apply to built-in provider-key patterns. They do not edit the compiled audience set; they decide whether a match that falls outside it is enforced. Widening this way is a real security decision, so each one warns at load naming the entry and every match is audited. `exempt_domains` behaves differently on these patterns and is stricter: an entry naming any host outside the compiled audience is REJECTED at load, and an entry that only repeats compiled audience hosts loads with a warning and is ignored. For a custom provider-key pattern that you own, use a narrowly scoped pattern and the controls appropriate to the carrier: `exempt_domains` for URL DLP and `suppress` for request-body or request-header DLP.
 
 Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) cannot be exempted this way. A pattern that reuses one of those names with `exempt_domains` is rejected at startup and on reload, and the configured scanner ignores the field for those names even if one slipped through, so a core credential class is blocked on every destination regardless of overrides.
 
@@ -1845,6 +1871,8 @@ Partitioning a JSON body into buckets therefore does not widen this envelope: th
 
 **Scope note:** Cross-request detection scans all outbound content visible to the proxy: URLs, request bodies, MCP JSON-RPC payloads, and WebSocket frames. CONNECT tunnels without TLS interception only expose the target hostname (entropy tracking only). Enable `tls_interception` for full cross-request coverage on tunneled traffic.
 
+**Request body read limit:** cross-request detection reads at most the first 64 KiB of a request body for fragment extraction. JSON leaves that complete within that window are partitioned into keyed streams as usual; when the body is longer, the document is truncated mid-value, so the leaves that completed before the cut are still partitioned and the truncated tail is scanned only on the raw concatenated stream. A JSON leaf whose value begins after the first 64 KiB is therefore inspected only through that raw stream, not as its own keyed stream. Per-request request-body DLP (`request_body_scanning`) still scans up to its own `max_body_bytes`; this limit applies only to the cross-request fragment-reassembly layer.
+
 Fragment reassembly detects known DLP patterns inside the configured byte and time window. It does not guarantee prevention for arbitrary multi-request data transfer. MCP arguments are buffered independently so ordinary sibling values are not treated as one payload; a tool can therefore send data in separate populated arguments, and a stream can also age out after `fragment_reassembly.window_minutes`. Use fragment reassembly for detection and evidence, then use `entropy_budget.action: block` with a tuned `bits_per_window` and `window_minutes` when a lower sustained-throughput ceiling is worth the false-positive cost.
 
 ## Finding Suppression
@@ -1953,7 +1981,19 @@ trusted_domains:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `trusted_domains` | `[]` | Top-level list. Supports `*.example.com` wildcards (also matches apex `example.com`). |
+| `trusted_domains` | `[]` | Top-level list. Supports `*.example.com` wildcards (also matches apex `example.com`). A wildcard must target a registrable domain: `*.co.uk`, `*.com.au` and `*.com` are refused at load because each matches every domain registered under a public suffix. |
+
+**Wildcard breadth is checked against the published public suffix list.** A pattern whose base is a registry-operated suffix is refused at load, so `*.co.uk` cannot be configured on this list; it would exempt every UK commercial domain from the internal-IP check.
+
+A pattern whose base is a suffix from the list's *private* section is accepted, with an advisory on `trusted_domains`. `*.googleapis.com` and `*.githubusercontent.com` are examples, and both ship in this repository's own presets. The distinction the check makes is about who administers the boundary, not about how many unrelated parties sit below it: the private section is submitted by the operators of those services themselves, and some of its entries -- `github.io`, `blogspot.com` -- sit above content belonging to unrelated people. So a private-suffix wildcard still covers every tenant of that service rather than only yours. Prefer the narrowest host that works.
+
+On `trusted_domains` specifically, such a pattern gets a startup advisory rather than a refusal, because that list exempts a hostname from the internal-IP check and the two ends of this look identical in a config file. Some of these shared boundaries let anyone choose their own subdomain and point it wherever they like, so the exemption reaches names you do not control. Others are the opposite: with a cloud private endpoint the public hostname resolves to an address inside your own network, and this list is the documented way to allow it. Nothing in the suffix list distinguishes those two cases, which is why this is an advisory for you to judge rather than a rule. `pipelock check` prints it alongside any other advisory.
+
+The breadth rule is not applied everywhere, and where it stops is deliberate. It governs `trusted_domains`, the entropy and content exemption lists, and DLP `exempt_domains` -- the fields that hand out trust or turn a detector off. It does not govern a list that matches or denies traffic, such as a `request_policy` route or the domain blocklist, where a deliberately broad wildcard is a policy rather than a mistake. It DOES govern `api_allowlist`, including a per-agent one, because that list grants reachability: in strict mode `*.com` there would permit every host under an entire registry, which reads like strict mode is enabled and behaves as though it is not.
+
+**Every host list is checked for spelling, in every direction.** A pattern must be ASCII (write an internationalized name in its `xn--` form) and must be a legal hostname: no URL, no `host:port`, no fragment, no interior wildcard, and no malformed DNS label. The full list, and it is exhaustive rather than illustrative: `api_allowlist` and a per-agent `api_allowlist`; `fetch_proxy.monitoring.blocklist`; `request_policy` route hosts; `trusted_domains`; `browser_shield.tracking_domains`; the `host` of a `fetch_proxy.monitoring.path_entropy_exclusions` entry; `subdomain_entropy_exclusions` and `query_entropy_exclusions`; `websocket_proxy.content_entropy_exclusions` and `request_body_scanning.content_entropy_exclusions`; and a DLP pattern's `exempt_domains`. It is separate from the breadth rule above and is not directional, because a misspelled pattern is compared literally and therefore matches nothing: on a deny list that is a rule that never denies, and on an allowlist it refuses traffic you meant to permit. An exact IP literal, IPv4 or IPv6, stays valid on the lists that match one.
+
+Two families of list handle a *sloppy but recognizable* spelling differently, and the difference is worth knowing before you file a bug. `trusted_domains`, `request_policy` route hosts, the entropy exclusion lists and `tracking_domains` **canonicalize** on load: `*.vendor.example..` is accepted and stored as `*.vendor.example`. The lists that are matched verbatim -- `api_allowlist`, a per-agent `api_allowlist`, and `fetch_proxy.monitoring.blocklist` -- instead **refuse** it, because matching those trims only a single trailing dot, so the entry would be compared as a different string than the one validation approved. In both families a single trailing dot is fine. If you want one rule that is always safe, write the host exactly as it will be compared: no surrounding whitespace, at most one trailing dot.
 
 **Important:** This is a **top-level** config field, not nested under `forward_proxy`. Placing it under `forward_proxy` will silently do nothing. DLP and other content scanning still runs on trusted domains -- only the SSRF IP check is bypassed.
 
@@ -3402,7 +3442,7 @@ browser_shield:
 | `strip_hidden_traps` | bool | `true` | Remove hidden prompt-trap DOM content |
 | `strip_tracking_pixels` | bool | `true` | Remove tracking pixels and beacon-style calls |
 | `inject_fingerprint_shims` | bool | `false` | Inject browser fingerprinting defense shims where supported |
-| `tracking_domains` | []string | `[]` | Additional tracking hostnames for the shield engine |
+| `tracking_domains` | []string | `[]` | Additional tracking hostnames for the shield engine. Exact hostnames only: entries are matched literally, so a wildcard is refused at load rather than accepted and silently never matched. |
 
 For production soak, start with:
 

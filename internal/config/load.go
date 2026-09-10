@@ -127,6 +127,9 @@ func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Co
 	if err := cfg.ValidateReservedDoWLimits(); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
+	if err := validateExplicitEntropyThreshold(data, cfg); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
 
 	cfg.rawBytes = data
 
@@ -276,7 +279,7 @@ func (c *Config) validateForRules() error {
 	if err := c.validateMode(); err != nil {
 		return err
 	}
-	if err := c.validateDLPPatternConfig(); err != nil {
+	if err := c.validateDLPPatternConfig(nil); err != nil {
 		return err
 	}
 	var warnings []Warning

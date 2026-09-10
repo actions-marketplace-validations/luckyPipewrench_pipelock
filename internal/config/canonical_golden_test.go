@@ -373,7 +373,32 @@ const (
 	// its effective value, so a config that omits the field and a config that
 	// sets it to the default keep one identity, and the three enabled goldens
 	// below did not move.
-	goldenHashDefaults = "77017505d2e86bb57cd2acf64087b87c7bbb087bf957b1457f0a67bb86e694f5"
+	// Re-bumped for path_entropy_exclusions: the Monitoring struct gained a
+	// new policy field, so the canonical view emits it and ph shifts even for
+	// a config that never sets it. These structs carry no json tags, so
+	// json.Marshal has no omitempty to suppress an unset slice; any added
+	// policy field moves this hash. Intentional and visible in review, per
+	// the contract above. Governance fields on the new type (reason, owner,
+	// expires) are dropped by canonicalPathEntropyExclusions, so editing a
+	// reason does NOT move ph. The rich fixtures here do NOT configure this
+	// field and prove nothing about it; the focused tests in
+	// path_entropy_canonical_test.go do, including the positive control that
+	// a changed route DOES move the hash.
+	// Re-bumped for DLPPattern.CredentialAudienceHosts. The field is
+	// compiled-in and yaml:"-", so strict decode REJECTS an operator that
+	// tries to set it; the canonical view still emits it because these
+	// structs carry no json tags and nothing suppresses an unset slice.
+	// That is the right outcome rather than an accident: the built-in set
+	// decides which destinations a credential pattern is enforced against,
+	// so two binaries shipping different built-ins genuinely enforce
+	// differently and must not report one policy identity. This hash now
+	// moves with the BINARY, not with operator configuration.
+	// Re-bumped when the Discord bot-token audience gained gateway.discord.gg.
+	// The Gateway is a different domain from discord.com, so without it a bot
+	// token in an outbound frame stayed a DLP match and blocked a legitimate
+	// connection. Adding a host changes which destinations that credential is
+	// enforced against, which is a policy-semantics change.
+	goldenHashDefaults = "86381cc788e7098bbf397a24a32aa69e302c74f345fd4138b94378bf198c487d"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -562,7 +587,28 @@ const (
 	// Re-bumped for fragment_reassembly.max_sessions: see goldenHashDefaults.
 	// The rich fixture sets cross-request detection, so a changed evidence
 	// capacity must produce a distinct policy identity here as well.
-	goldenHashRichConfig = "ee43de75debebd876bb0e5d8524524aa0bd6e100ae0547724f0814c3638a5f6b"
+	// Re-bumped for path_entropy_exclusions alongside goldenHashDefaults.
+	// Re-bumped for DLPPattern.CredentialAudienceHosts. The field is
+	// compiled-in and yaml:"-", so strict decode REJECTS an operator that
+	// tries to set it; the canonical view still emits it because these
+	// structs carry no json tags and nothing suppresses an unset slice.
+	// That is the right outcome rather than an accident: the built-in set
+	// decides which destinations a credential pattern is enforced against,
+	// so two binaries shipping different built-ins genuinely enforce
+	// differently and must not report one policy identity. This hash now
+	// moves with the BINARY, not with operator configuration.
+	// Re-bumped when the Discord bot-token audience gained gateway.discord.gg.
+	// The Gateway is a different domain from discord.com, so without it a bot
+	// token in an outbound frame stayed a DLP match and blocked a legitimate
+	// connection. Adding a host changes which destinations that credential is
+	// enforced against, which is a policy-semantics change.
+	// Re-bumped again when a customized pattern stopped inheriting a built-in
+	// audience. The rich fixture carries a pattern that reuses a built-in name
+	// with different content; it previously kept the built-in audience hosts
+	// and could earn an allow at that vendor. It no longer does, which is a
+	// fail-closed policy change. The defaults hash is unaffected because the
+	// default set has no customized pattern.
+	goldenHashRichConfig = "f97d86c32b35e0726cdc39a88b87ebffb9e0be2fc645e43d5610f973e5e3dd66"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It

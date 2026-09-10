@@ -97,13 +97,13 @@ func TestExtractOutboundPayload_QueryParams(t *testing.T) {
 			RawQuery: "other=data&key=secret_value",
 		},
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	got := string(payload)
 
 	// Wire order preserved, values only (keys excluded for fragment contiguity).
 	want := "datasecret_value"
 	if got != want {
-		t.Errorf("extractOutboundPayload = %q, want %q", got, want)
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
 	}
 }
 
@@ -114,10 +114,10 @@ func TestExtractOutboundPayload_Body(t *testing.T) {
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	got := string(payload)
 	if got != body {
-		t.Errorf("extractOutboundPayload = %q, want %q", got, body)
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, body)
 	}
 
 	// Body must still be readable after extraction (re-wrapping).
@@ -139,13 +139,13 @@ func TestExtractOutboundPayload_QueryAndBody(t *testing.T) {
 		Body:          io.NopCloser(strings.NewReader(body)),
 		ContentLength: int64(len(body)),
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	got := string(payload)
 
 	// Query values first, then body, concatenated without separator.
 	want := "query-data" + body
 	if got != want {
-		t.Errorf("extractOutboundPayload = %q, want %q", got, want)
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
 	}
 
 	// Body must still be readable after extraction (re-wrapping).
@@ -162,7 +162,7 @@ func TestExtractOutboundPayload_NoQueryNoBody(t *testing.T) {
 	r := &http.Request{
 		URL: &url.URL{},
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	if len(payload) != 0 {
 		t.Errorf("expected empty payload, got %q", string(payload))
 	}
@@ -173,7 +173,7 @@ func TestExtractOutboundPayload_NilBody(t *testing.T) {
 		URL:  &url.URL{},
 		Body: nil,
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	if len(payload) != 0 {
 		t.Errorf("expected empty payload for nil body, got %q", string(payload))
 	}
@@ -524,7 +524,7 @@ func TestExtractOutboundPayload_ZeroContentLength(t *testing.T) {
 		Body:          io.NopCloser(strings.NewReader("should not be read")),
 		ContentLength: 0,
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	if len(payload) != 0 {
 		t.Errorf("expected empty payload for zero content-length, got %q", string(payload))
 	}
@@ -1251,20 +1251,19 @@ func TestExtractOutboundPayload_ExcludesPath(t *testing.T) {
 			RawQuery: "key=value",
 		},
 	}
-	payload := extractOutboundPayload(r)
+	payload := extractOutboundPayloads(r, false, "", nil).outbound
 	got := string(payload)
 	want := testCEEParamValue
 	if got != want {
-		t.Errorf("extractOutboundPayload = %q, want %q", got, want)
+		t.Errorf("extractOutboundPayloads outbound = %q, want %q", got, want)
 	}
 }
 
 // --- Path-split secret regression tests ---
 
-func TestCeeAdmit_PathContributesToEntropy(t *testing.T) {
-	// Tests ceeAdmit directly with path-containing payload. HTTP handlers
-	// no longer include paths in the payload, but this validates ceeAdmit
-	// entropy tracking works for any input data shape.
+func TestCeeAdmit_EntropyBudgetRecordsOutboundBytes(t *testing.T) {
+	// Tests the entropy-budget path directly with representative outbound bytes.
+	// HTTP handlers carry URL paths separately, so this is not path coverage.
 	et := scanner.NewEntropyTracker(1.0, 300) // 1-bit budget
 	defer et.Close()
 	m := metrics.New()
@@ -1279,21 +1278,22 @@ func TestCeeAdmit_PathContributesToEntropy(t *testing.T) {
 		},
 	}
 
-	// Simulate path data with high entropy (passed directly, not via urlPayload).
-	pathPayload := []byte("/api/tokens/x7k9mQ2pR4wL8nJ5")
-	result := ceeAdmit(context.Background(), ceeAdmitOptions{SessionKey: testCEESessionKey, Outbound: pathPayload, TargetURL: "http://example.com/api/tokens/x7k9mQ2pR4wL8nJ5", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
+	outbound := []byte("opaque-outbound-x7k9mQ2pR4wL8nJ5")
+	result := ceeAdmit(context.Background(), ceeAdmitOptions{SessionKey: testCEESessionKey, Outbound: outbound, TargetURL: "http://example.com/api/tokens/x7k9mQ2pR4wL8nJ5", Agent: testCEEAgent, ClientIP: testCEEClientIP, RequestID: testCEERequestID, Config: ceeCfg, Entropy: et, Logger: logger, Metrics: m})
 	if !result.Blocked {
-		t.Fatal("expected block: high-entropy path should exceed 1-bit budget")
+		t.Fatal("expected block: high-entropy outbound bytes should exceed 1-bit budget")
 	}
 	if !result.EntropyHit {
 		t.Error("expected EntropyHit = true")
 	}
 }
 
-func TestCeeAdmit_PathQueryBoundarySecret(t *testing.T) {
-	// Tests ceeAdmit directly with path-containing payload. HTTP handlers
-	// no longer include paths, but this validates fragment reassembly DLP
-	// works for any input data shape.
+func TestCeeAdmit_OutboundFragmentReassemblySecret(t *testing.T) {
+	// Named for what it proves: fragment-reassembly DLP over the Outbound
+	// byte stream. The fixture bytes are path-shaped, but production sends
+	// URL paths through PathPayload, not Outbound, so this does NOT cover
+	// HTTP path or query handling. Renamed from PathQueryBoundarySecret,
+	// whose name asserted that coverage.
 	cfg := config.Defaults()
 	cfg.Internal = nil
 	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
@@ -1382,12 +1382,12 @@ func TestExtractOutboundPayload_Deterministic(t *testing.T) {
 				RawQuery: "z=zval&a=aval&m=mval",
 			},
 		}
-		payload := extractOutboundPayload(r)
+		payload := extractOutboundPayloads(r, false, "", nil).outbound
 		got := string(payload)
 		// Wire order, values only: zval, aval, mval.
 		want := "zvalavalmval"
 		if got != want {
-			t.Errorf("iteration %d: extractOutboundPayload = %q, want %q", i, got, want)
+			t.Errorf("iteration %d: extractOutboundPayloads outbound = %q, want %q", i, got, want)
 		}
 	}
 }

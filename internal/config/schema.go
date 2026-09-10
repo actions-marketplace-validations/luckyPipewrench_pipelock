@@ -1074,6 +1074,14 @@ type Monitoring struct {
 	// "*.example.com". An empty list (default) preserves the prior
 	// always-on query entropy behavior.
 	QueryEntropyExclusions []string `yaml:"query_entropy_exclusions"`
+	// PathEntropyExclusions scopes a path-entropy exemption to one host plus a
+	// literal path prefix, leaving subdomain entropy, query entropy, DLP and
+	// SSRF enforced for the same request. Prefer this over adding a host to
+	// SubdomainEntropyExclusions for a path false positive: that list governs
+	// BOTH the path and subdomain gates, so it gives up a second detection.
+	// Ships empty; a route enters the defaults only with the vendor's own
+	// published route contract behind it.
+	PathEntropyExclusions []PathEntropyExclusion `yaml:"path_entropy_exclusions"`
 
 	// QueryEntropyParamExclusions lists exact HTTPS endpoint+parameter tuples
 	// whose query value may bypass only the raw Shannon query-value entropy
@@ -1101,6 +1109,35 @@ type QueryEntropyParamExclusion struct {
 	Expires string `yaml:"expires,omitempty"`
 }
 
+// PathEntropyExclusion is a narrow URL-path entropy exemption for one host and
+// one literal path prefix. It affects ONLY the path-entropy gate: subdomain
+// entropy, query entropy, DLP and SSRF all still run for the same request.
+//
+// It exists because the path gate had no STANDALONE scoped exemption. Two
+// controls already reached it and neither is a plain path exemption. A
+// request_policy route that names both a host and path constraints suppresses
+// path entropy on exactly those paths (reqpolicy.Matcher.PathEntropyExempt),
+// but only as a side effect of adopting that enforcement rail for the host,
+// which an operator who just wants one route quiet has no other reason to do.
+// The one standalone knob, subdomain_entropy_exclusions, is host-wide AND also
+// drives the subdomain gate, so fixing a path false positive with it silently
+// gave up an unrelated detection.
+//
+// WHAT AN ENTRY ASSERTS, and it is deliberately narrow: on this exact route the
+// opaque segment is a service-issued resource identifier. It is a policy
+// assertion, not a classifier, and it does NOT make the route safe. An agent
+// that can place a chosen opaque segment on an exempted route, and later read
+// that value back, can still use it to carry data; verify that is not possible
+// for a route before exempting it.
+type PathEntropyExclusion struct {
+	Scheme     string `yaml:"scheme,omitempty"` // https when unset; an entry never matches a scheme it does not name
+	Host       string `yaml:"host"`             // exact host, or *.example.com
+	PathPrefix string `yaml:"path_prefix"`      // literal prefix of the normalized path, e.g. /document/d/
+	Reason     string `yaml:"reason,omitempty"` // why this route is exempt, for the operator reading it later
+	Owner      string `yaml:"owner,omitempty"`
+	Expires    string `yaml:"expires,omitempty"`
+}
+
 // DLP configures data loss prevention scanning.
 type DLP struct {
 	ScanEnv            bool         `yaml:"scan_env"`
@@ -1113,15 +1150,16 @@ type DLP struct {
 
 // DLPPattern is a named regex pattern for detecting secrets in URLs.
 type DLPPattern struct {
-	Name          string   `yaml:"name"`
-	Regex         string   `yaml:"regex"`
-	Severity      string   `yaml:"severity"`            // critical, high, medium, low
-	Validator     string   `yaml:"validator,omitempty"` // post-match checksum: "luhn", "mod97", "aba"
-	ExemptDomains []string `yaml:"exempt_domains"`      // domains where this pattern is not enforced
-	Action        string   `yaml:"action,omitempty"`    // reserved - not yet implemented; rejected at validation
-	Bundle        string   `yaml:"-"`                   // set by rules loader, not from YAML
-	BundleVersion string   `yaml:"-"`                   // set by rules loader, not from YAML
-	Compiled      bool     `yaml:"-"`                   // true for patterns created in Defaults()
+	Name                    string   `yaml:"name"`
+	Regex                   string   `yaml:"regex"`
+	Severity                string   `yaml:"severity"`            // critical, high, medium, low
+	Validator               string   `yaml:"validator,omitempty"` // post-match checksum: "luhn", "mod97", "aba"
+	ExemptDomains           []string `yaml:"exempt_domains"`      // domains where this pattern is not enforced
+	Action                  string   `yaml:"action,omitempty"`    // reserved - not yet implemented; rejected at validation
+	Bundle                  string   `yaml:"-"`                   // set by rules loader, not from YAML
+	BundleVersion           string   `yaml:"-"`                   // set by rules loader, not from YAML
+	Compiled                bool     `yaml:"-"`                   // true for patterns created in Defaults()
+	CredentialAudienceHosts []string `yaml:"-"`                   // compiled built-ins only; strict YAML rejects attempts to configure it
 	// CredentialURLWhitespaceGrammar is set only by the built-in default
 	// registry. It is runtime provenance, not an operator-facing setting.
 	CredentialURLWhitespaceGrammar bool `yaml:"-"`
@@ -2093,7 +2131,7 @@ type BrowserShield struct {
 	StripHiddenTraps       bool     `yaml:"strip_hidden_traps"`       // strip hidden DOM elements with instructions
 	StripTrackingPixels    bool     `yaml:"strip_tracking_pixels"`    // strip 1x1 images and beacon calls
 	InjectFingerprintShims bool     `yaml:"inject_fingerprint_shims"` // canvas/WebGL/audio defense shims
-	TrackingDomains        []string `yaml:"tracking_domains"`         // hostnames (validated same as exempt)
+	TrackingDomains        []string `yaml:"tracking_domains"`         // EXACT hostnames; matched literally, so a wildcard is refused at load
 }
 
 // BrowserShield strictness constants.

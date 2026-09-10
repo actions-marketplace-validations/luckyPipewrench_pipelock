@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1535,5 +1536,95 @@ func TestMergeAgentProfile_SandboxBestEffortCarriesAuthorization(t *testing.T) {
 	}
 	if !merged.Sandbox.BestEffort || merged.Sandbox.BestEffortReason != "top-level override" || merged.Sandbox.BestEffortExpiry != expiry {
 		t.Fatal("a profile that says nothing about best_effort must inherit the top-level override and its authorization")
+	}
+}
+
+// A per-agent api_allowlist REPLACES the base list instead of merging into it,
+// so it never passed through the top-level raw-host check. U+212A KELVIN SIGN
+// lowercases to ASCII "k", so "*.<KELVIN>example.com" is stored as typed and
+// then matched as "*.kexample.com" — in strict mode that is an egress grant for
+// a host the operator never wrote. Written as a Go escape on purpose: the same
+// input lost its rune to a shell heredoc once and silently became ASCII "K",
+// which is legitimately accepted and asserts nothing.
+// The other half of the per-agent contract. A malformed pattern is compared
+// literally by MatchDomain, so in strict mode it matches nothing and denies
+// traffic the operator meant to permit. The first repair here gated raw bytes
+// only, which left this accepted.
+func TestValidateAgents_APIAllowlistRefusesMalformedHost(t *testing.T) {
+	for _, pattern := range []string{
+		"example.com#disabled",
+		"bad_host.example.com",
+		"example.com:443",
+		"https://example.com",
+	} {
+		cfg := testConfig()
+		cfg.Agents = map[string]config.AgentProfile{
+			"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{pattern}},
+		}
+		err := ValidateAgents(cfg)
+		if err == nil {
+			t.Errorf("%q was accepted on a per-agent api_allowlist; it matches nothing and silently denies the traffic it names", pattern)
+			continue
+		}
+		if !strings.Contains(err.Error(), "api_allowlist") {
+			t.Errorf("error for %q does not name the field, so the operator cannot locate it: %v", pattern, err)
+		}
+	}
+}
+
+func TestValidateAgents_APIAllowlistRefusesFoldingHost(t *testing.T) {
+	const kelvin = "*.\u212Aexample.com" // U+212A KELVIN SIGN, written as an escape on purpose
+
+	// The rune must survive into the source, or every assertion below passes for
+	// the wrong reason: an earlier draft of a sibling test lost it to a shell
+	// heredoc and became a plain ASCII "K", which is legitimately accepted.
+	if !strings.ContainsFunc(kelvin, func(r rune) bool { return r > 127 }) {
+		t.Fatal("the test input is pure ASCII; the Kelvin sign was lost and this test would assert nothing")
+	}
+
+	// Control: the same shape in plain ASCII is accepted, so a rejection below
+	// is about the rune and not about the wildcard or the strict mode.
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.kexample.com"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Fatalf("control failed: the ASCII spelling must be accepted: %v", err)
+	}
+
+	cfg = testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{kelvin}},
+	}
+	err := ValidateAgents(cfg)
+	if err == nil {
+		t.Fatal("a KELVIN SIGN host was accepted on a per-agent api_allowlist; it folds to an ASCII egress grant the operator never wrote")
+	}
+	if !strings.Contains(err.Error(), "ASCII") {
+		t.Errorf("rejected for an unexpected reason, so this may not be the folding gate: %v", err)
+	}
+}
+
+// A per-agent api_allowlist REPLACES the base list, so the breadth rule has to
+// reach it independently or an agent profile becomes the way around a check the
+// top level enforces. Same reasoning as the top-level case: in strict mode this
+// list decides what may leave at all.
+func TestValidateAgents_APIAllowlistRefusesRegistryWildcard(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.com"}},
+	}
+	if err := ValidateAgents(cfg); err == nil {
+		t.Error("\"*.com\" was accepted on a per-agent api_allowlist; that grants egress to every host under a registry")
+	}
+
+	// Control: a private boundary stays accepted here too, matching the
+	// top-level rule and this repository's own presets.
+	cfg = testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"claude-code": {Mode: config.ModeStrict, APIAllowlist: []string{"*.googleapis.com"}},
+	}
+	if err := ValidateAgents(cfg); err != nil {
+		t.Errorf("a private-boundary wildcard must stay accepted on a per-agent allowlist: %v", err)
 	}
 }
