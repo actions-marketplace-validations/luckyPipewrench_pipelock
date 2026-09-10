@@ -71,6 +71,10 @@ uses strict JSON output, a cross-file synthesis pass, and a second actual-code
 judge pass before publishing findings. It strips mentions and command-shaped
 text from model-supplied fields.
 
+The coverage status is written against the pull request head that GitHub reports when the review finishes. If the head or base moved, it marks that current head as needing another review. A terminal writer publishes only when its admission is still the newest one, so an older job can't replace a newer verdict.
+
+The publisher makes three total status requests and waits only between attempts. If all three fail, it changes the review comment to `failed` and says the pull request can't show the coverage verdict. That result isn't green.
+
 ## Setup
 
 ### Required GitHub Secret
@@ -263,10 +267,14 @@ code under the pin. Replace `YOUR_GITHUB_LOGIN` with the login allowed to
 trigger a review, or drop those clauses and rely on `author_association ==
 'OWNER'` alone.
 
-Grant both `issues: write` and `pull-requests: write`. A called workflow cannot
-hold a permission its caller withheld, so dropping either one silently strips it
-from the reviewer rather than failing at load, and the review then ends on a
-permission error when it tries to post.
+Grant `issues: write`, `pull-requests: write`, and `statuses: write`. A called
+workflow cannot hold a permission its caller withheld, so dropping any one of
+them silently strips it from the reviewer rather than failing at load, and the
+review then ends on a permission error when it tries to use it. The first two
+carry the review comment. `statuses: write` carries the `pr-review/coverage`
+commit status, which is the only surface a comment-triggered run has on the pull
+request itself: without it a review that did not finish fails its own run while
+the pull request still shows every check passing.
 
 Personal-account repositories must map each named secret explicitly, because
 `secrets: inherit` is not available to them.
@@ -286,6 +294,7 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+  statuses: write
 
 jobs:
   review:
