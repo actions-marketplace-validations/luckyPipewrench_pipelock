@@ -1406,7 +1406,7 @@ mcp_ws_listener:
 
 ## Session Profiling
 
-Per-session behavioral analysis that detects domain bursts and volume spikes.
+Per-session behavioral analysis that detects domain bursts.
 
 ```yaml
 session_profiling:
@@ -1414,7 +1414,6 @@ session_profiling:
   anomaly_action: warn
   domain_burst: 5
   window_minutes: 5
-  volume_spike_ratio: 3.0
   max_sessions: 1000
   session_ttl_minutes: 30
   cleanup_interval_seconds: 60
@@ -1426,7 +1425,6 @@ session_profiling:
 | `anomaly_action` | `"warn"` | warn or block on anomaly |
 | `domain_burst` | `5` | New unique domains in window to flag |
 | `window_minutes` | `5` | Rolling window duration |
-| `volume_spike_ratio` | `3.0` | Spike threshold (ratio of avg) |
 | `max_sessions` | `1000` | Hard cap on concurrent sessions |
 | `session_ttl_minutes` | `30` | Idle session eviction |
 | `cleanup_interval_seconds` | `60` | Background cleanup interval |
@@ -2139,7 +2137,9 @@ Resolution precedence with binding enabled: context override > `default_agent_id
 
 ## Agent Profiles
 
-Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`, `volume_spike_ratio`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+
+Per-agent burst detection separates callers only when their identity is infrastructure-bound. Domain-burst detection runs a second, IP-level counter that catches a single caller rotating a self-declared `X-Pipelock-Agent` header to evade the per-agent counter: it emits an `ip_domain_burst` anomaly and, with `anomaly_action: block`, returns HTTP 403 once `domain_burst` unique domains are seen within `window_minutes`. That IP-level counter groups all self-declared and header-matched callers on one client IP together, because a request-supplied name cannot be trusted to partition state. Distinct callers that share one client IP are counted separately only when each is bound by its own per-agent listener; a `source_cidrs` match separates distinct source addresses, not callers that share one address (see the [mediation envelope guide](guides/mediation-envelope.md) for identity grades). Several listener-bound callers on one host therefore do not false-positive as one bursting agent.
 
 ```yaml
 agents:
@@ -2187,13 +2187,13 @@ agents:
 
 Pipelock resolves the agent name for each request using this priority order:
 
-1. **Listener binding**: matched by the port the request arrived on (injected as a context override, spoof-proof)
+1. **Listener binding**: matched by the port the request arrived on (injected as a context override; network-bound, so a request cannot change it)
 2. **Source CIDRs**: matched by client IP against `source_cidrs` ranges defined on each agent profile. The client IP is the connection's own peer address; forwarded-address headers such as `X-Forwarded-For` are ignored, so a deployment behind another proxy sees that proxy's address here
 3. **Header** (`X-Pipelock-Agent`): set by the calling agent or orchestrator
 4. **Query parameter** (`?agent=name`): appended to fetch/WebSocket URLs
 5. **Fallback**: `_default` profile if defined, otherwise base config
 
-Listener-based resolution is the only method that cannot be spoofed by the agent. It injects a context override that takes priority over header and query param. Header and query param methods are convenient but trust the caller. Use listeners when isolation matters.
+Listener-based resolution and a `source_cidrs` match are the two methods the agent cannot change from inside a request; both are graded `bound`. Listener resolution injects a context override that takes priority over header and query param. Header and query param methods are convenient but trust the caller. Use listeners when callers share one source address and isolation matters.
 
 On the reverse-proxy listener, a `source_cidrs` match sets the agent identity used for attribution and the outbound mediation envelope. It does not select per-agent scanner, budget, or policy overrides: reverse-proxy enforcement uses that listener's configured generic policy or `profile: submit` policy.
 
@@ -2308,7 +2308,7 @@ it cannot corrupt MCP stdio framing.
 
 Each agent can bind to one or more dedicated ports via the `listeners` field. Pipelock opens these ports at startup alongside the main proxy port. Requests arriving on an agent's listener are automatically resolved to that agent without relying on headers or query params.
 
-This is the only spoof-proof resolution method. The agent process connects to its assigned port, and pipelock knows which profile to apply based on the port alone.
+Listener binding and a `source_cidrs` match are the two network-bound resolution methods; both grade the identity `bound`. A request cannot change either one, but neither authenticates the host or process behind the peer address, so access to the listener port and the integrity of the source address are the operator's controls. With a listener, the agent process connects to its assigned port and pipelock knows which profile to apply from the port alone.
 
 ```yaml
 agents:
