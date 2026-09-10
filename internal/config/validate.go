@@ -55,23 +55,32 @@ func ValidateTrustedDomains(domains []string, label string) error {
 		// made it dangerous. This list exempts hosts from the SSRF internal-IP
 		// check, which is why it gets the same normalizer as everything else
 		// rather than its own copy of the rule.
+		// ORDER MATTERS, and getting it wrong regressed a message once. The
+		// bare wildcard is checked FIRST because its own message names what
+		// this list controls, and "disables all SSRF protection" tells the
+		// operator something the generic shape error cannot. Routing through
+		// the shared entry point before this check replaced that message with
+		// the generic one, which an existing test caught.
 		d := NormalizeHostPattern(raw)
 		if d == "" {
 			return fmt.Errorf("%s[%d] is empty", label, i)
 		}
-		if strings.Contains(d, "://") || strings.Contains(d, "/") || strings.Contains(d, ":") {
-			return fmt.Errorf("%s[%d] %q: use a hostname pattern, not a URL or host:port", label, i, raw)
-		}
 		if d == "*" {
 			return fmt.Errorf("%s[%d]: bare wildcard disables all SSRF protection", label, i)
 		}
-		if strings.HasPrefix(d, "*.") {
-			// Wildcard must target a concrete domain (*.com is too broad).
-			if strings.Count(d[2:], ".") < 1 {
-				return fmt.Errorf("%s[%d] %q: wildcard must target a concrete domain like *.example.com", label, i, raw)
-			}
-		} else if strings.ContainsAny(d, "*?[]") {
-			return fmt.Errorf("%s[%d] %q: only exact hosts and *.example.com wildcards are supported", label, i, raw)
+		// Then the shared entry point, which rejects raw non-ASCII before case
+		// folding and validates shape.
+		if _, err := NormalizeAndCheckHostPattern(raw); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+		// Everything else goes through the ONE shared breadth predicate. This
+		// list previously carried a DUPLICATE of the rule rather than calling
+		// it, so it did not inherit the public-suffix fix: both copies counted
+		// dots and both accepted "*.co.uk", and fixing one left the other
+		// behind. That is the cost of a second implementation, and it is why
+		// this list calls the predicate instead of restating it.
+		if err := HostPatternBreadthError(d); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
 		}
 		domains[i] = d
 	}
@@ -471,6 +480,7 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 		return warnings, err
 	}
 	c.validateAPIAllowlistWarnings(&warnings)
+	c.validateTrustedDomainTenancyWarnings(&warnings)
 	if err := c.validateLogging(); err != nil {
 		return warnings, err
 	}
@@ -683,6 +693,64 @@ func (c *Config) validateAPIAllowlistWarnings(warnings *[]Warning) {
 	*warnings = append(*warnings, Warning{
 		Field:   "api_allowlist",
 		Message: fmt.Sprintf("contains messaging/collaboration domains (%s); these are common exfiltration channels, so keep only deployment-required exact hosts and rely on DLP/content scanning for payload control", strings.Join(messagingDomains, ", ")),
+	})
+}
+
+// validateTrustedDomainTenancyWarnings warns about a wildcard on
+// trusted_domains whose base is a boundary in the public suffix list's PRIVATE
+// section. It WARNS rather than refusing, and which of those it does is the
+// whole decision here.
+//
+// Why it is worth saying anything. trusted_domains exempts a hostname from the
+// SSRF internal-IP check, and only loopback, RFC1918 and similar addresses are
+// exemptible - the cloud-metadata floor is never overridable. Several private
+// boundaries are dynamic-DNS services where a THIRD PARTY sets the address for
+// their own name: duckdns.org, no-ip.org, ddns.net, hopto.org and dynv6.net are
+// all private boundaries. So "*.duckdns.org" exempts every name any stranger
+// can point at an internal address. Reproduced: with that pattern trusted, a
+// host resolving to 127.0.0.1 was ALLOWED, while the same host with an
+// unrelated trust entry was blocked as "resolves to internal IP 127.0.0.1".
+//
+// Why it does NOT refuse, which was the first instinct and was wrong. The same
+// shape is a legitimate and EFFECTIVE entry elsewhere. Azure private endpoints
+// keep the public hostname - Microsoft's private-endpoint DNS documentation
+// says connection URLs do not change - so "myaccount.blob.core.windows.net"
+// resolves to a private VNet address, and blob.core.windows.net is itself a
+// private boundary. trusted_domains is this product's own documented remedy for
+// that case, so refusing the wildcard would break a common deployment on a
+// regulated-industry stack. An over-strict guard on a security product gets
+// switched off, which costs more than the warning buys.
+//
+// The distinction that matters is who controls the ADDRESS behind a matching
+// name, and the public suffix list does not record that. It marks who
+// administers a boundary and nothing else, so no predicate here can separate
+// the dynamic-DNS case from the private-endpoint case. That is precisely why
+// this is an advisory to a human rather than a rule.
+//
+// It fires on ZERO shipped configurations: every trusted_domains value in
+// configs/ and examples/ is a bare internal hostname.
+func (c *Config) validateTrustedDomainTenancyWarnings(warnings *[]Warning) {
+	var broad []string
+	for _, raw := range c.TrustedDomains {
+		normalized := NormalizeHostPattern(raw)
+		if !strings.HasPrefix(normalized, "*.") {
+			continue
+		}
+		base := normalized[2:]
+		// An ICANN boundary never reaches here: ValidateTrustedDomains refuses
+		// it outright, so this warning is about the private section only.
+		if suffix, icann := publicsuffix.PublicSuffix(base); !icann && suffix == base {
+			broad = append(broad, normalized)
+		}
+	}
+	if len(broad) == 0 {
+		return
+	}
+	*warnings = append(*warnings, Warning{
+		Field: "trusted_domains",
+		Message: fmt.Sprintf(
+			"%s covers every name under a shared service boundary, not only yours, and this list exempts a hostname from the internal-IP check; where that service lets other people choose their own subdomain and address, the exemption reaches their names too. Prefer the exact hosts you operate, or a pattern below the shared boundary.",
+			strings.Join(broad, ", ")),
 	})
 }
 
@@ -1048,6 +1116,120 @@ func (c *Config) validateMode() error {
 	if c.Mode == ModeStrict && len(c.APIAllowlist) == 0 {
 		return fmt.Errorf("strict mode requires at least one domain in api_allowlist")
 	}
+	// The RAW gate applies to the allowlist even though the BREADTH rule
+	// deliberately does not. Breadth is directional and this list's wildcard
+	// semantics are left alone on purpose. Retargeting is not directional: in
+	// strict mode the scanner copies these patterns into the enforced allowlist
+	// and MatchDomain folds case, so "*.<KELVIN>example.com" loads and then
+	// PERMITS sub.kexample.com. That is an egress grant for a host the operator
+	// never wrote, which is the fail-open direction on the list that decides
+	// what may leave at all.
+	if err := ValidateHostGrantList(c.APIAllowlist, "api_allowlist"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ValidateHostMatchList validates an allowlist or blocklist entry's RAW
+// bytes and its SHAPE, without judging breadth. Breadth is directional and does
+// not belong here: a broad wildcard on one of these lists is the operator's
+// policy. The other two halves are not directional, and leaving either one out
+// has now produced a defect each:
+//
+//   - Raw bytes: a value that folds into a different host retargets the rule.
+//   - Shape: a malformed pattern is compared LITERALLY by MatchDomain, so it
+//     matches nothing. On the blocklist that is a deny rule that never denies -
+//     "example.com#disabled" is accepted and lets example.com straight through.
+//     On an allowlist it instead denies traffic the operator meant to permit.
+//
+// Wildcard semantics for every well-formed ASCII pattern are unchanged, and an
+// exact IP literal stays valid because MatchDomain compares an IP hostname for
+// equality. A WILDCARD over an IP such as "*.8.8.8.8" stays ACCEPTED: numeric
+// labels are legal DNS labels, and while the pattern is inert against real IP
+// traffic (MatchDomain takes an equality-only branch once the hostname parses
+// as an IP) it does match a domain like "foo.8.8.8.8". Refusing it here was
+// tried and reverted on an earlier round as over-strict rather than unsafe.
+//
+// Shared with the per-agent allowlists, which the enterprise merge REPLACES
+// rather than merges, so they never passed through the top-level check.
+func ValidateHostMatchList(hosts []string, label string) error {
+	for i, raw := range hosts {
+		normalized, err := NormalizeAndCheckHostPattern(raw)
+		if err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+		if err := matcherParityError(raw, normalized); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+	}
+	return nil
+}
+
+// ValidateHostGrantList is ValidateHostMatchList plus the wildcard BREADTH
+// rule, for a list that GRANTS reachability rather than matching or denying it.
+//
+// The split exists because the same shared checker serves three fields and only
+// two of them grant: the top-level and per-agent api_allowlist do, and
+// fetch_proxy.monitoring.blocklist does not. Breadth is directional, so adding
+// it inside the shared function would refuse a broad wildcard on a DENY list,
+// where breadth is the operator's policy rather than a mistake. An earlier
+// revision of this branch made exactly that error on request_policy routes.
+//
+// Why an allowlist needs it. In strict mode this list decides what may leave at
+// all, so "*.com" is not a broad grant but the absence of one: it permits every
+// host under an entire registry, which is strict mode spelled as if it were
+// enabled while behaving as if it were off. That is the same silent-no-op class
+// this file already refuses elsewhere, in its most consequential form, and two
+// independent reviews rated it high on this change.
+//
+// It is safe for shipped configuration BECAUSE breadth refuses only ICANN
+// boundaries. Every wildcard in this repository's presets and defaults is
+// either an ordinary registrable domain ("*.anthropic.com") or a PRIVATE
+// boundary ("*.googleapis.com", "*.githubusercontent.com"), and private ones
+// stay accepted. Verified by classifying all 84 wildcard patterns under
+// configs/, charts/, docs/ and examples/ against the list: the only ICANN-
+// boundary mentions are documentation prose describing the refusal.
+func ValidateHostGrantList(hosts []string, label string) error {
+	if err := ValidateHostMatchList(hosts, label); err != nil {
+		return err
+	}
+	for i, raw := range hosts {
+		normalized := NormalizeHostPattern(raw)
+		if !strings.HasPrefix(normalized, "*.") {
+			continue
+		}
+		if err := wildcardBaseBreadthError(normalized[2:]); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", label, i, raw, err)
+		}
+	}
+	return nil
+}
+
+// matcherParityError refuses a pattern that VALIDATES as one host and MATCHES
+// as another. These lists store the operator's string verbatim and hand it to
+// destination.MatchDomain, which folds case and trims exactly ONE trailing dot
+// and nothing else. NormalizeHostPattern is stricter: it also trims surrounding
+// whitespace and every trailing dot. So a value both accept means the same
+// thing, and a value they read differently was approved on the strength of a
+// string the matcher will never see.
+//
+// "example.com.." is the reachable case and it was a fail-open on the deny
+// list: it validated as "example.com", stayed stored as typed, and the matcher
+// compared "example.com." to "example.com" and did not block. Leading or
+// trailing whitespace does the same. A single trailing dot is fine and stays
+// accepted, because the matcher removes it too.
+//
+// The repair belongs HERE rather than in MatchDomain. Making the matcher trim
+// all trailing dots would silently WIDEN every pattern already stored in that
+// shape: "*.com.." is inert today and would start matching every .com host.
+// Refusing the input keeps the fix from being a behavior change to traffic.
+func matcherParityError(raw, normalized string) error {
+	matcherView := strings.ToLower(strings.TrimSuffix(raw, "."))
+	if matcherView != normalized {
+		return fmt.Errorf(
+			"host pattern must be written as %q: as typed, matching would compare %q and never agree with the validated form",
+			normalized, matcherView)
+	}
 	return nil
 }
 
@@ -1180,11 +1362,18 @@ func (c *Config) validateFetchProxy() error {
 		return err
 	}
 
-	// Validate blocklist patterns are well-formed
+	// Validate blocklist patterns are well-formed. The RAW and SHAPE gates
+	// apply here even though the BREADTH rule deliberately does not: breadth is
+	// directional, because a broad wildcard on a deny list is a policy, but a
+	// retargeted or unmatchable pattern is wrong in EVERY direction. See
+	// ValidateHostMatchList for both failure directions.
 	for _, b := range c.FetchProxy.Monitoring.Blocklist {
 		if b == "" {
 			return fmt.Errorf("empty blocklist entry")
 		}
+	}
+	if err := ValidateHostMatchList(c.FetchProxy.Monitoring.Blocklist, "fetch_proxy.monitoring.blocklist"); err != nil {
+		return err
 	}
 
 	if err := validateHostnamePatternList("subdomain_entropy_exclusions", c.FetchProxy.Monitoring.SubdomainEntropyExclusions); err != nil {
@@ -1217,9 +1406,13 @@ func (c *Config) validateFetchProxy() error {
 
 func validateHostnamePatternList(field string, entries []string) error {
 	for i, raw := range entries {
-		// Normalize the trailing dot BEFORE the breadth check so a
-		// trailing-dot input like "*.com." cannot pass as "*.com." and then
-		// normalize down to the over-broad "*.com".
+		// The RAW value is gated before folding; see RawHostASCIIError. Then
+		// the trailing dot is normalized before the breadth check, so a
+		// trailing-dot input like "*.com." cannot pass and then normalize down
+		// to the over-broad "*.com".
+		if err := RawHostASCIIError(raw); err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, raw, err)
+		}
 		d := NormalizeHostPattern(raw)
 		if d == "" {
 			return fmt.Errorf("%s[%d] is empty", field, i)
@@ -1259,31 +1452,239 @@ func NormalizeHostPattern(raw string) string {
 // root prefix and a cleartext scheme while still installing "*.com", which
 // MatchDomain then matched against every .com host. One predicate, two callers.
 //
-// Known limitation, pre-existing and shared with every caller of this rule: the
-// breadth test counts dots rather than consulting a public-suffix list, so
-// "*.co.uk" is accepted and is over-broad in reality. Fixing that changes
-// behavior for trusted_domains and the other host lists too, so it is not done
-// here.
+// Breadth is measured against the published public suffix list, not by counting
+// dots. The dot count remains only as a floor for a single-label base.
 func HostPatternBreadthError(normalized string) error {
-	// Empty is rejected HERE so the predicate does not depend on its caller
-	// having checked emptiness first. A caller that tested the raw value and
-	// then normalized would otherwise pass "." through as "", and a predicate
-	// whose safety depends on call order is a predicate that will be called in
-	// the wrong order.
+	// SHAPE FIRST, from the one shape predicate, so the two cannot diverge.
+	// They did diverge once: both returned early after the "*." prefix and so
+	// both accepted an interior wildcard like "*.example*.com". Layering means
+	// a shape rule added for one surface protects the other for free.
+	if err := HostPatternSyntaxError(normalized); err != nil {
+		return err
+	}
+	if strings.HasPrefix(normalized, "*.") {
+		return wildcardBaseBreadthError(normalized[2:])
+	}
+	return nil
+}
+
+// RawHostASCIIError rejects a host value carrying non-ASCII BEFORE any case
+// folding. It is separate and exported because the ORDER is the security
+// property, not a style choice: a check applied after folding is not the same
+// check. Five call sites reach it directly, one of them the scanner's
+// unvalidated-config builder in another package, and four more reach it through
+// NormalizeAndCheckHostPattern. Counting them by eye went wrong four separate
+// times in this area, so count them rather than trusting this sentence:
+//
+//	grep -rn 'RawHostASCIIError(' --include='*.go' internal/ enterprise/
+//
+// U+212A KELVIN SIGN lowercases to ASCII "k", so "Kexample.com" written with
+// that rune folds to "kexample.com". A validator that folds first then tests
+// for ASCII sees a clean ASCII hostname and installs an exemption for a
+// DIFFERENT host than the operator typed. The first repair for this covered
+// only three surfaces and left five entropy-exemption lists, the scanner's
+// defensive builder and the query-parameter host validator still folding
+// first, which is what this function exists to stop recurring.
+//
+// An ASCII A-label such as "xn--..." is unaffected: that is how an
+// internationalized name is written here, because runtime matching folds case
+// rather than performing IDNA normalization.
+func RawHostASCIIError(raw string) error {
+	if strings.IndexFunc(raw, func(r rune) bool { return r > unicode.MaxASCII }) >= 0 {
+		return errors.New("host must be ASCII; write an internationalized name in its xn-- A-label form")
+	}
+	return nil
+}
+
+// NormalizeAndCheckHostPattern normalizes a RAW host pattern and validates its
+// shape, returning the normalized value. It is the entry point every caller
+// should use, and it exists because doing these two steps separately has
+// produced two defects in this area already.
+//
+// ORDER IS LOAD-BEARING. The raw value is checked for non-ASCII BEFORE case
+// folding, because some non-ASCII runes fold INTO ASCII: U+212A KELVIN SIGN
+// lowercases to "k", so "*.Kexample.com" written with that rune would fold to
+// "*.kexample.com" and pass an ASCII check applied afterwards. That is not
+// rejecting non-ASCII, it is silently retargeting the operator's rule at a
+// different host. An ASCII A-label such as "xn--..." is unaffected and stays
+// supported.
+func NormalizeAndCheckHostPattern(raw string) (string, error) {
+	if err := RawHostASCIIError(raw); err != nil {
+		return "", err
+	}
+	normalized := NormalizeHostPattern(raw)
+	if err := HostPatternSyntaxError(normalized); err != nil {
+		return "", err
+	}
+	return normalized, nil
+}
+
+// HostPatternSyntaxError reports whether a normalized host pattern is
+// well-formed, WITHOUT judging how much of the internet it covers. Use it for
+// DENY and MATCH surfaces, where breadth is the operator's intent rather than a
+// mistake: a request_policy route that blocks "*.co.uk" is a policy, not a
+// misconfiguration, and refusing it would remove the ability to express one.
+//
+// The DNS label grammar applies to an exact host as well as to a wildcard base.
+// Scoping it to wildcards only was a defect: "vendor.example#disabled" loaded
+// as an exact route host, and the matcher compares hostnames for equality, so
+// no request could equal it and a block rule carrying it denied nothing. An IP
+// literal is the one exception, because an exact IP host is legitimate and this
+// repository's own route tests block by address.
+func HostPatternSyntaxError(normalized string) error {
 	if normalized == "" {
 		return errors.New("host pattern is empty")
+	}
+	// The exact-IP exception is tested FIRST, before the host:port rejection,
+	// because an IPv6 literal is made of colons: "2001:db8::1" read as a
+	// host:port and was refused while the comment below and the documentation
+	// both promised an exact IP literal was valid. That was invisible until
+	// three more lists were routed through this predicate. An address with a
+	// port or brackets does not parse as an IP and still falls through to the
+	// rejection.
+	if net.ParseIP(normalized) != nil {
+		return nil
 	}
 	if strings.Contains(normalized, "://") || strings.Contains(normalized, "/") || strings.Contains(normalized, ":") {
 		return errors.New("use a hostname pattern, not a URL or host:port")
 	}
 	if strings.HasPrefix(normalized, "*.") {
-		if strings.Count(normalized[2:], ".") < 1 {
-			return errors.New("wildcard must target a concrete domain like *.example.com")
+		base := normalized[2:]
+		if base == "" {
+			return errors.New("wildcard must name a domain, as in *.example.com")
 		}
-		return nil
+		return hostLabelGrammarError(base, "wildcard base")
 	}
 	if strings.ContainsAny(normalized, "*?[]") {
 		return errors.New("only exact hosts and *.example.com wildcards are supported")
+	}
+	return hostLabelGrammarError(normalized, "host")
+}
+
+func hostLabelGrammarError(base, what string) error {
+	if strings.ContainsAny(base, "*?[]") {
+		return fmt.Errorf("wildcard may appear only as the leading *., not inside %q", base)
+	}
+	if strings.IndexFunc(base, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r) || r > unicode.MaxASCII
+	}) >= 0 {
+		return fmt.Errorf("%s must contain only ASCII DNS label characters", what)
+	}
+	// No IP-literal rejection here, deliberately. It was tried and was
+	// OVER-STRICT: the reqpolicy matcher compares `host == base` as well as a
+	// suffix, so "*.8.8.8.8" does match the address itself, and refusing it
+	// made validation disagree with the runtime contract. Aligning the
+	// validator to the matcher is the smaller change; giving the matcher
+	// explicit IP semantics would be a runtime behaviour change and belongs in
+	// its own decision. An IP's labels are digits, so the grammar below accepts
+	// it without a special case.
+	if len(base) > 253 {
+		return fmt.Errorf("%s must be 253 bytes or shorter", what)
+	}
+	for _, label := range strings.Split(base, ".") {
+		if label == "" {
+			return fmt.Errorf("%s contains an empty DNS label", what)
+		}
+		if len(label) > 63 {
+			return fmt.Errorf("%s DNS labels must be 63 bytes or shorter", what)
+		}
+		if strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
+			return fmt.Errorf("%s labels must not start or end with '-'", what)
+		}
+		for _, r := range label {
+			if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+				continue
+			}
+			return fmt.Errorf("%s must contain only DNS label characters", what)
+		}
+	}
+	if _, err := hostIDNAProfile.ToASCII(base); err != nil {
+		return fmt.Errorf("%s must be valid under IDNA lookup processing: %w", what, err)
+	}
+	return nil
+}
+
+// hostIDNAProfile is idna.Lookup with the CheckHyphens rule turned OFF, and
+// nothing else changed.
+//
+// CheckHyphens forbids a hyphen in the third and fourth positions of a label,
+// which is a UTS #46 registration-era rule and NOT a DNS rule: "my--host" and
+// "ab--cd" are legal RFC 1123 hostnames. x/net says so in CheckHyphens' own
+// documentation, naming "r3---sn-apo3qvuoxuxbt-j5pe" as a label in common use,
+// and that is a googlevideo CDN host - a shape this repository's own shipped
+// patterns already reach through *.googlevideo.com.
+//
+// Using idna.Lookup here made validation STRICTER THAN MATCHING, which is the
+// failure direction that gets a check switched off: MatchDomain matches
+// "my--host.example.com" happily, so an operator with one in a host list would
+// have had a config that worked before the upgrade and refuses to load after.
+// Caught in review, and the tests below pin both directions.
+//
+// The ORDER of these options is load-bearing. MapForLookup calls
+// ValidateLabels(true) internally, which sets checkHyphens AND installs the
+// punycode validator; CheckHyphens(false) must come after it to switch off the
+// hyphen rule alone. Reversing them re-enables the rule. Everything Lookup
+// enforces beyond hyphens is retained on purpose, and an invalid xn-- label is
+// still refused - the test asserts that, because dropping IDNA entirely would
+// have "fixed" this finding while silently accepting malformed punycode.
+var hostIDNAProfile = idna.New(
+	idna.MapForLookup(),
+	idna.BidiRule(),
+	idna.CheckHyphens(false),
+)
+
+// wildcardBaseBreadthError reports why `*.base` is too broad to be a scoped
+// match, or nil when it is acceptable.
+//
+// TWO rules, and both are needed. The single-label test catches "*.com" and
+// "*.example": a base with no dot is a whole top-level namespace. The
+// public-suffix test catches what counting dots cannot, because a registry
+// suffix can be several labels: "*.co.uk" has a dot and is every UK commercial
+// domain. Before this, the dot count alone accepted it, and the pattern then
+// exempted every host under that suffix from whichever gate the list governs,
+// including the SSRF internal-IP check that trusted_domains controls.
+//
+// The ICANN flag is the discriminator, and using it is the difference between a
+// fix and a regression. publicsuffix reports icann=true for registry-operated
+// suffixes (com, co.uk, com.au) and icann=false for suffixes in the list's
+// PRIVATE section (s3.amazonaws.com, github.io, cloudfront.net). The private
+// section says who ADMINISTERS the boundary and nothing about tenancy:
+// github.io and blogspot.com sit above content owned by unrelated people. Rejecting every bare public suffix would therefore refuse
+// "*.s3.amazonaws.com", which is a pattern an operator legitimately writes.
+// Rejecting only the ICANN ones refuses what has no legitimate use and accepts
+// what does.
+//
+// A private-suffix wildcard is broad without being wrong, and rejecting the
+// whole class was tried and REPRODUCED AS A BREAK: five patterns this
+// repository itself ships are private PSL boundaries, including
+// "*.googleapis.com" and "*.githubusercontent.com" in configs/claude-code.yaml
+// and the DLP exempt lists in defaults.go, plus "*.ngrok.io",
+// "*.ngrok-free.app" and "*.readthedocs.io". A rule that refuses Pipelock's own
+// presets is worse than the weakness it replaces. The principled objection is
+// real (a PSL boundary marks a REGISTRATION boundary, not an ownership one, so
+// "*.googleapis.com" is every Google-hosted API namespace and not just yours).
+// Surfacing breadth as an advisory rather than refusing it is the direction
+// this leans, and nothing here does that yet.
+//
+// THIS RULE IS FOR ALLOW, TRUST AND DETECTOR-BYPASS SURFACES ONLY. A DENY or
+// MATCH surface must use HostPatternSyntaxError instead, because there a broad
+// wildcard is the POINT: "*.co.uk" as a trust exemption gives away every UK
+// commercial domain, while the same pattern as a request_policy block is a
+// legitimate policy. The domain blocklist was already validated for nothing but
+// emptiness. Getting this wrong is not hypothetical: an earlier revision of
+// this change applied the breadth rule to request_policy route hosts, which
+// support `block`, and so refused a legitimate broad block.
+// The caller guarantees a non-empty base: NormalizeHostPattern collapses "*."
+// and "*.." to "*", which the wildcard-character branch above rejects before
+// this is reached. An explicit empty check here would be unreachable, and an
+// unreachable branch cannot be tested, so the invariant is written down instead.
+// Should it ever be reached, the single-label test below refuses it anyway.
+func wildcardBaseBreadthError(base string) error {
+	if !strings.Contains(base, ".") {
+		return fmt.Errorf("wildcard must target a concrete domain like *.example.com, not the whole %q namespace", base)
+	}
+	if suffix, icann := publicsuffix.PublicSuffix(base); icann && suffix == base {
+		return fmt.Errorf("wildcard must target a registrable domain like *.example.%s, not the public suffix %q, which would match every domain registered under it", base, base)
 	}
 	return nil
 }
@@ -1306,6 +1707,9 @@ func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
 			return fmt.Errorf("%s.scheme %q must be https", field, entry.Scheme)
 		}
 
+		if err := RawHostASCIIError(entry.Host); err != nil {
+			return fmt.Errorf("%s.host %q: %w", field, entry.Host, err)
+		}
 		// One normalizer, so this cannot accidentally trim a second dot that
 		// validateHostnamePatternList also trims. That double-trim is what made
 		// validation reject "*.com.." while the single-normalizing runtime
@@ -1427,6 +1831,9 @@ func normalizeQueryEntropyParamHost(raw string) (string, error) {
 		return unicode.IsSpace(r) || unicode.IsControl(r)
 	}) >= 0 {
 		return "", errors.New("host must not contain spaces or control characters")
+	}
+	if err := RawHostASCIIError(raw); err != nil {
+		return "", err
 	}
 	host := NormalizeHostPattern(raw)
 	if host == "" {
@@ -2119,8 +2526,9 @@ func (c *Config) validateRequestPolicy(warnings *[]Warning) error {
 }
 
 // validateRequestPolicyRoute validates and normalizes a request_policy route in
-// place: it requires at least one constraint, checks hosts against the trusted
-// domain validator, uppercases and validates methods, compiles path_patterns,
+// place: it requires at least one constraint, checks host SHAPE only because a
+// route may deny and a broad wildcard there is a policy, uppercases and
+// validates methods, compiles path_patterns,
 // rejects empty prefixes, and normalizes content types. label prefixes every
 // error (e.g. `request_policy rule "x"` or `request_policy batch 0`) so rule
 // and batch routes share one validator without drifting.
@@ -2130,8 +2538,15 @@ func validateRequestPolicyRoute(route *RequestPolicyRoute, label string) error {
 		len(route.ContentTypes) == 0 {
 		return fmt.Errorf("%s has no route constraints; set at least one of hosts/methods/path_prefixes/path_patterns/content_types", label)
 	}
-	if err := ValidateTrustedDomains(route.Hosts, label+" hosts"); err != nil {
-		return err
+	// A request_policy route MATCHES traffic and its action may be `block`, so
+	// its hosts get shape validation only. Running the breadth rule here
+	// refused a legitimate broad block, which is why the two validators exist.
+	for i := range route.Hosts {
+		normalized, err := NormalizeAndCheckHostPattern(route.Hosts[i])
+		if err != nil {
+			return fmt.Errorf("%s hosts[%d] %q: %w", label, i, route.Hosts[i], err)
+		}
+		route.Hosts[i] = normalized
 	}
 	for j, m := range route.Methods {
 		up := strings.ToUpper(strings.TrimSpace(m))
@@ -4496,8 +4911,28 @@ func (c *Config) validateBrowserShield() error {
 	if err := ValidateTrustedDomains(c.BrowserShield.ExemptDomains, "browser_shield.exempt_domains"); err != nil {
 		return err
 	}
-	if err := ValidateTrustedDomains(c.BrowserShield.TrackingDomains, "browser_shield.tracking_domains"); err != nil {
-		return err
+	// tracking_domains is a detection INCLUSION list, not a trust or bypass
+	// list, so the breadth rule is the wrong question for it: a broad entry
+	// here widens detection rather than granting anything. It also cannot take
+	// a wildcard at all. The shield merges each entry through
+	// regexp.QuoteMeta (internal/shield/shield.go), so "*.tracker.example"
+	// compiles to a regex for the LITERAL characters "*.tracker.example",
+	// which no URL contains; the entry is inert and the operator has no way to
+	// know. Refusing it is the only honest answer, and it matches the
+	// documented contract of "tracking hostnames".
+	for i, raw := range c.BrowserShield.TrackingDomains {
+		field := fmt.Sprintf("browser_shield.tracking_domains[%d]", i)
+		if strings.TrimSpace(raw) == "" {
+			return fmt.Errorf("%s is empty", field)
+		}
+		if strings.HasPrefix(NormalizeHostPattern(raw), "*.") || strings.ContainsAny(raw, "*?[]") {
+			return fmt.Errorf("%s %q: wildcards are not supported here; the shield matches these entries literally, so list the exact hostnames", field, raw)
+		}
+		d, err := NormalizeAndCheckHostPattern(raw)
+		if err != nil {
+			return fmt.Errorf("%s %q: %w", field, raw, err)
+		}
+		c.BrowserShield.TrackingDomains[i] = d
 	}
 
 	return nil

@@ -1979,7 +1979,19 @@ trusted_domains:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `trusted_domains` | `[]` | Top-level list. Supports `*.example.com` wildcards (also matches apex `example.com`). |
+| `trusted_domains` | `[]` | Top-level list. Supports `*.example.com` wildcards (also matches apex `example.com`). A wildcard must target a registrable domain: `*.co.uk`, `*.com.au` and `*.com` are refused at load because each matches every domain registered under a public suffix. |
+
+**Wildcard breadth is checked against the published public suffix list.** A pattern whose base is a registry-operated suffix is refused at load, so `*.co.uk` cannot be configured on this list; it would exempt every UK commercial domain from the internal-IP check.
+
+A pattern whose base is a suffix from the list's *private* section is accepted, with an advisory on `trusted_domains`. `*.googleapis.com` and `*.githubusercontent.com` are examples, and both ship in this repository's own presets. The distinction the check makes is about who administers the boundary, not about how many unrelated parties sit below it: the private section is submitted by the operators of those services themselves, and some of its entries -- `github.io`, `blogspot.com` -- sit above content belonging to unrelated people. So a private-suffix wildcard still covers every tenant of that service rather than only yours. Prefer the narrowest host that works.
+
+On `trusted_domains` specifically, such a pattern gets a startup advisory rather than a refusal, because that list exempts a hostname from the internal-IP check and the two ends of this look identical in a config file. Some of these shared boundaries let anyone choose their own subdomain and point it wherever they like, so the exemption reaches names you do not control. Others are the opposite: with a cloud private endpoint the public hostname resolves to an address inside your own network, and this list is the documented way to allow it. Nothing in the suffix list distinguishes those two cases, which is why this is an advisory for you to judge rather than a rule. `pipelock check` prints it alongside any other advisory.
+
+The breadth rule is not applied everywhere, and where it stops is deliberate. It governs `trusted_domains`, the entropy and content exemption lists, and DLP `exempt_domains` -- the fields that hand out trust or turn a detector off. It does not govern a list that matches or denies traffic, such as a `request_policy` route or the domain blocklist, where a deliberately broad wildcard is a policy rather than a mistake. It DOES govern `api_allowlist`, including a per-agent one, because that list grants reachability: in strict mode `*.com` there would permit every host under an entire registry, which reads like strict mode is enabled and behaves as though it is not.
+
+**Every host list is checked for spelling, in every direction.** A pattern must be ASCII (write an internationalized name in its `xn--` form) and must be a legal hostname: no URL, no `host:port`, no fragment, no interior wildcard, and no malformed DNS label. The full list, and it is exhaustive rather than illustrative: `api_allowlist` and a per-agent `api_allowlist`; `fetch_proxy.monitoring.blocklist`; `request_policy` route hosts; `trusted_domains`; `browser_shield.tracking_domains`; the `host` of a `fetch_proxy.monitoring.path_entropy_exclusions` entry; `subdomain_entropy_exclusions` and `query_entropy_exclusions`; `websocket_proxy.content_entropy_exclusions` and `request_body_scanning.content_entropy_exclusions`; and a DLP pattern's `exempt_domains`. It is separate from the breadth rule above and is not directional, because a misspelled pattern is compared literally and therefore matches nothing: on a deny list that is a rule that never denies, and on an allowlist it refuses traffic you meant to permit. An exact IP literal, IPv4 or IPv6, stays valid on the lists that match one.
+
+Two families of list handle a *sloppy but recognizable* spelling differently, and the difference is worth knowing before you file a bug. `trusted_domains`, `request_policy` route hosts, the entropy exclusion lists and `tracking_domains` **canonicalize** on load: `*.vendor.example..` is accepted and stored as `*.vendor.example`. The lists that are matched verbatim -- `api_allowlist`, a per-agent `api_allowlist`, and `fetch_proxy.monitoring.blocklist` -- instead **refuse** it, because matching those trims only a single trailing dot, so the entry would be compared as a different string than the one validation approved. In both families a single trailing dot is fine. If you want one rule that is always safe, write the host exactly as it will be compared: no surrounding whitespace, at most one trailing dot.
 
 **Important:** This is a **top-level** config field, not nested under `forward_proxy`. Placing it under `forward_proxy` will silently do nothing. DLP and other content scanning still runs on trusted domains -- only the SSRF IP check is bypassed.
 
@@ -3428,7 +3440,7 @@ browser_shield:
 | `strip_hidden_traps` | bool | `true` | Remove hidden prompt-trap DOM content |
 | `strip_tracking_pixels` | bool | `true` | Remove tracking pixels and beacon-style calls |
 | `inject_fingerprint_shims` | bool | `false` | Inject browser fingerprinting defense shims where supported |
-| `tracking_domains` | []string | `[]` | Additional tracking hostnames for the shield engine |
+| `tracking_domains` | []string | `[]` | Additional tracking hostnames for the shield engine. Exact hostnames only: entries are matched literally, so a wildcard is refused at load rather than accepted and silently never matched. |
 
 For production soak, start with:
 
