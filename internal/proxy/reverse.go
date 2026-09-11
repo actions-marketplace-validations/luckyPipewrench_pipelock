@@ -29,6 +29,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
 	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
+	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
@@ -36,6 +37,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/session"
 	"github.com/luckyPipewrench/pipelock/internal/shield"
 )
 
@@ -68,13 +70,20 @@ type ReverseProxyBlockResponse struct {
 // to a configured upstream URL. Request bodies are scanned for DLP patterns
 // (secret exfiltration) and response bodies are scanned for prompt injection.
 type ReverseProxyHandler struct {
-	upstream             *url.URL
-	proxy                *httputil.ReverseProxy
-	cfgPtr               *atomic.Pointer[config.Config]
-	scPtr                *atomic.Pointer[scanner.Scanner]
-	redactionRuntimePtr  *atomic.Pointer[redactionRuntime]
-	logger               *audit.Logger
-	metrics              *metrics.Metrics
+	upstream            *url.URL
+	proxy               *httputil.ReverseProxy
+	cfgPtr              *atomic.Pointer[config.Config]
+	scPtr               *atomic.Pointer[scanner.Scanner]
+	redactionRuntimePtr *atomic.Pointer[redactionRuntime]
+	logger              *audit.Logger
+	metrics             *metrics.Metrics
+	// owner is the parent Proxy that holds the session manager, entropy
+	// tracker, and fragment buffer. It is wired after construction via
+	// SetOwnerProxy so the reverse path can call the same per-session control
+	// helpers (session profiling, cross-request entropy, taint) the fetch,
+	// forward, and WebSocket transports use. A nil owner means those controls
+	// are simply absent for this handler; it never bypasses an existing block.
+	owner                *Proxy
 	ks                   *killswitch.Controller
 	captureObs           capture.CaptureObserver
 	shieldEngine         *shield.Engine
@@ -242,6 +251,15 @@ func (rp *ReverseProxyHandler) SetEnvelopeEmitter(ptr *atomic.Pointer[envelope.E
 // SetEnvelopeVerifier sets the atomic pointer to the inbound envelope verifier.
 func (rp *ReverseProxyHandler) SetEnvelopeVerifier(ptr *atomic.Pointer[envelope.Verifier]) {
 	rp.envelopeVerifierPtr = ptr
+}
+
+// SetOwnerProxy wires the parent Proxy so the reverse path can invoke the same
+// per-session control helpers (session profiling, cross-request entropy, taint)
+// the fetch, forward, and WebSocket transports use, keyed on the same
+// transport-independent session keys. When unset, those controls are absent for
+// this handler and every existing block path is unaffected.
+func (rp *ReverseProxyHandler) SetOwnerProxy(p *Proxy) {
+	rp.owner = p
 }
 
 // SetReceiptEmitter sets the atomic pointer to the action-receipt emitter.
@@ -602,6 +620,79 @@ func (rp *ReverseProxyHandler) snapshotAndAcquire() (reverseRuntimeSnapshot, fun
 	return rp.snapshotRuntime(), func() {}, false
 }
 
+// recordRequestBlockSignal feeds an adaptive SignalBlock for an enforce-mode
+// request-scan block that returns BEFORE the end-of-handler session-activity
+// recording. The forward proxy records session activity ahead of its
+// enforce-mode block return (forward.go handleForwardHTTP, "record BEFORE the
+// enforce-mode early return"), so a blocked forward request still contributes a
+// SignalBlock to its adaptive scope. Reverse's URL- and header-DLP enforce
+// blocks return earlier, so without this a run of blocked reverse DLP requests
+// leaves the scoped adaptive score at zero and a caller probing URL- or
+// header-embedded secrets never escalates. It reuses the same helper, session
+// key (sessionKeyFor(agent, clientIP)) and upstream-host scope the end-of-handler
+// recording uses, so a blocked request records exactly once: it returns before
+// that later recording, never reaching it. A nil owner has no session manager
+// (matching the guard on the end-of-handler recording), and
+// recordSessionActivityWithUserAgent is inert when session profiling is disabled,
+// so this can only ADD a denial signal, never remove one.
+//
+// A DLP block to an adaptive-exempt upstream is score-neutral, mirroring the
+// forward proxy's CONNECT header-DLP block (forward.go handleConnect, "record as
+// allowed with deferClean=true so session profiling tracks the domain but neither
+// escalation signals nor clean-decay fire. Blocked exempt traffic is
+// score-neutral"). Auth headers and tokens to a trusted destination are expected
+// and must not feed escalation, so the exempt case records the activity as
+// ALLOWED (with DeferClean so the allow does not fire a clean decay either) while
+// the caller still returns the DLP 403. The 403 is unconditional; only the
+// adaptive scoring differs by exemption.
+func (rp *ReverseProxyHandler) recordRequestBlockSignal(r *http.Request, agent, clientIP, requestID string, actorAuth envelope.ActorAuth, cfg *config.Config) {
+	if rp.owner == nil {
+		return
+	}
+	// Uses exempt_domains (adaptive trust), not api_allowlist (reachability),
+	// scoped to the upstream host the SignalBlock would be recorded against.
+	result := scanner.Result{Allowed: false, Scanner: scanner.ScannerDLP, Score: 0.9}
+	if isAdaptiveExempt(rp.upstream.Hostname(), cfg.AdaptiveEnforcement.ExemptDomains) {
+		result = scanner.Result{Allowed: true}
+	}
+	rp.owner.recordSessionActivityWithUserAgent(sessionActivityOptions{
+		ClientIP:   clientIP,
+		Agent:      agent,
+		Hostname:   rp.upstream.Hostname(),
+		RequestID:  requestID,
+		UserAgent:  r.UserAgent(),
+		ActorAuth:  actorAuth,
+		Result:     result,
+		Config:     cfg,
+		Logger:     rp.logger,
+		DeferClean: true,
+	})
+}
+
+// recordRequestNearMissSignal feeds the same destination-scoped adaptive
+// near-miss used by forward request-header DLP when a reverse URL or header DLP
+// finding is observed without an enforce-mode block. The ordinary session
+// activity recorded later tracks the request but deliberately defers clean
+// decay, so it cannot stand in for this finding signal.
+func (rp *ReverseProxyHandler) recordRequestNearMissSignal(agent, clientIP, requestID string, cfg *config.Config) {
+	if rp.owner == nil || !cfg.AdaptiveEnforcement.Enabled || isAdaptiveExempt(rp.upstream.Hostname(), cfg.AdaptiveEnforcement.ExemptDomains) {
+		return
+	}
+	sm := rp.owner.sessionMgrPtr.Load()
+	if sm == nil {
+		return
+	}
+	key := sessionKeyFor(agent, clientIP)
+	recordAdaptiveSignalForScope(sm.GetOrCreate(key), adaptiveScopeForHost(rp.upstream.Hostname()), session.SignalNearMiss, &cfg.AdaptiveEnforcement, decide.EscalationParams{
+		Threshold: cfg.AdaptiveEnforcement.EscalationThreshold,
+		Logger:    rp.logger,
+		Metrics:   rp.metrics,
+		Session:   key,
+		ClientIP:  clientIP,
+		RequestID: requestID,
+	})
+}
+
 // ServeHTTP handles incoming requests: scan the request body for DLP,
 // then forward to upstream via the reverse proxy.
 func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -870,14 +961,33 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 				len(patternNames), patternNames, nil)
 
 			if action == config.ActionBlock && cfg.EnforceEnabled() {
+				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg)
 				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
 				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "url_dlp")
 				reason := fmt.Sprintf("URL DLP: %s", strings.Join(patternNames, ", "))
+				// Sign the denial so every reverse DLP block leaves a receipt,
+				// matching the intercept URL-scan block (intercept.go, Layer:
+				// urlResult.Scanner) and the reverse data-budget/inflight blocks
+				// just below. Without it a URL-DLP 403 returns unattested and an
+				// auditor reconstructing the enforcement timeline from receipts
+				// cannot see that this request was refused.
+				emitReverseReceipt(receipt.EmitOpts{
+					ActionID:  receipt.NewActionID(),
+					Verdict:   config.ActionBlock,
+					Layer:     scanner.ScannerDLP,
+					Pattern:   reason,
+					Transport: TransportReverse,
+					Method:    r.Method,
+					Target:    targetURL,
+					RequestID: requestID,
+					Agent:     agent,
+				})
 				writeReverseProxyBlock(w, http.StatusForbidden,
 					blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP),
 					reason)
 				return
 			}
+			rp.recordRequestNearMissSignal(agent, clientIP, requestID, cfg)
 		}
 	}
 
@@ -918,14 +1028,31 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 				action, patternNames, nil)
 
 			if headerHardBlock || (action == config.ActionBlock && cfg.EnforceEnabled()) {
+				rp.recordRequestBlockSignal(r, agent, clientIP, requestID, resolvedIdentity.Auth, cfg)
 				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
 				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "header_dlp")
 				reason := fmt.Sprintf("header DLP: %s", strings.Join(patternNames, ", "))
+				// Sign the denial under the cross-transport header-DLP layer
+				// (forward.go and the fetch path both emit Layer "dlp_header"),
+				// so a reverse header-DLP 403 is attested the same way. Previously
+				// this path returned without a receipt.
+				emitReverseReceipt(receipt.EmitOpts{
+					ActionID:  receipt.NewActionID(),
+					Verdict:   config.ActionBlock,
+					Layer:     "dlp_header",
+					Pattern:   reason,
+					Transport: TransportReverse,
+					Method:    r.Method,
+					Target:    targetURL,
+					RequestID: requestID,
+					Agent:     agent,
+				})
 				writeReverseProxyBlock(w, http.StatusForbidden,
 					blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP),
 					reason)
 				return
 			}
+			rp.recordRequestNearMissSignal(agent, clientIP, requestID, cfg)
 		}
 	}
 
@@ -997,6 +1124,222 @@ func (rp *ReverseProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			requestScannerVerdict = scannerVerdictForContinuingAction(requestEffectiveAction, cfg.EnforceEnabled())
 		}
 		reverseBodyBytes = bodyBytes
+	}
+
+	// Per-session controls: session profiling / adaptive signals, taint, and
+	// cross-request entropy. These run on the SAME transport-independent session
+	// keys the fetch/forward/WebSocket paths use, so a reverse caller accumulates
+	// cross-request entropy with its other traffic, trips session-profiling
+	// anomalies, and isolates taint by bound identity. The owner Proxy holds the
+	// session manager, entropy tracker, and fragment buffer; a nil owner means
+	// these controls are absent for this handler and never a bypass of an
+	// existing block. Placed after request scanning and before the upstream call,
+	// matching the fetch/forward equivalent points. Hostname uses the resolved
+	// upstream host (operator-fixed on this listener) the way forward uses the
+	// request host: the value is cross-transport accumulation, not per-request
+	// domain diversity.
+	if rp.owner != nil {
+		actorAuth := resolvedIdentity.Auth
+		upstreamHost := rp.upstream.Hostname()
+
+		// (1) Session profiling + adaptive signals. Record even when a warn-mode
+		// finding was raised (DeferClean=true so a clean decay does not offset a
+		// later CEE/response signal on the same round trip). A block verdict is a
+		// block; a disabled profiler returns an empty result and the guards below
+		// are skipped, so this can only add a denial, never remove one.
+		sessionResult := rp.owner.recordSessionActivityWithUserAgent(sessionActivityOptions{
+			ClientIP:   clientIP,
+			Agent:      agent,
+			Hostname:   upstreamHost,
+			RequestID:  requestID,
+			UserAgent:  r.UserAgent(),
+			ActorAuth:  actorAuth,
+			Result:     scanner.Result{Allowed: !cfg.EnforceEnabled() || requestEffectiveAction != config.ActionBlock},
+			Config:     cfg,
+			Logger:     rp.logger,
+			DeferClean: true,
+		})
+		if sessionResult.Blocked {
+			rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+			rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "session_profiling")
+			emitReverseReceipt(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   config.ActionBlock,
+				Layer:     "session_profiling",
+				Pattern:   sessionResult.Detail,
+				Transport: TransportReverse,
+				Method:    r.Method,
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			writeReverseProxyBlock(w, http.StatusForbidden,
+				blockInfoFor(blockreason.SessionAnomaly, "session_profiling"),
+				sessionResult.Detail)
+			return
+		}
+		// block_all: deny ALL traffic (including clean) when the session sits at
+		// an escalation level whose adaptive action resolves to block.
+		if sessionResult.Level > 0 && decide.UpgradeAction("", sessionResult.Level, &cfg.AdaptiveEnforcement) == config.ActionBlock {
+			sessionKey := sessionKeyFor(agent, clientIP)
+			recordAdaptiveUpgrade(rp.logger, rp.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionResult.Level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
+			rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+			rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, adaptiveSessionDeny)
+			emitReverseReceipt(receipt.EmitOpts{
+				ActionID:  receipt.NewActionID(),
+				Verdict:   config.ActionBlock,
+				Layer:     adaptiveSessionDeny,
+				Pattern:   "session escalation level " + session.EscalationLabel(sessionResult.Level),
+				Transport: TransportReverse,
+				Method:    r.Method,
+				Target:    targetURL,
+				RequestID: requestID,
+				Agent:     agent,
+			})
+			writeReverseProxyBlock(w, http.StatusForbidden,
+				blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny),
+				adaptiveBlockedReason)
+			return
+		}
+
+		// (2) Taint: evaluate the accumulated session risk against this outbound
+		// request. Reverse carries writes, so it mirrors the forward proxy's
+		// ask/block enforcement rather than the read-only fetch path. The taint
+		// recorder key is the folded, transport-independent key, so taint
+		// introduced by a prior response on ANY transport is visible here.
+		var reverseTaintRec session.Recorder
+		if sm := rp.owner.SessionMgrPtr().Load(); sm != nil {
+			reverseTaintRec = sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, actorAuth))
+		}
+		if parsedTarget, perr := url.Parse(targetURL); perr == nil {
+			reverseTaint := evaluateHTTPTaint(cfg, reverseTaintRec, r.Method, parsedTarget)
+			if reverseTaint.Result.Decision == session.PolicyAsk || reverseTaint.Result.Decision == session.PolicyBlock {
+				rp.logger.LogTaintDecision(
+					newHTTPAuditContext(r.Context(), rp.logger, httpAuditEvent{Method: r.Method, TargetURL: targetURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}),
+					audit.TaintDecision{
+						TaintLevel:  reverseTaint.Risk.Level.String(),
+						ActionClass: reverseTaint.ActionClass.String(),
+						Sensitivity: reverseTaint.Sensitivity.String(),
+						Authority:   reverseTaint.Authority.String(),
+						Decision:    reverseTaint.Result.Decision.String(),
+						Reason:      reverseTaint.Result.Reason,
+						SourceURL:   reverseTaint.Risk.SecurityOriginURL(),
+						SourceKind:  reverseTaint.Risk.SecurityOriginKind(),
+					},
+				)
+			}
+			emitReverseTaintBlock := func(reason string) {
+				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "taint_policy")
+				emitReverseReceipt(receipt.EmitOpts{
+					ActionID:            receipt.NewActionID(),
+					Verdict:             config.ActionBlock,
+					Layer:               "taint_policy",
+					Pattern:             reason,
+					Transport:           TransportReverse,
+					Method:              r.Method,
+					Target:              targetURL,
+					RequestID:           requestID,
+					Agent:               agent,
+					SessionTaintLevel:   reverseTaint.Risk.Level.String(),
+					SessionContaminated: reverseTaint.Risk.Contaminated,
+					RecentTaintSources:  reverseTaint.Risk.Sources,
+					SessionTaskID:       reverseTaint.Task.CurrentTaskID,
+					SessionTaskLabel:    reverseTaint.Task.CurrentTaskLabel,
+					AuthorityKind:       reverseTaint.Authority.String(),
+					TaintDecision:       reverseTaint.Result.Decision.String(),
+					TaintDecisionReason: reverseTaint.Result.Reason,
+					TaskOverrideApplied: reverseTaint.TaskOverrideApplied,
+				})
+				writeReverseProxyBlock(w, http.StatusForbidden,
+					blockInfoFor(blockreason.AuthorityMismatch, "taint_policy"),
+					reason)
+			}
+			switch reverseTaint.Result.Decision {
+			case session.PolicyBlock:
+				emitReverseTaintBlock(reverseTaint.Result.Reason)
+				return
+			case session.PolicyAsk:
+				approved, blockReason := rp.owner.resolveTaintAsk(agent, targetURL, r.Method, reverseTaint.Result.Reason)
+				if !approved {
+					emitReverseTaintBlock(blockReason)
+					return
+				}
+			}
+		}
+
+		// (3) Cross-request entropy: feed this request's outbound payloads and
+		// enforce the verdict, the way the forward proxy does for a body-carrying
+		// transport. admitCurrentCEE records the payloads AND returns the verdict,
+		// which subsumes the CONNECT-only currentCEEEntropy read (CONNECT cannot
+		// feed body data; reverse can, so the forward HTTP path is the analog).
+		// extractOutboundPayloads re-wraps r.Body so the forwarded request still
+		// carries it to the upstream.
+		ceeSession := responseTaintSessionKey(agent, clientIP, actorAuth)
+		var ceePartitionKey []byte
+		if fb := rp.owner.FragmentBufferPtr().Load(); fb != nil {
+			ceePartitionKey = fb.PartitionKey()
+		}
+		ceePayloads := extractOutboundPayloads(r, ceeJSONBodyPartitioningEnabled(cfg), ceeSession, ceePartitionKey)
+		ceeAdmission := rp.owner.admitCurrentCEE(r.Context(), ceeAdmitRequest{
+			SessionKey: ceeSession, Outbound: ceePayloads.outbound, BodyFragmentPayloads: ceePayloads.bodyFragmentPayloads,
+			PartitionReason: ceePayloads.partitionReason,
+			KeyPayload:      queryParamKeys(r.URL), PathPayload: pathSegments(r.URL), TargetURL: targetURL, Agent: agent, ClientIP: clientIP,
+			RequestID: requestID, IncludeFragments: true,
+		})
+		if ceeAdmission.Active {
+			ceeRes := ceeAdmission.Result
+			var ceeRec session.Recorder
+			var ceeBlockAll bool
+			if sm := ceeAdmission.Sessions; sm != nil {
+				ceeRec, ceeBlockAll = ceeRecordSignalsAndBlockAll(ceeSignalParams{
+					Result: ceeRes, Sessions: sm, SessionKey: ceeSession,
+					AdaptiveCfg: &ceeAdmission.AdaptiveConfig, Logger: rp.logger, Metrics: rp.metrics,
+					ClientIP: clientIP, RequestID: requestID,
+				})
+			}
+			if ceeRes.Blocked {
+				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, "cross_request")
+				emitReverseReceipt(receipt.EmitOpts{
+					ActionID:   receipt.NewActionID(),
+					Verdict:    config.ActionBlock,
+					Layer:      "cross_request",
+					PolicyHash: ceeAdmission.PolicyHash,
+					Pattern:    ceeRes.Reason,
+					Transport:  TransportReverse,
+					Method:     r.Method,
+					Target:     targetURL,
+					RequestID:  requestID,
+					Agent:      agent,
+				})
+				writeReverseProxyBlock(w, http.StatusForbidden,
+					blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
+					ceeRes.Reason)
+				return
+			}
+			if ceeBlockAll {
+				level := recEscalationLevel(ceeRec)
+				recordAdaptiveUpgrade(rp.logger, rp.metrics, adaptiveUpgrade{SessionKey: ceeSession, Level: session.EscalationLabel(level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
+				rp.metrics.RecordReverseProxyRequest(r.Method, "403")
+				rp.metrics.RecordReverseProxyScanBlocked(scanDirectionRequest, adaptiveSessionDeny)
+				emitReverseReceipt(receipt.EmitOpts{
+					ActionID:  receipt.NewActionID(),
+					Verdict:   config.ActionBlock,
+					Layer:     adaptiveSessionDeny,
+					Pattern:   "session escalation level " + session.EscalationLabel(level),
+					Transport: TransportReverse,
+					Method:    r.Method,
+					Target:    targetURL,
+					RequestID: requestID,
+					Agent:     agent,
+				})
+				writeReverseProxyBlock(w, http.StatusForbidden,
+					blockInfoFor(blockreason.EscalationLevel, adaptiveSessionDeny),
+					adaptiveBlockedReason)
+				return
+			}
+		}
 	}
 
 	// request_policy runs before the contract gate so a contract allow can
@@ -1642,6 +1985,38 @@ func (rp *ReverseProxyHandler) modifyResponse(resp *http.Response) error {
 		requestActionID = actionID
 	}
 	targetURL := resp.Request.URL.String()
+	// Response taint: observe this response against the SAME transport-independent
+	// taint key the request path evaluated, so a prompt-injection hit or an
+	// untrusted-origin response introduces taint that a later request on any
+	// transport sees. The defer runs on every exit path (buffered scan, media
+	// stream, oversize, shield); responsePromptHit is set true when the buffered
+	// injection scan below finds a hit. taint_disabled and a nil owner/session
+	// manager make observeHTTPResponseTaint inert, so this changes nothing when
+	// the feature is off.
+	responsePromptHit := false
+	var responseTaintRec session.Recorder
+	// sseHandlesResponseTaint is set true only on the SSE scanning path, which
+	// scans asynchronously in its onComplete goroutine AFTER this function (and
+	// this defer) returns. That path records its own taint observation once the
+	// finding is known, so the defer below skips it to avoid firing with a
+	// premature clean promptHit and to avoid double-counting. Every non-SSE exit
+	// (buffered scan, oversize, shield, read-error, compressed) completes before
+	// the defer, so responsePromptHit is already final for those. This mirrors the
+	// forward proxy, whose SSE scan runs synchronously so its single deferred
+	// observation already reflects the final promptHit.
+	sseHandlesResponseTaint := false
+	if rp.owner != nil {
+		if sm := rp.owner.SessionMgrPtr().Load(); sm != nil {
+			agentAuth := agentAuthFromContext(resp.Request.Context())
+			responseTaintRec = sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, envelope.ActorAuth(agentAuth)))
+			defer func() {
+				if sseHandlesResponseTaint {
+					return
+				}
+				observeHTTPResponseTaint(responseTaintRec, cfg, targetURL, resp.Header.Get("Content-Type"), "reverse_response", responsePromptHit)
+			}()
+		}
+	}
 	outcomeTracker := reverseOutcomeFromContext(resp.Request.Context())
 	recordReverseOutcome := func(status int, bytesTransferred int64, reason string) {
 		outcomeTracker.Record(status, bytesTransferred, reason)
@@ -2134,6 +2509,19 @@ responseScanning:
 			recordReverseOutcome(resp.StatusCode, resp.ContentLength, "sse_stream_unscanned")
 			return nil
 		}
+		// This scanning SSE path owns the response-taint observation: it scans
+		// asynchronously in onComplete below, so the modifyResponse-level defer
+		// must not record early with a clean promptHit. sseResponsePromptHit is
+		// set by OnFinding (warn mode, forwarded inline) and by an
+		// IsSSEStreamFinding onComplete error (block mode), matching the forward
+		// proxy which sets responsePromptHit on both. When there is no session
+		// recorder (nil owner or session manager), the defer already records
+		// nothing, so leave it in charge.
+		sseContentType := resp.Header.Get("Content-Type")
+		sseResponsePromptHit := false
+		if responseTaintRec != nil {
+			sseHandlesResponseTaint = true
+		}
 		actx := newHTTPAuditContext(reverseRequestContext(resp), rp.logger, httpAuditEvent{Method: resp.Request.Method, TargetURL: resp.Request.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""})
 		sseLayer := LayerSSEStream
 		sseOpts := SSEDispatchOptions{
@@ -2145,6 +2533,7 @@ responseScanning:
 				Suppress:           cfg.Suppress,
 				ResponseScanExempt: revRespExempt,
 				OnFinding: func(err error) {
+					sseResponsePromptHit = true
 					rp.logger.LogResponseScan(actx, config.ActionWarn, 0, []string{sseLayer + ": " + err.Error()}, nil)
 				},
 				OnDroppedDLP: func(match scanner.TextDLPMatch, reason string) {
@@ -2156,6 +2545,18 @@ responseScanning:
 			},
 		}
 		onComplete := func(err error) {
+			// Record the response-taint observation now the async scan is done and
+			// the final finding state is known. OnFinding (warn mode) and an
+			// IsSSEStreamFinding error (block mode) both mean the stream carried an
+			// injection, so it upgrades the session to hostile taint the same way a
+			// buffered injection response would. This runs on every completion path
+			// (clean EOF, finding, scan error, cancel); observeHTTPResponseTaint is
+			// inert when taint is disabled. Both operands are final at this point:
+			// DispatchSSEScan (and every OnFinding it fires) completes before
+			// onComplete, all in the one streaming goroutine.
+			if responseTaintRec != nil {
+				observeHTTPResponseTaint(responseTaintRec, cfg, targetURL, sseContentType, "reverse_response", sseResponsePromptHit || IsSSEStreamFinding(err))
+			}
 			if err == nil {
 				return
 			}
@@ -2524,6 +2925,9 @@ responseScanning:
 	// Scan the response text for injection patterns.
 	result := sc.ScanResponseBodyWithSuppress(resp.Request.Context(), body, resp.Request.URL.String(), cfg.Suppress)
 	recordSuppressedResponseScanExempts(rp.metrics, result.SuppressedMatches, TransportReverse)
+	// A response injection match is a taint source; the deferred taint
+	// observation above reads this flag when the response completes.
+	responsePromptHit = !result.Clean
 	actx := newHTTPAuditContext(reverseRequestContext(resp), rp.logger, httpAuditEvent{Method: resp.Request.Method, TargetURL: resp.Request.URL.String(), ClientIP: clientIP, RequestID: requestID, Agent: ""})
 	recordDroppedResponseScanMatches(rp.metrics, rp.logger, actx, result.SuppressedMatches, TransportReverse)
 
