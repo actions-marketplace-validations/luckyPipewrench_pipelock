@@ -123,11 +123,19 @@ func TestLaunchExecEnvLines_Shape(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	lines := launchExecEnvLines(env)
 	joined := strings.Join(lines, "\n")
-	if lines[0] != "exec env \\" {
-		t.Errorf("first line = %q, want 'exec env \\'", lines[0])
+	// env -i (not plain env) is the operator->agent leak fix: the wrapper must
+	// start from an empty environment and rebuild only the contract.
+	if lines[0] != "exec env -i \\" {
+		t.Errorf("first line = %q, want 'exec env -i \\'", lines[0])
+	}
+	if strings.Contains(joined, "exec env \\") {
+		t.Errorf("launch wrapper still uses plain `env` (ambient operator env would leak):\n%s", joined)
 	}
 	for _, want := range []string{
 		"HOME=" + agentHomeDir(env),
+		"USER=" + env.agentUserName,
+		"LOGNAME=" + env.agentUserName,
+		"SHELL=/bin/bash",
 		"HTTPS_PROXY=http://127.0.0.1:8888",
 		`PATH="$AGENT_PATH"`,
 		`"$TARGET" "$@"`,
@@ -139,8 +147,12 @@ func TestLaunchExecEnvLines_Shape(t *testing.T) {
 			t.Errorf("launch exec env missing %q", want)
 		}
 	}
-	if strings.Contains(joined, posturebinding.RuntimeProofEnv+"=") {
-		t.Fatalf("launch wrapper must preserve caller-provided %s, got:\n%s", posturebinding.RuntimeProofEnv, joined)
+	// Under env -i the caller's PIPELOCK_POSTURE_PROOF is cleared, so it must be
+	// explicitly forwarded (preserving a run-provided value, else the default) or
+	// the child grades containment UNKNOWN.
+	wantForward := posturebinding.RuntimeProofEnv + `="${` + posturebinding.RuntimeProofEnv + ":-" + posturebinding.DefaultContainRunProofPath + `}"`
+	if !strings.Contains(joined, wantForward) {
+		t.Fatalf("launch wrapper must forward %s under env -i, want %q, got:\n%s", posturebinding.RuntimeProofEnv, wantForward, joined)
 	}
 	// Every continuation line except the last must end with a backslash.
 	for i, l := range lines[:len(lines)-1] {
@@ -830,5 +842,84 @@ func TestStepWriteUtilityWrappers_WriteErrorRollsBack(t *testing.T) {
 	s := stepWriteUtilityWrappers()
 	if _, err := s.apply(context.Background(), env); err == nil {
 		t.Fatalf("expected write error to surface")
+	}
+}
+
+// TestLaunchPathsShareEnvNameSet is the anti-drift check named in
+// containLaunchEnv's doc: the `contain run` Go launcher and the installed
+// plk-launch wrapper must export the SAME ordered set of environment variable
+// names, so the two contained-launch paths can never disagree on what the tool
+// sees.
+func TestLaunchPathsShareEnvNameSet(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+
+	goEnv := containLaunchEnv(env.agentUserName, agentHomeDir(env), env.proxyPort, "")
+	goNames := make([]string, 0, len(goEnv))
+	for _, e := range goEnv {
+		name, _, ok := strings.Cut(e, "=")
+		if !ok {
+			t.Fatalf("malformed go env entry %q", e)
+		}
+		goNames = append(goNames, name)
+	}
+
+	wrapperNames := make([]string, 0, len(goNames))
+	for _, l := range launchExecEnvLines(env) {
+		l = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(l), `\`))
+		if l == "" || strings.HasPrefix(l, "exec env") || strings.HasPrefix(l, `"$TARGET"`) {
+			continue
+		}
+		name, _, ok := strings.Cut(l, "=")
+		if !ok {
+			continue
+		}
+		wrapperNames = append(wrapperNames, strings.TrimSpace(name))
+	}
+
+	if !slices.Equal(goNames, wrapperNames) {
+		t.Fatalf("launch env name sets diverged:\n  go     =%v\n  wrapper=%v", goNames, wrapperNames)
+	}
+}
+
+// TestLaunchExecEnvLines_EnvIClearsLeakAndForwardsPosture proves the rendered
+// plk-launch env block, run through a real bash, (a) forwards a caller-provided
+// PIPELOCK_POSTURE_PROOF, (b) falls back to the default when it is unset, and
+// (c) drops operator variables that were standing in the wrapper's own
+// environment (the leak `env -i` closes).
+func TestLaunchExecEnvLines_EnvIClearsLeakAndForwardsPosture(t *testing.T) {
+	if _, err := os.Stat("/bin/bash"); err != nil {
+		t.Skip("bash unavailable")
+	}
+	if _, err := os.Stat("/usr/bin/env"); err != nil {
+		t.Skip("/usr/bin/env unavailable")
+	}
+	env, _, _ := newFakeEnv(t)
+	body := "#!/bin/bash\nset -euo pipefail\nAGENT_PATH=/usr/bin:/bin\nTARGET=/usr/bin/env\n" +
+		strings.Join(launchExecEnvLines(env), "\n") + "\n"
+	tmp := filepath.Join(t.TempDir(), "plk-launch")
+	writeScriptFixture(t, tmp, body)
+
+	// Caller (sudo) leaves operator variables standing AND a run-specific proof.
+	res := execRealCommand(t, "/bin/bash", "-c",
+		"PIPELOCK_POSTURE_PROOF=/custom/run/proof.json DISPLAY=:0 XAUTHORITY=/x SUDO_USER=josh bash "+shellQuote(tmp))
+	if res.exit != 0 {
+		t.Fatalf("run: exit=%d out=%s", res.exit, res.output)
+	}
+	if !strings.Contains(res.output, posturebinding.RuntimeProofEnv+"=/custom/run/proof.json") {
+		t.Fatalf("posture proof not forwarded under env -i:\n%s", res.output)
+	}
+	for _, leak := range []string{"DISPLAY=", "XAUTHORITY=", "SUDO_USER="} {
+		if strings.Contains(res.output, leak) {
+			t.Fatalf("env -i leaked operator variable %q:\n%s", leak, res.output)
+		}
+	}
+
+	// With no caller-provided proof, the default binds.
+	res2 := execRealCommand(t, "/bin/bash", "-c", "unset PIPELOCK_POSTURE_PROOF; bash "+shellQuote(tmp))
+	if res2.exit != 0 {
+		t.Fatalf("run (default): exit=%d out=%s", res2.exit, res2.output)
+	}
+	if !strings.Contains(res2.output, posturebinding.RuntimeProofEnv+"="+posturebinding.DefaultContainRunProofPath) {
+		t.Fatalf("posture proof did not fall back to default:\n%s", res2.output)
 	}
 }
