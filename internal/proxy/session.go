@@ -106,9 +106,28 @@ type adaptiveScopeState struct {
 	airlock          AirlockState
 }
 
+// sessionMutex behaves like sync.Mutex in production. Tests can install an
+// onBlocked callback to observe that a caller actually contended on the lock.
+type sessionMutex struct {
+	sync.Mutex
+	onBlocked func()
+}
+
+func (m *sessionMutex) Lock() {
+	if m.onBlocked == nil {
+		m.Mutex.Lock()
+		return
+	}
+	if m.TryLock() {
+		return
+	}
+	m.onBlocked()
+	m.Mutex.Lock()
+}
+
 // SessionState tracks behavioral state for a single agent session.
 type SessionState struct {
-	mu           sync.Mutex
+	mu           sessionMutex
 	key          string
 	kind         string // "identity" or "invocation" - set at creation, not inferred from key
 	created      time.Time
@@ -179,6 +198,36 @@ func (s *SessionState) EscalateAirlock(tier, trigger string) (changed bool, from
 	return s.airlock.SetTierWithProvenance(tier, trigger, airlockSourceTriggers)
 }
 
+// ForceSetAirlockTierAllScopes force-sets the session-wide airlock tier AND
+// every destination-scoped airlock to the same tier. An operator override is
+// session-wide intent, but adaptive escalation writes the tier per destination
+// scope (AirlockForScope), so setting only the session-wide airlock would leave
+// a scoped drain in place after an operator releases the session to none, and a
+// scoped session unaffected when an operator forces drain. Applying to every
+// scope makes both directions match operator expectation: release frees every
+// destination, force-drain quarantines every destination the session has
+// touched. Returns whether any tier changed and the strongest prior tier, so
+// an operator release of a scoped drain is reported as a real drain-to-none
+// transition even when the session-wide tier was already none. Lock order is
+// s.mu > airlock.mu, matching AirlockForScope. Holding s.mu across the global
+// and scoped writes makes the operator override one admission-visible change:
+// a scoped reader cannot observe the new global tier with an old scoped tier.
+func (s *SessionState) ForceSetAirlockTierAllScopes(tier, trigger, source string) (changed bool, from, to string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed, from, to = s.airlock.ForceSetTierWithProvenance(tier, trigger, source)
+	for _, st := range s.scopes {
+		scopeChanged, scopeFrom, _ := st.airlock.ForceSetTierWithProvenance(tier, trigger, source)
+		if scopeChanged {
+			changed = true
+			if AirlockTierOrder[scopeFrom] > AirlockTierOrder[from] {
+				from = scopeFrom
+			}
+		}
+	}
+	return changed, from, to
+}
+
 // maxAdaptiveScopes bounds the per-session destination-scope cardinality.
 // Each scope holds its own adaptive lane and airlock (mutex + cancel slice),
 // so an agent that touches an unbounded number of distinct hosts must not be
@@ -203,7 +252,10 @@ func (s *SessionState) getOrCreateScopeLocked(scope string) *adaptiveScopeState 
 			// every caller guards it.
 			return nil
 		}
-		st = &adaptiveScopeState{airlock: AirlockState{tier: config.AirlockTierNone}}
+		// A session-wide operator override also governs destinations first seen
+		// after the override. Inheriting the current global tier prevents a new
+		// scope from weakening a forced hard/drain state back to none.
+		st = &adaptiveScopeState{airlock: s.airlock.inheritedEntry()}
 		s.scopes[scope] = st
 	}
 	return st
@@ -2329,9 +2381,12 @@ func (sm *SessionManager) ForceSetAirlockTier(key, tier string) (found, changed 
 		return false, false, "", ""
 	}
 	// Hold RLock across the tier change so cleanup/eviction can't remove
-	// the session between lookup and mutation. ForceSetTier acquires its
-	// own mutex internally (lock ordering: sm.mu > airlock.mu).
-	changed, from, to = sess.Airlock().ForceSetTierWithProvenance(tier, airlockTriggerManual, airlockSourceAdminAPI)
+	// the session between lookup and mutation. ForceSetAirlockTierAllScopes
+	// acquires s.mu and airlock.mu internally (lock ordering: sm.mu > s.mu >
+	// airlock.mu). Apply to every destination scope, not just the session-wide
+	// airlock, so an operator release clears a scoped drain and an operator
+	// drain quarantines every destination the session has touched.
+	changed, from, to = sess.ForceSetAirlockTierAllScopes(tier, airlockTriggerManual, airlockSourceAdminAPI)
 	if changed {
 		sess.RecordEvent(SessionEvent{
 			Kind:     "airlock_override",
