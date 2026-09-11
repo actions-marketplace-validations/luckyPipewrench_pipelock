@@ -208,13 +208,11 @@ The `pr-review-tests` job in `ci.yaml` runs the same command. A suite that runs
 only inside a review cannot gate a change to the reviewer, because a review runs
 the default-branch copy.
 
-**Two signals, and they mean different things.** The `review` job reports
-whether the runner published a verdict, so `partial` and `inconclusive` are
-successful runner outcomes. The `completeness` job reports whether the reviewer
-settled the whole pull request. It fails when the reviewer missed work or a
-candidate still needs human verification. Read the comment for the exact cause.
-Combining these signals would make a working review look crashed or give an
-unsettled review a green check.
+**The signed comment is the review signal.** The `review` job reports whether
+the runner published a verdict, so `partial` and `inconclusive` are successful
+runner outcomes. Automation reads the signed marker in the comment to decide
+whether the reviewer settled the whole pull request; review verdicts do not
+publish commit statuses or CI checks.
 
 **Deletions are a security change.** Removing a guard reads as a deletion hunk.
 Deep mode reads deletion hunks in full and splits an oversized one into bounded
@@ -267,14 +265,12 @@ code under the pin. Replace `YOUR_GITHUB_LOGIN` with the login allowed to
 trigger a review, or drop those clauses and rely on `author_association ==
 'OWNER'` alone.
 
-Grant `issues: write`, `pull-requests: write`, and `statuses: write`. A called
-workflow cannot hold a permission its caller withheld, so dropping any one of
-them silently strips it from the reviewer rather than failing at load, and the
-review then ends on a permission error when it tries to use it. The first two
-carry the review comment. `statuses: write` carries the `pr-review/coverage`
-commit status, which is the only surface a comment-triggered run has on the pull
-request itself: without it a review that did not finish fails its own run while
-the pull request still shows every check passing.
+Grant `issues: write` and `pull-requests: write`. A called workflow cannot hold
+a permission its caller withheld, so dropping either one silently strips it
+from the reviewer rather than failing at load, and the review then ends on a
+permission error when it tries to update its pull-request comment. Review
+verdicts are informational and do not publish commit statuses or CI checks;
+automation must read the signed review marker in the comment.
 
 Personal-account repositories must map each named secret explicitly, because
 `secrets: inherit` is not available to them.
@@ -294,7 +290,6 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
-  statuses: write
 
 jobs:
   review:

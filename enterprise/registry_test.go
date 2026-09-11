@@ -590,7 +590,8 @@ func TestAgentRegistryResolveFromRequest_CIDR(t *testing.T) {
 func TestAgentRegistryResolveFromRequest_Header(t *testing.T) {
 	cfg := testConfig()
 	cfg.Agents = map[string]config.AgentProfile{
-		testProfileClaudeCode: {Mode: config.ModeStrict},
+		testProfileClaudeCode: {Mode: config.ModeAudit},
+		testProfileDefault:    {Mode: config.ModeStrict},
 	}
 
 	reg, err := NewAgentRegistry(cfg)
@@ -603,15 +604,114 @@ func TestAgentRegistryResolveFromRequest_Header(t *testing.T) {
 	r.Header.Set(edition.AgentHeader, testProfileClaudeCode)
 
 	ra, id := reg.ResolveFromRequest(context.Background(), r, cfg, nil)
-	if id.Profile != testProfileClaudeCode {
-		t.Errorf("profile = %q, want %q", id.Profile, testProfileClaudeCode)
+	if id.Name != testProfileClaudeCode {
+		t.Errorf("name = %q, want claimed name %q retained for attribution", id.Name, testProfileClaudeCode)
 	}
-	if ra.Name != testProfileClaudeCode {
-		t.Errorf("name = %q, want %q", ra.Name, testProfileClaudeCode)
+	if id.Profile != testProfileDefault {
+		t.Errorf("profile = %q, want fallback %q", id.Profile, testProfileDefault)
+	}
+	if ra.Name != testProfileDefault {
+		t.Errorf("resolved policy = %q, want fallback %q", ra.Name, testProfileDefault)
+	}
+	if ra.Config.Mode != config.ModeStrict {
+		t.Errorf("resolved mode = %q, want fallback strict policy", ra.Config.Mode)
 	}
 	// Self-declared, even though the name matches a configured profile.
 	if id.Auth != envelope.ActorAuthMatched {
 		t.Errorf("auth = %q, want %q", id.Auth, envelope.ActorAuthMatched)
+	}
+}
+
+func TestAgentRegistryResolveFromRequest_CallerNameRotationSharesFallbackBudget(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		"caller-a":         {Mode: config.ModeAudit},
+		"caller-b":         {Mode: config.ModeAudit},
+		testProfileDefault: {Budget: config.BudgetConfig{MaxRequestsPerSession: 1, WindowMinutes: 60}},
+	}
+
+	reg, err := NewAgentRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+
+	resolve := func(name string) (*edition.ResolvedAgent, edition.AgentIdentity) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com", nil)
+		req.Header.Set(edition.AgentHeader, name)
+		return reg.ResolveFromRequest(req.Context(), req, cfg, nil)
+	}
+
+	first, firstID := resolve("caller-a")
+	second, secondID := resolve("caller-b")
+	if firstID.Name == secondID.Name || first != second || first.Budget != second.Budget {
+		t.Fatalf("rotated attribution did not share fallback policy and budget: first=%+v second=%+v", firstID, secondID)
+	}
+	if err := first.Budget.RecordRequest("example.com", 0); err != nil {
+		t.Fatalf("record first fallback request: %v", err)
+	}
+	if err := second.Budget.CheckAdmission("example.com"); err == nil {
+		t.Fatal("caller-controlled name rotation obtained a fresh fallback budget")
+	}
+}
+
+func TestAgentRegistryResolveFromRequest_QueryCannotSelectPolicy(t *testing.T) {
+	cfg := testConfig()
+	cfg.Agents = map[string]config.AgentProfile{
+		testProfileClaudeCode: {Mode: config.ModeAudit},
+		testProfileDefault:    {Mode: config.ModeStrict},
+	}
+
+	reg, err := NewAgentRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com?agent="+testProfileClaudeCode, nil)
+	ra, id := reg.ResolveFromRequest(r.Context(), r, cfg, nil)
+	if id.Name != testProfileClaudeCode || id.Auth != envelope.ActorAuthMatched {
+		t.Fatalf("identity = %+v, want matched claimed name retained for attribution", id)
+	}
+	if id.Profile != testProfileDefault || ra.Name != testProfileDefault || ra.Config.Mode != config.ModeStrict {
+		t.Fatalf("policy identity = %+v, resolved = %q mode = %q; want strict fallback", id, ra.Name, ra.Config.Mode)
+	}
+}
+
+func TestAgentRegistryResolveFromRequest_BoundDefaultSelectsPolicy(t *testing.T) {
+	cfg := testConfig()
+	cfg.DefaultAgentIdentity = testProfileClaudeCode
+	cfg.BindDefaultAgentIdentity = true
+	cfg.Agents = map[string]config.AgentProfile{
+		testProfileClaudeCode: {Mode: config.ModeStrict},
+		testProfileCursor:     {Mode: config.ModeAudit},
+	}
+
+	reg, err := NewAgentRegistry(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reg.Close()
+
+	r := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com", nil)
+	r.Header.Set(edition.AgentHeader, "unknown-agent")
+	ra, id := reg.ResolveFromRequest(r.Context(), r, cfg, nil)
+	if id.Auth != envelope.ActorAuthConfigDefault || id.Profile != testProfileClaudeCode {
+		t.Fatalf("identity = %+v, want config-default profile %q", id, testProfileClaudeCode)
+	}
+	if ra.Name != testProfileClaudeCode || ra.Config.Mode != config.ModeStrict {
+		t.Fatalf("resolved = %q mode = %q, want bound default strict profile", ra.Name, ra.Config.Mode)
+	}
+
+	// A known request-supplied profile cannot suppress the operator-bound
+	// default identity or its policy.
+	r.Header.Set(edition.AgentHeader, testProfileCursor)
+	ra, id = reg.ResolveFromRequest(r.Context(), r, cfg, nil)
+	if id.Name != testProfileClaudeCode || id.Auth != envelope.ActorAuthConfigDefault || id.Profile != testProfileClaudeCode {
+		t.Fatalf("known claimed identity = %+v, want bound-default identity and profile %q", id, testProfileClaudeCode)
+	}
+	if ra.Name != testProfileClaudeCode || ra.Config.Mode != config.ModeStrict {
+		t.Fatalf("known claim resolved = %q mode = %q, want bound default strict policy", ra.Name, ra.Config.Mode)
 	}
 }
 

@@ -455,7 +455,7 @@ request_body_scanning:
 
 **Header scanning:** Headers are scanned regardless of destination host. An agent can exfiltrate secrets via `Authorization: Bearer <secret>` to any host, including allowlisted ones. The URL allowlist controls URL-level blocking, not header DLP bypass.
 
-**Security hard-blocks:** In enforce mode, immutable core DLP findings in request bodies and headers hard-block with `X-Pipelock-Block-Reason: dlp_match` even when `request_body_scanning.action: warn`; they cannot be disabled or downgraded by `pattern_actions`. Request-body prompt-injection findings hard-block with `X-Pipelock-Block-Reason: prompt_injection` on every destination except those listed in `request_body_scanning.trusted_hosts`, where they follow `action`; a fully redacted critical credential follows `action` on a trusted host the same way. Operators that need audit-only rollout for selected non-core critical body-DLP patterns can set those exact names under `request_body_scanning.pattern_actions` with `warn`, or run the deployment with `enforce: false`.
+**Security hard-blocks:** In enforce mode, immutable core DLP findings in request bodies and headers hard-block with `X-Pipelock-Block-Reason: dlp_match` even when `request_body_scanning.action: warn`; they cannot be disabled or downgraded by `pattern_actions`. The same immutable core floor also hard-blocks a core credential found in MCP input (`tools/call` arguments and other JSON-RPC fields) regardless of `mcp_input_scanning.action` — except a core credential that request-side redaction fully rewrites, which follows the configured action, as described under MCP Input Scanning — and in an A2A body regardless of `a2a_scanning.action`, including the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. The A2A floor covers a core credential carried in a URL field (query or path) and in an `A2A-Extensions` header URI, not only in text fields, so a URL-embedded core credential cannot be downgraded to warn. WebSocket frames still follow the generic body floor. Scan failures and incomplete scans fail closed. Findings the core predicate does not classify as core follow the configured action; a positive core match can only raise the action to block, never lower it. Non-body inbound MCP responses use the separate inbound-DLP path, not this floor. Request-body prompt-injection findings hard-block with `X-Pipelock-Block-Reason: prompt_injection` on every destination except those listed in `request_body_scanning.trusted_hosts`, where they follow `action`; a fully redacted critical credential follows `action` on a trusted host the same way. Operators that need audit-only rollout for selected non-core critical body-DLP patterns can set those exact names under `request_body_scanning.pattern_actions` with `warn`, or run the deployment with `enforce: false`.
 
 Some APIs accept an AWS presigned URL inside a JSON or form body so the server can fetch an attachment. The URL contains an AWS access-key ID, which belongs to the immutable DLP floor and cannot be handled with `suppress`, `disable_patterns`, or `pattern_actions`. Use `sigv4_credential_routes` only for the exact outbound HTTPS API request carrying that body; the route matches the outer request, not the embedded AWS URL. Routes apply to forward-proxy, intercepted CONNECT, and reverse-proxy requests. WebSocket frames never match a route, because a frame has no request method or declared content type; the embedded key stays blocked there. Pipelock separately requires the embedded URL to use an AWS-owned hostname and a complete SigV4 structure before exempting the key inside `X-Amz-Credential`; the same value anywhere else remains blocked. Long-lived presigned URLs keep the existing `SigV4 Long Expiry` warning.
 
@@ -1094,13 +1094,15 @@ mcp_input_scanning:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable input scanning |
-| `action` | `"warn"` | warn or block |
+| `action` | `"warn"` | warn or block. Immutable core DLP findings (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) in a request hard-block regardless of this action; the operator cannot downgrade the core floor here. The one exception is a core credential that top-level `redaction` fully rewrites, which follows this action instead — see the redaction note below. Non-core findings follow this action. |
 | `on_parse_error` | `"block"` | What to do with malformed JSON-RPC |
 | `response_timeout_seconds` | `0` | Per-read timeout (seconds) for upstream MCP server responses. `0` disables it (default). When set, a wrapped server that accepts a request but never replies no longer hangs the agent: the proxy fails closed, emitting a JSON-RPC `-32000` error for every pending request. The deadline is per complete response message (one JSON-RPC message, or one SSE data event on the bridge): it resets when each message arrives, so a steady stream of responses is never severed, but it does bound the wait for the *next* message — set it above your slowest legitimate tool's response latency. Applies to the **stdio subprocess proxy** (`-- COMMAND`, including sandboxed mode) and the **stdio-to-HTTP bridge** (`--upstream URL`). On the subprocess proxy a timeout **terminates the hung child** (a stuck subprocess cannot recover); on the HTTP bridge it **fails the affected request closed and the session keeps serving** (one slow response should not kill a shared HTTP upstream). The HTTP reverse-proxy listener (`--listen`) instead uses its own HTTP client/server timeouts. |
 
 Auto-enabled when running `pipelock mcp proxy`. `response_timeout_seconds` applies independently of `enabled`; it governs the response read path whenever the stdio-fronted proxy is running.
 
-If top-level `redaction.enabled` is also set, `tools/call` `params.arguments` are rewritten through the same matcher before input DLP runs. The behavior is identical across stdio, HTTP/SSE upstream mode, HTTP listener mode, and MCP-over-WebSocket.
+The stdio proxy always runs the full input content scan. When this section is disabled, the HTTP and WebSocket listeners skip configurable input findings but still scan for the immutable core credential floor; a core credential in `tools/call` arguments or another JSON-RPC field therefore hard-blocks on every MCP transport.
+
+If top-level `redaction.enabled` is also set, `tools/call` `params.arguments` are rewritten through the same matcher and the immutable core floor is evaluated on the redacted bytes rather than the original request. A core credential that redaction fully rewrites — so the forwarded request carries a placeholder and no credential — follows `mcp_input_scanning.action` instead of hard-blocking, matching the request-body floor's treatment of a fully redacted critical credential on a trusted destination; an MCP upstream is operator-configured, so no host list is consulted. Following the action is not the same as allowing: under the default warn action the scrubbed request forwards, but the pre-redaction finding is still recorded as a warn — logged with its pattern name and a redacted marker, captured on the input DLP verdict, and stamped on the action receipt as a warn — so a scrubbed core credential is never counted as a clean request or credited toward adaptive de-escalation. This matches the request-body floor, which keeps the pre-redaction DLP finding as a warn on a fully redacted body. The floor still hard-blocks, fail-closed, when redaction is disabled, when it leaves any part of the credential in place, or when the post-redaction rescan still finds a core match. A non-core credential in warn mode continues to forward its redacted payload instead of the original secret, and it is recorded as a warn the same way. The behavior is identical across stdio, HTTP/SSE upstream mode, HTTP listener mode, and MCP-over-WebSocket.
 
 ## MCP Tool Scanning
 
@@ -1406,7 +1408,7 @@ mcp_ws_listener:
 
 ## Session Profiling
 
-Per-session behavioral analysis that detects domain bursts and volume spikes.
+Per-session behavioral analysis that detects domain bursts.
 
 ```yaml
 session_profiling:
@@ -1414,7 +1416,6 @@ session_profiling:
   anomaly_action: warn
   domain_burst: 5
   window_minutes: 5
-  volume_spike_ratio: 3.0
   max_sessions: 1000
   session_ttl_minutes: 30
   cleanup_interval_seconds: 60
@@ -1426,7 +1427,6 @@ session_profiling:
 | `anomaly_action` | `"warn"` | warn or block on anomaly |
 | `domain_burst` | `5` | New unique domains in window to flag |
 | `window_minutes` | `5` | Rolling window duration |
-| `volume_spike_ratio` | `3.0` | Spike threshold (ratio of avg) |
 | `max_sessions` | `1000` | Hard cap on concurrent sessions |
 | `session_ttl_minutes` | `30` | Idle session eviction |
 | `cleanup_interval_seconds` | `60` | Background cleanup interval |
@@ -2139,7 +2139,9 @@ Resolution precedence with binding enabled: context override > `default_agent_id
 
 ## Agent Profiles
 
-Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`, `volume_spike_ratio`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+
+Per-agent burst detection separates callers only when their identity is infrastructure-bound. Domain-burst detection runs a second, IP-level counter that catches a single caller rotating a self-declared `X-Pipelock-Agent` header to evade the per-agent counter: it emits an `ip_domain_burst` anomaly and, with `anomaly_action: block`, returns HTTP 403 once `domain_burst` unique domains are seen within `window_minutes`. That IP-level counter groups all self-declared and header-matched callers on one client IP together, because a request-supplied name cannot be trusted to partition state. Distinct callers that share one client IP are counted separately only when each is bound by its own per-agent listener; a `source_cidrs` match separates distinct source addresses, not callers that share one address (see the [mediation envelope guide](guides/mediation-envelope.md) for identity grades). Several listener-bound callers on one host therefore do not false-positive as one bursting agent.
 
 ```yaml
 agents:
@@ -2185,19 +2187,20 @@ agents:
 
 ### Agent Resolution
 
-Pipelock resolves the agent name for each request using this priority order:
+Pipelock resolves the agent name for attribution using this priority order:
 
-1. **Listener binding**: matched by the port the request arrived on (injected as a context override, spoof-proof)
+1. **Listener binding**: matched by the port the request arrived on (injected as a context override; network-bound, so a request cannot change it)
 2. **Source CIDRs**: matched by client IP against `source_cidrs` ranges defined on each agent profile. The client IP is the connection's own peer address; forwarded-address headers such as `X-Forwarded-For` are ignored, so a deployment behind another proxy sees that proxy's address here
 3. **Header** (`X-Pipelock-Agent`): set by the calling agent or orchestrator
-4. **Query parameter** (`?agent=name`): appended to fetch/WebSocket URLs
-5. **Fallback**: `_default` profile if defined, otherwise base config
+4. **Configured default** (`default_agent_identity`): used when no header is present, including when binding is disabled
+5. **Query parameter** (`?agent=name`): appended to fetch/WebSocket URLs
+6. **Fallback**: `_default` profile if defined, otherwise base config
 
-Listener-based resolution is the only method that cannot be spoofed by the agent. It injects a context override that takes priority over header and query param. Header and query param methods are convenient but trust the caller. Use listeners when isolation matters.
+Listener-based resolution and a `source_cidrs` match are the two methods the agent cannot change from inside a request; both are graded `bound`. Listener resolution injects a context override that takes priority over header and query param. Header and query values remain attribution hints: the claimed name is retained with grade `matched` or `self-declared`, while the request uses the `_default` profile or base policy. A configured default has grade `config-default` and selects its matching profile whether or not `bind_default_agent_identity` is enabled. Binding changes precedence by making the configured default override caller-supplied header and query values. Use listeners when callers share one source address and need different policies.
 
 On the reverse-proxy listener, a `source_cidrs` match sets the agent identity used for attribution and the outbound mediation envelope. It does not select per-agent scanner, budget, or policy overrides: reverse-proxy enforcement uses that listener's configured generic policy or `profile: submit` policy.
 
-For MCP proxy mode, the `--agent` flag resolves the profile directly at startup (not through the HTTP resolution chain).
+For MCP proxy mode, the operator-supplied `--agent` flag resolves the profile directly at startup and does not use the HTTP request-resolution chain.
 
 ### Override Fields
 
@@ -2308,7 +2311,7 @@ it cannot corrupt MCP stdio framing.
 
 Each agent can bind to one or more dedicated ports via the `listeners` field. Pipelock opens these ports at startup alongside the main proxy port. Requests arriving on an agent's listener are automatically resolved to that agent without relying on headers or query params.
 
-This is the only spoof-proof resolution method. The agent process connects to its assigned port, and pipelock knows which profile to apply based on the port alone.
+Listener binding and a `source_cidrs` match are the two network-bound resolution methods; both grade the identity `bound`. A request cannot change either one, but neither authenticates the host or process behind the peer address, so access to the listener port and the integrity of the source address are the operator's controls. With a listener, the agent process connects to its assigned port and pipelock knows which profile to apply from the port alone.
 
 ```yaml
 agents:
@@ -3036,7 +3039,7 @@ a2a_scanning:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable A2A protocol detection and scanning |
-| `action` | `warn` | Action on findings: `block` or `warn` |
+| `action` | `warn` | Action on findings: `block` or `warn`. Immutable core DLP findings in an A2A body hard-block regardless of this action, including on the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. Non-core findings follow this action. |
 | `scan_agent_cards` | `true` | Scan Agent Card skill descriptions for injection |
 | `detect_card_drift` | `true` | Detect Agent Card modification mid-session (rug-pull) |
 | `session_smuggling_detection` | `true` | Track contextId to detect session smuggling |

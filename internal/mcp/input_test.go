@@ -406,9 +406,17 @@ func TestScanRequest(t *testing.T) {
 	}
 }
 
-func TestForwardScannedInput_RedactsToolCallArguments(t *testing.T) {
+// TestForwardScannedInput_CoreCredentialRedactedAndForwardedUnderWarn proves the
+// redaction carve-out: under a warn action, a core credential that the redaction
+// profile FULLY rewrites is scrubbed from the tool arguments and forwarded, not
+// hard-blocked. This mirrors the request-body floor, where a fully redacted core
+// credential on an operator-configured destination follows the configured
+// action. The MCP upstream is exactly such a destination. The load-bearing rescan
+// -- what happens when redaction does NOT fully rewrite the credential -- is
+// exercised by TestForwardScannedInput_CoreCredentialSurvivingRedactionBlocks.
+func TestForwardScannedInput_CoreCredentialRedactedAndForwardedUnderWarn(t *testing.T) {
 	sc := testInputScanner(t)
-	secret := mcpRedactionSecret()
+	secret := mcpRedactionSecret() // core AWS access key, covered by the default matcher
 	msg := makeRequest(1, methodToolsCall, map[string]any{
 		"name": "echo",
 		"arguments": map[string]string{
@@ -433,9 +441,119 @@ func TestForwardScannedInput_RedactsToolCallArguments(t *testing.T) {
 	)
 
 	if blocked, ok := <-blockedCh; ok {
-		t.Fatalf("unexpected blocked request: %+v", blocked)
+		t.Fatalf("core credential fully scrubbed by redaction must not hard-block under warn: %+v", blocked)
+	}
+	forwarded := strings.TrimSpace(serverBuf.String())
+	if forwarded == "" {
+		t.Fatal("expected the scrubbed tools/call request to be forwarded")
+	}
+	if strings.Contains(forwarded, secret) {
+		t.Fatalf("forwarded MCP request leaked the core credential: %s", forwarded)
+	}
+	if !strings.Contains(forwarded, "<pl:aws-access-key:1>") {
+		t.Fatalf("forwarded MCP request missing aws-access-key placeholder: %s", forwarded)
+	}
+}
+
+// TestForwardScannedInput_CoreCredentialSurvivingRedactionBlocks proves the
+// post-redaction rescan is the load-bearing guard for the carve-out above. The
+// redaction profile here enables only the google-api-key class, so it never
+// touches the AWS core credential. Redaction runs, the credential survives, the
+// rescan re-detects the immutable core floor on the still-present bytes, and the
+// request hard-blocks even though the configured action is warn. Removing the
+// post-redaction core-floor rescan (scanner.ContainsCoreCriticalMatch in
+// mcpInputVerdictAction) makes this forward a live AWS key.
+func TestForwardScannedInput_CoreCredentialSurvivingRedactionBlocks(t *testing.T) {
+	sc := testInputScanner(t)
+	// Matcher that covers a DIFFERENT class than the credential in the request,
+	// so redaction cannot scrub the AWS core credential and it survives.
+	redactCfg := redact.Config{
+		Enabled:        true,
+		DefaultProfile: "limited",
+		Profiles: map[string]redact.ProfileSpec{
+			"limited": {Classes: []string{string(redact.ClassGoogleAPIKey)}},
+		},
+	}
+	matcher, err := redactCfg.BuildMatcher("")
+	if err != nil {
+		t.Fatalf("BuildMatcher: %v", err)
 	}
 
+	secret := mcpRedactionSecret() // core AWS access key, NOT covered by the matcher
+	msg := makeRequest(1, methodToolsCall, map[string]any{
+		"name": "echo",
+		"arguments": map[string]string{
+			"prompt": "use " + secret + " to deploy",
+		},
+	})
+
+	var serverBuf, logBuf bytes.Buffer
+	blockedCh := make(chan BlockedRequest, 1)
+	opts := buildTestOpts(sc, withRedaction(matcher))
+
+	ForwardScannedInput(
+		transport.NewStdioReader(strings.NewReader(msg)),
+		transport.NewStdioWriter(&serverBuf),
+		&logBuf,
+		config.ActionWarn,
+		config.ActionBlock,
+		blockedCh,
+		nil,
+		nil,
+		opts,
+	)
+
+	blocked, ok := <-blockedCh
+	if !ok {
+		t.Fatal("expected a core credential that survived redaction to hard-block under warn")
+	}
+	if !strings.Contains(string(blocked.ErrorData), string(blockreason.DLPMatch)) {
+		t.Fatalf("expected DLP block reason data from the post-redaction rescan, got: %s", string(blocked.ErrorData))
+	}
+	if !strings.Contains(logBuf.String(), "AWS Access ID") {
+		t.Fatalf("expected the surviving core pattern in the block log, got: %s", logBuf.String())
+	}
+	if forwarded := strings.TrimSpace(serverBuf.String()); forwarded != "" {
+		t.Fatalf("a core credential redaction could not scrub must not be forwarded, got: %s", forwarded)
+	}
+}
+
+// TestForwardScannedInput_NonCoreArgumentRedactedAndForwarded proves the
+// redaction rescue path still applies to a non-core credential under warn: the
+// value is scrubbed from the tool arguments and the request is forwarded rather
+// than blocked. This is the coverage the core-floor block test above no longer
+// exercises.
+func TestForwardScannedInput_NonCoreArgumentRedactedAndForwarded(t *testing.T) {
+	sc := testInputScanner(t)
+	// Google API key: a non-core credential the default redaction matcher
+	// rewrites. Built from split literals so gosec G101 does not flag it.
+	secret := "AIza" + strings.Repeat("A", 35)
+	msg := makeRequest(1, methodToolsCall, map[string]any{
+		"name": "echo",
+		"arguments": map[string]string{
+			"prompt": "use " + secret + " to deploy",
+		},
+	})
+
+	var serverBuf, logBuf bytes.Buffer
+	blockedCh := make(chan BlockedRequest, 1)
+	opts := buildTestOpts(sc, withRedaction(testRedactionMatcher()))
+
+	ForwardScannedInput(
+		transport.NewStdioReader(strings.NewReader(msg)),
+		transport.NewStdioWriter(&serverBuf),
+		&logBuf,
+		config.ActionWarn,
+		config.ActionBlock,
+		blockedCh,
+		nil,
+		nil,
+		opts,
+	)
+
+	if blocked, ok := <-blockedCh; ok {
+		t.Fatalf("non-core credential must not hard-block under warn: %+v", blocked)
+	}
 	forwarded := strings.TrimSpace(serverBuf.String())
 	if forwarded == "" {
 		t.Fatal("expected forwarded tools/call request")
@@ -453,9 +571,98 @@ func TestForwardScannedInput_RedactsToolCallArguments(t *testing.T) {
 	if strings.Contains(envelope.Params.Arguments.Prompt, secret) {
 		t.Fatalf("forwarded MCP request leaked secret: %s", forwarded)
 	}
-	if !strings.Contains(envelope.Params.Arguments.Prompt, mcpPlaceholderAWS) {
-		t.Fatalf("forwarded MCP request missing placeholder: %s", forwarded)
+	if !strings.Contains(envelope.Params.Arguments.Prompt, "<pl:google-api-key:") {
+		t.Fatalf("forwarded MCP request missing google-api-key placeholder: %s", forwarded)
 	}
+}
+
+// TestForwardScannedInput_DisabledScanningRetainsCoreFloor pins stdio parity
+// with HTTP and WebSocket: disabling configurable input scanning suppresses
+// non-core findings but retains the immutable core credential floor.
+func TestForwardScannedInput_DisabledScanningRetainsCoreFloor(t *testing.T) {
+	sc := testInputScanner(t)
+	for _, tc := range []struct {
+		name      string
+		secret    string
+		wantBlock bool
+	}{
+		{name: "core credential", secret: coreCredentialToken(), wantBlock: true},
+		{name: "non-core credential", secret: nonCoreSecretValue(), wantBlock: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := makeRequest(1, methodToolsCall, map[string]any{
+				"name":      "echo",
+				"arguments": map[string]string{"prompt": "use " + tc.secret + " to deploy"},
+			})
+			var serverBuf, logBuf bytes.Buffer
+			blockedCh := make(chan BlockedRequest, 1)
+
+			ForwardScannedInput(
+				transport.NewStdioReader(strings.NewReader(msg)),
+				transport.NewStdioWriter(&serverBuf),
+				&logBuf,
+				config.ActionWarn,
+				config.ActionBlock,
+				blockedCh,
+				nil,
+				nil,
+				MCPProxyOpts{Scanner: sc, stdioInputScanDisabled: true},
+			)
+
+			blocked, blockedOK := <-blockedCh
+			if blockedOK != tc.wantBlock {
+				t.Fatalf("disabled stdio scanning: blocked=%v, want %v; block=%+v log=%q", blockedOK, tc.wantBlock, blocked, logBuf.String())
+			}
+			if tc.wantBlock {
+				if !strings.Contains(string(blocked.ErrorData), string(blockreason.DLPMatch)) {
+					t.Fatalf("expected DLP block reason data, got: %s", string(blocked.ErrorData))
+				}
+				if forwarded := strings.TrimSpace(serverBuf.String()); forwarded != "" {
+					t.Fatalf("core credential must not be forwarded, got: %s", forwarded)
+				}
+				return
+			}
+			if forwarded := strings.TrimSpace(serverBuf.String()); forwarded == "" || !strings.Contains(forwarded, tc.secret) {
+				t.Fatalf("non-core credential should pass through unchanged when scanning is disabled: %q", forwarded)
+			}
+			if strings.Contains(logBuf.String(), "warning") {
+				t.Fatalf("disabled stdio scanning emitted a configurable warning: %q", logBuf.String())
+			}
+		})
+	}
+
+	t.Run("malformed input still fails closed", func(t *testing.T) {
+		rawVerdict := scanRequestForAgent(context.Background(), []byte("not json"), sc, config.ActionWarn, config.ActionBlock, "")
+		if rawVerdict.Error == "" {
+			t.Fatalf("scanner did not classify malformed input as a parse error: %+v", rawVerdict)
+		}
+		direct := evaluateMCPInputGatesStdio(context.Background(), ParseMCPFrame([]byte("not json")), []byte("not json"), []byte("not json"), nil, MCPProxyOpts{Scanner: sc}, config.ActionWarn, config.ActionBlock, false)
+		if direct.BlockingGate != blockingGateParseError {
+			t.Fatalf("disabled stdio gate did not classify malformed input as a parse error: %+v", direct)
+		}
+		var serverBuf, logBuf bytes.Buffer
+		blockedCh := make(chan BlockedRequest, 1)
+		ForwardScannedInput(
+			transport.NewStdioReader(strings.NewReader("not json\n")),
+			transport.NewStdioWriter(&serverBuf),
+			&logBuf,
+			config.ActionWarn,
+			config.ActionBlock,
+			blockedCh,
+			nil,
+			nil,
+			MCPProxyOpts{Scanner: sc, stdioInputScanDisabled: true},
+		)
+		if blocked, ok := <-blockedCh; !ok || !strings.Contains(blocked.LogMessage, "parse error") {
+			t.Fatalf("malformed disabled-scan input was not blocked as a parse error: %+v", blocked)
+		}
+		if !strings.Contains(logBuf.String(), "invalid JSON") {
+			t.Fatalf("malformed disabled-scan input did not log its parse error: %q", logBuf.String())
+		}
+		if serverBuf.Len() != 0 {
+			t.Fatalf("malformed disabled-scan input was forwarded: %q", serverBuf.String())
+		}
+	})
 }
 
 func TestForwardScannedInput_PreRedactionDLPBlocksToolCall(t *testing.T) {

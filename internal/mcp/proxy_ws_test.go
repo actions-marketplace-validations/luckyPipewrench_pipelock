@@ -24,6 +24,7 @@ import (
 	gobwasutil "github.com/gobwas/ws/wsutil"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
@@ -113,14 +114,25 @@ func wsRespondServer(t *testing.T, response []byte, responseSent chan<- struct{}
 
 func wsDrainServer(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
+	srv, frames, _ := wsDrainServerObserved(t)
+	return srv, frames
+}
+
+func wsDrainServerObserved(t *testing.T) (*httptest.Server, *atomic.Int64, <-chan struct{}) {
+	t.Helper()
 	var frames atomic.Int64
+	var closeOnce sync.Once
+	closed := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, _, _, err := ws.UpgradeHTTP(r, w)
 		if err != nil {
 			t.Errorf("ws upgrade: %v", err)
 			return
 		}
-		defer func() { _ = conn.Close() }()
+		defer func() {
+			_ = conn.Close()
+			closeOnce.Do(func() { close(closed) })
+		}()
 		for {
 			msgs, err := gobwasutil.ReadClientMessage(conn, nil)
 			if err != nil {
@@ -133,7 +145,19 @@ func wsDrainServer(t *testing.T) (*httptest.Server, *atomic.Int64) {
 			}
 		}
 	}))
-	return srv, &frames
+	return srv, &frames, closed
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	testwait.For(t, time.Second, func() bool {
+		select {
+		case <-signal:
+			return true
+		default:
+			return false
+		}
+	}, "%s", description)
 }
 
 func TestRunWSProxy_ForwardsCleanRequest(t *testing.T) {
@@ -1025,7 +1049,8 @@ func TestRunWSProxy_InputScanWarnMode(t *testing.T) {
 	sc := scanner.MustNew(cfg)
 	t.Cleanup(sc.Close)
 
-	fakeKey := "AKIA" + "IOSFODNN7EXAMPLE"
+	// Non-core secret so warn mode forwards; a core credential would hard-block.
+	fakeKey := nonCoreSecretValue()
 	pr, pw := io.Pipe()
 	var stderr bytes.Buffer
 
@@ -1067,6 +1092,61 @@ func TestRunWSProxy_InputScanWarnMode(t *testing.T) {
 	// Warning should be logged.
 	if !strings.Contains(stderr.String(), "warning") {
 		t.Errorf("expected warning log, got stderr: %s", stderr.String())
+	}
+}
+
+func TestRunWSProxy_InputScanWarnModeCoreCredentialBlocks(t *testing.T) {
+	srv, upstreamFrames, upstreamClosed := wsDrainServerObserved(t)
+	defer srv.Close()
+
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+
+	stdin := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"` + coreCredentialToken() + `"}}}` + "\n")
+	var stdout, stderr bytes.Buffer
+	inputCfg := &InputScanConfig{Enabled: true, Action: config.ActionWarn, OnParseError: config.ActionBlock}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg}); err != nil {
+		t.Fatalf("RunWSProxy: %v", err)
+	}
+	waitForSignal(t, upstreamClosed, "WebSocket upstream connection closed")
+	if got := upstreamFrames.Load(); got != 0 {
+		t.Fatalf("core credential reached WebSocket upstream in warn mode: frames=%d", got)
+	}
+	if got := decodeRPCError(t, stdout.String())[mcpBlockReasonKey]; got != string(blockreason.DLPMatch) {
+		t.Fatalf("WebSocket core-floor block reason = %v, want %s", got, blockreason.DLPMatch)
+	}
+}
+
+func TestRunWSProxy_InputScanDisabledCoreCredentialBlocks(t *testing.T) {
+	srv, upstreamFrames, upstreamClosed := wsDrainServerObserved(t)
+	defer srv.Close()
+
+	cfg := config.Defaults()
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+
+	stdin := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"echo","arguments":{"text":"` + coreCredentialToken() + `"}}}` + "\n")
+	var stdout, stderr bytes.Buffer
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := RunWSProxy(ctx, stdin, &stdout, &stderr, wsURL(srv), MCPProxyOpts{Scanner: sc}); err != nil {
+		t.Fatalf("RunWSProxy: %v", err)
+	}
+	waitForSignal(t, upstreamClosed, "WebSocket upstream connection closed")
+	if got := upstreamFrames.Load(); got != 0 {
+		t.Fatalf("core credential reached WebSocket upstream with input scanning disabled: frames=%d", got)
+	}
+	if got := decodeRPCError(t, stdout.String())[mcpBlockReasonKey]; got != string(blockreason.DLPMatch) {
+		t.Fatalf("WebSocket disabled-scan core-floor block reason = %v, want %s", got, blockreason.DLPMatch)
 	}
 }
 
