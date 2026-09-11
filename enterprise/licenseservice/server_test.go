@@ -50,7 +50,13 @@ func newTestServer(t *testing.T) *Server {
 	}
 
 	// Polar mock returns active pro subscription.
-	polarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	polarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every production Polar read must carry the version pin; these
+		// end-to-end fixtures are the ones that would otherwise let an
+		// unpinned client through.
+		if got := r.Header.Get("Polar-Version"); got != defaultPolarAPIVersion {
+			t.Errorf("Polar-Version = %q, want %q", got, defaultPolarAPIVersion)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{
 			"id": "%s",
@@ -87,9 +93,10 @@ func newTestServer(t *testing.T) *Server {
 		ListenAddr:          ":0",
 		FromEmail:           "test@pipelock.dev",
 		PolarAPIBase:        polarSrv.URL,
+		PolarAPIVersion:     defaultPolarAPIVersion,
 	}
 
-	polar := NewPolarClient(cfg.PolarAPIToken, cfg.PolarAPIBase)
+	polar := NewPolarClient(cfg.PolarAPIToken, cfg.PolarAPIBase, cfg.PolarAPIVersion)
 	email := &EmailSender{
 		apiKey:    cfg.ResendAPIKey,
 		fromEmail: cfg.FromEmail,
@@ -422,7 +429,7 @@ func TestServer_WebhookProcessingError_Returns500(t *testing.T) {
 	defer badPolarSrv.Close()
 
 	// Rewire the handler's Polar client.
-	srv.handler.polar = NewPolarClient(testPolarAPIToken, badPolarSrv.URL)
+	srv.handler.polar = NewPolarClient(testPolarAPIToken, badPolarSrv.URL, defaultPolarAPIVersion)
 
 	body := `{"type":"subscription.created","data":{"id":"sub_bad"}}`
 	req := signedWebhookRequest(t, srv, body)
