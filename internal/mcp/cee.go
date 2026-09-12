@@ -16,6 +16,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/identitykey"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -313,6 +314,7 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 	}
 	tracker, buffer, m, ceeCfg, release := opts.cee.snapshot()
 	defer release()
+	identity := identitykey.NewMCPCEEIdentity(opts.sessionKey)
 	if tracker == nil && (buffer == nil || !ceeCfg.FragmentReassembly.Enabled) {
 		return ""
 	}
@@ -345,13 +347,13 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 
 	// Entropy budget check.
 	if tracker != nil && ceeCfg.EntropyBudget.Enabled {
-		tracker.Record(opts.sessionKey, opts.entropyPayload)
-		if tracker.BudgetExceeded(opts.sessionKey) {
+		tracker.Record(identity, opts.entropyPayload)
+		if tracker.BudgetExceeded(identity) {
 			if m != nil {
 				m.RecordCrossRequestEntropyExceeded()
 			}
 			reason := fmt.Sprintf("cross-request entropy budget exceeded: %.0f/%.0f bits",
-				tracker.CurrentUsage(opts.sessionKey), tracker.Budget())
+				tracker.CurrentUsage(identity), tracker.Budget())
 			_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
 			if ceeCfg.EntropyBudget.Action == config.ActionBlock {
 				if opts.logger != nil {
@@ -370,6 +372,8 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 	if buffer != nil && ceeCfg.FragmentReassembly.Enabled {
 		seenSingletonFindings := make(map[string]struct{})
 		seenArgumentFindings := make(map[string]struct{})
+		var paths []string
+		var appends []scanner.FragmentAppend
 		for _, path := range mcpCEEFragmentPayloadPaths(fragmentPayloads) {
 			payload := fragmentPayloads[path]
 			if len(payload) == 0 {
@@ -381,10 +385,6 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 			// stream made an ordinary one-argument call cost two slots, so a
 			// small max_sessions denied a first call outright, and let one
 			// client's streams crowd out unrelated clients.
-			owner := opts.sessionKey
-			if owner == "" {
-				owner = fragmentKey
-			}
 			// Capacity exhaustion always blocks, regardless of the configured
 			// cross-request action, because the request is no longer inspectable.
 			// Argument streams are the class whose cardinality the frame
@@ -394,9 +394,18 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 			// argument evidence a split secret is reassembled from.
 			budgetGroup := fragmentKey
 			if path != "" {
-				budgetGroup = owner + mcpCEEArgumentStreamSuffix
+				budgetGroup = opts.sessionKey + mcpCEEArgumentStreamSuffix
 			}
-			appendResult := buffer.AppendOwnedInGroup(owner, budgetGroup, fragmentKey, payload)
+			paths = append(paths, path)
+			appends = append(appends, scanner.FragmentAppend{
+				Group:   identity.Stream(strings.TrimPrefix(budgetGroup, opts.sessionKey)),
+				Stream:  identity.Stream(strings.TrimPrefix(fragmentKey, opts.sessionKey)),
+				Payload: payload,
+			})
+		}
+		appendResult, streamMatches := buffer.AppendAndScanOwnedBatch(context.Background(), identity, appends, opts.sc)
+		for i, path := range paths {
+			payload := fragmentPayloads[path]
 			if appendResult.OwnerMismatch {
 				if m != nil {
 					m.RecordCrossRequestFragmentOwnerMismatch()
@@ -414,14 +423,15 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				if m != nil {
 					m.RecordCrossRequestFragmentCapacityExceeded()
 				}
-				reason := "cross-request fragment session capacity exhausted; request cannot be safely inspected"
+				reason := "cross-request fragment session capacity exhausted; request cannot be safely inspected; increase cross_request_detection.fragment_reassembly.max_sessions or reduce active sessions"
 				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
 				if opts.logger != nil {
 					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_capacity", reason)
 				}
 				return reason
 			}
-			if matches := buffer.ScanForSecrets(context.Background(), fragmentKey, opts.sc); len(matches) > 0 {
+			matches := streamMatches[i]
+			if len(matches) > 0 {
 				findingKey, kind := mcpCEEFragmentFindingKey(path, payload, matches[0].PatternName)
 				if mcpCEEFragmentFindingAlreadyRecorded(kind, findingKey, seenSingletonFindings, seenArgumentFindings) {
 					continue
