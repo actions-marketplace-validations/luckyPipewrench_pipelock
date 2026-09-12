@@ -330,7 +330,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 				RequestID:  requestID,
 				UserAgent:  r.UserAgent(),
 				ActorAuth:  id.Auth,
-				Result:     scanner.Result{Allowed: false, Score: 0.9},
+				Result:     scanner.Result{Allowed: false, Scanner: scanner.ScannerDLP, Reason: "CONNECT blocked: header DLP match", Score: 0.9},
 				Config:     cfg,
 				Logger:     p.logger,
 				DeferClean: false,
@@ -590,9 +590,12 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Early airlock check for opaque CONNECT: reject before dialing/hijacking
 	// so the client gets a proper HTTP 403 (not a torn-down connection).
 	// TLS-intercepted tunnels handle airlock per inner request instead.
+	// Admission reads the same trust-graded session as the adaptive writer.
+	// Request-controlled names fold to the source IP, so rotating a name cannot
+	// select a fresh airlock lane.
 	shouldIntercept := cfg.TLSInterception.Enabled && !isPassthrough(host, cfg.TLSInterception.PassthroughDomains)
 	if !shouldIntercept {
-		if connectSess, ok := connectRec.(*SessionState); ok && connectSess != nil {
+		if connectSess := p.airlockSessionForIdentity(agent, clientIP, id.Auth); connectSess != nil {
 			tier := airlockTierForScope(connectSess, adaptiveScopeForHost(host))
 			if tier == config.AirlockTierHard || tier == config.AirlockTierDrain {
 				p.logger.LogAirlockDeny(connectSess.key, tier, TransportConnect, http.MethodConnect, clientIP, requestID)
@@ -759,6 +762,10 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Airlock cancel hooks (intercepted and raw tunnels below) attach to the
+	// same trust-graded session the adaptive writer transitions.
+	connectAirlockSess := p.airlockSessionForIdentity(agent, clientIP, id.Auth)
+
 	// TLS interception: decrypt tunnel and scan body/headers/responses.
 	// Branch here after SNI verification but before raw splice. If interception
 	// is enabled and the host is not on the passthrough list, interceptTunnel
@@ -789,14 +796,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		defer interceptCancel()
 		// Register airlock cancel for intercepted tunnels so escalation to
 		// hard/drain terminates the inner-request http.Server via context.
-		if connectSess, ok := connectRec.(*SessionState); ok && connectSess != nil {
-			connectSess.AirlockForScope(adaptiveScopeForHost(host)).RegisterCancel(interceptCancel)
+		if connectAirlockSess != nil {
+			connectAirlockSess.AirlockForScope(adaptiveScopeForHost(host)).RegisterCancel(interceptCancel)
 		}
 		// Obtain a live session recorder for the tunnel. This provides live
 		// escalation level lookups instead of a stale snapshot from sr.Level.
 		var interceptRec session.Recorder
 		if sm := p.sessionMgrPtr.Load(); sm != nil {
-			interceptRec = sm.GetOrCreate(sessionKeyFor(agent, clientIP))
+			interceptRec = sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, id.Auth))
 		}
 		if err := interceptTunnel(interceptCtx, interceptConn, &InterceptContext{
 			TargetHost:         host,
@@ -841,8 +848,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	// Register airlock cancel for raw CONNECT tunnels. When the session
 	// escalates to hard/drain, closing both ends terminates the relay.
-	if connectSess, ok := connectRec.(*SessionState); ok && connectSess != nil {
-		connectSess.AirlockForScope(adaptiveScopeForHost(host)).RegisterCancel(func() {
+	if connectAirlockSess != nil {
+		connectAirlockSess.AirlockForScope(adaptiveScopeForHost(host)).RegisterCancel(func() {
 			safeClose(clientConn, "airlock.clientConn", p.logger)
 			safeClose(targetConn, "airlock.targetConn", p.logger)
 		})
@@ -1089,8 +1096,13 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	forwardTaint := evaluateHTTPTaint(cfg, forwardRec, r.Method, r.URL)
 	forwardRequiresReauth := false
 
-	// Airlock action classification for forward proxy.
-	if forwardSess, ok := forwardRec.(*SessionState); ok && forwardSess != nil {
+	// Airlock action classification for forward proxy. Admission reads the RAW
+	// adaptive session (sessionKeyFor) via airlockSessionForIdentity - the
+	// airlock writer's key - not the CEE-safe taint recorder above; see the
+	// fetch path for the rationale. This same raw session is carried into the
+	// redirect context below so every hop admits against the writer's session.
+	forwardAirlockSess := p.airlockSessionForIdentity(agent, clientIP, id.Auth)
+	if forwardSess := forwardAirlockSess; forwardSess != nil {
 		tier := airlockTierForScope(forwardSess, adaptiveScopeForHost(r.URL.Hostname()))
 		if tier != config.AirlockTierNone {
 			allowed, reason := ClassifyAction(tier, r.Method, TransportForward, false)
@@ -1946,6 +1958,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportForward)
 	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, forwardRec)
+	if forwardAirlockSess != nil {
+		ctx = context.WithValue(ctx, ctxKeyRedirectAirlockSession, forwardAirlockSess.key)
+	}
 	if forwardEntropyWarnRoute != nil {
 		ctx = context.WithValue(ctx, ctxKeyEntropyWarnRoute, forwardEntropyWarnRoute)
 	}
@@ -2689,6 +2704,9 @@ func (p *Proxy) handleForwardHTTP(w http.ResponseWriter, r *http.Request) {
 					if a2aResult.Reason == "" {
 						a2aResult.Reason = cardResult.Reason
 					}
+				}
+				if cardResult.DriftAdopted {
+					p.logger.LogAnomaly(actx, scannerLabelA2ACardDrift, "a2a: Agent Card descriptive drift adopted", 0)
 				}
 				// Positive attestation: emit an allow receipt when the card's
 				// signature verified against a trusted, origin-scoped key.

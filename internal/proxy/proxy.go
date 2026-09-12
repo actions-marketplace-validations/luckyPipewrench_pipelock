@@ -130,6 +130,14 @@ const (
 	// recorder into CheckRedirect so policy is re-evaluated against the same
 	// identity and state on every hop.
 	ctxKeyRedirectSessionRecorder
+	// ctxKeyRedirectAirlockSession carries the RAW adaptive session key (the
+	// airlock writer's key, sessionKeyFor(agent, clientIP)) into CheckRedirect so a
+	// redirect hop admits airlock against the same session the writer raised the
+	// tier on - not the CEE-safe taint recorder in ctxKeyRedirectSessionRecorder,
+	// whose key folds a named agent to the client IP and would miss that tier.
+	// Redirect taint stays on ctxKeyRedirectSessionRecorder; only airlock
+	// admission reads this one. See airlockSessionForIdentity.
+	ctxKeyRedirectAirlockSession
 	// ctxKeyEntropyWarnRoute binds a request-body entropy warning exception to
 	// its exact admitted HTTPS destination. CheckRedirect refuses a replay to
 	// any other route because 307/308 preserve the already-scanned body.
@@ -275,6 +283,12 @@ func redirectBlockedInfo(blockedErr *blockedRequestError) blockreason.Info {
 	// layer header alone would otherwise misreport the enforcing layer.
 	if blockedErr != nil && blockedErr.layer == blockLayerRequestPolicy {
 		return blockInfoFor(blockreason.RequestPolicyDeny, "")
+	}
+	// Airlock admission is an operator quarantine decision, not a scanner
+	// denial. Preserve its reason code across redirect handling so callers can
+	// distinguish quarantine from an unrelated redirect scan failure.
+	if blockedErr != nil && blockedErr.layer == "airlock" {
+		return blockInfoFor(blockreason.AirlockActive, "")
 	}
 	layer := ""
 	if blockedErr != nil {
@@ -602,7 +616,7 @@ const shieldRewriteHeader = "X-Pipelock-Shield-Rewrite"
 
 const (
 	adaptiveEnforcementLayer = "adaptive_enforcement"
-	adaptiveRecoverHint      = "wait for auto-recovery or inspect/reset the identity session with the session operator commands"
+	adaptiveRecoverHint      = "wait for auto-recovery or run pipelock session reset <key>"
 	adaptiveBlockedReason    = "blocked by adaptive enforcement"
 	adaptiveRecoveryTimer    = "time_based_recovery"
 	adaptiveRecoveryClean    = "clean_request_recovery"
@@ -878,7 +892,22 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 					return newRedirectTaintBlockedRequest(redirectTaint, blockReason)
 				}
 			}
-			if redirectSess, ok := redirectRec.(*SessionState); ok && redirectSess != nil {
+			// Airlock admission on a redirect hop reads the RAW adaptive
+			// session (the airlock writer's key), NOT redirectRec above:
+			// redirectRec is the CEE-safe taint recorder, whose key folds a
+			// named agent to the client IP and would miss a tier the adaptive
+			// path set. The originating fetch/forward handler stages the stable
+			// session key, then every hop resolves it through the current manager.
+			// This avoids retaining a stale SessionState across a hot reload.
+			var redirectAirlockSess *SessionState
+			redirectAirlockKey, _ := req.Context().Value(ctxKeyRedirectAirlockSession).(string)
+			if sm := p.sessionMgrPtr.Load(); sm != nil && redirectAirlockKey != "" {
+				redirectAirlockSess = sm.SessionByKey(redirectAirlockKey)
+			}
+			if redirectAirlockSess == nil {
+				redirectAirlockSess = p.airlockSessionForIdentity(agentName, clientIP, envelope.ActorAuth(agentAuthFromContext(req.Context())))
+			}
+			if redirectSess := redirectAirlockSess; redirectSess != nil {
 				tier := airlockTierForScope(redirectSess, adaptiveScopeForHost(req.URL.Hostname()))
 				if allowed, reason := ClassifyAction(tier, req.Method, redirectTransport, false); !allowed {
 					logger.LogAirlockDeny(redirectSess.key, tier, redirectTransport, req.Method, clientIP, requestID)
@@ -3052,12 +3081,18 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 			// allowlisted domain) are not real attacks, but repeated
 			// probing should still accumulate a weak signal so the
 			// session isn't completely invisible to adaptive scoring.
-			if recordScopedAdaptiveSignal(sess, scope, session.SignalNearMiss, ep) {
+			// Retries of the same mismatch still must not pump the score.
+			deniedEP := classifiedDenialParams(ep, result.Scanner, result.Reason, cfg.CanonicalPolicyHash())
+			if recordScopedAdaptiveSignal(sess, scope, session.SignalNearMiss, deniedEP) {
 				escalated = true
 				sess.SetScopedBlockAll(scope, decide.UpgradeAction("", sess.EffectiveEscalationLevel(scope), &adaptiveCfg) == config.ActionBlock)
 			}
 		} else if !result.Allowed {
-			if recordScopedAdaptiveSignal(sess, scope, adaptiveBlockSignal(result, &adaptiveCfg), ep) {
+			// The request stays denied either way. Only the first classified
+			// occurrence of this destination+finding contributes threat score;
+			// retries of the same already-enforced denial must not pump it.
+			deniedEP := classifiedDenialParams(ep, result.Scanner, result.Reason, cfg.CanonicalPolicyHash())
+			if recordScopedAdaptiveSignal(sess, scope, adaptiveBlockSignal(result, &adaptiveCfg), deniedEP) {
 				escalated = true
 				// Update block_all flag so RecordRequest stops refreshing lastActivity.
 				sess.SetScopedBlockAll(scope, decide.UpgradeAction("", sess.EffectiveEscalationLevel(scope), &adaptiveCfg) == config.ActionBlock)
@@ -3115,8 +3150,18 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 			trigger = airlockTriggerOnCritical
 		}
 		if targetTier != "" && targetTier != config.AirlockTierNone {
-			if changed, from, to := sess.AirlockForScope(scope).SetTierWithProvenance(targetTier, trigger, airlockSourceTriggers); changed {
-				sess.RecordEvent(SessionEvent{
+			// Keep the existing per-agent profiling state, but enforce airlock on
+			// the trust-graded key. For request-controlled identities this folds
+			// agent-name rotation to the source IP; bound identities already use
+			// the same key as the profiling session.
+			enforcementKey := responseTaintSessionKey(agent, clientIP, opts.ActorAuth)
+			enforcementSess := sess
+			if enforcementKey != key {
+				enforcementSess = sm.GetOrCreate(enforcementKey)
+				_, _, _ = sess.AirlockForScope(scope).SetTierWithProvenance(targetTier, trigger, airlockSourceTriggers)
+			}
+			if changed, from, to := enforcementSess.AirlockForScope(scope).SetTierWithProvenance(targetTier, trigger, airlockSourceTriggers); changed {
+				enforcementSess.RecordEvent(SessionEvent{
 					Kind:     "airlock_enter",
 					Target:   scope,
 					Detail:   from + "->" + to,
@@ -3124,7 +3169,7 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 					Score:    sess.ScopedThreatScore(scope),
 				})
 				if log != nil {
-					log.LogAirlockEnter(key, to, "adaptive_"+session.EscalationLabel(level), clientIP, requestID)
+					log.LogAirlockEnter(enforcementKey, to, "adaptive_"+session.EscalationLabel(level), clientIP, requestID)
 				}
 				if p.metrics != nil {
 					p.metrics.RecordAirlockTransition(from, to, "adaptive")
@@ -3176,11 +3221,28 @@ func baselineAgentKeyForSessionKey(key string) string {
 	return key
 }
 
+func classifiedDenialParams(ep decide.EscalationParams, scannerName, reason, policyHash string) decide.EscalationParams {
+	ep.DenialScanner = scannerName
+	ep.DenialReason = reason
+	ep.PolicyHash = policyHash
+	return ep
+}
+
+func shouldScoreClassifiedDenial(rec session.Recorder, scope string, ep decide.EscalationParams) bool {
+	if ep.DenialScanner == "" && ep.DenialReason == "" {
+		return true
+	}
+	return session.NoteClassifiedDenial(rec, scope, ep.DenialScanner, ep.DenialReason, ep.PolicyHash)
+}
+
 func recordScopedAdaptiveSignal(sess *SessionState, scope string, sig session.SignalType, ep decide.EscalationParams) bool {
 	if sess == nil {
 		return false
 	}
 	scope = normalizeAdaptiveScope(scope)
+	if session.ClassifiedDenialSignal(sig) && !shouldScoreClassifiedDenial(sess, scope, ep) {
+		return false
+	}
 	if scope == "" {
 		return decide.RecordSignal(sess, sig, ep)
 	}
@@ -3213,6 +3275,9 @@ func recordAdaptiveSignalForScope(rec session.Recorder, scope string, sig sessio
 			level := sess.EffectiveEscalationLevel(scope)
 			sess.SetScopedBlockAll(scope, decide.UpgradeAction("", level, adaptiveCfg) == config.ActionBlock)
 		}
+		return
+	}
+	if session.ClassifiedDenialSignal(sig) && !shouldScoreClassifiedDenial(rec, normalizeAdaptiveScope(scope), ep) {
 		return
 	}
 	decide.RecordSignal(rec, sig, ep)
@@ -3325,6 +3390,19 @@ func airlockTierForScope(sess *SessionState, scope string) string {
 		return config.AirlockTierNone
 	}
 	return tier
+}
+
+// airlockSessionForIdentity returns the trust-graded adaptive SessionState the
+// writer uses. Bound identities retain per-agent isolation; request-controlled
+// identities fold to the source IP so rotating a name cannot escape airlock.
+// Admission is lookup-only: a request cannot materialize session state merely
+// by presenting high-cardinality names or destinations.
+func (p *Proxy) airlockSessionForIdentity(agent, clientIP string, auth envelope.ActorAuth) *SessionState {
+	sm := p.sessionMgrPtr.Load()
+	if sm == nil {
+		return nil
+	}
+	return sm.SessionByKey(responseTaintSessionKey(agent, clientIP, auth))
 }
 
 // applyShield runs Browser Shield rewriting on a response body when enabled
@@ -4649,8 +4727,15 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	fetchTaint := evaluateHTTPTaint(cfg, fetchRec, http.MethodGet, parsed)
 
-	// Airlock check: drain tier blocks all traffic including fetch.
-	if fetchSess, ok := fetchRec.(*SessionState); ok && fetchSess != nil {
+	// Airlock check: drain tier blocks all traffic including fetch. Admission
+	// reads the RAW adaptive session (sessionKeyFor) via airlockSessionForIdentity
+	// - the one the airlock writer (recordSessionActivityWithUserAgent) raised
+	// the tier on - NOT the CEE-safe taint recorder above. This same raw session
+	// is carried into the redirect context below so every hop admits against the
+	// writer's session too. See airlockSessionForIdentity for the fail-open the
+	// CEE-safe key would open.
+	fetchAirlockSess := p.airlockSessionForIdentity(agent, clientIP, id.Auth)
+	if fetchSess := fetchAirlockSess; fetchSess != nil {
 		tier := airlockTierForScope(fetchSess, adaptiveScopeForHost(parsed.Hostname()))
 		if tier == config.AirlockTierDrain {
 			p.logger.LogAirlockDeny(fetchSess.key, tier, TransportFetch, r.Method, clientIP, requestID)
@@ -4892,12 +4977,15 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				headerSignal = session.SignalBlock
 			}
 			recordAdaptiveSignalForScope(fetchRec, adaptiveScopeForHost(parsed.Hostname()), headerSignal, &cfg.AdaptiveEnforcement, decide.EscalationParams{
-				Threshold: cfg.AdaptiveEnforcement.EscalationThreshold,
-				Logger:    log,
-				Metrics:   p.metrics,
-				Session:   CeeSessionKey(agent, clientIP),
-				ClientIP:  clientIP,
-				RequestID: requestID,
+				Threshold:     cfg.AdaptiveEnforcement.EscalationThreshold,
+				Logger:        log,
+				Metrics:       p.metrics,
+				Session:       CeeSessionKey(agent, clientIP),
+				ClientIP:      clientIP,
+				RequestID:     requestID,
+				DenialScanner: scanner.ScannerDLP,
+				DenialReason:  "request header contains secret",
+				PolicyHash:    cfg.CanonicalPolicyHash(),
 			})
 		}
 	}
@@ -5267,6 +5355,9 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
 	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
+	if fetchAirlockSess != nil {
+		ctx = context.WithValue(ctx, ctxKeyRedirectAirlockSession, fetchAirlockSess.key)
+	}
 	ctx = withAllowedSSRFDialScanSnapshot(ctx, sc, parsed.Hostname(), effectiveURLPort(parsed), result)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {

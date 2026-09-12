@@ -148,6 +148,10 @@ func (ic *InterceptContext) Validate() error {
 // gauge updates). Used by newInterceptHandler to feed signals back to the
 // adaptive system.
 func interceptRecordSignal(ic *InterceptContext, sig session.SignalType) {
+	interceptRecordFinding(ic, sig, "", "")
+}
+
+func interceptRecordFinding(ic *InterceptContext, sig session.SignalType, scannerName, reason string) {
 	if !ic.Config.AdaptiveEnforcement.Enabled {
 		return
 	}
@@ -166,13 +170,20 @@ func interceptRecordSignal(ic *InterceptContext, sig session.SignalType) {
 			rec = sm.GetOrCreate(sessionKey)
 		}
 	}
+	policyHash := ""
+	if ic.Config != nil {
+		policyHash = ic.Config.CanonicalPolicyHash()
+	}
 	recordAdaptiveSignalForScope(rec, interceptAdaptiveScope(ic), sig, &ic.Config.AdaptiveEnforcement, decide.EscalationParams{
-		Threshold: ic.Config.AdaptiveEnforcement.EscalationThreshold,
-		Logger:    ic.Logger,
-		Metrics:   m,
-		Session:   sessionKey,
-		ClientIP:  ic.ClientIP,
-		RequestID: ic.RequestID,
+		Threshold:     ic.Config.AdaptiveEnforcement.EscalationThreshold,
+		Logger:        ic.Logger,
+		Metrics:       m,
+		Session:       sessionKey,
+		ClientIP:      ic.ClientIP,
+		RequestID:     ic.RequestID,
+		DenialScanner: scannerName,
+		DenialReason:  reason,
+		PolicyHash:    policyHash,
 	})
 }
 
@@ -325,6 +336,10 @@ const scannerLabelA2A = "a2a_scan"
 // signature attestation outcomes (positive verification and verification
 // failures distinct from generic A2A content findings).
 const scannerLabelA2ACardSignature = "a2a_card_signature"
+
+// scannerLabelA2ACardDrift identifies Agent Card drift audit events. Benign
+// descriptive drift keeps the response clean but must remain operator-visible.
+const scannerLabelA2ACardDrift = "a2a_card_drift"
 
 // interceptHandshakeTimeout is the maximum time for the client-side TLS
 // handshake during interception. Prevents goroutine/semaphore exhaustion
@@ -596,9 +611,16 @@ func newInterceptHandler(
 			return
 		}
 
-		// Airlock classification of the inner request method.
+		// Airlock classification of the inner request method. Read the
+		// DESTINATION-SCOPED tier of the raw adaptive session the airlock
+		// writer raised, via airlockTierForScope - the scoped read that fetch,
+		// forward, opaque CONNECT, and WebSocket already use - NOT the
+		// session-wide Airlock().Tier(). AirlockForScope returns a distinct
+		// per-destination state, so a normal scoped drain leaves the global
+		// tier at none; reading the global tier here would admit every
+		// intercepted inner request under a scoped quarantine (fail-open).
 		if interceptSess, ok := ic.Recorder.(*SessionState); ok && interceptSess != nil {
-			tier := interceptSess.Airlock().Tier()
+			tier := airlockTierForScope(interceptSess, adaptiveScopeForHost(ic.TargetHost))
 			if tier != config.AirlockTierNone {
 				allowed, reason := ClassifyAction(tier, r.Method, TransportConnect, true)
 				if !allowed {
@@ -753,9 +775,9 @@ func newInterceptHandler(
 				case urlResult.IsInfrastructureError():
 					// Score-neutral: fail-closed block is still enforced below.
 				case urlResult.IsConfigMismatch():
-					interceptRecordSignal(ic, session.SignalNearMiss)
+					interceptRecordFinding(ic, session.SignalNearMiss, urlResult.Scanner, urlResult.Reason)
 				default:
-					interceptRecordSignal(ic, session.SignalBlock)
+					interceptRecordFinding(ic, session.SignalBlock, urlResult.Scanner, urlResult.Reason)
 				}
 				ic.Logger.LogBlockedDetail(actx, urlResult.Scanner, urlResult.Reason, auditDetailFromResult(urlResult))
 				ic.Metrics.RecordTLSRequestBlocked("url_scan")
@@ -792,9 +814,9 @@ func newInterceptHandler(
 				case urlResult.IsInfrastructureError():
 					// Score-neutral: see scan path above for rationale.
 				case urlResult.IsConfigMismatch():
-					interceptRecordSignal(ic, session.SignalNearMiss)
+					interceptRecordFinding(ic, session.SignalNearMiss, urlResult.Scanner, urlResult.Reason)
 				default:
-					interceptRecordSignal(ic, session.SignalBlock)
+					interceptRecordFinding(ic, session.SignalBlock, urlResult.Scanner, urlResult.Reason)
 				}
 				ic.Logger.LogBlockedDetail(actx, urlResult.Scanner, urlResult.Reason+" (escalated)", auditDetailFromResult(urlResult))
 				ic.Metrics.RecordTLSRequestBlocked("url_scan")
@@ -818,7 +840,7 @@ func newInterceptHandler(
 			// evidence of misbehavior and must not feed adaptive scoring via
 			// the audit path either.
 			if !urlResult.IsInfrastructureError() {
-				interceptRecordSignal(ic, session.SignalNearMiss)
+				interceptRecordFinding(ic, session.SignalNearMiss, urlResult.Scanner, urlResult.Reason)
 			}
 			ic.Logger.LogAnomaly(actx, urlResult.Scanner, urlResult.Reason, urlResult.Score)
 		}
@@ -871,9 +893,9 @@ func newInterceptHandler(
 						// Infrastructure errors (DNS timeout on embedded URLs)
 						// are score-neutral even when they cause a block.
 					case a2aHdrResult.IsConfigMismatch():
-						interceptRecordSignal(ic, session.SignalNearMiss)
+						interceptRecordFinding(ic, session.SignalNearMiss, scannerLabelA2A, a2aHdrResult.Reason)
 					default:
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabelA2A, a2aHdrResult.Reason)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabelA2A, a2aHdrResult.Reason)
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabelA2A)
@@ -951,9 +973,9 @@ func newInterceptHandler(
 					switch {
 					case a2aBodyResult.IsAdaptiveNeutral():
 					case a2aBodyResult.IsConfigMismatch():
-						interceptRecordSignal(ic, session.SignalNearMiss)
+						interceptRecordFinding(ic, session.SignalNearMiss, scannerLabelA2A, a2aBodyResult.Reason)
 					default:
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabelA2A, a2aBodyResult.Reason)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabelA2A, reason)
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabelA2A)
@@ -1155,7 +1177,7 @@ func newInterceptHandler(
 				// tunnels, so it fails closed here.
 				if promptInjectionHardBlock || dlpHardBlock || isFailClosedBodyResult(result, bodyBytes) || action == config.ActionAsk || (action == config.ActionBlock && ic.Config.EnforceEnabled()) {
 					if !bodyAdaptiveExempt {
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, reason)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason)
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabel)
@@ -1182,7 +1204,7 @@ func newInterceptHandler(
 				// without any escalation, which is not the intent.
 				if action == config.ActionBlock && action != originalBodyAction && !ic.Config.EnforceEnabled() {
 					if !bodyAdaptiveExempt {
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabel, reason)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabel, reason+" (escalated)")
 					ic.Metrics.RecordTLSRequestBlocked(scannerLabel)
@@ -1236,9 +1258,9 @@ func newInterceptHandler(
 						case a2aBodyResult.IsAdaptiveNeutral():
 							// Score-neutral: see header-scan path above.
 						case a2aBodyResult.IsConfigMismatch():
-							interceptRecordSignal(ic, session.SignalNearMiss)
+							interceptRecordFinding(ic, session.SignalNearMiss, scannerLabelA2A, reason)
 						default:
-							interceptRecordSignal(ic, session.SignalBlock)
+							interceptRecordFinding(ic, session.SignalBlock, scannerLabelA2A, reason)
 						}
 						ic.Logger.LogBlocked(actx, scannerLabelA2A, reason)
 						ic.Metrics.RecordTLSRequestBlocked(scannerLabelA2A)
@@ -1363,7 +1385,7 @@ func newInterceptHandler(
 				}
 				// ActionAsk: no HITL terminal in intercepted tunnels, fail closed.
 				if headerHardBlock || action == config.ActionAsk || (action == config.ActionBlock && (ic.Config.EnforceEnabled() || escalatedBlock)) {
-					interceptRecordSignal(ic, session.SignalBlock)
+					interceptRecordFinding(ic, session.SignalBlock, scanner.ScannerDLP, reason)
 					ic.Logger.LogBlocked(actx, "header_dlp", reason)
 					ic.Metrics.RecordTLSRequestBlocked("header_dlp")
 					_ = interceptEmitReceipt(ic, withInterceptRedaction(receipt.EmitOpts{
@@ -2175,7 +2197,7 @@ func newInterceptHandler(
 		mediaVerdict := applyMediaPolicy(ic.Config, resp.Header.Get("Content-Type"), respBody)
 		logMediaExposureIfPresent(ic.Logger, actx, mediaVerdict, "connect")
 		if mediaVerdict.Blocked {
-			interceptRecordSignal(ic, session.SignalBlock)
+			interceptRecordFinding(ic, session.SignalBlock, "media_policy", mediaVerdict.BlockReason)
 			ic.Logger.LogBlocked(actx, "media_policy", mediaVerdict.BlockReason)
 			ic.Metrics.RecordTLSResponseBlocked("media_policy")
 			// Reuse the envelope/request actionID so the block receipt
@@ -2234,6 +2256,9 @@ func newInterceptHandler(
 						a2aRespResult.Reason = cardResult.Reason
 					}
 				}
+				if cardResult.DriftAdopted {
+					ic.Logger.LogAnomaly(actx, scannerLabelA2ACardDrift, "a2a: Agent Card descriptive drift adopted", 0)
+				}
 				// Positive attestation: emit an allow receipt when the card's
 				// signature verified against a trusted, origin-scoped key.
 				if cardResult.SignatureVerified {
@@ -2288,9 +2313,9 @@ func newInterceptHandler(
 					case a2aRespResult.IsAdaptiveNeutral():
 						// Score-neutral: see header-scan path above.
 					case a2aRespResult.IsConfigMismatch():
-						interceptRecordSignal(ic, session.SignalNearMiss)
+						interceptRecordFinding(ic, session.SignalNearMiss, scannerLabelA2A, a2aRespResult.Reason)
 					default:
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, scannerLabelA2A, a2aRespResult.Reason)
 					}
 					ic.Logger.LogBlocked(actx, scannerLabelA2A, reason)
 					ic.Metrics.RecordTLSResponseBlocked(scannerLabelA2A)
@@ -2409,7 +2434,7 @@ func newInterceptHandler(
 					// ActionAsk: no HITL terminal available inside intercepted tunnels,
 					// so fail-closed to block (consistent with HITL non-terminal default).
 					if !interceptRespExempt {
-						interceptRecordSignal(ic, session.SignalBlock)
+						interceptRecordFinding(ic, session.SignalBlock, responseScanLayer, reason)
 					}
 					ic.Logger.LogBlocked(actx, responseScanLayer, reason)
 					ic.Metrics.RecordTLSResponseBlocked("injection")
@@ -2433,7 +2458,7 @@ func newInterceptHandler(
 					// Record SignalStrip for adaptive enforcement scoring.
 					// Exempt domains skip scoring - findings are logged but don't escalate.
 					if !interceptRespExempt {
-						interceptRecordSignal(ic, session.SignalStrip)
+						interceptRecordFinding(ic, session.SignalStrip, responseScanLayer, reason)
 					}
 					respBody = []byte(scanResult.TransformedContent)
 					// Update Content-Length to match stripped body; prevents HTTP/1.1

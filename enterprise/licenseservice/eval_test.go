@@ -53,7 +53,13 @@ func newEvalTestSetup(t *testing.T) *evalTestSetup {
 	def := defaultEvalOrderJSON(orderStatusPaidJSON())
 	orderJSON.Store(&def)
 
-	polarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	polarSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Every production Polar read must carry the version pin; these
+		// end-to-end fixtures are the ones that would otherwise let an
+		// unpinned client through.
+		if got := r.Header.Get("Polar-Version"); got != defaultPolarAPIVersion {
+			t.Errorf("Polar-Version = %q, want %q", got, defaultPolarAPIVersion)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(*orderJSON.Load()))
 	}))
@@ -88,12 +94,13 @@ func newEvalTestSetup(t *testing.T) *evalTestSetup {
 		ListenAddr:          ":0",
 		FromEmail:           "test@pipelock.dev",
 		PolarAPIBase:        polarSrv.URL,
+		PolarAPIVersion:     defaultPolarAPIVersion,
 		EvalProductIDs:      []string{testEvalProductID},
 		EvalAmountCents:     testEvalAmount,
 		EvalCurrency:        "usd",
 	}
 	email := &EmailSender{apiKey: cfg.ResendAPIKey, fromEmail: cfg.FromEmail, client: emailSrv.Client(), apiURL: emailSrv.URL}
-	polar := NewPolarClient(cfg.PolarAPIToken, cfg.PolarAPIBase)
+	polar := NewPolarClient(cfg.PolarAPIToken, cfg.PolarAPIBase, cfg.PolarAPIVersion)
 	handler, err := NewWebhookHandler(cfg, db, polar, email, ledger, priv, zerolog.Nop())
 	if err != nil {
 		t.Fatalf("NewWebhookHandler: %v", err)

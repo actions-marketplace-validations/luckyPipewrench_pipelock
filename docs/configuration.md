@@ -150,7 +150,7 @@ fetch_proxy:
 | `monitoring.subdomain_entropy_exclusions` | `files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com` | Domains excluded from subdomain and path entropy checks; override to replace defaults, or set an empty list to disable exclusions entirely (query entropy still checked) |
 | `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query parameter values as destinations |
 | `monitoring.query_entropy_exclusions` | `[]` | Host-wide query-string entropy exclusions for hosts whose query values are broadly opaque by contract |
-| `monitoring.path_entropy_exclusions` | `[]` | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply |
+| `monitoring.path_entropy_exclusions` | 5 document-sharing routes | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply. Ships with Google Docs, Sheets, Slides, Forms and Drive file routes; override to replace the defaults, or set an empty list to disable them |
 | `monitoring.query_entropy_param_exclusions` | `[]` | Exact HTTPS endpoint+parameter query-value entropy exclusions; DLP, SSRF, query-key entropy, adjacent parameters, path/subdomain entropy, rate limits, and data budgets still apply |
 
 **Entropy guidance:**
@@ -191,7 +191,24 @@ fetch_proxy:
 
 An entry asserts that on that exact route the opaque segment is a service-issued resource identifier. It is a policy assertion rather than a classifier, and it does not make the route safe: before exempting one, confirm an agent cannot place a chosen opaque segment there and later read that value back, because such a route can carry data out. `https` only, and an entry with no host, no path prefix, or the bare root prefix `/` is refused at load rather than treated as a wildcard, because each of those three would exempt far more than one route. The prefix must be a canonical path: an encoded slash or backslash, a query or fragment delimiter in either literal or percent-encoded form, a wildcard, a dot segment, and a traversal segment are all refused. Matching compares the prefix against the request's escaped path, so a request that spells the route differently, such as `/document%2Fd/`, is a different route and stays subject to path entropy. **End `path_prefix` with `/` when you mean one path segment.** The prefix is matched literally, so `/document/d` also exempts `/document/de`, `/document/detail`, and every other path starting with those characters, while `/document/d/` does not. Dropping one character widens the exemption. `reason`, `owner` and `expires` are governance metadata. Editing any of them does not change the policy hash a receipt carries. Nothing revokes an entry when its `expires` date passes; `pipelock doctor` reports the expired, unowned, unexplained and inert entries so a standing exemption gets revisited instead of quietly outliving its reason.
 
-This ships empty. A vendor route enters the shipped defaults only with that vendor's own published route contract behind it.
+**Shipped defaults.** Five document-sharing routes ship enabled, because an ordinary Google Docs, Sheets, Slides, Forms or Drive link carries an opaque service-issued file ID by construction and was otherwise blocked on a fresh install:
+
+```yaml
+- host: docs.google.com
+  path_prefix: /document/d/
+- host: docs.google.com
+  path_prefix: /spreadsheets/d/
+- host: docs.google.com
+  path_prefix: /presentation/d/
+- host: docs.google.com
+  path_prefix: /forms/d/e/
+- host: drive.google.com
+  path_prefix: /file/d/
+```
+
+What a shipped entry encodes is the vendor's published route shape, never the identifier format. Google documents these product URL shapes; it documents the file ID itself as opaque, with no charset or length, so keying on the ID would be an invented value. A vendor route enters the shipped defaults only on that basis. Setting the field to an empty list removes them; setting your own list replaces them.
+
+Each entry still exempts only the path-entropy gate for that one host and prefix. It does not make the route safe to send secrets to, and the warning above applies with equal force to a shipped entry: an agent that can place a chosen opaque segment on one of these routes and read it back later can carry data out over it.
 
 **Query entropy parameter exclusions** skip only the raw query-value entropy gate for one exact HTTPS endpoint and one exact parameter key. Subdomain entropy, path entropy, query-key entropy, adjacent parameters, DLP, SSRF, rate limits, and data budgets still apply. Use this first when a structured query language or endpoint contract creates a false positive in one parameter.
 
@@ -1673,13 +1690,13 @@ The `{key}` parameter is URL-encoded. For example, `my-agent|10.0.0.1` becomes `
 
 Sessions are classified as `identity` (operator-targetable, e.g. `my-agent|10.0.0.1`) or `invocation` (internal MCP sessions, e.g. `mcp-stdio-42`). Only identity sessions can be reset, mutated, or terminated.
 
-**Operator CLI:** the admin API is exposed through `pipelock session <subcommand>` for airlock recovery, `pipelock adaptive <subcommand>` for fleet-level adaptive state, and `pipelock baseline <subcommand>` for behavioral-baseline inspection and ratification. See [cli/session.md](cli/session.md), [cli/adaptive.md](cli/adaptive.md), and [cli/baseline.md](cli/baseline.md) for the operator references.
+**Operator CLI:** the admin API is exposed through `pipelock session <subcommand>` for airlock recovery and identity reset (`session reset` maps to `POST /api/v1/sessions/{key}/reset`), `pipelock adaptive <subcommand>` for fleet-level adaptive state, and `pipelock baseline <subcommand>` for behavioral-baseline inspection and ratification. See [cli/session.md](cli/session.md), [cli/adaptive.md](cli/adaptive.md), and [cli/baseline.md](cli/baseline.md) for the operator references. `session release` only moves session-wide airlock; destination-scoped scores and airlock need `session reset`.
 
 **Token hot-reload:** `kill_switch.api_token` is hot-reloaded on SIGHUP or fsnotify config-file changes. Rotating the token in YAML (or via the `PIPELOCK_KILLSWITCH_API_TOKEN` env var, which wins over YAML) takes effect on the next admin API call without restarting the proxy. The previous bearer credential is revoked atomically: requests in flight at the moment of rotation complete against the token they were issued against; subsequent requests must present the new bearer. Setting `api_token` to the empty string disables the endpoint (HTTP 503) without tearing down the listener, so an operator can revoke access during an incident and restore it later with a second reload.
 
 ### Airlock
 
-Per-session graduated quarantine with timer-based recovery. When adaptive enforcement escalates a session, the airlock state machine can transition the session through `soft` (observe-only), `hard` (reads allowed, writes blocked, long-lived connections torn down), and `drain` (no new traffic, existing in-flight requests complete within `drain_timeout_seconds`). At hard tier, Pipelock blocks MCP `tools/call` requests for the affected client across subprocess stdio, HTTP upstream, WebSocket upstream, and HTTP listener modes. Protocol setup and discovery requests, including `initialize` and `tools/list`, remain available for diagnosis and recovery. All three tiers are **timed quarantines** that auto-recover back down through lower tiers as `soft_minutes`/`hard_minutes`/`drain_minutes` expire — `drain` is not a terminal state and is not equivalent to `POST /api/v1/sessions/{key}/terminate`. Operators can override the tier at any time through the session admin API or the `pipelock session` CLI; explicit termination (the destructive reset) lives behind the dedicated `terminate` endpoint.
+Per-session graduated quarantine with timer-based recovery. When adaptive enforcement escalates a session, the airlock state machine can transition the session through `soft` (observe-only), `hard` (reads allowed, writes blocked, long-lived connections torn down), and `drain` (no new traffic, existing in-flight requests complete within `drain_timeout_seconds`). At hard tier, Pipelock blocks MCP `tools/call` requests for the affected client across subprocess stdio, HTTP upstream, WebSocket upstream, and HTTP listener modes. Protocol setup and discovery requests, including `initialize` and `tools/list`, remain available for diagnosis and recovery. All three tiers are **timed quarantines** that auto-recover back down through lower tiers as `soft_minutes`/`hard_minutes`/`drain_minutes` expire — `drain` is not a terminal state and is not equivalent to `POST /api/v1/sessions/{key}/terminate`. Operators can override the tier at any time through the session admin API or the `pipelock session` CLI; explicit termination (the destructive operation, distinct from `session reset`) lives behind the dedicated `terminate` endpoint. Airlock is destination-scoped, and every airlock read and teardown hook is evaluated against the same raw adaptive session the escalation writes the tier to, never a request-folded key. Admission for a quarantined destination is enforced across fetch, forward-proxy, WebSocket, TLS-intercepted requests, opaque CONNECT tunnels, and redirect hops, regardless of how the agent declares its name; an in-flight opaque CONNECT, TLS-intercepted, or WebSocket tunnel to that destination is torn down when its tier escalates, because the teardown hook is registered on that same session; and an operator override through the session admin API or the `pipelock session` CLI is command-specific: `session release` sets the session-wide airlock tier and every destination scope's tier to the requested value, while `session reset` additionally clears the destination-scoped adaptive score and `block_all`. Reach for `release` to lift an airlock tier, and for `reset` when a destination is still denying traffic because of its own accumulated score rather than its tier.
 
 > **Airlock requires triggers:** `airlock.enabled: true` alone is a no-op. Configure at least one trigger (`triggers.on_high`, `triggers.on_critical`) to specify which tier fires at each adaptive escalation level. All shipped presets wire `on_high: soft` + `on_critical: hard` by default. Freehand configs that set `enabled: true` with no triggers will reach critical escalation without ever entering airlock.
 
@@ -3041,7 +3058,7 @@ a2a_scanning:
 | `enabled` | `false` | Enable A2A protocol detection and scanning |
 | `action` | `warn` | Action on findings: `block` or `warn`. Immutable core DLP findings in an A2A body hard-block regardless of this action, including on the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. Non-core findings follow this action. |
 | `scan_agent_cards` | `true` | Scan Agent Card skill descriptions for injection |
-| `detect_card_drift` | `true` | Detect Agent Card modification mid-session (rug-pull) |
+| `detect_card_drift` | `true` | Detect Agent Card modification mid-session (rug-pull). Evaluates what a change introduced rather than blocking on the fact of a change — see below. |
 | `session_smuggling_detection` | `true` | Track contextId to detect session smuggling |
 | `max_context_messages` | `100` | Per-context message cap |
 | `max_contexts` | `1000` | Total tracked contexts |
@@ -3050,7 +3067,17 @@ a2a_scanning:
 | `require_signed_agent_cards` | `false` | Treat an **unsigned** Agent Card as a finding (enforced at `action`). When `false`, unsigned cards keep their existing scan/drift behavior. |
 | `trusted_agent_card_keys` | _(none)_ | Operator-pinned Ed25519 signing keys, each scoped to one or more origins. When non-empty, signed cards are cryptographically verified. |
 
-A2A detection works on the forward proxy (CONNECT and plain HTTP) and MCP HTTP proxy paths. Agent Cards are scanned for skill description poisoning. Card drift detection tracks cards by URL + auth fingerprint and alerts on mid-session changes.
+A2A detection works on the forward proxy (CONNECT and plain HTTP) and MCP HTTP proxy paths. Agent Cards are scanned for skill description poisoning. Card drift detection tracks cards by URL + auth fingerprint and evaluates mid-session changes.
+
+#### Agent Card drift: what adopts silently, what blocks
+
+An Agent Card carries endpoints and auth by construction (`url`, `provider`, `securitySchemes`, capabilities, skill schemas), so blocking on the bare fact of any change blocks every ordinary vendor description edit — the fastest way to get drift detection turned off. Drift detection instead splits the card into two views and asks what a change introduced.
+
+A change is **adopted silently as the new baseline** (no block, and the change is recorded for audit) only when it is confined to descriptive free text — the card name, the card description, and skill names and descriptions — and introduces no cue class. A refined description or a reworded skill description adopts. A bare `version` bump is not compared at all: neither view covers `version`, so a version-only change is ignored rather than adopted, and it records no drift and no adoption.
+
+A change **blocks** and preserves the prior baseline (so repeated fetches keep blocking until an operator accepts the new card) when it is an endpoint or structural change — `url`, `securitySchemes`, capabilities, default input/output modes, or the set of skill ids and their schemas — or when a descriptive change introduces a cue class such as an instruction-injection or tool-poison pattern, an embedded egress instruction, a concealment instruction, or a reference to another tool. Adding a new skill is a structural change (a new capability surface) and blocks. The block reason names the axis for a structural change and the introduced cue classes for a descriptive one. A card that cannot be re-parsed fails closed.
+
+Fields the semantic hash does not currently cover (`provider`, `documentationUrl`, `iconUrl`) are outside drift comparison, unchanged from prior releases; widening drift to them is a separate change.
 
 ### Agent Card Signature Verification
 
@@ -3166,7 +3193,7 @@ Profile lifecycle: `observe` → `learn` → `ratify` → `locked`. Enforcement 
 
 ## Taint-Aware Policy Escalation (v2.1)
 
-Classifies each session by how recently it observed untrusted content and escalates scrutiny on protected operations. A session that just fetched a blog post cannot, without a trust override, then edit a file under `*/auth/*`. Runs across fetch, forward proxy, WebSocket, MCP stdio, MCP HTTP/SSE, and A2A.
+Classifies each session by how recently it observed untrusted content and escalates scrutiny on protected operations. Under `strict` or `balanced`, a session that fetched untrusted content from a non-allowlisted source is evaluated before it edits a file under `*/auth/*`: a protected write returns `PolicyAsk` when authority is below `AuthorityUserExact`, and `PolicyAllow` with exact user authority. An allowlisted source does not raise taint, and hostile taint returns `PolicyBlock` for sensitive actions. Under `permissive` the taint is still recorded and the operation is allowed (`taint_permissive_observe_only`), so that policy observes without restricting. Runs across fetch, forward proxy, reverse proxy, WebSocket, MCP stdio, MCP HTTP/SSE, and A2A.
 
 ```yaml
 taint:

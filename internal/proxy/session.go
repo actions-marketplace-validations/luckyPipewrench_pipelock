@@ -106,9 +106,28 @@ type adaptiveScopeState struct {
 	airlock          AirlockState
 }
 
+// sessionMutex behaves like sync.Mutex in production. Tests can install an
+// onBlocked callback to observe that a caller actually contended on the lock.
+type sessionMutex struct {
+	sync.Mutex
+	onBlocked func()
+}
+
+func (m *sessionMutex) Lock() {
+	if m.onBlocked == nil {
+		m.Mutex.Lock()
+		return
+	}
+	if m.TryLock() {
+		return
+	}
+	m.onBlocked()
+	m.Mutex.Lock()
+}
+
 // SessionState tracks behavioral state for a single agent session.
 type SessionState struct {
-	mu           sync.Mutex
+	mu           sessionMutex
 	key          string
 	kind         string // "identity" or "invocation" - set at creation, not inferred from key
 	created      time.Time
@@ -127,6 +146,11 @@ type SessionState struct {
 	atBlockAll                 bool // true when current level has block_all=true
 	globalSignalsAuthoritative bool
 	scopes                     map[string]*adaptiveScopeState
+	// classifiedDenials remembers the first scored denial per destination
+	// and finding fingerprint so retries of the same already-enforced
+	// block do not keep adding SignalBlock. Bounded; unknown fingerprints
+	// past the cap still score (fail closed).
+	classifiedDenials map[string]struct{}
 
 	// Behavioral baseline accumulation - collected per-session for
 	// baseline learning and deviation checking.
@@ -179,6 +203,36 @@ func (s *SessionState) EscalateAirlock(tier, trigger string) (changed bool, from
 	return s.airlock.SetTierWithProvenance(tier, trigger, airlockSourceTriggers)
 }
 
+// ForceSetAirlockTierAllScopes force-sets the session-wide airlock tier AND
+// every destination-scoped airlock to the same tier. An operator override is
+// session-wide intent, but adaptive escalation writes the tier per destination
+// scope (AirlockForScope), so setting only the session-wide airlock would leave
+// a scoped drain in place after an operator releases the session to none, and a
+// scoped session unaffected when an operator forces drain. Applying to every
+// scope makes both directions match operator expectation: release frees every
+// destination, force-drain quarantines every destination the session has
+// touched. Returns whether any tier changed and the strongest prior tier, so
+// an operator release of a scoped drain is reported as a real drain-to-none
+// transition even when the session-wide tier was already none. Lock order is
+// s.mu > airlock.mu, matching AirlockForScope. Holding s.mu across the global
+// and scoped writes makes the operator override one admission-visible change:
+// a scoped reader cannot observe the new global tier with an old scoped tier.
+func (s *SessionState) ForceSetAirlockTierAllScopes(tier, trigger, source string) (changed bool, from, to string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed, from, to = s.airlock.ForceSetTierWithProvenance(tier, trigger, source)
+	for _, st := range s.scopes {
+		scopeChanged, scopeFrom, _ := st.airlock.ForceSetTierWithProvenance(tier, trigger, source)
+		if scopeChanged {
+			changed = true
+			if AirlockTierOrder[scopeFrom] > AirlockTierOrder[from] {
+				from = scopeFrom
+			}
+		}
+	}
+	return changed, from, to
+}
+
 // maxAdaptiveScopes bounds the per-session destination-scope cardinality.
 // Each scope holds its own adaptive lane and airlock (mutex + cancel slice),
 // so an agent that touches an unbounded number of distinct hosts must not be
@@ -186,6 +240,12 @@ func (s *SessionState) EscalateAirlock(tier, trigger string) (changed bool, from
 // back to the session-wide (global) lane, which is stricter — fail-safe.
 // Mirrors the 10,000-tool MCP baseline cap in spirit.
 const maxAdaptiveScopes = 1024
+
+// maxClassifiedDenials bounds remembered denial fingerprints per session.
+// Same cardinality as destination scopes: a client that fans out unique
+// findings still scores each new one, and a retry storm against one
+// finding stays a single score.
+const maxClassifiedDenials = 1024
 
 func (s *SessionState) getOrCreateScopeLocked(scope string) *adaptiveScopeState {
 	scope = normalizeAdaptiveScope(scope)
@@ -203,7 +263,10 @@ func (s *SessionState) getOrCreateScopeLocked(scope string) *adaptiveScopeState 
 			// every caller guards it.
 			return nil
 		}
-		st = &adaptiveScopeState{airlock: AirlockState{tier: config.AirlockTierNone}}
+		// A session-wide operator override also governs destinations first seen
+		// after the override. Inheriting the current global tier prevents a new
+		// scope from weakening a forced hard/drain state back to none.
+		st = &adaptiveScopeState{airlock: s.airlock.inheritedEntry()}
 		s.scopes[scope] = st
 	}
 	return st
@@ -236,6 +299,40 @@ func (s *SessionState) AirlockForScope(scope string) *AirlockState {
 		return &s.airlock
 	}
 	return &st.airlock
+}
+
+// NoteClassifiedDenial records a denied finding fingerprint. It returns
+// true when this is the first time this session has scored that
+// fingerprint, so the caller should add an adaptive signal. Duplicate
+// retries return false: the request stays denied, but it must not keep
+// pumping threat score.
+func (s *SessionState) NoteClassifiedDenial(scope, scannerName, reason, policyHash string) bool {
+	key := classifiedDenialKey(scope, scannerName, reason, policyHash)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, seen := s.classifiedDenials[key]; seen {
+		return false
+	}
+	if s.classifiedDenials == nil {
+		s.classifiedDenials = make(map[string]struct{})
+	}
+	if len(s.classifiedDenials) >= maxClassifiedDenials {
+		// Unknown fingerprint at cap: still score. Forgetting a storm's
+		// fingerprint would fail open on retries; scoring a new unique
+		// finding is the fail-closed direction.
+		return true
+	}
+	s.classifiedDenials[key] = struct{}{}
+	return true
+}
+
+func classifiedDenialKey(scope, scannerName, reason, policyHash string) string {
+	return strings.Join([]string{
+		normalizeAdaptiveScope(scope),
+		scannerName,
+		reason,
+		policyHash,
+	}, "\x1f")
 }
 
 type domainEntry struct {
@@ -806,12 +903,23 @@ func (s *SessionState) RecentEvents() []SessionEvent {
 // Reset zeros all enforcement fields in place and refreshes lastActivity.
 // The session remains in the map so live Recorder pointers stay valid.
 // Returns previous score and level for the API response.
-func (s *SessionState) Reset() (prevScore float64, prevLevel int) {
+// Reset clears enforcement state. cancelInFlight decides whether registered
+// airlock cancel functions are FIRED before they are cleared, and the two are
+// deliberately separable: firing them tears down live requests and tunnels,
+// while clearing them is what stops a stale callback re-firing on a later
+// hard/drain escalation. Only the clearing is a safety requirement.
+//
+// POST /api/v1/sessions/{key}/reset is documented as clearing enforcement
+// state WITHOUT cutting connections, so HandleReset passes false. Terminate is
+// the destructive operation and passes true. Before this split both paths
+// fired, so the recovery command an operator reaches for when a destination
+// scope has locked a session out also killed that session's in-flight work.
+func (s *SessionState) Reset(cancelInFlight bool) (prevScore float64, prevLevel int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.airlock.mu.Lock()
 	defer s.airlock.mu.Unlock()
-	return s.resetWhileLocked()
+	return s.resetWhileLocked(cancelInFlight)
 }
 
 // resetWhileLocked performs the in-place reset under the assumption
@@ -824,7 +932,7 @@ func (s *SessionState) Reset() (prevScore float64, prevLevel int) {
 //
 // Callers are responsible for holding s.mu AND s.airlock.mu. Lock
 // order is sess.mu > sess.airlock.mu; acquire in that order.
-func (s *SessionState) resetWhileLocked() (prevScore float64, prevLevel int) {
+func (s *SessionState) resetWhileLocked(cancelInFlight bool) (prevScore float64, prevLevel int) {
 	prevScore = s.threatScore
 	prevLevel = s.escalationLevel
 
@@ -836,10 +944,17 @@ func (s *SessionState) resetWhileLocked() (prevScore float64, prevLevel int) {
 	s.globalSignalsAuthoritative = false
 	for _, scoped := range s.scopes {
 		scoped.airlock.mu.Lock()
-		scoped.airlock.callCancelFuncsLocked()
+		if cancelInFlight {
+			scoped.airlock.callCancelFuncsLocked()
+		} else {
+			// Drop the callbacks without firing them: the scope is going away,
+			// so nothing may re-fire, but the connections stay up.
+			scoped.airlock.cancelFuncs = nil
+		}
 		scoped.airlock.mu.Unlock()
 	}
 	s.scopes = nil
+	s.classifiedDenials = nil
 	s.domainWindows = nil
 	s.lastBurstAt = time.Time{}
 	s.lastActivity = time.Now()
@@ -860,7 +975,9 @@ func (s *SessionState) resetWhileLocked() (prevScore float64, prevLevel int) {
 	s.airlock.enteredAt = time.Time{}
 	s.airlock.trigger = ""
 	s.airlock.source = ""
-	s.airlock.callCancelFuncsLocked()
+	if cancelInFlight {
+		s.airlock.callCancelFuncsLocked()
+	}
 	s.airlock.cancelFuncs = nil
 
 	return prevScore, prevLevel
@@ -1092,6 +1209,16 @@ type AdaptiveFlushResult struct {
 	IdentitySessions     int  `json:"identity_sessions"`
 	SkippedInvocations   int  `json:"skipped_invocations"`
 	IPDomainStateCleared bool `json:"ip_domain_state_cleared"`
+}
+
+// SessionResetResult is the operator-facing body for POST /api/v1/sessions/{key}/reset.
+type SessionResetResult struct {
+	Key             string  `json:"key"`
+	Reset           bool    `json:"reset"`
+	PreviousLevel   string  `json:"previous_level"`
+	PreviousScore   float64 `json:"previous_score"`
+	IPStateCleared  bool    `json:"ip_state_cleared"`
+	CEEStateCleared bool    `json:"cee_state_cleared"`
 }
 
 type scopedLevelTransition struct {
@@ -1767,7 +1894,8 @@ func (sm *SessionManager) ResetSession(key string) (prev SessionSnapshot, found 
 
 	// Reset session in place while still holding sm.mu to prevent an
 	// eviction race between lock release and Reset.
-	prevScore, prevLevel := sess.Reset()
+	// Destructive path: in-flight work is torn down.
+	prevScore, prevLevel := sess.Reset(true)
 	sm.mu.Unlock()
 
 	// Decrement adaptive gauge if session was escalated (lock-free prometheus op).
@@ -1838,7 +1966,8 @@ func (sm *SessionManager) ResetSessionIfResettable(key string) (prev SessionSnap
 
 	// Reset session in place while still holding sm.mu to prevent an
 	// eviction race between lock release and Reset.
-	prevScore, prevLevel := sess.Reset()
+	// Connections stay up: this is the non-destructive reset behind POST /reset.
+	prevScore, prevLevel := sess.Reset(false)
 	sm.mu.Unlock()
 
 	// Decrement adaptive gauge if session was escalated (lock-free prometheus op).
@@ -1938,7 +2067,7 @@ func (sm *SessionManager) SnapshotAndResetIfResettable(key string) (preSnap sess
 	// so the snapshot fields above and the fields being cleared come
 	// from the same critical section. No concurrent goroutine can
 	// mutate sess or sess.airlock between the capture and the reset.
-	_, _ = sess.resetWhileLocked()
+	_, _ = sess.resetWhileLocked(true)
 
 	// Decrement adaptive gauge if session was escalated. Lock-free
 	// prometheus op; safe to call under the session locks.
@@ -1965,7 +2094,7 @@ func (sm *SessionManager) ResetAllIdentitySessions() (reset, skipped int) {
 		sess.mu.Lock()
 		sess.airlock.mu.Lock()
 		prevLevel := sess.escalationLevel
-		sess.resetWhileLocked()
+		sess.resetWhileLocked(true)
 		sess.airlock.mu.Unlock()
 		sess.mu.Unlock()
 		if prevLevel > 0 && sm.metrics != nil {
@@ -2329,9 +2458,12 @@ func (sm *SessionManager) ForceSetAirlockTier(key, tier string) (found, changed 
 		return false, false, "", ""
 	}
 	// Hold RLock across the tier change so cleanup/eviction can't remove
-	// the session between lookup and mutation. ForceSetTier acquires its
-	// own mutex internally (lock ordering: sm.mu > airlock.mu).
-	changed, from, to = sess.Airlock().ForceSetTierWithProvenance(tier, airlockTriggerManual, airlockSourceAdminAPI)
+	// the session between lookup and mutation. ForceSetAirlockTierAllScopes
+	// acquires s.mu and airlock.mu internally (lock ordering: sm.mu > s.mu >
+	// airlock.mu). Apply to every destination scope, not just the session-wide
+	// airlock, so an operator release clears a scoped drain and an operator
+	// drain quarantines every destination the session has touched.
+	changed, from, to = sess.ForceSetAirlockTierAllScopes(tier, airlockTriggerManual, airlockSourceAdminAPI)
 	if changed {
 		sess.RecordEvent(SessionEvent{
 			Kind:     "airlock_override",

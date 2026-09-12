@@ -385,6 +385,9 @@ func (m *autoAnchorMonitor) submitOrReusePending(anchorCfg config.FlightRecorder
 		m.pendingCheckpoint.ReceiptCount == checkpoint.ReceiptCount &&
 		m.pendingCheckpoint.RootHash == checkpoint.RootHash &&
 		m.pendingCheckpoint.FinalSeq == checkpoint.FinalSeq {
+		// The retained proof was verified by verifyAutoAnchorProof before it was
+		// stored below; keep that ordering if this reuse path is ever refactored,
+		// or an unverified proof could reach persistence through the retry.
 		proof := m.pendingProof
 		m.mu.Unlock()
 		return proof, false, nil
@@ -421,17 +424,34 @@ func (m *autoAnchorMonitor) submitOrReusePending(anchorCfg config.FlightRecorder
 }
 
 // verifyAutoAnchorProof checks a freshly returned anchor proof before it is
-// persisted, so a misconfigured or buggy backend that returns a syntactically
-// accepted but invalid proof cannot make the chain look anchored. The local
-// backend verifies deterministically. A Rekor submission is witnessed
-// independently by the offline verifier against the log's public key, which the
-// runtime does not hold, so it is recorded without an immediate
-// self-verification (the documented submit-and-audit-offline model).
+// persisted, so a misconfigured, buggy, or hostile backend that returns a
+// syntactically accepted but invalid proof cannot make the chain look anchored.
+//
+// Verification is the DEFAULT: every backend is asked to verify its own proof.
+// This is fail-closed on the backend's own verifier error; it is not an
+// independent check of an arbitrary backend implementation, whose Verify remains
+// its own trust mechanism. The choice of whether to verify keys off the CONCRETE
+// backend type, which the runtime built from local config (autoAnchorBackend),
+// not off proof.Backend. The backend controls proof.Backend, so trusting that
+// field would let a buggy or mislabelled backend mark its proof "rekor" to dodge
+// verification. Both the value and pointer Rekor forms are exempt so a future
+// factory change cannot silently turn Rekor into an always-failing verify.
+//
+// Rekor is the one exception: its proofs are witnessed offline against the log's
+// public key, which the runtime does not hold (autoAnchorBackend builds RekorLog
+// without TrustedLogKeys), so an immediate self-verification here would always
+// fail with "trusted Rekor log public key required". Recording it without a
+// local self-verification is the documented submit-and-audit-offline model.
+//
+// Failure direction: fail closed. A non-Rekor backend (LocalLog today, any
+// future custom backend tomorrow) whose Verify errors keeps its proof out of the
+// persisted anchor state. Only the named Rekor type is exempt.
 func verifyAutoAnchorProof(backend anchorpkg.Backend, proof anchorpkg.Proof, checkpoint anchorpkg.Checkpoint) error {
-	if local, ok := backend.(anchorpkg.LocalLog); ok {
-		return local.Verify(proof, checkpoint)
+	switch backend.(type) {
+	case anchorpkg.RekorLog, *anchorpkg.RekorLog:
+		return nil
 	}
-	return nil
+	return backend.Verify(proof, checkpoint)
 }
 
 func (m *autoAnchorMonitor) checkpointAdvanced(receiptCount uint64) bool {

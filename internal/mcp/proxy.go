@@ -434,6 +434,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					Metrics:       m,
 					ConsoleWriter: logW,
 					Session:       firstNonEmpty(opts.ServerName, "default"),
+					DenialScanner: "media_policy",
+					DenialReason:  mediaResult.BlockReason,
+					PolicyHash:    opts.receiptPolicyHash(),
 				})
 			}
 			resp := blockMediaPolicyResponse(rpcID, mediaResult.BlockReason)
@@ -650,6 +653,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 							Metrics:       m,
 							ConsoleWriter: logW,
 							Session:       firstNonEmpty(opts.ServerName, "default"),
+							DenialScanner: "tool_scanning",
+							DenialReason:  blockReason,
+							PolicyHash:    opts.receiptPolicyHash(),
 						})
 					}
 					resp := blockResponseReason(toolResult.RPCID, blockReason)
@@ -674,6 +680,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 						Metrics:       m,
 						ConsoleWriter: logW,
 						Session:       firstNonEmpty(opts.ServerName, "default"),
+						DenialScanner: "tool_scanning",
+						DenialReason:  "tool poisoning detected in tools/list",
+						PolicyHash:    opts.receiptPolicyHash(),
 					})
 				}
 			}
@@ -688,6 +697,22 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		} else {
 			a2aOpts := opts.a2aResponseOpts(respScanOpts)
 			a2aOpts.Method = trackedMethod
+			a2aOpts.OnCardDriftAdopted = func() {
+				const detail = "a2a: Agent Card descriptive drift adopted"
+				_, _ = fmt.Fprintf(logW, "pipelock: a2a response: %s\n", detail)
+				if opts.AuditLogger != nil {
+					resource := opts.responseTarget()
+					if resource == "" {
+						resource = "mcp://response"
+					}
+					opts.AuditLogger.LogAnomaly(
+						mustMCPAuditContext(opts.AuditLogger, "MCP", resource),
+						"a2a_card_drift",
+						detail,
+						0,
+					)
+				}
+			}
 			verdict = ScanResponseA2A(line, sc, a2aOpts)
 		}
 
@@ -949,6 +974,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				Metrics:       m,
 				ConsoleWriter: logW,
 				Session:       firstNonEmpty(opts.ServerName, "default"),
+				DenialScanner: "mcp_response_scan",
+				DenialReason:  firstNonEmpty(pattern, "mcp_response_scan"),
+				PolicyHash:    opts.receiptPolicyHash(),
 			}
 			switch effectiveAction {
 			case config.ActionBlock:
