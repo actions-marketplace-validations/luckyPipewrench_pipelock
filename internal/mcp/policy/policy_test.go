@@ -13,6 +13,8 @@ import (
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 )
 
 const (
@@ -1230,9 +1232,13 @@ func TestDefaultToolPolicyRules_MatchDestructiveDelete(t *testing.T) {
 
 func TestDefaultToolPolicyRules_MatchCredentialAccess(t *testing.T) {
 	pc := defaultConfig(t)
-	v := pc.CheckToolCall("read_file", []string{"/home/user/.ssh/id_rsa"})
-	if !v.Matched {
-		t.Error("expected match for .ssh credential access")
+	for _, toolName := range strings.Split(fileReadToolPattern, "|") {
+		t.Run(toolName, func(t *testing.T) {
+			v := pc.CheckToolCall(toolName, []string{"/home/user/.ssh/id_rsa"})
+			if !v.Matched || !slices.Contains(v.Rules, "Credential File Access") {
+				t.Fatalf("verdict = %+v, want Credential File Access", v)
+			}
+		})
 	}
 }
 
@@ -1527,9 +1533,813 @@ func TestDefaultToolPolicyRules_MatchAliasInjection(t *testing.T) {
 
 func TestDefaultToolPolicyRules_MatchZshrcViaWriteFile(t *testing.T) {
 	pc := defaultConfig(t)
-	v := pc.CheckToolCall("write_file", []string{"/home/user/.zshrc"})
+	for _, toolName := range strings.Split(fileWriteToolPattern, "|") {
+		t.Run(toolName, func(t *testing.T) {
+			assertDefaultPolicyRule(t, pc, toolName, map[string]any{
+				"path": "/home/user/.zshrc", "content": "replacement",
+			}, "Shell Profile Modification")
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_ApplyPatchTargetsOnly(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		patch    string
+		wantRule string
+	}{
+		{
+			name:  "README context mentions profile",
+			patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-source ~/.bashrc\n+describe source ~/.bashrc\n",
+		},
+		{
+			name:     "profile target header",
+			patch:    "--- a/.bashrc\n+++ b/.bashrc\n@@ -1 +1 @@\n-old\n+new\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:  "README contains added diff example",
+			patch: "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n++++ b/.bashrc\n",
+		},
+		{
+			name:  "README removes a diff example naming a profile",
+			patch: "--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,1 @@\n--- a/.bashrc\n-+++ b/.bashrc\n keep\n",
+		},
+		{
+			name:  "SQL migration removes comment lines",
+			patch: "*** Begin Patch\n*** Update File: migrations/001.sql\n@@\n--- drop the legacy index\n--- see .bashrc for the shell side\n CREATE INDEX i ON t (id);\n*** End Patch",
+		},
+		{
+			name:     "audit log patch target",
+			patch:    "*** Begin Patch\n*** Update File: /var/lib/pipelock/evidence/evidence-proxy-1.jsonl\n@@\n-old\n+new\n*** End Patch",
+			wantRule: "Audit Log Patch",
+		},
+		{
+			name:     "audit log relative git target",
+			patch:    "diff --git a/var/log/audit.log b/var/log/audit.log\nindex 1111111..2222222 100644\n--- a/var/log/audit.log\n+++ b/var/log/audit.log\n@@ -1 +1 @@\n-old\n+new\n",
+			wantRule: "Audit Log Patch",
+		},
+		{
+			name:     "apply patch update header",
+			patch:    "*** Begin Patch\n*** Update File: /home/user/.bashrc\n@@\n-old\n+new\n*** End Patch",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "unified deletion old-file header",
+			patch:    "--- a/.bashrc\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git rename destination",
+			patch:    "diff --git a/staged.txt b/.bashrc\nsimilarity index 100%\nrename from staged.txt\nrename to .bashrc\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git rename source",
+			patch:    "diff --git a/.bashrc b/backup.txt\nsimilarity index 100%\nrename from .bashrc\nrename to backup.txt\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git mode change",
+			patch:    "diff --git a/.bashrc b/.bashrc\nold mode 100644\nnew mode 100755\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git rename persistence destination",
+			patch:    "diff --git a/x b/etc/systemd/system/p.service\nsimilarity index 100%\nrename from x\nrename to etc/systemd/system/p.service\n",
+			wantRule: "Persistence Path Write",
+		},
+		{
+			name:     "git header and hunk without unified file headers",
+			patch:    "diff --git a/.bashrc b/.bashrc\nindex 1111111..2222222 100644\n@@ -1 +1 @@\n-old\n+new\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git copy destination",
+			patch:    "diff --git a/staged.txt b/.bashrc\nsimilarity index 100%\ncopy from staged.txt\ncopy to .bashrc\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:  "git copy protected source to safe destination",
+			patch: "diff --git a/.bashrc b/backup.txt\nsimilarity index 100%\ncopy from .bashrc\ncopy to backup.txt\n",
+		},
+		{
+			name:     "git new file",
+			patch:    "diff --git a/.bashrc b/.bashrc\nnew file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/.bashrc\n@@ -0,0 +1 @@\n+new\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git deleted file",
+			patch:    "diff --git a/.bashrc b/.bashrc\ndeleted file mode 100644\nindex 1111111..0000000\n--- a/.bashrc\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git binary patch",
+			patch:    "diff --git a/.bashrc b/.bashrc\nindex 1111111..2222222 100644\nGIT binary patch\nliteral 1\nAcmZQz\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "git binary files differ",
+			patch:    "diff --git a/.bashrc b/.bashrc\nindex 1111111..2222222 100644\nBinary files a/.bashrc and b/.bashrc differ\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "apply patch move destination",
+			patch:    "*** Begin Patch\n*** Update File: staged.txt\n*** Move to: .bashrc\n@@\n-old\n+new\n*** End Patch",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "apply patch move source",
+			patch:    "*** Begin Patch\n*** Update File: .bashrc\n*** Move to: backup.txt\n@@\n-old\n+new\n*** End Patch",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "apply patch add header",
+			patch:    "*** Begin Patch\n*** Add File: .bashrc\n+new\n*** End Patch",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "apply patch delete header",
+			patch:    "*** Begin Patch\n*** Delete File: .bashrc\n*** End Patch",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "quoted git paths",
+			patch:    "diff --git \"a/.bashrc\" \"b/.bashrc\"\nold mode 100644\nnew mode 100755\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "unquoted git paths with spaces",
+			patch:    "diff --git a/.bashrc backup b/.bashrc backup\nold mode 100644\nnew mode 100755\n",
+			wantRule: "Shell Profile Modification",
+		},
+		{
+			name:     "malformed git header fails configured closed",
+			patch:    "diff --git a/.bashrc\nold mode 100644\nnew mode 100755\n",
+			wantRule: uninspectablePatchTargetsRule,
+		},
+		{
+			name:     "truncated apply patch fails configured closed",
+			patch:    "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n",
+			wantRule: uninspectablePatchTargetsRule,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args := map[string]any{"patch": tc.patch}
+			raw, err := json.Marshal(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+			v := pc.CheckToolCallWithArgs("apply_patch", extracted.Strings, raw)
+			if tc.wantRule == "" {
+				if v.Matched {
+					t.Fatalf("documentation patch matched rules %v", v.Rules)
+				}
+				return
+			}
+			if !v.Matched || !slices.Contains(v.Rules, tc.wantRule) {
+				t.Fatalf("verdict = %+v, want rule %q", v, tc.wantRule)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_ApplyPatchOrdinaryArgumentFallback(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name string
+		args any
+	}{
+		{name: "structured edits", args: map[string]any{"file": "main.go", "edits": []map[string]string{{"old": "x := 1", "new": "x := 2"}}}},
+		{name: "path and content", args: map[string]any{"path": "main.go", "content": "package main\n"}},
+		{name: "empty patch", args: map[string]any{"patch": ""}},
+		{name: "empty object", args: map[string]any{}},
+		{name: "plain string", args: "please update the readme for me"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			request := toolCallRequest(t, "apply_patch", tc.args)
+			if v := pc.CheckRequest(request); v.Matched {
+				t.Fatalf("verdict = %+v, want allowed", v)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		args     any
+		wantRule string
+	}{
+		{name: "structured shell profile path", args: map[string]any{"path": "/home/user/.bashrc", "content": "replacement"}, wantRule: "Shell Profile Modification"},
+		{name: "structured persistence path", args: map[string]any{"file": "/etc/systemd/system/p.service", "edits": []map[string]string{{"old": "x", "new": "y"}}}, wantRule: "Persistence Path Write"},
+		{name: "plain shell profile path", args: "replace /home/user/.bashrc", wantRule: "Shell Profile Modification"},
+		{name: "plain persistence path", args: "replace /etc/systemd/system/p.service", wantRule: "Persistence Path Write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := pc.CheckRequest(toolCallRequest(t, "apply_patch", tc.args))
+			if !v.Matched || !slices.Contains(v.Rules, tc.wantRule) {
+				t.Fatalf("verdict = %+v, want %q", v, tc.wantRule)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_ApplyPatchMixedArguments(t *testing.T) {
+	pc := defaultConfig(t)
+	safePatch := "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-source ~/.bashrc\n+describe source ~/.bashrc\n"
+
+	if v := pc.CheckRequest(toolCallRequest(t, "apply_patch", map[string]any{
+		"patch": safePatch,
+		"path":  "main.go",
+	})); v.Matched {
+		t.Fatalf("safe mixed arguments matched rules %v", v.Rules)
+	}
+
+	for _, tc := range []struct {
+		name     string
+		path     string
+		wantRule string
+	}{
+		{name: "shell profile", path: "/home/user/.bashrc", wantRule: "Shell Profile Modification"},
+		{name: "persistence", path: "/etc/systemd/system/p.service", wantRule: "Persistence Path Write"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := pc.CheckRequest(toolCallRequest(t, "apply_patch", map[string]any{
+				"patch": safePatch,
+				"path":  tc.path,
+			}))
+			if !v.Matched || !slices.Equal(v.Rules, []string{tc.wantRule}) {
+				t.Fatalf("mixed target %q verdict = %+v, want only %q", tc.path, v, tc.wantRule)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_UninspectablePatchTargets(t *testing.T) {
+	pc := defaultConfig(t)
+	for _, tc := range []struct {
+		name  string
+		patch string
+	}{
+		{name: "malformed git header", patch: "diff --git a/file"},
+		{name: "truncated apply patch", patch: "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := pc.CheckRequest(toolCallRequest(t, "apply_patch", map[string]any{"patch": tc.patch}))
+			if !v.Matched || v.Action != config.ActionBlock || !slices.Equal(v.Rules, []string{uninspectablePatchTargetsRule}) {
+				t.Fatalf("verdict = %+v, want dedicated configured-closed verdict", v)
+			}
+		})
+	}
+}
+
+func toolCallRequest(t *testing.T, toolName string, args any) []byte {
+	t.Helper()
+	request, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      toolName,
+			"arguments": args,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
+}
+
+func TestExtractPatchTargetPathsInspection(t *testing.T) {
+	tests := []struct {
+		name        string
+		patch       string
+		wantTargets []string
+		inspection  patchTargetInspection
+	}{
+		{name: "no patch headers", patch: "plain text"},
+		{name: "git-like prose", patch: "diff --github settings"},
+		{name: "unpaired unified header", patch: "--- a/file", inspection: patchTargetsUninspectable},
+		{name: "empty unified target", patch: "--- \n+++ b/file", inspection: patchTargetsUninspectable},
+		{name: "invalid quoted unified target", patch: "--- \"a/file\n+++ b/file", inspection: patchTargetsUninspectable},
+		{
+			name:        "unified timestamps and CRLF",
+			patch:       "--- a/file\told-time\r\n+++ b/file\tnew-time\r\n",
+			wantTargets: []string{"a/file", "b/file"},
+			inspection:  patchTargetsInspectable,
+		},
+		{name: "rename header outside git section", patch: "rename from old\nrename to new\n"},
+		{name: "copy header outside git section", patch: "copy from old\ncopy to new\n"},
+		{name: "incomplete git rename", patch: "diff --git a/old b/new\nrename from old\n", wantTargets: []string{"a/old", "b/new", "old"}, inspection: patchTargetsUninspectable},
+		{name: "incomplete git copy", patch: "diff --git a/old b/new\ncopy to new\n", wantTargets: []string{"b/new", "new"}, inspection: patchTargetsUninspectable},
+		{name: "conflicting git operations", patch: "diff --git a/old b/new\nrename from old\nrename to new\ncopy from old\ncopy to new\n", wantTargets: []string{"b/new", "new"}, inspection: patchTargetsUninspectable},
+		{name: "empty apply update path", patch: "*** Update File: ", inspection: patchTargetsUninspectable},
+		{name: "empty apply add path", patch: "*** Add File: ", inspection: patchTargetsUninspectable},
+		{name: "empty apply delete path", patch: "*** Delete File: ", inspection: patchTargetsUninspectable},
+		{name: "empty apply move path", patch: "*** Move to: ", inspection: patchTargetsUninspectable},
+		{
+			name:        "quoted apply path",
+			patch:       "*** Begin Patch\n*** Update File: \"dir/file\"\n@@\n-old\n+new\n*** End Patch",
+			wantTargets: []string{"dir/file"},
+			inspection:  patchTargetsInspectable,
+		},
+		// Hunk bodies are content. A removed `-- ` comment renders as `--- `,
+		// an added `++ ` line as `+++ `, and neither names a file.
+		{
+			name:        "unified hunk removes dash-dash comment lines",
+			patch:       "--- a/schema.sql\n+++ b/schema.sql\n@@ -1,3 +1,2 @@\n--- old note\n--- second note\n CREATE TABLE t (id int);\n+-- kept\n",
+			wantTargets: []string{"a/schema.sql", "b/schema.sql"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "git hunk removes dash-dash comment line",
+			patch:       "diff --git a/schema.sql b/schema.sql\nindex 1111111..2222222 100644\n--- a/schema.sql\n+++ b/schema.sql\n@@ -1,2 +1,1 @@\n--- old note\n CREATE TABLE t (id int);\n",
+			wantTargets: []string{"a/schema.sql", "b/schema.sql", "a/schema.sql", "b/schema.sql"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "apply patch hunk removes dash-dash comment line",
+			patch:       "*** Begin Patch\n*** Update File: schema.sql\n@@\n--- old note\n CREATE TABLE t (id int);\n*** End Patch",
+			wantTargets: []string{"schema.sql"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "apply patch hunk carries unified header text as content",
+			patch:       "*** Begin Patch\n*** Update File: notes.md\n@@\n+--- a/.bashrc\n++++ b/.bashrc\n*** End Patch",
+			wantTargets: []string{"notes.md"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "hunk body header lookalikes are consumed by the declared counts",
+			patch:       "--- a/notes.md\n+++ b/notes.md\n@@ -1,2 +1,2 @@\n--- a/.bashrc\n-+++ b/.bashrc\n+--- a/.bashrc\n++++ b/.bashrc\n",
+			wantTargets: []string{"a/notes.md", "b/notes.md"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "no newline marker does not count",
+			patch:       "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n",
+			wantTargets: []string{"a/file", "b/file"},
+			inspection:  patchTargetsInspectable,
+		},
+		{
+			name:        "empty body line is context",
+			patch:       "--- a/file\n+++ b/file\n@@ -1,3 +1,3 @@\n a\n\n-b\n+c\n",
+			wantTargets: []string{"a/file", "b/file"},
+			inspection:  patchTargetsInspectable,
+		},
+		// A header shadowed by another header before its `+++` partner is leading
+		// text to git apply and GNU patch, which touch only the paired file. The
+		// recorded targets match what the applier changes.
+		{
+			name:        "shadowed old header is leading text",
+			patch:       "--- a/protected\n--- a/benign\n+++ b/benign\n@@ -1 +1 @@\n-safe\n+changed\n",
+			wantTargets: []string{"a/benign", "b/benign"},
+			inspection:  patchTargetsInspectable,
+		},
+		{name: "hunk shorter than declared", patch: "--- a/file\n+++ b/file\n@@ -1,3 +1,3 @@\n-old\n+new\n", wantTargets: []string{"a/file", "b/file"}, inspection: patchTargetsUninspectable},
+		{name: "hunk body with foreign line", patch: "--- a/file\n+++ b/file\n@@ -1 +1 @@\nold\n+new\n", wantTargets: []string{"a/file", "b/file"}, inspection: patchTargetsUninspectable},
+		{name: "hunk overruns declared counts", patch: "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n-older\n+new\n", wantTargets: []string{"a/file", "b/file"}, inspection: patchTargetsUninspectable},
+		{name: "hunk count overflows", patch: "--- a/file\n+++ b/file\n@@ -1,99999999999999999999 +1 @@\n-old\n+new\n", wantTargets: []string{"a/file", "b/file"}, inspection: patchTargetsUninspectable},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotTargets, gotInspection := extractPatchTargetPaths([]string{tc.patch})
+			if !slices.Equal(gotTargets, tc.wantTargets) || gotInspection != tc.inspection {
+				t.Fatalf("extractPatchTargetPaths() = (%v, %v), want (%v, %v)", gotTargets, gotInspection, tc.wantTargets, tc.inspection)
+			}
+		})
+	}
+
+	t.Run("hunk does not continue into the next argument", func(t *testing.T) {
+		gotTargets, gotInspection := extractPatchTargetPaths([]string{
+			"--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-old\n+new\n",
+			"-older\n+newer\n",
+		})
+		if !slices.Equal(gotTargets, []string{"a/file", "b/file"}) || gotInspection != patchTargetsUninspectable {
+			t.Fatalf("extractPatchTargetPaths() = (%v, %v), want uninspectable file targets", gotTargets, gotInspection)
+		}
+	})
+}
+
+func TestParseGitDiffPaths(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		input        string
+		wantOld      string
+		wantNew      string
+		wantAccepted bool
+	}{
+		{name: "same unquoted path", input: "a/file b/file", wantOld: "a/file", wantNew: "b/file", wantAccepted: true},
+		{name: "renamed unquoted path", input: "a/old b/new", wantOld: "a/old", wantNew: "b/new", wantAccepted: true},
+		{name: "same unquoted path containing delimiter", input: "a/dir b/file b/dir b/file", wantOld: "a/dir b/file", wantNew: "b/dir b/file", wantAccepted: true},
+		{name: "missing destination", input: "a/file"},
+		{name: "quoted paths", input: `"a/old name" "b/new name"`, wantOld: "a/old name", wantNew: "b/new name", wantAccepted: true},
+		{name: "invalid quoted source", input: `"a/old b/new`},
+		{name: "missing quoted destination", input: `"a/old"`},
+		{name: "invalid quoted destination", input: `"a/old" "b/new`},
+		{name: "trailing data", input: `"a/old" "b/new" extra`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			oldPath, newPath, accepted := parseGitDiffPaths(tc.input)
+			if oldPath != tc.wantOld || newPath != tc.wantNew || accepted != tc.wantAccepted {
+				t.Fatalf("parseGitDiffPaths(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.input, oldPath, newPath, accepted, tc.wantOld, tc.wantNew, tc.wantAccepted)
+			}
+		})
+	}
+}
+
+func TestParseGitPathToken(t *testing.T) {
+	for _, tc := range []struct {
+		input        string
+		wantPath     string
+		wantRest     string
+		wantAccepted bool
+	}{
+		{},
+		{input: "plain", wantPath: "plain", wantAccepted: true},
+		{input: "plain rest", wantPath: "plain", wantRest: " rest", wantAccepted: true},
+		{input: `"quoted\tpath" rest`, wantPath: "quoted\tpath", wantRest: " rest", wantAccepted: true},
+		{input: `"bad\q"`},
+		{input: `"unfinished`},
+		{input: `"unfinished\\`},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			path, rest, accepted := parseGitPathToken(tc.input)
+			if path != tc.wantPath || rest != tc.wantRest || accepted != tc.wantAccepted {
+				t.Fatalf("parseGitPathToken(%q) = (%q, %q, %v), want (%q, %q, %v)", tc.input, path, rest, accepted, tc.wantPath, tc.wantRest, tc.wantAccepted)
+			}
+		})
+	}
+}
+
+func TestParsePatchPath(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		input        string
+		stripTime    bool
+		want         string
+		wantAccepted bool
+	}{
+		{name: "unquoted", input: " path ", want: "path", wantAccepted: true},
+		{name: "timestamp", input: "path\tdate", stripTime: true, want: "path", wantAccepted: true},
+		{name: "empty", input: " "},
+		{name: "quoted", input: `"dir/file"`, want: "dir/file", wantAccepted: true},
+		{name: "quoted empty", input: `""`},
+		{name: "invalid quote", input: `"dir/file`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path, accepted := parsePatchPath(tc.input, tc.stripTime)
+			if path != tc.want || accepted != tc.wantAccepted {
+				t.Fatalf("parsePatchPath(%q) = (%q, %v), want (%q, %v)", tc.input, path, accepted, tc.want, tc.wantAccepted)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_MaintenanceCommandsRemainAllowed(t *testing.T) {
+	pc := defaultConfig(t)
+	for _, command := range []string{
+		"pipelock evidence compact --receipt-dir /var/lib/pipelock/evidence --session proxy --key public.key",
+		"pipelock contain rollback --keep-data",
+	} {
+		t.Run(command, func(t *testing.T) {
+			if v := pc.CheckToolCall("bash", []string{command}); v.Matched {
+				t.Fatalf("maintenance command matched rules %v", v.Rules)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_AuditArtifactLocations(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		toolName string
+		args     map[string]any
+		wantRule string
+	}{
+		{name: "own app log delete", toolName: "delete_file", args: map[string]any{"path": "/home/v/myapp/app.log"}},
+		{name: "build log chmod", toolName: "chmod_file", args: map[string]any{"path": "/tmp/build.log"}},
+		{name: "JSONL dataset delete", toolName: "delete_file", args: map[string]any{"path": "/home/v/data/train.jsonl"}},
+		{name: "rotate own log", toolName: "move_file", args: map[string]any{"source": "app.log", "destination": "app.log.1"}},
+		{name: "receipt chain delete", toolName: "delete_file", args: map[string]any{"path": "/var/lib/pipelock/evidence/evidence-proxy-1.jsonl"}, wantRule: "Audit Log Delete"},
+		{name: "system audit delete", toolName: "delete_file", args: map[string]any{"path": "/var/log/audit/audit.log"}, wantRule: "Audit Log Delete"},
+		{name: "receipt namespace delete", toolName: "delete_file", args: map[string]any{"path": "/var/lib/pipelock"}, wantRule: "Audit Log Delete"},
+		{name: "system log namespace delete", toolName: "delete_file", args: map[string]any{"path": "/var/log"}, wantRule: "Audit Log Delete"},
+		// Alternate spellings of the same file. The server resolves each of these
+		// to the protected path, so the rule has to as well.
+		{name: "double slash root delete", toolName: "delete_file", args: map[string]any{"path": "//var/log/audit/audit.log"}, wantRule: "Audit Log Delete"},
+		{name: "dot segment delete", toolName: "delete_file", args: map[string]any{"path": "/./var/log/audit/audit.log"}, wantRule: "Audit Log Delete"},
+		{name: "traversal into receipts move", toolName: "move_file", args: map[string]any{"source": "/tmp/../var/lib/pipelock/evidence/evidence-proxy-1.jsonl", "destination": "/tmp/x"}, wantRule: "Audit Log Move"},
+		{name: "traversal into log namespace chmod", toolName: "chmod_file", args: map[string]any{"path": "/home/v/../../var/log/audit.log", "mode": "0777"}, wantRule: "Audit Log Metadata Change"},
+		{name: "traversal link target", toolName: "create_symlink", args: map[string]any{"target": "/opt/../var/log/audit.log", "linkPath": "/tmp/l"}, wantRule: "Audit Log Link Creation"},
+		{name: "traversal copy destination", toolName: "copy_file", args: map[string]any{"source": "/tmp/fake.log", "destination": "/tmp/../var/log/audit.log"}, wantRule: "Audit Log Copy"},
+		{name: "separator run inside path delete", toolName: "delete_file", args: map[string]any{"path": "/var//log/journal/events"}, wantRule: "Audit Log Delete"},
+		{name: "dot segment inside path delete", toolName: "delete_file", args: map[string]any{"path": "/var/./log/journal/events"}, wantRule: "Audit Log Delete"},
+		{name: "separator run in copy destination", toolName: "copy_file", args: map[string]any{"source": "/tmp/fake.log", "destination": "/var//lib//pipelock/evidence/x.jsonl"}, wantRule: "Audit Log Copy"},
+		{name: "separator run in patch target", toolName: "apply_patch", args: map[string]any{"patch": "*** Begin Patch\n*** Update File: /var//lib/./pipelock/evidence/x.jsonl\n@@\n-old\n+new\n*** End Patch"}, wantRule: "Audit Log Patch"},
+		{name: "receipt chain direct write", toolName: "write_file", args: map[string]any{"path": "/var/lib/pipelock/evidence/evidence-proxy-1.jsonl", "content": ""}, wantRule: "Audit Log Write"},
+		{name: "receipt chain edit", toolName: "edit_file", args: map[string]any{"path": "/var//lib/pipelock/contain/egress-events.jsonl", "old": "denied", "new": "allowed"}, wantRule: "Audit Log Write"},
+		{name: "ordinary log write stays allowed", toolName: "write_file", args: map[string]any{"path": "/var/log/application.log", "content": "ordinary event"}},
+		{name: "ordinary nested log write stays allowed", toolName: "append_file", args: map[string]any{"path": "/var/log/myapp/worker.log", "content": "ordinary event"}},
+		{name: "auth log direct write", toolName: "write_file", args: map[string]any{"path": "/var/log/auth.log", "content": ""}, wantRule: "Audit Log Write"},
+		{name: "auditd log direct write", toolName: "write_file", args: map[string]any{"path": "/var/log/audit/audit.log", "content": ""}, wantRule: "Audit Log Write"},
+		{name: "auditd log separator run write", toolName: "edit_file", args: map[string]any{"path": "/var//log/audit.log", "old": "denied", "new": ""}, wantRule: "Audit Log Write"},
+		{name: "login records direct write", toolName: "write_file_binary", args: map[string]any{"path": "/var/log/wtmp", "content": ""}, wantRule: "Audit Log Write"},
+		{name: "journal direct write", toolName: "write_file", args: map[string]any{"path": "/var/log/journal/abc/system.journal", "content": ""}, wantRule: "Audit Log Write"},
+		{name: "system log name in another directory stays allowed", toolName: "write_file", args: map[string]any{"path": "/home/v/project/auth.log", "content": "test fixture"}},
+		{name: "similar name outside namespace", toolName: "delete_file", args: map[string]any{"path": "/home/v/varlog/audit.log"}},
+		{name: "hyphenated sibling outside namespace", toolName: "delete_file", args: map[string]any{"path": "/srv/my-var/log/app.log"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+			v := pc.CheckToolCallWithArgs(tc.toolName, extracted.Strings, raw)
+			if tc.wantRule == "" {
+				if v.Matched {
+					t.Fatalf("ordinary file matched rules %v", v.Rules)
+				}
+				return
+			}
+			if !v.Matched || !slices.Contains(v.Rules, tc.wantRule) {
+				t.Fatalf("verdict = %+v, want rule %q", v, tc.wantRule)
+			}
+		})
+	}
+}
+
+// TestNormalizeArgTokens_CollapsesPathSeparators: the spellings a filesystem
+// resolves to one separator reach the rules as one separator, while a URL keeps
+// its scheme separator and `..` segments are untouched.
+func TestNormalizeArgTokens_CollapsesPathSeparators(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "/var//log/x", want: "/var/log/x"},
+		{in: "/var/./log/x", want: "/var/log/x"},
+		{in: "//var/log/x", want: "/var/log/x"},
+		{in: "/./var/log/x", want: "/var/log/x"},
+		{in: "/var///.//log/x", want: "/var/log/x"},
+		{in: "/tmp/../var/log/x", want: "/tmp/../var/log/x"},
+		{in: "https://api.vendor.example//x", want: "https://api.vendor.example/x"},
+		{in: "https://api.vendor.example/x", want: "https://api.vendor.example/x"},
+		{in: "dir/.hidden", want: "dir/.hidden"},
+		{in: "rm -rf /var//log/journal", want: "rm -rf /var/log/journal"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			_, joined := normalizeArgTokens([]string{tc.in}, normalize.ForMatching, nil)
+			if joined != tc.want {
+				t.Fatalf("normalizeArgTokens(%q) = %q, want %q", tc.in, joined, tc.want)
+			}
+		})
+	}
+}
+
+// TestDefaultToolPolicyRules_SeparatorRunsAcrossPathRules: the separator
+// canonicalization is shared, so every path rule sees the resolved spelling.
+func TestDefaultToolPolicyRules_SeparatorRunsAcrossPathRules(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		toolName string
+		args     map[string]any
+		wantRule string
+	}{
+		{name: "persistence write", toolName: "write_file", args: map[string]any{"path": "/etc//systemd/system/p.service", "content": "[Unit]"}, wantRule: "Persistence Path Write"},
+		{name: "credential read", toolName: "read_file", args: map[string]any{"path": "/home/user/.ssh//id_rsa"}, wantRule: "Credential File Access"},
+		{name: "shell profile write", toolName: "write_file", args: map[string]any{"path": "/home/user//.bashrc", "content": "alias ls=rm"}, wantRule: "Shell Profile Modification"},
+		{name: "shell audit delete", toolName: "bash", args: map[string]any{"command": "rm /var//log/journal/events"}, wantRule: "Audit Log Tampering"},
+		{name: "shell audit truncate", toolName: "bash", args: map[string]any{"command": "echo '' > /var/./lib/pipelock/evidence/evidence-proxy-1.jsonl"}, wantRule: "Audit Log Tampering"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assertDefaultPolicyRule(t, pc, tc.toolName, tc.args, tc.wantRule)
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_MatchProtectedPathMoveTools(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		path     string
+		wantRule string
+	}{
+		{name: "persistence", path: "/etc/systemd/system/p.service", wantRule: "Persistence Path Write"},
+		{name: "shell profile", path: "/home/user/.bashrc", wantRule: "Shell Profile Modification"},
+		{name: "audit log", path: "/var/log/audit.log", wantRule: "Audit Log Move"},
+	}
+	for _, toolName := range []string{"move_file", "file_move", "rename_file", "move-file"} {
+		for _, tc := range tests {
+			t.Run(toolName+"/source/"+tc.name, func(t *testing.T) {
+				assertDefaultPolicyRule(t, pc, toolName, map[string]any{
+					"source": tc.path, "destination": "/tmp/staged",
+				}, tc.wantRule)
+			})
+			t.Run(toolName+"/destination/"+tc.name, func(t *testing.T) {
+				assertDefaultPolicyRule(t, pc, toolName, map[string]any{
+					"source": "/tmp/staged", "destination": tc.path,
+				}, tc.wantRule)
+			})
+		}
+	}
+}
+
+func TestDefaultToolPolicyRules_CopyProtectedDestinationOnly(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		path     string
+		wantRule string
+	}{
+		{name: "persistence", path: "/etc/systemd/system/p.service", wantRule: "Protected Path Copy"},
+		{name: "shell profile", path: "/home/user/.bashrc", wantRule: "Protected Path Copy"},
+		{name: "audit log", path: "/var/log/audit.log", wantRule: "Audit Log Copy"},
+	}
+	for _, toolName := range strings.Split(fileCopyToolPattern, "|") {
+		for _, tc := range tests {
+			t.Run(toolName+"/destination/"+tc.name, func(t *testing.T) {
+				assertDefaultPolicyRule(t, pc, toolName, map[string]any{
+					"source": "/tmp/staged", "destination": tc.path,
+				}, tc.wantRule)
+			})
+			t.Run(toolName+"/source/"+tc.name, func(t *testing.T) {
+				args := map[string]any{"source": tc.path, "destination": "/tmp/backup"}
+				raw, err := json.Marshal(args)
+				if err != nil {
+					t.Fatal(err)
+				}
+				v := pc.CheckToolCallWithArgs(toolName, []string{tc.path, "/tmp/backup"}, raw)
+				if v.Matched {
+					t.Fatalf("copying from protected path matched rules %v", v.Rules)
+				}
+			})
+		}
+	}
+}
+
+func TestDefaultToolPolicyRules_EquivalentWritesUnderVarLogRemainAllowed(t *testing.T) {
+	pc := defaultConfig(t)
+	for _, toolName := range strings.Split(fileWriteToolPattern, "|") {
+		t.Run(toolName, func(t *testing.T) {
+			args := map[string]any{"path": "/var/log/application.log", "content": "ordinary event"}
+			raw, err := json.Marshal(args)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v := pc.CheckToolCallWithArgs(toolName, []string{"/var/log/application.log", "ordinary event"}, raw)
+			if v.Matched {
+				t.Fatalf("safe log write matched rules %v", v.Rules)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_ProtectedPathStateChanges(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		path     string
+		wantRule string
+	}{
+		{name: "persistence", path: "/etc/systemd/system/p.service", wantRule: "Protected Path %s"},
+		{name: "shell profile", path: "/home/user/.bashrc", wantRule: "Protected Path %s"},
+		{name: "audit log", path: "/var/log/audit.log", wantRule: "Audit Log %s"},
+	}
+	classes := []struct {
+		name    string
+		pattern string
+		suffix  string
+	}{
+		{name: "delete", pattern: fileDeleteToolPattern, suffix: "Delete"},
+		{name: "metadata", pattern: fileMetadataToolPattern, suffix: "Metadata Change"},
+	}
+	for _, class := range classes {
+		for _, toolName := range strings.Split(class.pattern, "|") {
+			for _, tc := range tests {
+				t.Run(class.name+"/"+toolName+"/"+tc.name, func(t *testing.T) {
+					assertDefaultPolicyRule(t, pc, toolName, map[string]any{
+						"path": tc.path,
+					}, fmt.Sprintf(tc.wantRule, class.suffix))
+				})
+			}
+		}
+	}
+}
+
+func TestDefaultToolPolicyRules_ProtectedPathLinkDirections(t *testing.T) {
+	pc := defaultConfig(t)
+	tests := []struct {
+		name     string
+		path     string
+		wantRule string
+	}{
+		{name: "persistence", path: "/etc/systemd/system/p.service", wantRule: "Protected Path Link Creation"},
+		{name: "shell profile", path: "/home/user/.bashrc", wantRule: "Protected Path Link Creation"},
+		{name: "audit log", path: "/var/log/audit.log", wantRule: "Audit Log Link Creation"},
+		{name: "credential", path: "/home/user/.ssh/id_rsa", wantRule: "Credential File Access"},
+	}
+	for _, toolName := range strings.Split(fileLinkToolPattern, "|") {
+		for _, tc := range tests {
+			for _, direction := range []string{"target", "linkPath"} {
+				t.Run(toolName+"/"+direction+"/"+tc.name, func(t *testing.T) {
+					args := map[string]any{"target": "/tmp/target", "linkPath": "/tmp/link"}
+					args[direction] = tc.path
+					assertDefaultPolicyRule(t, pc, toolName, args, tc.wantRule)
+				})
+			}
+		}
+	}
+}
+
+func TestDefaultToolPolicyRules_SafeStateChangesRemainAllowed(t *testing.T) {
+	pc := defaultConfig(t)
+	for _, pattern := range []string{fileDeleteToolPattern, fileMetadataToolPattern, fileLinkToolPattern} {
+		for _, toolName := range strings.Split(pattern, "|") {
+			t.Run(toolName, func(t *testing.T) {
+				args := map[string]any{"path": "/tmp/application.txt", "target": "/tmp/target", "linkPath": "/tmp/link"}
+				raw, err := json.Marshal(args)
+				if err != nil {
+					t.Fatal(err)
+				}
+				extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+				v := pc.CheckToolCallWithArgs(toolName, extracted.Strings, raw)
+				if v.Matched {
+					t.Fatalf("safe state change matched rules %v", v.Rules)
+				}
+			})
+		}
+	}
+}
+
+func TestDefaultToolPolicyRules_MatchWindowsShellProfilePath(t *testing.T) {
+	pc := defaultConfig(t)
+	assertDefaultPolicyRule(t, pc, "write_file", map[string]any{
+		"path": `C:\\Users\\user\\.bashrc`, "content": "replacement",
+	}, "Shell Profile Modification")
+}
+
+func TestDefaultToolPolicyRules_EquivalentOperationRequestShapes(t *testing.T) {
+	pc := defaultConfig(t)
+	call := `{"jsonrpc":"2.0","method":"tools/call","params":{"name":"move_file","arguments":{"source":"/tmp/staged","destination":"/home/user/.bashrc"}}}`
+	tests := map[string]string{
+		"request":      `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"move_file","arguments":{"source":"/tmp/staged","destination":"/home/user/.bashrc"}}}`,
+		"notification": call,
+		"batch":        `[{"jsonrpc":"2.0","id":1,"method":"tools/list"},` + call + `]`,
+		"nested args":  `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"move_file","arguments":{"operation":{"source":"/tmp/staged","destination":"/home/user/.bashrc"}}}}`,
+	}
+	for name, request := range tests {
+		t.Run(name, func(t *testing.T) {
+			v := pc.CheckRequest([]byte(request))
+			if !v.Matched || v.Action != config.ActionBlock || !slices.Contains(v.Rules, "Shell Profile Modification") {
+				t.Fatalf("verdict = %+v, want Shell Profile Modification block", v)
+			}
+		})
+	}
+}
+
+func TestDefaultToolPolicyRules_ProtectedPathSpellings(t *testing.T) {
+	pc := defaultConfig(t)
+	for name, path := range map[string]string{
+		"home variable":          `$HOME/.bashrc`,
+		"tilde":                  `~/.bashrc`,
+		"absolute":               `/home/user/.bashrc`,
+		"relative":               `.bashrc`,
+		"dot slash":              `.//.bashrc`,
+		"dot dot":                `/home/user/work/../.bashrc`,
+		"trailing dot":           `/home/user/.bashrc.`,
+		"trailing space":         `/home/user/.bashrc `,
+		"ASCII case insensitive": `/home/user/.BASHRC`,
+		"Cyrillic confusable":    `/home/user/.bаshrc`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assertDefaultPolicyRule(t, pc, "write_file", map[string]any{"path": path}, "Shell Profile Modification")
+		})
+	}
+}
+
+func assertDefaultPolicyRule(t *testing.T, pc *Config, toolName string, args map[string]any, wantRule string) {
+	t.Helper()
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	extracted := jsonrpc.ExtractStringsFromJSONResult(raw)
+	v := pc.CheckToolCallWithArgs(toolName, extracted.Strings, raw)
 	if !v.Matched {
-		t.Error("expected match for .zshrc write via write_file tool")
+		t.Fatalf("%s(%s) did not match", toolName, raw)
+	}
+	if !slices.Contains(v.Rules, wantRule) {
+		t.Fatalf("%s(%s) rules = %v, want %q", toolName, raw, v.Rules, wantRule)
 	}
 }
 
