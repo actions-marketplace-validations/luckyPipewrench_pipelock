@@ -23,9 +23,10 @@ import (
 )
 
 const (
-	uninspectableJSONDepthRule = "uninspectable_json_depth"
-	duplicateJSONKeyRule       = "duplicate_json_object_key"
-	malformedA2AParamsRule     = "malformed_a2a_params"
+	uninspectableJSONDepthRule    = "uninspectable_json_depth"
+	uninspectablePatchTargetsRule = "uninspectable_patch_targets"
+	duplicateJSONKeyRule          = "duplicate_json_object_key"
+	malformedA2AParamsRule        = "malformed_a2a_params"
 )
 
 // shellExpansionRe matches shell variable expansions used as whitespace substitutes.
@@ -148,6 +149,7 @@ type CompiledRule struct {
 	ToolPattern      *regexp.Regexp
 	ArgPattern       *regexp.Regexp // nil = match on tool name alone
 	ArgKey           *regexp.Regexp // nil = match all arg values; non-nil = scope to matching keys
+	ArgSource        string
 	ArgType          string
 	ArgNumberGT      *json.Number
 	ArgNumberLT      *json.Number
@@ -184,6 +186,7 @@ func New(cfg config.MCPToolPolicy) *Config {
 		compiled := &CompiledRule{
 			Name:            r.Name,
 			ToolPattern:     regexp.MustCompile(r.ToolPattern),
+			ArgSource:       r.ArgSource,
 			ArgType:         r.ArgType,
 			ArgNumberGT:     r.ArgNumberGT,
 			ArgNumberLT:     r.ArgNumberLT,
@@ -289,6 +292,7 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 		ruleTokens, ruleJoined := tokens, joined
 		ruleAltTokens, ruleAltJoined := altTokens, altJoined
 		ruleBaseTokens, ruleBaseJoined := baseTokens, baseJoined
+		patchInspection := patchTargetsOrdinary
 		if rule.ArgKey != nil && len(rawArgs) == 0 {
 			if rule.hasStructuralValidators() {
 				return uninspectableStructuralArgsVerdict(rule.Name)
@@ -305,8 +309,18 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 			ruleAltTokens, ruleAltJoined = normalizeArgTokens(scopedStrings, normalize.ForPolicy, policyPreNormalize)
 			ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(scopedStrings, normalize.ForMatching, nil)
 		}
+		if rule.ArgSource == config.ToolPolicyArgSourcePatchTargets {
+			patchTargets, inspection := extractPatchTargetPaths(argStrings)
+			patchInspection = inspection
+			if inspection != patchTargetsOrdinary {
+				matchStrings := patchTargetMatchStrings(argStrings, patchTargets)
+				ruleTokens, ruleJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, policyPreNormalize)
+				ruleAltTokens, ruleAltJoined = normalizeArgTokens(matchStrings, normalize.ForPolicy, policyPreNormalize)
+				ruleBaseTokens, ruleBaseJoined = normalizeArgTokens(matchStrings, normalize.ForMatching, nil)
+			}
+		}
 
-		argPatternMatched := rule.ArgPattern == nil ||
+		argPatternMatched := patchInspection == patchTargetsUninspectable || rule.ArgPattern == nil ||
 			matchArgPattern(rule.ArgPattern, ruleTokens, ruleJoined) ||
 			matchArgPattern(rule.ArgPattern, ruleAltTokens, ruleAltJoined) ||
 			matchArgPattern(rule.ArgPattern, ruleBaseTokens, ruleBaseJoined)
@@ -322,7 +336,13 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 			continue
 		}
 
-		matchedRules = append(matchedRules, rule.Name)
+		matchedRule := rule.Name
+		if patchInspection == patchTargetsUninspectable {
+			matchedRule = uninspectablePatchTargetsRule
+			matchedRules = appendUniqueRule(matchedRules, matchedRule)
+		} else {
+			matchedRules = append(matchedRules, matchedRule)
+		}
 		action := rule.Action
 		if action == "" {
 			action = pc.Action
@@ -358,6 +378,15 @@ func (pc *Config) CheckToolCallWithArgs(toolName string, argStrings []string, ra
 	}
 }
 
+func appendUniqueRule(rules []string, rule string) []string {
+	for _, existing := range rules {
+		if existing == rule {
+			return rules
+		}
+	}
+	return append(rules, rule)
+}
+
 // normalizeArgTokens applies an optional pre-normalizer, a Unicode normalization
 // function, shell escape decoding, and shell construction resolution to
 // each argument string, then splits into tokens. normFn selects the Unicode
@@ -381,9 +410,24 @@ func normalizeArgTokens(argStrings []string, normFn func(string) string, preNorm
 		normalized = shellHomeSlashRe.ReplaceAllString(normalized, "/")
 		normalized = expandBraces(normalized)
 		normalized = shellExpansionRe.ReplaceAllString(normalized, " ")
+		normalized = collapsePathSeparators(normalized)
 		tokens = append(tokens, strings.Fields(normalized)...)
 	}
 	return tokens, strings.Join(tokens, " ")
+}
+
+// pathSeparatorRunRe matches a run of `/` and `./` segments that a filesystem
+// resolves to a single separator. The run must begin at the start of the text
+// or after a character other than `:`, so a URL keeps its `://`.
+var pathSeparatorRunRe = regexp.MustCompile(`(^|[^:/])/(?:\.?/)+`)
+
+// collapsePathSeparators rewrites `/var//log/x`, `/var/./log/x`, and
+// `//var/log/x` to `/var/log/x` before pattern matching, so a path rule sees
+// the spelling the server resolves rather than the one the caller typed.
+// `..` segments are left alone: the path rules match protected namespaces as
+// segments anywhere in the value, so a traversal spelling still matches.
+func collapsePathSeparators(s string) string {
+	return pathSeparatorRunRe.ReplaceAllString(s, "${1}/")
 }
 
 // maxPairwiseTokens caps token count for O(n²) pairwise matching.
@@ -419,6 +463,404 @@ func matchArgPattern(pat *regexp.Regexp, tokens []string, joined string) bool {
 		}
 	}
 	return false
+}
+
+const (
+	gitDiffMarker          = "diff --git"
+	gitDiffHeader          = gitDiffMarker + " "
+	gitRenameFromHeader    = "rename from "
+	gitRenameToHeader      = "rename to "
+	gitCopyFromHeader      = "copy from "
+	gitCopyToHeader        = "copy to "
+	unifiedOldFileHeader   = "--- "
+	unifiedNewFileHeader   = "+++ "
+	applyPatchHeaderPrefix = "*** "
+	applyPatchBeginHeader  = "*** Begin Patch"
+	applyPatchEndHeader    = "*** End Patch"
+	applyPatchUpdateHeader = "*** Update File: "
+	applyPatchAddHeader    = "*** Add File: "
+	applyPatchDeleteHeader = "*** Delete File: "
+	applyPatchMoveHeader   = "*** Move to: "
+)
+
+type gitPatchTargets struct {
+	oldPath    string
+	newPath    string
+	oldHeader  string
+	newHeader  string
+	renameFrom string
+	renameTo   string
+	copyFrom   string
+	copyTo     string
+}
+
+type patchTargetInspection uint8
+
+const (
+	patchTargetsOrdinary patchTargetInspection = iota
+	patchTargetsInspectable
+	patchTargetsUninspectable
+)
+
+// extractPatchTargetPaths returns the semantic file targets named by Git,
+// unified-diff, or Codex apply_patch headers. Move-class operations expose both
+// sides because they can remove or replace either protected path. Copy-class
+// operations expose only the destination so a protected source may be backed
+// up to an ordinary path. Input without a patch framing or target header is
+// ordinary structured tool input and falls back to all-argument matching.
+// Patch-shaped input that cannot be inspected fails in the configured direction.
+func extractPatchTargetPaths(argStrings []string) ([]string, patchTargetInspection) {
+	var targets []string
+	var gitSection *gitPatchTargets
+	var pendingUnifiedOld string
+	var sawPatchShape, sawTargetHeader, malformed bool
+	var applyPatchBegins, applyPatchEnds int
+	// Hunk bodies are consumed by the line counts in their `@@` header, the way
+	// git apply and GNU patch consume them, so a removed line that begins with
+	// `-- ` or an added line that begins with `++ ` is content and never a file
+	// header. Inside a Codex apply_patch envelope only `*** ` lines are headers.
+	var oldRemaining, newRemaining int
+
+	flushGitSection := func() {
+		if gitSection == nil {
+			return
+		}
+		copyOperation := gitSection.copyFrom != "" || gitSection.copyTo != ""
+		renameOperation := gitSection.renameFrom != "" || gitSection.renameTo != ""
+		if (gitSection.copyFrom == "") != (gitSection.copyTo == "") ||
+			(gitSection.renameFrom == "") != (gitSection.renameTo == "") ||
+			copyOperation && renameOperation {
+			malformed = true
+		}
+		if copyOperation {
+			for _, target := range []string{gitSection.newPath, gitSection.newHeader, gitSection.copyTo} {
+				targets = appendPatchTarget(targets, target)
+			}
+		} else {
+			for _, target := range []string{
+				gitSection.oldPath,
+				gitSection.newPath,
+				gitSection.oldHeader,
+				gitSection.newHeader,
+				gitSection.renameFrom,
+				gitSection.renameTo,
+			} {
+				targets = appendPatchTarget(targets, target)
+			}
+		}
+		gitSection = nil
+	}
+
+	for _, arg := range argStrings {
+		lines := strings.Split(arg, "\n")
+		if n := len(lines); n > 0 && lines[n-1] == "" {
+			lines = lines[:n-1]
+		}
+		for _, rawLine := range lines {
+			line := strings.TrimSuffix(rawLine, "\r")
+			if isPatchShapeMarker(line) {
+				sawPatchShape = true
+			}
+			if oldRemaining > 0 || newRemaining > 0 {
+				if consumeHunkLine(line, &oldRemaining, &newRemaining) {
+					continue
+				}
+				malformed = true
+				oldRemaining, newRemaining = 0, 0
+			}
+			if applyPatchBegins > applyPatchEnds && !strings.HasPrefix(line, applyPatchHeaderPrefix) {
+				continue
+			}
+			if m := unifiedHunkHeaderRe.FindStringSubmatch(line); m != nil {
+				oldCount, okOld := hunkLineCount(m[1])
+				newCount, okNew := hunkLineCount(m[2])
+				if !okOld || !okNew {
+					malformed = true
+					continue
+				}
+				oldRemaining, newRemaining = oldCount, newCount
+				continue
+			}
+			if strings.HasPrefix(line, gitDiffHeader) {
+				flushGitSection()
+				sawTargetHeader = true
+				oldPath, newPath, ok := parseGitDiffPaths(strings.TrimPrefix(line, gitDiffHeader))
+				if !ok {
+					malformed = true
+					continue
+				}
+				gitSection = &gitPatchTargets{oldPath: oldPath, newPath: newPath}
+				continue
+			}
+
+			switch {
+			case line == applyPatchBeginHeader:
+				applyPatchBegins++
+			case line == applyPatchEndHeader:
+				applyPatchEnds++
+			case strings.HasPrefix(line, unifiedOldFileHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, unifiedOldFileHeader), true)
+				if !ok {
+					malformed = true
+					continue
+				}
+				pendingUnifiedOld = path
+				if gitSection != nil {
+					gitSection.oldHeader = path
+				}
+			case strings.HasPrefix(line, unifiedNewFileHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, unifiedNewFileHeader), true)
+				if !ok {
+					malformed = true
+					continue
+				}
+				if gitSection != nil {
+					gitSection.newHeader = path
+				} else if pendingUnifiedOld != "" {
+					targets = appendPatchTarget(targets, pendingUnifiedOld)
+					targets = appendPatchTarget(targets, path)
+				}
+				pendingUnifiedOld = ""
+			case strings.HasPrefix(line, gitRenameFromHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitRenameFromHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.renameFrom = path
+			case strings.HasPrefix(line, gitRenameToHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitRenameToHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.renameTo = path
+			case strings.HasPrefix(line, gitCopyFromHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitCopyFromHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.copyFrom = path
+			case strings.HasPrefix(line, gitCopyToHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, gitCopyToHeader), false)
+				if !ok || gitSection == nil {
+					malformed = true
+					continue
+				}
+				gitSection.copyTo = path
+			case strings.HasPrefix(line, applyPatchUpdateHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchUpdateHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchAddHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchAddHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchDeleteHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchDeleteHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			case strings.HasPrefix(line, applyPatchMoveHeader):
+				sawTargetHeader = true
+				path, ok := parsePatchPath(strings.TrimPrefix(line, applyPatchMoveHeader), false)
+				if !ok {
+					malformed = true
+					continue
+				}
+				targets = appendPatchTarget(targets, path)
+			}
+		}
+		if oldRemaining > 0 || newRemaining > 0 {
+			malformed = true
+			oldRemaining, newRemaining = 0, 0
+		}
+	}
+	flushGitSection()
+
+	if pendingUnifiedOld != "" {
+		malformed = true
+	}
+	if applyPatchBegins != applyPatchEnds {
+		malformed = true
+	}
+	if !sawPatchShape {
+		return nil, patchTargetsOrdinary
+	}
+	if !sawTargetHeader || malformed {
+		return targets, patchTargetsUninspectable
+	}
+	return targets, patchTargetsInspectable
+}
+
+// unifiedHunkHeaderRe captures the old and new line counts of a unified hunk
+// header. An omitted count means one line, as in `@@ -1 +1 @@`.
+var unifiedHunkHeaderRe = regexp.MustCompile(`^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@`)
+
+func hunkLineCount(count string) (int, bool) {
+	if count == "" {
+		return 1, true
+	}
+	n, err := strconv.Atoi(count)
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// consumeHunkLine charges one body line against the counts declared by the
+// enclosing hunk header. It reports false for a line that no applier would
+// accept inside a hunk, or one that overruns the declared counts.
+func consumeHunkLine(line string, oldRemaining, newRemaining *int) bool {
+	switch {
+	case strings.HasPrefix(line, `\ `):
+		// "\ No newline at end of file" annotates the preceding line.
+		return true
+	case line == "" || line[0] == ' ':
+		*oldRemaining--
+		*newRemaining--
+	case line[0] == '-':
+		*oldRemaining--
+	case line[0] == '+':
+		*newRemaining--
+	default:
+		return false
+	}
+	return *oldRemaining >= 0 && *newRemaining >= 0
+}
+
+func isPatchShapeMarker(line string) bool {
+	return line == gitDiffMarker ||
+		strings.HasPrefix(line, gitDiffHeader) ||
+		line == strings.TrimSpace(unifiedOldFileHeader) ||
+		strings.HasPrefix(line, unifiedOldFileHeader) ||
+		line == strings.TrimSpace(unifiedNewFileHeader) ||
+		strings.HasPrefix(line, unifiedNewFileHeader) ||
+		line == applyPatchBeginHeader ||
+		line == applyPatchEndHeader ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchUpdateHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchAddHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchDeleteHeader, " ")) ||
+		strings.HasPrefix(line, strings.TrimSuffix(applyPatchMoveHeader, " "))
+}
+
+func patchTargetMatchStrings(argStrings, patchTargets []string) []string {
+	matchStrings := append([]string(nil), patchTargets...)
+	for _, arg := range argStrings {
+		patchShaped := false
+		for _, rawLine := range strings.Split(arg, "\n") {
+			if isPatchShapeMarker(strings.TrimSuffix(rawLine, "\r")) {
+				patchShaped = true
+				break
+			}
+		}
+		if !patchShaped {
+			matchStrings = append(matchStrings, arg)
+		}
+	}
+	return matchStrings
+}
+
+func appendPatchTarget(targets []string, target string) []string {
+	if target == "" || target == "/dev/null" {
+		return targets
+	}
+	return append(targets, target)
+}
+
+func parseGitDiffPaths(value string) (string, string, bool) {
+	if !strings.HasPrefix(value, "\"") {
+		var fallbackOld, fallbackNew string
+		for offset := 0; ; {
+			rel := strings.Index(value[offset:], " b/")
+			if rel < 0 {
+				break
+			}
+			delim := offset + rel
+			oldPath, newPath := value[:delim], value[delim+1:]
+			if strings.HasPrefix(oldPath, "a/") && strings.HasPrefix(newPath, "b/") {
+				fallbackOld, fallbackNew = oldPath, newPath
+				if strings.TrimPrefix(oldPath, "a/") == strings.TrimPrefix(newPath, "b/") {
+					return oldPath, newPath, true
+				}
+			}
+			offset = delim + len(" b/")
+		}
+		return fallbackOld, fallbackNew, fallbackOld != ""
+	}
+
+	oldPath, rest, ok := parseGitPathToken(value)
+	if !ok {
+		return "", "", false
+	}
+	newPath, rest, ok := parseGitPathToken(strings.TrimLeft(rest, " \t"))
+	if !ok || strings.TrimSpace(rest) != "" {
+		return "", "", false
+	}
+	return oldPath, newPath, true
+}
+
+func parseGitPathToken(value string) (string, string, bool) {
+	if value == "" {
+		return "", "", false
+	}
+	if value[0] != '"' {
+		end := strings.IndexAny(value, " \t")
+		if end < 0 {
+			return value, "", value != ""
+		}
+		return value[:end], value[end:], end > 0
+	}
+	for i, escaped := 1, false; i < len(value); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case value[i] == '\\':
+			escaped = true
+		case value[i] == '"':
+			path, err := strconv.Unquote(value[:i+1])
+			return path, value[i+1:], err == nil && path != ""
+		}
+	}
+	return "", "", false
+}
+
+func parsePatchPath(value string, stripTimestamp bool) (string, bool) {
+	if stripTimestamp {
+		if before, _, ok := strings.Cut(value, "\t"); ok {
+			value = before
+		}
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", false
+	}
+	if value[0] == '"' {
+		unquoted, err := strconv.Unquote(value)
+		if err != nil || unquoted == "" {
+			return "", false
+		}
+		return unquoted, true
+	}
+	return value, true
 }
 
 const structuralMaxArgDepth = 64
@@ -995,6 +1437,43 @@ func expandBraces(s string) string {
 
 // DefaultToolPolicyRules returns the built-in set of tool call policy rules
 // covering common dangerous operations that agents might attempt.
+const (
+	fileReadToolPattern     = `read_file|file_read|read_text_file|read_media_file|read_multiple_files|head_file|tail_file|batch_read`
+	fileWriteToolPattern    = `write_file|file_write|edit_file|create_file|modify_file|append_file|write_file_binary|find_replace|replace_content|replace_in_file|insert_lines|delete_lines|file_write_chunked`
+	filePatchToolPattern    = `apply_patch`
+	fileMoveToolPattern     = `move_file|file_move|rename_file|move-file`
+	fileCopyToolPattern     = `copy_file|file_copy`
+	fileDeleteToolPattern   = `delete_file|file_delete`
+	fileMetadataToolPattern = `chmod_file|chown_file`
+	fileLinkToolPattern     = `create_symlink|create_hardlink`
+
+	persistencePathPattern  = `/etc/crontab\b|/etc/cron\.(?:d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(?:Daemons|Agents)/`
+	shellProfilePathPattern = `(?:^|[\\/])\.(?:bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|/etc/profile\b`
+	// The audit namespaces are matched as path segments anywhere in the value,
+	// not only at an absolute-path start. A start anchor treated `//var/log/x`,
+	// `/./var/log/x`, and `/tmp/../var/log/x` as unprotected even though the
+	// server resolves all three to the protected file. A relative patch target
+	// such as `var/log/x` is the same file after the applier strips its prefix.
+	auditLogPathPattern = `(?:^|[\s/])(?:var/log|var/lib/pipelock)(?:/|$)`
+	// Pipelock's own state directory, the narrower namespace the write rule
+	// guards on its own.
+	pipelockStatePathPattern = `(?:^|[\s/])var/lib/pipelock(?:/|$)`
+	// The system's own security and login records under /var/log: the syslog
+	// family, auditd's default log directory and file name, and the login
+	// accounting files. An application's log next to them stays ordinary.
+	systemLogPathPattern = `(?:^|[\s/])var/log/(?:auth\.log|secure|syslog|messages|kern\.log|audit\.log|audit/|wtmp|btmp|lastlog|faillog|journal/)`
+	// Shell-context form of the audit namespaces, for command text where the
+	// path follows a redirect or a command word rather than standing alone.
+	auditLogShellPathPattern = `/(?:var/log|var/lib/pipelock)/`
+	// Credential locations accept both separators. A Windows spelling such as
+	// `C:\\Users\\v\\.ssh\\id_rsa` is the same secret as its POSIX form, and a
+	// slash-only pattern matched neither the read nor the relocate route. The
+	// separator is OPTIONAL because policy normalization strips a backslash that
+	// precedes a word character, so a Windows spelling reaches the matcher with
+	// no separator left between the directory and the file name.
+	sensitiveFilePathPattern = `\.ssh[\\/]?(id_|authorized)|\.aws[\\/]?credentials|\.env\b|\.netrc|/etc/shadow`
+)
+
 func DefaultToolPolicyRules() []config.ToolPolicyRule {
 	return []config.ToolPolicyRule{
 		{
@@ -1009,9 +1488,13 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			ArgPattern:  `(?i)\b(chmod\s+(-R|--recursive)\s+(777|666)|chmod\s+(777|666)\s+(-R|--recursive)|chown\s+(-R|--recursive))\b`,
 		},
 		{
+			// Move and copy are matched unscoped, so the credential matches on the
+			// SOURCE side. This is the mirror of the destination-protection rules:
+			// for a secret the danger is relocating it somewhere unguarded and
+			// reading it there, so copying a credential OUT is itself the finding.
 			Name:        "Credential File Access",
-			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|read_file|file_read)$`,
-			ArgPattern:  `(?i)(\.ssh/(id_|authorized)|\.aws/credentials|\.env\b|\.netrc|/etc/shadow)`,
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|` + fileReadToolPattern + `|` + fileLinkToolPattern + `|` + fileMoveToolPattern + `|` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + sensitiveFilePathPattern + `)`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1028,6 +1511,27 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			Name:        "Reverse Shell",
 			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec)$`,
 			ArgPattern:  `(?i)(bash\s+-i\s+>&|/dev/tcp/|mkfifo\s+|nc\s+-e|ncat\s+-e)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Protected Path Delete",
+			ToolPattern: `(?i)^(` + fileDeleteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Protected Path Metadata Change",
+			ToolPattern: `(?i)^(` + fileMetadataToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Both link arguments are security-sensitive. A protected link path is
+			// replaced directly; a protected target gains an alias that can be used
+			// for later reads or writes outside the visible protected namespace.
+			Name:        "Protected Path Link Creation",
+			ToolPattern: `(?i)^(` + fileLinkToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1070,8 +1574,25 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			// Covers system-wide (/etc/systemd, /lib/systemd) and user-scoped
 			// (~/.config/systemd/user/) systemd paths, plus macOS LaunchAgents/Daemons.
 			Name:        "Persistence Path Write",
-			ToolPattern: `(?i)^(write_file|file_write|edit_file|create_file|modify_file|append_file)$`,
-			ArgPattern:  `(?i)(/etc/crontab\b|/etc/cron\.(d|daily|hourly|weekly|monthly)/|/var/spool/cron/|/etc/init\.d/|/etc/systemd/|/lib/systemd/|/usr/lib/systemd/|\.config/systemd/user/|/Library/Launch(Daemons|Agents)/)`,
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `|` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Persistence Path Write",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
+			Action:      config.ActionBlock,
+		},
+		{
+			// Copy is destination-scoped: reading a protected source into a safe
+			// backup path remains allowed. The named schema is the one published by
+			// copy_file servers covered by this built-in rule.
+			Name:        "Protected Path Copy",
+			ToolPattern: `(?i)^(` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + persistencePathPattern + `|` + shellProfilePathPattern + `)`,
+			ArgKey:      `(?i)^destination$`,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1084,10 +1605,17 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			Action:      config.ActionBlock,
 		},
 		{
-			// File write tools: any mention of a profile file implies modification.
+			// File write tools directly name the file they modify.
 			Name:        "Shell Profile Modification",
-			ToolPattern: `(?i)^(write_file|file_write|edit_file|create_file|modify_file|append_file)$`,
-			ArgPattern:  `(?i)((?:^|/)\.(bashrc|bash_profile|profile|zshrc|zprofile|zshenv|bash_logout)\b|/etc/profile\b)`,
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `|` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + shellProfilePathPattern + `)`,
+			Action:      config.ActionBlock,
+		},
+		{
+			Name:        "Shell Profile Modification",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + shellProfilePathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
 			Action:      config.ActionBlock,
 		},
 		{
@@ -1109,9 +1637,55 @@ func DefaultToolPolicyRules() []config.ToolPolicyRule {
 			ArgPattern:  `(?i)(\bnohup\s+|\bdisown\b|\bsetsid\s+|\bscreen\s+(-\S+\s+)*-[dDm]|\btmux\s+(new-session|new)\s+-d)`,
 		},
 		{
+			// Move tools are deliberately unscoped and therefore protect both source
+			// and destination paths.
+			Name:        "Audit Log Move",
+			ToolPattern: `(?i)^(` + fileMoveToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Copy",
+			ToolPattern: `(?i)^(` + fileCopyToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+			ArgKey:      `(?i)^destination$`,
+		},
+		{
+			Name:        "Audit Log Delete",
+			ToolPattern: `(?i)^(` + fileDeleteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Metadata Change",
+			ToolPattern: `(?i)^(` + fileMetadataToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			Name:        "Audit Log Link Creation",
+			ToolPattern: `(?i)^(` + fileLinkToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+		},
+		{
+			// Ordinary writes under /var/log stay allowed: an application appending
+			// to its own log is the normal case there. Nothing an agent runs has
+			// a reason to write into Pipelock's own state directory, where the
+			// receipt chain and the containment egress log live, or into the
+			// system's security and login records.
+			Name:        "Audit Log Write",
+			ToolPattern: `(?i)^(` + fileWriteToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + pipelockStatePathPattern + `|` + systemLogPathPattern + `)`,
+		},
+		{
+			// A patch edits its target in place, so a patch naming the receipt
+			// chain or an audit log is the same mutation as a direct write.
+			Name:        "Audit Log Patch",
+			ToolPattern: `(?i)^(` + filePatchToolPattern + `)$`,
+			ArgPattern:  `(?i)(` + auditLogPathPattern + `)`,
+			ArgSource:   config.ToolPolicyArgSourcePatchTargets,
+		},
+		{
 			Name:        "Audit Log Tampering",
-			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|write_file|file_write|edit_file|create_file|modify_file|append_file)$`,
-			ArgPattern:  `(?i)(\b(rm|truncate|shred)\b[^;|&]*/var/log/|\b(rm|truncate|shred)\b[^;|&]*\.(log|audit|jsonl)\b|>{1,2}\s*[^;|&]*(/var/log/|\.(log|audit|jsonl)\b)|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bexport\s+HISTFILE=/dev/null\b)`,
+			ToolPattern: `(?i)^(bash|shell|exec|run_command|execute|terminal|bash_exec|` + fileWriteToolPattern + `)$`,
+			ArgPattern:  `(?i)(\b(rm|truncate|shred)\b[^;|&]*(` + auditLogShellPathPattern + `|\.(log|audit|jsonl)\b)|>{1,2}\s*[^;|&]*(` + auditLogShellPathPattern + `|\.(log|audit|jsonl)\b)|\bhistory\s+-c\b|\bunset\s+HISTFILE\b|\bexport\s+HISTFILE=/dev/null\b)`,
 		},
 	}
 }
