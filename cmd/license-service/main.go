@@ -117,6 +117,11 @@ func run(log zerolog.Logger) error {
 	}
 	defer func() { _ = db.Close() }()
 	log.Info().Str("db_path", cfg.DBPath).Msg("entitlement database ready")
+	db.ReportJournalMode(log)
+
+	// Name any customers the migration could not bring under the one-trial
+	// limit, so preserving their live trials is visible rather than quiet.
+	db.ReportDuplicateActiveTrials(context.Background(), log)
 
 	// Open the append-only audit ledger.
 	ledger, err := licenseservice.OpenAuditLedger(cfg.LedgerPath)
