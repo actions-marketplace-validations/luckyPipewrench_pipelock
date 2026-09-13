@@ -10,10 +10,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
+
 	// Pure-Go SQLite driver (no CGO requirement).
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Entitlement represents a customer's subscription state and the last
@@ -82,7 +88,24 @@ type LicenseIssuance struct {
 // EntitlementDB manages the SQLite entitlement store.
 type EntitlementDB struct {
 	db *sql.DB
+
+	// journalMode is the mode the database settled on at open time. See
+	// enableWAL for why it is not guaranteed to be WAL.
+	journalMode string
+
+	// inMemory records that the operator asked for the :memory: sentinel, which
+	// is the only configuration in which an ephemeral store is intended.
+	inMemory bool
 }
+
+// journalModeWAL is the mode a file database is expected to run in.
+const journalModeWAL = "wal"
+
+// journalModeMemory is what an in-memory database reports. It can never be WAL.
+const journalModeMemory = "memory"
+
+// inMemoryPath is the configured path that asks for an ephemeral database.
+const inMemoryPath = ":memory:"
 
 // ErrTerminalEntitlement means a stale active event tried to mint a license
 // after this subscription was already recorded in a terminal state.
@@ -93,6 +116,17 @@ var ErrTerminalEntitlement = errors.New("entitlement is terminal")
 // state; they may retry delivery from the persisted record.
 var ErrWebhookAlreadyCommitted = errors.New("webhook already committed")
 
+// ErrActiveTrialExists means another order owns the unexpired trial slot for
+// the entitlement's canonical customer email.
+var ErrActiveTrialExists = errors.New("active trial already exists")
+
+// ErrTrialEmailNotCanonical means the entitlement's customer email cannot be
+// canonicalized, so it can hold no trial slot and the one-active-trial rule
+// cannot be enforced for it. Granting a trial on this address is refused;
+// merely RECORDING an entitlement is not, because refusing that would block
+// revoking or status-mirroring a legacy row and buys no enforcement.
+var ErrTrialEmailNotCanonical = errors.New("trial email cannot be canonicalized")
+
 type entitlementExecer interface {
 	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
@@ -101,10 +135,89 @@ type entitlementQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+// dsnPragmas are applied to every connection the driver opens.
+//
+// They belong in the connection string rather than in an Exec after opening,
+// because a PRAGMA statement applies only to the connection that ran it: if
+// database/sql replaces the pooled connection, the replacement would come back
+// with no busy timeout and a concurrent trial claim would surface SQLITE_BUSY
+// as a failed grant on the billing path.
+//
+// journal_mode is deliberately absent. It is a property of the database file
+// rather than of a connection, so it is set once by enableWAL instead.
+const dsnPragmas = "_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)"
+
+// entitlementDSN builds the driver connection string for path.
+//
+// A filesystem path becomes an absolute file: URI rather than being pasted in
+// front of the parameters. The driver reads '?' as the start of its parameters
+// even in a bare path, so concatenating would both select a different database
+// and silently drop the pragmas for any operator whose configured path contains
+// one. An explicit URI has the pragmas merged into its query so its own
+// parameters and any fragment survive.
+func entitlementDSN(path string) (string, error) {
+	if path == inMemoryPath {
+		return path + "?" + dsnPragmas, nil
+	}
+	if strings.HasPrefix(path, "file:") {
+		return mergeDSNPragmas(path)
+	}
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		// Abs only fails when the working directory is unavailable, and there
+		// is no safe fallback: a relative path handed to fileURI would gain a
+		// leading slash and silently name a database at the filesystem root
+		// instead of the configured one. Refuse rather than open the wrong
+		// entitlement state.
+		return "", fmt.Errorf("resolve database path %q: %w", path, err)
+	}
+	return fileURI(filepath.ToSlash(absolute)), nil
+}
+
+// fileURI turns a slash-separated absolute path into a file: URI. A Windows
+// path arrives as "C:/data/x.db" with no leading slash; without one the result
+// is a relative URI reference and the driver would open a database beside the
+// process instead of the configured one.
+func fileURI(slashed string) string {
+	if !strings.HasPrefix(slashed, "/") {
+		slashed = "/" + slashed
+	}
+	u := url.URL{Scheme: "file", Path: slashed, RawQuery: dsnPragmas}
+	return u.String()
+}
+
+// mergeDSNPragmas adds the pragmas to an operator-supplied file: URI without
+// disturbing its own parameters.
+//
+// A fragment is refused rather than carried or quietly dropped. SQLite has no
+// use for one, and this driver does not accept it: left in place it fails at
+// the first query with "near \"#...\": syntax error", long after startup and
+// pointing at nothing the operator can act on. Refusing here names the problem
+// while the service is still starting.
+func mergeDSNPragmas(uri string) (string, error) {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return "", fmt.Errorf("parse database uri: %w", err)
+	}
+	if parsed.Fragment != "" || strings.Contains(uri, "#") {
+		return "", fmt.Errorf("database uri must not contain a fragment: %s", uri)
+	}
+	if parsed.RawQuery == "" {
+		parsed.RawQuery = dsnPragmas
+	} else {
+		parsed.RawQuery += "&" + dsnPragmas
+	}
+	return parsed.String(), nil
+}
+
 // OpenEntitlementDB opens (or creates) the SQLite database at path and
 // runs migrations. The database uses WAL mode for concurrent read access.
 func OpenEntitlementDB(ctx context.Context, path string) (*EntitlementDB, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn, err := entitlementDSN(path)
+	if err != nil {
+		return nil, fmt.Errorf("build entitlement db connection string: %w", err)
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open entitlement db: %w", err)
 	}
@@ -114,22 +227,48 @@ func OpenEntitlementDB(ctx context.Context, path string) (*EntitlementDB, error)
 	// ensure all queries hit the same underlying database.
 	db.SetMaxOpenConns(1)
 
-	// WAL mode for better concurrent read performance.
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL"); err != nil {
+	edb := &EntitlementDB{db: db, inMemory: path == inMemoryPath}
+
+	// Ask for WAL before migrating so the migration itself runs under it, and
+	// again afterwards if a lock was in the way the first time: by then the
+	// migration has held and released its own lock, which is long enough for a
+	// brief contender to have finished.
+	mode, err := enableWAL(ctx, db)
+	if err != nil {
 		_ = db.Close()
-		return nil, fmt.Errorf("set WAL mode: %w", err)
+		return nil, err
 	}
 
-	// Foreign keys on (defensive, even though we have a single table now).
-	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
-	}
-
-	edb := &EntitlementDB{db: db}
 	if err := edb.migrate(ctx); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate entitlement db: %w", err)
+	}
+
+	if mode != journalModeWAL {
+		if retried, err := enableWAL(ctx, db); err != nil {
+			_ = db.Close()
+			return nil, err
+		} else if retried != "" {
+			mode = retried
+		}
+	}
+	edb.journalMode = mode
+
+	// A database that cannot become WAL because it is not on disk keeps nothing
+	// across a restart, which empties the table the one-trial limit is read
+	// from and hands every customer their trial back. Refuse it: a log line
+	// does not stop that, and an operator who wanted an ephemeral store has the
+	// :memory: sentinel to ask for one by name.
+	//
+	// journal_mode=MEMORY on a real on-disk database is a different and
+	// legitimate setting, and it is not caught here: that database accepts the
+	// WAL request above and reports "wal". Only a database with no file behind
+	// it still answers "memory" after being asked.
+	if mode == journalModeMemory && !edb.inMemory {
+		_ = db.Close()
+		return nil, fmt.Errorf(
+			"entitlement database %q opens an in-memory database, which keeps no entitlement or trial state across a restart: point it at a file, or use %q to ask for an ephemeral database on purpose",
+			path, inMemoryPath)
 	}
 
 	return edb, nil
@@ -138,6 +277,50 @@ func OpenEntitlementDB(ctx context.Context, path string) (*EntitlementDB, error)
 // Close closes the underlying database connection.
 func (e *EntitlementDB) Close() error {
 	return e.db.Close()
+}
+
+// JournalMode reports the journal mode the database ended up in.
+//
+// A file database is expected to report "wal". Anything else means enableWAL
+// could not take the exclusive lock it needs, which the caller reports so the
+// condition does not pass silently.
+func (e *EntitlementDB) JournalMode() string {
+	return e.journalMode
+}
+
+// isBusyError reports whether err is SQLite refusing to take a lock another
+// connection holds. Only that is transient; an I/O or corruption error is not.
+func isBusyError(err error) bool {
+	var serr *sqlite.Error
+	if errors.As(err, &serr) {
+		code := serr.Code()
+		return code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED
+	}
+	return false
+}
+
+// enableWAL puts the database in write-ahead logging mode and reports the mode
+// it settled on.
+//
+// This cannot be a DSN pragma. Changing journal_mode needs an exclusive lock,
+// and SQLite refuses that request immediately instead of waiting out
+// busy_timeout, so a database another process held for even a moment would
+// fail every connection the driver opened and the service would not start. A
+// lock is a transient condition; refusing to boot over it is not a trade worth
+// making, because trial-claim correctness rests on the transactional slot
+// constraint rather than on WAL.
+//
+// Unlike busy_timeout and foreign_keys, journal_mode persists in the database
+// file, so setting it once on any connection is enough.
+func enableWAL(ctx context.Context, db *sql.DB) (string, error) {
+	var mode string
+	if err := db.QueryRowContext(ctx, "PRAGMA journal_mode=WAL").Scan(&mode); err != nil {
+		if isBusyError(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("enable write-ahead logging: %w", err)
+	}
+	return strings.ToLower(mode), nil
 }
 
 // migrate creates the entitlements table if it doesn't exist.
@@ -177,6 +360,12 @@ func (e *EntitlementDB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_entitlements_next_refresh ON entitlements(next_refresh_at);
 	CREATE INDEX IF NOT EXISTS idx_entitlements_founding ON entitlements(founding);
 	CREATE INDEX IF NOT EXISTS idx_entitlements_founding_reserved ON entitlements(founding_reserved_at);
+
+	CREATE TABLE IF NOT EXISTS active_trial_slots (
+		normalized_email TEXT PRIMARY KEY,
+		subscription_id  TEXT NOT NULL,
+		expires_at       DATETIME NOT NULL
+	);
 
 	CREATE TABLE IF NOT EXISTS license_revocations (
 		license_id      TEXT PRIMARY KEY,
@@ -276,8 +465,177 @@ func (e *EntitlementDB) migrate(ctx context.Context) error {
 	CREATE INDEX IF NOT EXISTS idx_imported_issuances_subscription ON imported_issuances(subscription_id);
 	CREATE INDEX IF NOT EXISTS idx_imported_issuances_issuer ON imported_issuances(issuer_key_id);
 	`
-	_, err := e.db.ExecContext(ctx, ddl)
-	return err
+	if _, err := e.db.ExecContext(ctx, ddl); err != nil {
+		return err
+	}
+	return e.backfillActiveTrialSlots(ctx)
+}
+
+// DuplicateActiveTrialEmails reports canonical emails that already hold more
+// than one active trial entitlement, newest expiry first per email.
+//
+// The slot table can represent only ONE owner per canonical email, so the
+// migration seeds the longest-running trial and leaves any others running.
+// Enforcement therefore begins at the migration: pre-existing duplicates are
+// preserved, not revoked, because terminating a customer's live paid trial is
+// a business decision and not something a schema migration should do quietly.
+// This method exists so that preservation is REPORTED rather than silent, and
+// an operator can reconcile deliberately.
+func (e *EntitlementDB) DuplicateActiveTrialEmails(ctx context.Context) (map[string][]string, error) {
+	const query = `
+	SELECT customer_email, subscription_id
+	FROM entitlements
+	WHERE tier IN (?, ?) AND status IN (?, ?) AND current_period_end > ?
+	ORDER BY current_period_end DESC, subscription_id ASC
+	`
+	rows, err := e.db.QueryContext(ctx, query,
+		tierTrial, tierEnterpriseTrial, statusActive, statusRevoked, time.Now().UTC(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read trial entitlements for duplicate report: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	byEmail := make(map[string][]string)
+	for rows.Next() {
+		var rawEmail, subscriptionID string
+		if err := rows.Scan(&rawEmail, &subscriptionID); err != nil {
+			return nil, fmt.Errorf("scan trial entitlement for duplicate report: %w", err)
+		}
+		canonical, nerr := NormalizeEmail(rawEmail)
+		if nerr != nil {
+			continue
+		}
+		byEmail[canonical] = append(byEmail[canonical], subscriptionID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate trial entitlements for duplicate report: %w", err)
+	}
+	for email, subs := range byEmail {
+		if len(subs) < 2 {
+			delete(byEmail, email)
+		}
+	}
+	return byEmail, nil
+}
+
+// ReportDuplicateActiveTrials logs every customer email that already holds more
+// than one active trial. It is called once at startup, after the migration, so
+// the trials the slot table could not bring under the limit are named instead
+// of preserved quietly. A read failure is reported and never fatal: the report
+// is an operator signal, and refusing to start the service over it would trade
+// a billing outage for a warning.
+func (e *EntitlementDB) ReportDuplicateActiveTrials(ctx context.Context, log zerolog.Logger) {
+	duplicates, err := e.DuplicateActiveTrialEmails(ctx)
+	if err != nil {
+		log.Warn().Err(err).Msg("could not check for pre-existing duplicate active trials")
+		return
+	}
+	// The order IDs are the reconciliation handle and the grouping already
+	// says which of them belong to one customer, so the address itself adds
+	// nothing an operator needs. Logs ship to a SIEM and are retained, and a
+	// customer email in a log line is personal data this service has no reason
+	// to put there.
+	for _, subscriptions := range duplicates {
+		log.Warn().
+			Strs("subscription_ids", subscriptions).
+			Msg("these orders are active trials for one customer; only the longest-running one holds the trial slot, the others keep running until they expire")
+	}
+}
+
+// ReportJournalMode records the journal mode the database is running in, and
+// warns when a file database did not get write-ahead logging.
+//
+// Failing to take WAL is survivable and does not affect the one-trial limit,
+// but it is not something to pass over in silence: another process held the
+// database when this service started, and journal_mode persists in the file
+// until something changes it. Restarting once nothing else has the database
+// open is the operator's move, and the message says so.
+func (e *EntitlementDB) ReportJournalMode(log zerolog.Logger) {
+	mode := e.JournalMode()
+	log.Info().Str("journal_mode", mode).Msg("entitlement database journal mode")
+
+	if mode == journalModeWAL {
+		return
+	}
+
+	// An in-memory database keeps its own mode and can never be WAL. Only the
+	// one asked for by name gets here; OpenEntitlementDB refuses any other.
+	if mode == journalModeMemory && e.inMemory {
+		return
+	}
+
+	log.Warn().
+		Str("journal_mode", mode).
+		Msg("entitlement database is not in write-ahead logging mode because another process held it at startup; restart this service once nothing else has the database open")
+}
+
+// backfillActiveTrialSlots seeds one slot per canonical email from existing
+// trial entitlements.
+//
+// It reads and groups in Go rather than in SQL for two reasons the SQL form got
+// wrong. First, the slot is keyed by CANONICAL email, and only NormalizeEmail
+// decides that, so "A@x.com" and "a@x.com" must collapse to one slot here or the
+// migration itself seeds the bypass it exists to close. Second, the owner and
+// the expiry must come from the SAME entitlement: an aggregate pairing
+// MIN(subscription_id) with MAX(current_period_end) can hand the slot one
+// trial's owner and another trial's end date, and a later write for that owner
+// then shortens the slot while the longer trial is still running, freeing a
+// trial early. Ties break on subscription_id so a rerun is deterministic.
+func (e *EntitlementDB) backfillActiveTrialSlots(ctx context.Context) error {
+	const selectTrials = `
+	SELECT customer_email, subscription_id, current_period_end
+	FROM entitlements
+	WHERE tier IN (?, ?) AND status IN (?, ?) AND current_period_end > ?
+	ORDER BY current_period_end DESC, subscription_id ASC
+	`
+	rows, err := e.db.QueryContext(ctx, selectTrials,
+		tierTrial, tierEnterpriseTrial, statusActive, statusRevoked, time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("read trial entitlements for slot backfill: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	type slot struct {
+		subscriptionID string
+		expiresAt      time.Time
+	}
+	// Rows arrive newest-expiry first, so the first canonical key wins and
+	// later duplicates are skipped rather than overwriting a longer trial.
+	claimed := make(map[string]slot)
+	for rows.Next() {
+		var rawEmail, subscriptionID string
+		var expiresAt time.Time
+		if err := rows.Scan(&rawEmail, &subscriptionID, &expiresAt); err != nil {
+			return fmt.Errorf("scan trial entitlement for slot backfill: %w", err)
+		}
+		canonical, nerr := NormalizeEmail(rawEmail)
+		if nerr != nil {
+			// An address this package cannot canonicalize gets no slot. It is
+			// not silently given one under a raw key, which would be a slot no
+			// later claim could ever match.
+			continue
+		}
+		if _, seen := claimed[canonical]; seen {
+			continue
+		}
+		claimed[canonical] = slot{subscriptionID: subscriptionID, expiresAt: expiresAt.UTC()}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate trial entitlements for slot backfill: %w", err)
+	}
+
+	const insertSlot = `
+	INSERT OR IGNORE INTO active_trial_slots (normalized_email, subscription_id, expires_at)
+	VALUES (?, ?, ?)
+	`
+	for email, s := range claimed {
+		if _, err := e.db.ExecContext(ctx, insertSlot, email, s.subscriptionID, s.expiresAt); err != nil {
+			return fmt.Errorf("backfill active trial slot for %s: %w", s.subscriptionID, err)
+		}
+	}
+	return nil
 }
 
 // Upsert inserts or updates an entitlement record. Updates the updated_at
@@ -286,8 +644,65 @@ func (e *EntitlementDB) Upsert(ctx context.Context, ent *Entitlement) error {
 	if ent == nil {
 		return errors.New("entitlement is nil")
 	}
-	if err := upsertEntitlement(ctx, e.db, ent); err != nil {
+	if !isTrialTier(ent.Tier) {
+		if err := upsertEntitlement(ctx, e.db, ent); err != nil {
+			return fmt.Errorf("upsert entitlement %s: %w", ent.SubscriptionID, err)
+		}
+		return nil
+	}
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin trial entitlement transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if err := upsertEntitlement(ctx, tx, ent); err != nil {
 		return fmt.Errorf("upsert entitlement %s: %w", ent.SubscriptionID, err)
+	}
+	// An ACTIVE trial written through this path must claim its slot, exactly as
+	// the issuance path does. syncActiveTrialSlot alone is update-only and
+	// reports success when no row matched, so a trial could commit owning
+	// nothing and a later subscription would then claim the free slot: two
+	// active trials for one email. A non-active status (revoked, canceled, or a
+	// cron status mirror) only refreshes a slot it already holds, so revocation
+	// never tries to take one.
+	if ent.Status == statusActive {
+		if err := claimActiveTrialSlot(ctx, tx, ent); err != nil && !errors.Is(err, ErrTrialEmailNotCanonical) {
+			return err
+		}
+	} else if err := syncActiveTrialSlot(ctx, tx, ent); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit trial entitlement transaction: %w", err)
+	}
+	committed = true
+	return nil
+}
+
+// syncActiveTrialSlot refreshes the expiry of a slot this subscription ALREADY
+// owns. It is update-only on purpose and must never be the sole guard on a path
+// that can create a trial: a missing row means this subscription owns no slot,
+// and treating that as success is how a second trial gets in.
+func syncActiveTrialSlot(ctx context.Context, exec entitlementExecer, ent *Entitlement) error {
+	// Any failure to canonicalize means this subscription can own no slot, so
+	// there is nothing to refresh. Skip rather than fail: this path grants
+	// nothing, and failing here would block revoking or status-mirroring an
+	// entitlement whose email predates canonicalization.
+	email, err := trialSlotKey(ent)
+	if err != nil {
+		return nil
+	}
+	const query = `
+	UPDATE active_trial_slots SET expires_at = ?
+	WHERE normalized_email = ? AND subscription_id = ?
+	`
+	if _, err := exec.ExecContext(ctx, query, ent.CurrentPeriodEnd.UTC(), email, ent.SubscriptionID); err != nil {
+		return fmt.Errorf("sync active trial slot for %s: %w", ent.SubscriptionID, err)
 	}
 	return nil
 }
@@ -682,6 +1097,11 @@ func (e *EntitlementDB) UpsertWithLicenseIssuanceAndWebhook(ctx context.Context,
 			return ErrWebhookAlreadyCommitted
 		}
 	}
+	if isTrialTier(ent.Tier) {
+		if err := claimActiveTrialSlot(ctx, tx, ent); err != nil {
+			return err
+		}
+	}
 	terminal, status, err := currentEntitlementTerminal(ctx, tx, ent.SubscriptionID)
 	if err != nil {
 		return err
@@ -699,6 +1119,49 @@ func (e *EntitlementDB) UpsertWithLicenseIssuanceAndWebhook(ctx context.Context,
 		return fmt.Errorf("commit entitlement issuance transaction: %w", err)
 	}
 	committed = true
+	return nil
+}
+
+// trialSlotKey is the canonical identity a trial slot is keyed by. The column
+// is named normalized_email and must actually hold one: without this, "A@x.com"
+// and "a@x.com" own separate slots and the one-active-trial rule buys nothing.
+// It fails CLOSED. An address this package cannot canonicalize gets no slot,
+// which denies a trial rather than handing out an unbounded one.
+func trialSlotKey(ent *Entitlement) (string, error) {
+	canonical, err := NormalizeEmail(ent.CustomerEmail)
+	if err != nil {
+		return "", fmt.Errorf("%w for %s: %w", ErrTrialEmailNotCanonical, ent.SubscriptionID, err)
+	}
+	return canonical, nil
+}
+
+func claimActiveTrialSlot(ctx context.Context, exec entitlementExecer, ent *Entitlement) error {
+	email, err := trialSlotKey(ent)
+	if err != nil {
+		return err
+	}
+	const query = `
+	INSERT INTO active_trial_slots (normalized_email, subscription_id, expires_at)
+	VALUES (?, ?, ?)
+	ON CONFLICT(normalized_email) DO UPDATE SET
+		subscription_id = excluded.subscription_id,
+		expires_at = excluded.expires_at
+	WHERE active_trial_slots.expires_at <= ?
+	   OR active_trial_slots.subscription_id = excluded.subscription_id
+	`
+	result, err := exec.ExecContext(ctx, query,
+		email, ent.SubscriptionID, ent.CurrentPeriodEnd.UTC(), time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("claim active trial slot for %s: %w", ent.SubscriptionID, err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read active trial slot result for %s: %w", ent.SubscriptionID, err)
+	}
+	if changed == 0 {
+		return fmt.Errorf("%w for this email", ErrActiveTrialExists)
+	}
 	return nil
 }
 
