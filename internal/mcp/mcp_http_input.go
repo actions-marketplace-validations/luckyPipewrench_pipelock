@@ -708,7 +708,8 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 		// caller-controlled name would let a client rotate that name to
 		// partition a secret across buckets and evade accumulation.
 		ceeKey := sessionKey
-		if reason := ceeRecordMCP(ceeRecordMCPOptions{
+		inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+		ceeOpts := ceeRecordMCPOptions{
 			sessionKey:     ceeKey,
 			entropyPayload: msg,
 			frame:          frame,
@@ -716,7 +717,12 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			sc:             sc,
 			logW:           logW,
 			logger:         auditLogger,
-		}); reason != "" {
+			inspectionMode: &inspectionMode,
+			fallbackReason: &fallbackReason,
+			matchedPattern: &matchedPattern,
+			blockKind:      &ceeBlockKind,
+		}
+		if reason := ceeRecordMCP(ceeOpts); reason != "" {
 			// Capture: record CEE verdict.
 			obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
 				Subsurface:        "cee_mcp_http",
@@ -733,8 +739,27 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				}},
 				EffectiveAction: config.ActionBlock,
 				Outcome:         capture.OutcomeBlocked,
+				InspectionMode:  inspectionMode,
+				FallbackReason:  fallbackReason,
 			})
+			// A method that carries neither a tool call nor required receipt
+			// metadata never minted a receipt identity, and the emitter drops a
+			// receipt with an empty action ID. Mint one here so a CEE block on
+			// any method leaves evidence, matching the authorization path in
+			// the deferred finalizer above.
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
 			receiptVerdict = config.ActionBlock
+			receiptLayer = "cross_request"
+			receiptPattern = ceeBlockKind
+			if matchedPattern != "" {
+				receiptPattern = matchedPattern
+			}
+			receiptSeverity = "critical"
 			result.Blocked = &BlockedRequest{
 				ID:             verdict.ID,
 				IsNotification: isRPCNotification(verdict.ID),
@@ -1175,7 +1200,8 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 		// caller-controlled name would let a client rotate that name to
 		// partition a secret across buckets and evade accumulation.
 		ceeKey := sessionKey
-		if reason := ceeRecordMCP(ceeRecordMCPOptions{
+		inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+		ceeOpts := ceeRecordMCPOptions{
 			sessionKey:     ceeKey,
 			entropyPayload: msg,
 			frame:          frame,
@@ -1183,7 +1209,12 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 			sc:             sc,
 			logW:           logW,
 			logger:         auditLogger,
-		}); reason != "" {
+			inspectionMode: &inspectionMode,
+			fallbackReason: &fallbackReason,
+			matchedPattern: &matchedPattern,
+			blockKind:      &ceeBlockKind,
+		}
+		if reason := ceeRecordMCP(ceeOpts); reason != "" {
 			// Capture: record CEE verdict (warn-path).
 			obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
 				Subsurface:        "cee_mcp_http",
@@ -1200,8 +1231,27 @@ func scanHTTPInputDecision(msg []byte, logW io.Writer, sessionKey, auditSessionK
 				}},
 				EffectiveAction: config.ActionBlock,
 				Outcome:         capture.OutcomeBlocked,
+				InspectionMode:  inspectionMode,
+				FallbackReason:  fallbackReason,
 			})
+			// A method that carries neither a tool call nor required receipt
+			// metadata never minted a receipt identity, and the emitter drops a
+			// receipt with an empty action ID. Mint one here so a CEE block on
+			// any method leaves evidence, matching the authorization path in
+			// the deferred finalizer above.
+			if actionID == "" {
+				actionID = receipt.NewActionID()
+			}
+			if toolName == "" {
+				toolName = mcpMethod
+			}
 			receiptVerdict = config.ActionBlock
+			receiptLayer = "cross_request"
+			receiptPattern = ceeBlockKind
+			if matchedPattern != "" {
+				receiptPattern = matchedPattern
+			}
+			receiptSeverity = "critical"
 			result.Blocked = &BlockedRequest{
 				ID:             verdict.ID,
 				IsNotification: isRPCNotification(verdict.ID),

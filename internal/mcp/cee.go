@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/luckyPipewrench/pipelock/internal/ceereason"
+
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/extract"
@@ -303,7 +305,25 @@ type ceeRecordMCPOptions struct {
 	sc               *scanner.Scanner
 	logW             io.Writer
 	logger           *audit.Logger
+	inspectionMode   *string
+	fallbackReason   *string
+	matchedPattern   *string
+	blockKind        *string
 }
+
+// ceeFragmentBlockClientReason is the neutral client-visible reason for a
+// cross-request fragment DLP block. The operator log and audit record keep the
+// full reason, including the tuning knob, which the client must not learn.
+const (
+	ceeFragmentBlockClientReason = ceereason.ClientFragmentMatch
+	ceeEntropyBlockClientReason  = ceereason.ClientEntropyBudget
+	ceeCapacityBlockClientReason = ceereason.ClientSessionCapacity
+	ceeOwnerMismatchClientReason = ceereason.ClientOwnerMismatch
+
+	ceeBlockKindEntropyBudget   = ceereason.KindEntropyBudget
+	ceeBlockKindSessionCapacity = ceereason.KindSessionCapacity
+	ceeBlockKindOwnerMismatch   = ceereason.KindOwnerMismatch
+)
 
 // ceeRecordMCP runs cross-request exfiltration checks on outbound MCP payload.
 // Returns a non-empty reason string if the request should be blocked.
@@ -318,11 +338,20 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 	if tracker == nil && (buffer == nil || !ceeCfg.FragmentReassembly.Enabled) {
 		return ""
 	}
+	if opts.fallbackReason != nil {
+		*opts.fallbackReason = ""
+	}
 
 	fragmentPayloads := opts.fragmentPayloads
+	inspectionMode, partitionFallbackReason := "raw", ""
 	if buffer != nil && ceeCfg.FragmentReassembly.Enabled && fragmentPayloads == nil {
 		var fallbackReason string
 		fragmentPayloads, fallbackReason = mcpCEEFragmentPayloads(opts.frame)
+		inspectionMode = "partitioned"
+		if fallbackReason != "" || !opts.frame.IsToolsCall() {
+			inspectionMode = "raw"
+		}
+		partitionFallbackReason = fallbackReason
 		// A tools/call frame that could not be partitioned into per-argument
 		// streams falls back to scanning the whole raw frame. Record the same
 		// partition-fallback counter the forward proxy uses so operators see the
@@ -356,10 +385,19 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				tracker.CurrentUsage(identity), tracker.Budget())
 			_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
 			if ceeCfg.EntropyBudget.Action == config.ActionBlock {
+				if opts.inspectionMode != nil {
+					*opts.inspectionMode = "raw"
+				}
+				if opts.fallbackReason != nil {
+					*opts.fallbackReason = partitionFallbackReason
+				}
+				if opts.blockKind != nil {
+					*opts.blockKind = ceeBlockKindEntropyBudget
+				}
 				if opts.logger != nil {
 					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_entropy", reason)
 				}
-				return reason
+				return ceeEntropyBlockClientReason
 			}
 			// Warn mode: emit structured anomaly event for audit trail.
 			if opts.logger != nil {
@@ -370,6 +408,12 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 
 	// Fragment reassembly DLP check.
 	if buffer != nil && ceeCfg.FragmentReassembly.Enabled {
+		if opts.inspectionMode != nil {
+			*opts.inspectionMode = inspectionMode
+		}
+		if opts.fallbackReason != nil {
+			*opts.fallbackReason = partitionFallbackReason
+		}
 		seenSingletonFindings := make(map[string]struct{})
 		seenArgumentFindings := make(map[string]struct{})
 		var paths []string
@@ -417,7 +461,10 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				if opts.logger != nil {
 					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_owner_mismatch", reason)
 				}
-				return reason
+				if opts.blockKind != nil {
+					*opts.blockKind = ceeBlockKindOwnerMismatch
+				}
+				return ceeOwnerMismatchClientReason
 			}
 			if appendResult.CapacityExceeded {
 				if m != nil {
@@ -428,7 +475,10 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				if opts.logger != nil {
 					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_capacity", reason)
 				}
-				return reason
+				if opts.blockKind != nil {
+					*opts.blockKind = ceeBlockKindSessionCapacity
+				}
+				return ceeCapacityBlockClientReason
 			}
 			matches := streamMatches[i]
 			if len(matches) > 0 {
@@ -439,17 +489,20 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				if m != nil {
 					m.RecordCrossRequestDLPMatch()
 				}
-				reason := fmt.Sprintf("cross-request fragment DLP match: %s; remove the secret from tool arguments, or lower cross_request_detection.fragment_reassembly.max_buffer_bytes for a narrower window (reduces protection against long chunk sequences)", matches[0].PatternName)
-				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
+				operatorReason := fmt.Sprintf("cross-request fragment DLP match: %s; remove the secret from tool arguments, or lower cross_request_detection.fragment_reassembly.max_buffer_bytes for a narrower window (reduces protection against long chunk sequences)", matches[0].PatternName)
+				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", operatorReason, opts.sessionKey)
 				if ceeCfg.Action == config.ActionBlock {
-					if opts.logger != nil {
-						opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment", reason)
+					if opts.matchedPattern != nil {
+						*opts.matchedPattern = matches[0].PatternName
 					}
-					return reason
+					if opts.logger != nil {
+						opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment", operatorReason)
+					}
+					return ceeFragmentBlockClientReason
 				}
 				// Warn mode: emit structured anomaly event for audit trail.
 				if opts.logger != nil {
-					opts.logger.LogAnomaly(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment", reason, 0)
+					opts.logger.LogAnomaly(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment", operatorReason, 0)
 				}
 			}
 		}

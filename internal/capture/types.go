@@ -212,6 +212,13 @@ type CaptureSummary struct {
 	Outcome string `json:"outcome"`
 	// SkipReason explains why scanning was skipped (e.g. "allowlisted domain").
 	SkipReason string `json:"skip_reason,omitempty"`
+	// InspectionMode is CEE-surface-only evidence showing whether raw payloads
+	// or keyed JSON leaf streams were inspected. Empty means an older producer
+	// did not record a mode.
+	InspectionMode string `json:"inspection_mode,omitempty"`
+	// FallbackReason is CEE-surface-only evidence describing a bounded reason
+	// that keyed JSON partitioning fell back to raw inspection.
+	FallbackReason string `json:"fallback_reason,omitempty"`
 }
 
 // CaptureRequest describes the originating request. Not all fields are set for
@@ -440,6 +447,13 @@ type CEERecord struct {
 	EffectiveAction   string
 	Outcome           string
 	SkipReason        string
+	// InspectionMode records whether fragment reassembly inspected keyed JSON
+	// fields or fell back to the raw request stream. It is evidence metadata,
+	// not an enforcement input.
+	InspectionMode string
+	// FallbackReason is populated only when InspectionMode is raw because field
+	// partitioning could not complete. Its values are bounded by the transport.
+	FallbackReason string
 }
 
 // ToolPolicyRecord holds the context for a tool-policy evaluation result.

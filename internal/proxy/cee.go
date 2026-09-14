@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/luckyPipewrench/pipelock/internal/ceereason"
+
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -207,6 +209,13 @@ type ceeOutboundPayloads struct {
 	outbound             []byte
 	bodyFragmentPayloads map[string][]byte
 	partitionReason      string
+}
+
+func (p ceeOutboundPayloads) inspectionMode() string {
+	if p.partitionReason != "" || len(p.bodyFragmentPayloads) == 0 {
+		return "raw"
+	}
+	return "partitioned"
 }
 
 const (
@@ -507,10 +516,35 @@ func ceeEffectiveConfig(ceeCfg config.CrossRequestDetection, enforcing bool) con
 
 // ceeResult holds the outcome of a CEE admission check.
 type ceeResult struct {
-	Blocked     bool
-	Reason      string
+	Blocked bool
+	Reason  string
+	// BlockKind is the stable machine token identifying why CEE denied the
+	// request, or the matched DLP pattern name for a fragment match. Client
+	// reasons are deliberately neutral prose, so signed receipts key on this
+	// field instead: a receipt whose Pattern held a sentence carried no
+	// queryable evidence of which control fired.
+	BlockKind   string
 	EntropyHit  bool // entropy budget exceeded (for metrics/signals)
 	FragmentHit bool // fragment DLP match (for metrics/signals)
+}
+
+// CEE block kinds and client reasons come from the shared package so the
+// MCP transport and this one cannot drift apart.
+const (
+	ceeBlockKindEntropyBudget   = ceereason.KindEntropyBudget
+	ceeBlockKindInspectionDepth = ceereason.KindInspectionDepth
+	ceeBlockKindSessionCapacity = ceereason.KindSessionCapacity
+	ceeBlockKindOwnerMismatch   = ceereason.KindOwnerMismatch
+)
+
+// ceeReceiptPattern is the receipt Pattern field for a CEE denial. It prefers
+// the stable block kind and falls back to the reason only if a future block
+// site forgets to set one, so a receipt is never empty.
+func ceeReceiptPattern(res ceeResult) string {
+	if res.BlockKind != "" {
+		return res.BlockKind
+	}
+	return res.Reason
 }
 
 // ceeAdmit runs cross-request exfiltration detection on outbound payload data.
@@ -602,7 +636,8 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 			if ceeCfg.EntropyBudget.Action == config.ActionBlock {
 				logger.LogBlocked(actx, "cross_request_entropy", detail)
 				result.Blocked = true
-				result.Reason = "cross-request entropy budget exceeded"
+				result.Reason = ceereason.ClientEntropyBudget
+				result.BlockKind = ceeBlockKindEntropyBudget
 				return result
 			}
 			logger.LogAnomaly(actx, "cross_request_entropy", detail, 0)
@@ -621,7 +656,8 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 		logger.LogBlocked(actx, "cross_request_path_depth", detail)
 		result.Blocked = true
 		result.FragmentHit = true
-		result.Reason = detail
+		result.Reason = ceereason.ClientInspectionDepth
+		result.BlockKind = ceeBlockKindInspectionDepth
 		return result
 	}
 
@@ -639,6 +675,7 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 			if res.Blocked {
 				result.Blocked = true
 				result.Reason = res.Reason
+				result.BlockKind = res.BlockKind
 				return result
 			}
 		}
@@ -666,6 +703,7 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 				if res.Blocked {
 					result.Blocked = true
 					result.Reason = res.Reason
+					result.BlockKind = res.BlockKind
 					return result
 				}
 			}
@@ -680,6 +718,7 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 				if res.Blocked {
 					result.Blocked = true
 					result.Reason = res.Reason
+					result.BlockKind = res.BlockKind
 					return result
 				}
 			}
@@ -694,6 +733,7 @@ func ceeAdmit(ctx context.Context, opts ceeAdmitOptions) ceeResult {
 				if res.Blocked {
 					result.Blocked = true
 					result.Reason = res.Reason
+					result.BlockKind = res.BlockKind
 					return result
 				}
 			}
@@ -774,7 +814,8 @@ func ceeFragmentEvaluate(ctx context.Context, appendResult scanner.FragmentAppen
 		return &ceeResult{
 			Blocked:     true,
 			FragmentHit: true,
-			Reason:      detail,
+			Reason:      ceereason.ClientInspectionDepth,
+			BlockKind:   ceeBlockKindInspectionDepth,
 		}
 	}
 	if appendResult.OwnerMismatch {
@@ -788,7 +829,8 @@ func ceeFragmentEvaluate(ctx context.Context, appendResult scanner.FragmentAppen
 		return &ceeResult{
 			Blocked:     true,
 			FragmentHit: true,
-			Reason:      detail,
+			Reason:      ceereason.ClientOwnerMismatch,
+			BlockKind:   ceeBlockKindOwnerMismatch,
 		}
 	}
 	if appendResult.CapacityExceeded {
@@ -799,7 +841,8 @@ func ceeFragmentEvaluate(ctx context.Context, appendResult scanner.FragmentAppen
 		return &ceeResult{
 			Blocked:     true,
 			FragmentHit: true,
-			Reason:      detail,
+			Reason:      ceereason.ClientSessionCapacity,
+			BlockKind:   ceeBlockKindSessionCapacity,
 		}
 	}
 	if len(matches) == 0 {
@@ -813,7 +856,8 @@ func ceeFragmentEvaluate(ctx context.Context, appendResult scanner.FragmentAppen
 		return &ceeResult{
 			Blocked:     true,
 			FragmentHit: true,
-			Reason:      fmt.Sprintf("cross-request secret detected: %s", matches[0].PatternName),
+			Reason:      ceereason.ClientFragmentMatch,
+			BlockKind:   matches[0].PatternName,
 		}
 	}
 	logger.LogAnomaly(actx, "cross_request_fragment", detail, 0)
