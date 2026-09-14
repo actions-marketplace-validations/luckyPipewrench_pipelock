@@ -5154,6 +5154,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			EffectiveFindings: ceeFindings,
 			EffectiveAction:   ceeAction,
 			Outcome:           captureOutcome(ceeAction, !ceeRes.Blocked && !ceeRes.EntropyHit && !ceeRes.FragmentHit),
+			// A literal rather than a computed mode, and no fallback reason:
+			// fetch is GET-only, so its CEE payload is the URL and this call
+			// site passes no body fragments and no partition reason. Keyed
+			// partitioning is never attempted here, so there is no fallback to
+			// report, which is different from attempting it and falling back.
+			InspectionMode: "raw",
 		})
 
 		var ceeRec session.Recorder
@@ -5177,7 +5183,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				Verdict:             config.ActionBlock,
 				Layer:               "cross_request",
 				PolicyHash:          admission.PolicyHash,
-				Pattern:             ceeRes.Reason,
+				Pattern:             ceeReceiptPattern(ceeRes),
 				Transport:           "fetch",
 				Method:              http.MethodGet,
 				Target:              displayURL,

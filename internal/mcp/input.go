@@ -915,7 +915,8 @@ func ForwardScannedInput(
 				continue
 			}
 			// Cross-request exfiltration check on clean outbound messages.
-			if reason := ceeRecordMCP(ceeRecordMCPOptions{
+			inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+			ceeOpts := ceeRecordMCPOptions{
 				sessionKey:     ceeStdioKey,
 				entropyPayload: line,
 				frame:          frame,
@@ -923,7 +924,12 @@ func ForwardScannedInput(
 				sc:             sc,
 				logW:           logW,
 				logger:         auditLogger,
-			}); reason != "" {
+				inspectionMode: &inspectionMode,
+				fallbackReason: &fallbackReason,
+				matchedPattern: &matchedPattern,
+				blockKind:      &ceeBlockKind,
+			}
+			if reason := ceeRecordMCP(ceeOpts); reason != "" {
 				// Capture: record CEE verdict.
 				obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
 					Subsurface:        "cee_mcp_stdio",
@@ -940,6 +946,8 @@ func ForwardScannedInput(
 					}},
 					EffectiveAction: config.ActionBlock,
 					Outcome:         capture.OutcomeBlocked,
+					InspectionMode:  inspectionMode,
+					FallbackReason:  fallbackReason,
 				})
 				blockedCh <- BlockedRequest{
 					ID:             verdict.ID,
@@ -948,6 +956,24 @@ func ForwardScannedInput(
 					ErrorCode:      -32005,
 					ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
 				}
+				// A method that carries neither a tool call nor required receipt
+				// metadata never minted a receipt identity, and the emitter drops
+				// a receipt with an empty action ID. Mint one here so a CEE block
+				// on any method leaves evidence, exactly as the authorization
+				// block below this loop already does.
+				if actionID == "" {
+					actionID = receipt.NewActionID()
+				}
+				if receiptTarget == "" {
+					receiptTarget = verdict.Method
+				}
+				receiptLayerOverride = "cross_request"
+				receiptPatternOverride = ceeBlockKind
+				if matchedPattern != "" {
+					receiptPatternOverride = matchedPattern
+				}
+				receiptSeverityOverride = "critical"
+				_ = emitToolReceipt(config.ActionBlock)
 				continue
 			}
 			contractGate, contractErr := evaluateMCPToolGate(frame, config.ActionAllow, false, opts)
@@ -1467,7 +1493,8 @@ func ForwardScannedInput(
 			_, _ = fmt.Fprintf(logW, "pipelock: input line %d: warning — %s request contains flagged content (%s)\n",
 				lineNum, method, reasonStr)
 			// Cross-request exfiltration check even in warn mode.
-			if reason := ceeRecordMCP(ceeRecordMCPOptions{
+			inspectionMode, fallbackReason, matchedPattern, ceeBlockKind := "", "", "", ""
+			ceeOpts := ceeRecordMCPOptions{
 				sessionKey:     ceeStdioKey,
 				entropyPayload: line,
 				frame:          frame,
@@ -1475,7 +1502,12 @@ func ForwardScannedInput(
 				sc:             sc,
 				logW:           logW,
 				logger:         auditLogger,
-			}); reason != "" {
+				inspectionMode: &inspectionMode,
+				fallbackReason: &fallbackReason,
+				matchedPattern: &matchedPattern,
+				blockKind:      &ceeBlockKind,
+			}
+			if reason := ceeRecordMCP(ceeOpts); reason != "" {
 				// Capture: record CEE verdict (warn-path).
 				obs.ObserveCEEVerdict(context.Background(), &capture.CEERecord{
 					Subsurface:        "cee_mcp_stdio",
@@ -1492,6 +1524,8 @@ func ForwardScannedInput(
 					}},
 					EffectiveAction: config.ActionBlock,
 					Outcome:         capture.OutcomeBlocked,
+					InspectionMode:  inspectionMode,
+					FallbackReason:  fallbackReason,
 				})
 				blockedCh <- BlockedRequest{
 					ID:             verdict.ID,
@@ -1500,6 +1534,24 @@ func ForwardScannedInput(
 					ErrorCode:      -32005,
 					ErrorMessage:   fmt.Sprintf("pipelock: %s", reason),
 				}
+				// A method that carries neither a tool call nor required receipt
+				// metadata never minted a receipt identity, and the emitter drops
+				// a receipt with an empty action ID. Mint one here so a CEE block
+				// on any method leaves evidence, exactly as the authorization
+				// block below this loop already does.
+				if actionID == "" {
+					actionID = receipt.NewActionID()
+				}
+				if receiptTarget == "" {
+					receiptTarget = verdict.Method
+				}
+				receiptLayerOverride = "cross_request"
+				receiptPatternOverride = ceeBlockKind
+				if matchedPattern != "" {
+					receiptPatternOverride = matchedPattern
+				}
+				receiptSeverityOverride = "critical"
+				_ = emitToolReceipt(config.ActionBlock)
 				continue
 			}
 			contractGate, contractErr := evaluateMCPToolGate(frame, effectiveAction, len(reasons) > 0, opts)

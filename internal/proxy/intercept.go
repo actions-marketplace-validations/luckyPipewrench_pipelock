@@ -1491,6 +1491,8 @@ func newInterceptHandler(
 					EffectiveFindings: ceeFindings,
 					EffectiveAction:   ceeAction,
 					Outcome:           captureOutcome(ceeAction, !ceeRes.Blocked && !ceeRes.EntropyHit && !ceeRes.FragmentHit),
+					InspectionMode:    outboundPayloads.inspectionMode(),
+					FallbackReason:    outboundPayloads.partitionReason,
 				})
 			}
 
@@ -1506,7 +1508,7 @@ func newInterceptHandler(
 					ActionID:   actionID,
 					Verdict:    config.ActionBlock,
 					Layer:      "cross_request",
-					Pattern:    ceeRes.Reason,
+					Pattern:    ceeReceiptPattern(ceeRes),
 					Transport:  "intercept",
 					Method:     r.Method,
 					Target:     targetURL,

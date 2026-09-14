@@ -671,11 +671,14 @@ func TestCeeRecordMCP_ReassemblesToolArgumentsAcrossCalls(t *testing.T) {
 		t.Fatalf("first fragment blocked: %s", reason)
 	}
 	reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf})
-	if !strings.Contains(reason, "cross-request fragment DLP match") {
+	if reason != ceeFragmentBlockClientReason {
 		t.Fatalf("second fragment reason = %q, want fragment DLP block", reason)
 	}
-	if !strings.Contains(reason, "cross_request_detection.fragment_reassembly.max_buffer_bytes") {
-		t.Fatalf("fragment block missing live remediation knob: %q", reason)
+	if strings.Contains(reason, "max_buffer_bytes") || strings.Contains(reason, "AWS Access ID") {
+		t.Fatalf("client reason leaked tuning or pattern detail: %q", reason)
+	}
+	if !strings.Contains(logBuf.String(), "cross_request_detection.fragment_reassembly.max_buffer_bytes") {
+		t.Fatalf("operator log missing live remediation knob: %q", logBuf.String())
 	}
 }
 
@@ -692,7 +695,7 @@ func TestCeeRecordMCP_ReassemblesRotatedSingletonArgumentsAcrossCalls(t *testing
 		t.Fatalf("first rotated fragment blocked: %s", reason)
 	}
 	reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf})
-	if !strings.Contains(reason, "cross-request fragment DLP match") {
+	if reason != ceeFragmentBlockClientReason {
 		t.Fatalf("second rotated fragment reason = %q, want fragment DLP block", reason)
 	}
 }
@@ -709,7 +712,7 @@ func TestCeeRecordMCP_ReassemblesSamePathWithinTool(t *testing.T) {
 	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: first.Raw, frame: first, cee: cee, sc: sc, logW: &logBuf}); reason != "" {
 		t.Fatalf("first same-path fragment blocked: %s", reason)
 	}
-	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf}); !strings.Contains(reason, "cross-request fragment DLP match") {
+	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf}); reason != ceeFragmentBlockClientReason {
 		t.Fatalf("same-path fragments within one tool = %q, want fragment DLP block", reason)
 	}
 }
@@ -781,7 +784,7 @@ func TestCeeRecordMCP_OwnerMismatchFailsClosed(t *testing.T) {
 		t.Fatalf("seeding a foreign-owned stream = %+v, want admission", seeded)
 	}
 	reason := record()
-	if !strings.Contains(reason, "belongs to another identity") {
+	if reason != ceeOwnerMismatchClientReason {
 		t.Fatalf("reason = %q, want a fail-closed ownership block", reason)
 	}
 	if strings.Contains(reason, "max_sessions") {
@@ -822,7 +825,7 @@ func TestCeeRecordMCP_HighLeafFallbackPreservesExistingFragment(t *testing.T) {
 	}
 
 	second := ParseMCPFrame(mcpSingletonCEERequest(3, "alpha", "integrity_checker", testMCPAWSKeySuffix))
-	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf}); !strings.Contains(reason, "cross-request fragment DLP match") {
+	if reason := ceeRecordMCP(ceeRecordMCPOptions{sessionKey: testMCPSessionKey, entropyPayload: second.Raw, frame: second, cee: cee, sc: sc, logW: &logBuf}); reason != ceeFragmentBlockClientReason {
 		t.Fatalf("secret split around high-leaf frame = %q, want fragment DLP block", reason)
 	}
 }
@@ -899,17 +902,26 @@ func TestCeeRecordMCP_EntropyUsesFragmentPayloadAndSkipsEmptyPath(t *testing.T) 
 	}, metrics.New())
 	t.Cleanup(cee.Close)
 
+	inspectionMode, blockKind := "", ""
 	reason := ceeRecordMCP(ceeRecordMCPOptions{
 		sessionKey: testMCPSessionKey,
 		fragmentPayloads: map[string][]byte{
 			"$/empty": nil,
 			"$/value": []byte("entropy"),
 		},
-		cee:  cee,
-		logW: &bytes.Buffer{},
+		cee:            cee,
+		logW:           &bytes.Buffer{},
+		inspectionMode: &inspectionMode,
+		blockKind:      &blockKind,
 	})
-	if !strings.Contains(reason, "entropy budget exceeded") {
-		t.Fatalf("reason = %q, want entropy budget block", reason)
+	if reason != ceeEntropyBlockClientReason {
+		t.Fatalf("reason = %q, want %q", reason, ceeEntropyBlockClientReason)
+	}
+	if inspectionMode != "raw" {
+		t.Fatalf("inspection mode = %q, want raw for entropy-only inspection", inspectionMode)
+	}
+	if blockKind != ceeBlockKindEntropyBudget {
+		t.Fatalf("block kind = %q, want %q", blockKind, ceeBlockKindEntropyBudget)
 	}
 }
 
@@ -941,7 +953,7 @@ func TestCeeRecordMCP_FragmentSkipsEmptyPayloads(t *testing.T) {
 			"$/active": second,
 		},
 		cee: cee, sc: sc, logW: &logBuf,
-	}); !strings.Contains(reason, "cross-request fragment DLP match") {
+	}); reason != ceeFragmentBlockClientReason {
 		t.Fatalf("second fragment reason = %q, want fragment DLP block", reason)
 	}
 }
@@ -1170,11 +1182,8 @@ func TestCeeRecordMCP_FragmentSessionCapacityFailsClosedAndCounts(t *testing.T) 
 	reason := ceeRecordMCP(ceeRecordMCPOptions{
 		sessionKey: testMCPSessionKey, entropyPayload: []byte("new fragment"), fragmentPayloads: map[string][]byte{"": []byte("new fragment")}, cee: cee, sc: sc, logW: &logBuf, logger: logger,
 	})
-	if !strings.Contains(reason, "fragment session capacity exhausted") {
-		t.Fatalf("capacity reason = %q, want visible fail-closed denial", reason)
-	}
-	if !strings.Contains(reason, "cross_request_detection.fragment_reassembly.max_sessions") {
-		t.Fatalf("capacity reason = %q, want the consulted capacity setting", reason)
+	if reason != ceeCapacityBlockClientReason {
+		t.Fatalf("capacity reason = %q, want %q", reason, ceeCapacityBlockClientReason)
 	}
 	logger.Close()
 	auditRaw, err := os.ReadFile(auditPath) // #nosec G304 -- auditPath is inside t.TempDir.
@@ -1183,6 +1192,9 @@ func TestCeeRecordMCP_FragmentSessionCapacityFailsClosedAndCounts(t *testing.T) 
 	}
 	if !bytes.Contains(auditRaw, []byte("cross_request_fragment_capacity")) {
 		t.Fatalf("capacity audit = %s, want blocking event", auditRaw)
+	}
+	if !bytes.Contains(auditRaw, []byte("cross_request_detection.fragment_reassembly.max_sessions")) {
+		t.Fatalf("capacity audit lost operator tuning detail: %s", auditRaw)
 	}
 
 	var count float64

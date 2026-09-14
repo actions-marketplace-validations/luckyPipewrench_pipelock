@@ -5703,7 +5703,7 @@ func TestScanHTTPInput_CEEReassemblesToolArgumentsAcrossCalls(t *testing.T) {
 	if blocked == nil {
 		t.Fatal("second fragment was allowed, want cross-request fragment DLP block")
 	}
-	if blocked.ErrorCode != -32005 || !strings.Contains(blocked.ErrorMessage, "cross-request fragment DLP match") {
+	if blocked.ErrorCode != -32005 || blocked.ErrorMessage != "pipelock: cross-request exfiltration attempt blocked" {
 		t.Fatalf("blocked request = %+v, want cross-request fragment DLP block", blocked)
 	}
 }
@@ -8565,4 +8565,163 @@ func listenerPost(t *testing.T, baseURL, token, body string) string {
 	}
 	_ = resp.Body.Close()
 	return string(payload)
+}
+
+// ceeCaptureObserver collects CEE capture records so a test can assert the
+// inspection-mode evidence fields the record site populates.
+type ceeCaptureObserver struct {
+	capture.NopObserver
+	mu      sync.Mutex
+	records []capture.CEERecord
+}
+
+func (o *ceeCaptureObserver) ObserveCEEVerdict(_ context.Context, rec *capture.CEERecord) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.records = append(o.records, *rec)
+}
+
+func (o *ceeCaptureObserver) snapshot() []capture.CEERecord {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]capture.CEERecord(nil), o.records...)
+}
+
+// TestScanHTTPInput_CEEBlockEmitsAttributedReceiptAndInspectionMode proves the
+// HTTP/SSE CEE block path reaches its deferred receipt emission with the
+// cross-request attribution applied, and that the capture record carries the
+// partitioned inspection mode rather than an empty string.
+func TestScanHTTPInput_CEEBlockEmitsAttributedReceiptAndInspectionMode(t *testing.T) {
+	sc := testMCPScanner()
+	t.Cleanup(sc.Close)
+	cee := testMCPCEEFragmentBlock(t)
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	obs := &ceeCaptureObserver{}
+	opts := MCPProxyOpts{Scanner: sc, CEE: cee, ReceiptEmitter: emitter, Transport: transportMCPHTTP, CaptureObs: obs}
+
+	if blocked := scanHTTPInput(mcpChunkedCEERequest(1, "AKI"+"A"), io.Discard, "mcp-session", "mcp-session", opts); blocked != nil {
+		t.Fatalf("first fragment blocked: %+v", blocked)
+	}
+	blocked := scanHTTPInput(mcpChunkedCEERequest(2, testMCPAWSKeySuffix), io.Discard, "mcp-session", "mcp-session", opts)
+	if blocked == nil {
+		t.Fatal("second fragment was allowed, want cross-request fragment DLP block")
+	}
+
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	var blockReceipts []receipt.Receipt
+	for _, item := range readActionReceipts(t, dir) {
+		if item.ActionRecord.Verdict == config.ActionBlock {
+			blockReceipts = append(blockReceipts, item)
+		}
+	}
+	if len(blockReceipts) != 1 {
+		t.Fatalf("block receipt count = %d, want 1", len(blockReceipts))
+	}
+	got := blockReceipts[0].ActionRecord
+	if got.Layer != "cross_request" || got.Pattern != "AWS Access ID" || got.Severity != "critical" {
+		t.Fatalf("receipt attribution = %+v, want cross_request/AWS Access ID/critical", got)
+	}
+
+	records := obs.snapshot()
+	if len(records) != 1 {
+		t.Fatalf("CEE capture records = %d, want 1", len(records))
+	}
+	if records[0].InspectionMode != "partitioned" {
+		t.Fatalf("InspectionMode = %q, want partitioned", records[0].InspectionMode)
+	}
+	if records[0].FallbackReason != "" {
+		t.Fatalf("FallbackReason = %q, want empty for a partitioned frame", records[0].FallbackReason)
+	}
+}
+
+// TestScanHTTPInput_CEEBlockOnGenericMethodEmitsReceipt is the HTTP twin of the
+// stdio generic-method case. A method that is neither a tool call nor a
+// required-metadata method mints no receipt identity up front, and the emitter
+// drops a receipt with an empty action ID, so the CEE block would fire and
+// leave nothing behind.
+func TestScanHTTPInput_CEEBlockOnGenericMethodEmitsReceipt(t *testing.T) {
+	sc := testMCPScanner()
+	t.Cleanup(sc.Close)
+	cee := NewCEEDeps(config.CrossRequestDetection{
+		Enabled: true,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1,
+			WindowMinutes: testMCPWindowSecs / 60,
+			Action:        config.ActionBlock,
+		},
+	}, metrics.New())
+	t.Cleanup(cee.Close)
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	opts := MCPProxyOpts{Scanner: sc, CEE: cee, ReceiptEmitter: emitter, Transport: transportMCPHTTP}
+
+	const generic = `{"jsonrpc":"2.0","id":9,"method":"resources/read","params":{"uri":"file:///etc/hosts"}}`
+	blocked := scanHTTPInput([]byte(generic), io.Discard, "mcp-session", "mcp-session", opts)
+	if blocked == nil {
+		t.Fatal("generic-method entropy request was allowed, want CEE block")
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+	blockReceipts := receiptsByVerdict(readActionReceipts(t, dir), config.ActionBlock)
+	if len(blockReceipts) != 1 {
+		t.Fatalf("block receipt count = %d, want 1 for a CEE block on a generic method", len(blockReceipts))
+	}
+	got := blockReceipts[0].ActionRecord
+	if got.ActionID == "" {
+		t.Fatalf("receipt has no action id: %+v", got)
+	}
+	if got.Target != "resources/read" {
+		t.Fatalf("receipt target = %q, want the method", got.Target)
+	}
+	if got.Layer != "cross_request" {
+		t.Fatalf("receipt layer = %q, want cross_request", got.Layer)
+	}
+}
+
+func TestScanHTTPInput_CEEEntropyReceiptUsesStablePattern(t *testing.T) {
+	sc := testMCPScanner()
+	t.Cleanup(sc.Close)
+	cee := NewCEEDeps(config.CrossRequestDetection{
+		Enabled: true,
+		EntropyBudget: config.CrossRequestEntropyBudget{
+			Enabled:       true,
+			BitsPerWindow: 1,
+			WindowMinutes: testMCPWindowSecs / 60,
+			Action:        config.ActionBlock,
+		},
+	}, metrics.New())
+	t.Cleanup(cee.Close)
+	emitter, rec, dir, _ := newReceiptTestHarness(t)
+	obs := &ceeCaptureObserver{}
+	opts := MCPProxyOpts{Scanner: sc, CEE: cee, ReceiptEmitter: emitter, Transport: transportMCPHTTP, CaptureObs: obs}
+
+	blocked := scanHTTPInput(mcpChunkedCEERequest(1, "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyz"), io.Discard, "mcp-session", "mcp-session", opts)
+	if blocked == nil {
+		t.Fatal("entropy budget request was allowed, want CEE block")
+	}
+	if blocked.ErrorMessage != "pipelock: "+ceeEntropyBlockClientReason {
+		t.Fatalf("client error = %q, want neutral entropy block reason", blocked.ErrorMessage)
+	}
+	records := obs.snapshot()
+	if len(records) != 1 || records[0].InspectionMode != "raw" {
+		t.Fatalf("CEE inspection records = %+v, want one raw entropy record", records)
+	}
+	if err := rec.Close(); err != nil {
+		t.Fatalf("recorder.Close: %v", err)
+	}
+
+	blockReceipts := receiptsByVerdict(readActionReceipts(t, dir), config.ActionBlock)
+	if len(blockReceipts) != 1 {
+		t.Fatalf("block receipt count = %d, want 1", len(blockReceipts))
+	}
+	pattern := blockReceipts[0].ActionRecord.Pattern
+	if pattern != ceeBlockKindEntropyBudget {
+		t.Fatalf("receipt pattern = %q, want %q", pattern, ceeBlockKindEntropyBudget)
+	}
+	if strings.Contains(pattern, " ") || regexp.MustCompile(`\d/\d`).MatchString(pattern) {
+		t.Fatalf("CEE receipt pattern must not contain prose or live usage: %q", pattern)
+	}
 }
