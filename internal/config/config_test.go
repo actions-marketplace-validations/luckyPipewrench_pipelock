@@ -4194,6 +4194,8 @@ func TestValidateReload_ActionDowngradesWarnForEnforcementSurfaces(t *testing.T)
 	updated.MCPToolScanning.Enabled = true
 	old.MCPToolScanning.Action = ActionBlock
 	updated.MCPToolScanning.Action = ActionWarn
+	old.MCPToolScanning.NewToolAction = ActionBlock
+	updated.MCPToolScanning.NewToolAction = ActionWarn
 	old.MCPToolPolicy.Enabled = true
 	updated.MCPToolPolicy.Enabled = true
 	old.MCPToolPolicy.Action = ActionBlock
@@ -4247,6 +4249,7 @@ func TestValidateReload_ActionDowngradesWarnForEnforcementSurfaces(t *testing.T)
 		"mcp_input_scanning.action",
 		"mcp_input_scanning.on_parse_error",
 		"mcp_tool_scanning.action",
+		"mcp_tool_scanning.new_tool_action",
 		"mcp_tool_policy.action",
 		"mcp_tool_policy.rules.deny-shell.action",
 		"mcp_binary_integrity.action",
@@ -5108,6 +5111,140 @@ func TestValidate_MCPToolScanningInvalidAction(t *testing.T) {
 	cfg.MCPToolScanning.Action = ActionStrip
 	if err := cfg.Validate(); err == nil {
 		t.Error("expected error for strip action on tool scanning")
+	}
+}
+
+// --- MCPToolScanning.NewToolAction Tests ---
+
+func TestApplyDefaults_MCPToolScanningNewToolActionDefaultsToWarn(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.NewToolAction = "" // omitted; YAML null/blank decode to the same zero value
+	cfg.ApplyDefaults()
+
+	if cfg.MCPToolScanning.NewToolAction != ActionWarn {
+		t.Errorf("expected NewToolAction=warn when enabled with no new_tool_action, got %q", cfg.MCPToolScanning.NewToolAction)
+	}
+}
+
+func TestValidate_MCPToolScanningNewToolActionExplicitWarn(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.NewToolAction = ActionWarn
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("explicit new_tool_action=warn should validate, got: %v", err)
+	}
+}
+
+func TestValidate_MCPToolScanningNewToolActionExplicitBlock(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.NewToolAction = ActionBlock
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("explicit new_tool_action=block should validate, got: %v", err)
+	}
+}
+
+// TestValidate_MCPToolScanningNewToolActionBlockWithoutDriftWarns pins the
+// operability half of the setting: new-tool admission is only evaluated inside
+// the drift-detection path, so block without detect_drift is inert. Accepting
+// it silently tells the operator a control is on when nothing changed, which is
+// the failure that gets a security setting trusted and then disbelieved.
+func TestValidate_MCPToolScanningNewToolActionBlockWithoutDriftWarns(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.DetectDrift = false
+	cfg.MCPToolScanning.NewToolAction = ActionBlock
+	warnings, err := cfg.ValidateWithWarnings()
+	if err != nil {
+		t.Fatalf("ValidateWithWarnings err = %v, want the pair accepted with a warning, not rejected", err)
+	}
+	var found bool
+	for _, w := range warnings {
+		if w.Field == "mcp_tool_scanning.new_tool_action" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %+v, want one naming mcp_tool_scanning.new_tool_action", warnings)
+	}
+}
+
+// TestValidate_MCPToolScanningNewToolActionBlockWithDriftIsSilent is the
+// negative control: the same pair WITH drift detection is a working
+// configuration and must not warn, or the warning becomes noise operators
+// learn to ignore.
+func TestValidate_MCPToolScanningNewToolActionBlockWithDriftIsSilent(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.DetectDrift = true
+	cfg.MCPToolScanning.NewToolAction = ActionBlock
+	warnings, err := cfg.ValidateWithWarnings()
+	if err != nil {
+		t.Fatalf("ValidateWithWarnings err = %v, want success", err)
+	}
+	for _, w := range warnings {
+		if w.Field == "mcp_tool_scanning.new_tool_action" {
+			t.Fatalf("a working configuration warned: %+v", w)
+		}
+	}
+}
+
+func TestValidate_MCPToolScanningNewToolActionInvalid(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = true
+	cfg.MCPToolScanning.Action = ActionWarn
+	cfg.MCPToolScanning.NewToolAction = testInvalid
+	if err := cfg.Validate(); err == nil {
+		t.Error("expected error for invalid new_tool_action")
+	}
+}
+
+func TestValidate_MCPToolScanningNewToolActionDisabledSkipsValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.MCPToolScanning.Enabled = false
+	cfg.MCPToolScanning.NewToolAction = testInvalid
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("disabled tool scanning should skip new_tool_action validation, got: %v", err)
+	}
+}
+
+func TestReload_MCPToolScanningNewToolActionDowngradeWarning(t *testing.T) {
+	old := Defaults()
+	old.MCPToolScanning.Enabled = true
+	old.MCPToolScanning.Action = ActionWarn
+	old.MCPToolScanning.NewToolAction = ActionBlock
+
+	updated := Defaults()
+	updated.MCPToolScanning.Enabled = true
+	updated.MCPToolScanning.Action = ActionWarn
+	updated.MCPToolScanning.NewToolAction = ActionWarn
+
+	warnings := ValidateReload(old, updated)
+	if !hasReloadWarning(warnings, "mcp_tool_scanning.new_tool_action") {
+		t.Errorf("expected a new_tool_action downgrade warning, got: %+v", warnings)
+	}
+}
+
+func TestReload_MCPToolScanningNewToolActionNoChangeNoWarning(t *testing.T) {
+	old := Defaults()
+	old.MCPToolScanning.Enabled = true
+	old.MCPToolScanning.Action = ActionWarn
+	old.MCPToolScanning.NewToolAction = ActionBlock
+
+	updated := Defaults()
+	updated.MCPToolScanning.Enabled = true
+	updated.MCPToolScanning.Action = ActionWarn
+	updated.MCPToolScanning.NewToolAction = ActionBlock
+
+	warnings := ValidateReload(old, updated)
+	if hasReloadWarning(warnings, "mcp_tool_scanning.new_tool_action") {
+		t.Errorf("expected no new_tool_action warning when unchanged, got: %+v", warnings)
 	}
 }
 
