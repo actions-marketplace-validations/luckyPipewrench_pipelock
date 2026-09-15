@@ -38,6 +38,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
@@ -2262,6 +2263,80 @@ func TestServer_ReloadScannerConstructionErrorPreservesLiveScanner(t *testing.T)
 	}
 	if !buf.contains("scanner construction failed") {
 		t.Fatalf("stderr missing scanner construction rejection:\n%s", buf.String())
+	}
+}
+
+func TestServer_ReloadWindowBudgetErrorPreservesLiveScanner(t *testing.T) {
+	s, buf := newTestServer(t, nil)
+	oldCfg := s.proxy.CurrentConfig()
+	oldScanner := s.proxy.ScannerPtr().Load()
+	if oldScanner == nil {
+		t.Fatal("live scanner is nil before reload")
+	}
+
+	originalConstructor := s.scannerConstructor
+	s.scannerConstructor = func(*config.Config) (*scanner.Scanner, error) {
+		return nil, errors.New("known-value window index memory budget exceeded")
+	}
+	t.Cleanup(func() { s.scannerConstructor = originalConstructor })
+
+	buf.reset()
+	err := s.Reload(oldCfg.Clone())
+	if err == nil || !strings.Contains(err.Error(), "known-value window index memory budget exceeded") {
+		t.Fatalf("Reload error = %v, want propagated window budget failure", err)
+	}
+	if s.proxy.CurrentConfig() != oldCfg || s.cfg != oldCfg {
+		t.Fatal("live config changed after rejected window-index construction")
+	}
+	if s.proxy.ScannerPtr().Load() != oldScanner {
+		t.Fatal("live scanner changed after rejected window-index construction")
+	}
+	if result := oldScanner.Scan(context.Background(), "http://169.254.169.254/latest/meta-data"); result.Allowed {
+		t.Fatalf("old scanner stopped blocking after rejected reload: %+v", result)
+	}
+	if !buf.contains("scanner construction failed") {
+		t.Fatalf("stderr missing scanner construction rejection:\n%s", buf.String())
+	}
+}
+
+func TestServer_ReloadRebuildsChangedSecretsFile(t *testing.T) {
+	s, _ := newTestServer(t, nil)
+	secretsPath := filepath.Join(t.TempDir(), "secrets.txt")
+	first := "Q7vP2mK9xR4nT8wB" + "6cD3fG1hJ5sL0zA"
+	second := "xL5pR8vN2qT7mC4z" + "9dF1hK6sW3eB0yU"
+	if err := os.WriteFile(secretsPath, []byte(first+"\n"), 0o600); err != nil {
+		t.Fatalf("write first secrets file: %v", err)
+	}
+
+	firstCfg := s.proxy.CurrentConfig().Clone()
+	firstCfg.DLP.SecretsFile = secretsPath
+	if err := s.Reload(firstCfg); err != nil {
+		t.Fatalf("reload first secrets file: %v", err)
+	}
+	firstScanner := s.proxy.ScannerPtr().Load()
+	if result := firstScanner.ScanTextForDLP(context.Background(), "checksum: "+first[:20]); result.Clean {
+		t.Fatalf("first scanner must match its loaded secret: %+v", result.Matches)
+	}
+
+	if err := os.WriteFile(secretsPath, []byte(second+"\n"), 0o600); err != nil {
+		t.Fatalf("write changed secrets file: %v", err)
+	}
+	// This models a later config reload after the file changed rather than the
+	// fsnotify/SIGHUP duplicate event that the short dedup window suppresses.
+	s.lastReloadAt = time.Time{}
+	secondCfg := firstCfg.Clone()
+	if err := s.Reload(secondCfg); err != nil {
+		t.Fatalf("reload changed secrets file: %v", err)
+	}
+	secondScanner := s.proxy.ScannerPtr().Load()
+	if secondScanner == firstScanner {
+		t.Fatal("changed secrets file reload kept the previous scanner")
+	}
+	if result := secondScanner.ScanTextForDLP(context.Background(), "checksum: "+second[:20]); result.Clean {
+		t.Fatalf("reloaded scanner must match changed secret: %+v", result.Matches)
+	}
+	if result := secondScanner.ScanTextForDLP(context.Background(), "checksum: "+first[:20]); !result.Clean {
+		t.Fatalf("reloaded scanner retained replaced secret: %+v", result.Matches)
 	}
 }
 

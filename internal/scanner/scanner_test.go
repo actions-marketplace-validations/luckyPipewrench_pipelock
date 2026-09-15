@@ -9,6 +9,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -20,6 +21,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
 )
@@ -4914,6 +4916,145 @@ func TestLoadSecretsFile_MaxEntriesEnforced(t *testing.T) {
 	}
 	if len(secrets) != 1000 {
 		t.Fatalf("expected 1000 secrets (max enforced), got %d", len(secrets))
+	}
+}
+
+func TestKnownValueWindowIndex_CompactRepresentation(t *testing.T) {
+	if got := unsafe.Sizeof(knownValueWindowCandidate{}); got > knownValueWindowEntryBytes {
+		t.Fatalf("knownValueWindowCandidate size = %d bytes, budget charges %d", got, knownValueWindowEntryBytes)
+	}
+
+	plainFileCapWindows := maxSecretsFileEntries * (maxSecretsFileLineLen - minKnownSecretSubstringLen + 1)
+	budget := newKnownValueWindowBudget(maxKnownValueWindowEntries)
+	if err := budget.reserve(plainFileCapWindows); err != nil {
+		t.Fatalf("whole-value loader cap must fit the compact construction budget: %v", err)
+	}
+	if err := budget.reserve(maxKnownValueWindowEntries); !errors.Is(err, errKnownValueWindowBudget) {
+		t.Fatalf("reserve beyond the remaining construction budget = %v, want budget error", err)
+	}
+	if maxKnownValueWindowBytes != maxKnownValueWindowEntries*knownValueWindowEntryBytes {
+		t.Fatalf("byte budget = %d, want entry budget %d * entry bytes %d", maxKnownValueWindowBytes, maxKnownValueWindowEntries, knownValueWindowEntryBytes)
+	}
+}
+
+func TestKnownValueWindowBudget_URLShapesFitDerivedCeiling(t *testing.T) {
+	var raw strings.Builder
+	for i := range 280 {
+		_, _ = fmt.Fprintf(&raw, "A%04x+/=", (i*251)%65536)
+	}
+	escaped := url.QueryEscape(raw.String())
+	tests := []string{
+		"https://user:" + escaped + "@vendor.example/path",
+		"https://vendor.example/path?token=" + escaped,
+	}
+	for _, prefix := range tests {
+		value := prefix + strings.Repeat("z", maxSecretsFileLineLen-len(prefix))
+		if len(value) != maxSecretsFileLineLen {
+			t.Fatalf("fixture length = %d, want %d", len(value), maxSecretsFileLineLen)
+		}
+		set, err := buildKnownValueWindows(newKnownValueWindowBudget(maxKnownValueWindowEntries), []string{value})
+		if err != nil {
+			t.Fatalf("max-length URL-shaped value exceeded derived budget: %v", err)
+		}
+		count := set[value].len()
+		if count > maxSecretsFileLineLen*2 {
+			t.Fatalf("URL-shaped value retained %d candidates, want at most %d", count, maxSecretsFileLineLen*2)
+		}
+		if count*maxSecretsFileEntries > maxKnownValueWindowEntries {
+			t.Fatalf("loader-cap projection = %d candidates, budget = %d", count*maxSecretsFileEntries, maxKnownValueWindowEntries)
+		}
+	}
+}
+
+func TestKnownValueWindowBudget_RejectsOversizedValueBeforeCollection(t *testing.T) {
+	value := strings.Repeat("Q7vP2mK9xR4nT8wB", maxKnownValuePartialInputBytes/minKnownSecretSubstringLen+1)
+	if len(value) <= maxKnownValuePartialInputBytes {
+		t.Fatalf("fixture length = %d, want greater than %d", len(value), maxKnownValuePartialInputBytes)
+	}
+	set, err := buildKnownValueWindows(newKnownValueWindowBudget(maxKnownValueWindowEntries), []string{value})
+	if !errors.Is(err, errKnownValueWindowBudget) {
+		t.Fatalf("oversized known value error = %v, want window budget error", err)
+	}
+	if set != nil {
+		t.Fatalf("oversized known value returned partial index: %+v", set)
+	}
+	if !strings.Contains(err.Error(), "partial matching accepts at most") {
+		t.Fatalf("oversized known value error = %v, want per-value remedy", err)
+	}
+}
+
+func TestKnownValueWindowBudget_FailsBeforePartialIndex(t *testing.T) {
+	envSecret := strings.Join([]string{"Q7vP2mK9", "xR4nT8wB"}, "")
+	fileSecret := strings.Join([]string{"xL5pR8vN", "2qT7mC4z"}, "")
+	set, err := buildKnownValueWindows(newKnownValueWindowBudget(1), []string{envSecret}, []string{fileSecret})
+	if !errors.Is(err, errKnownValueWindowBudget) {
+		t.Fatalf("combined env/file build error = %v, want window budget error", err)
+	}
+	if set != nil {
+		t.Fatalf("over-budget build returned a partial index: %+v", set)
+	}
+}
+
+func TestCollectValueWindowsBounded_DeduplicatesBeforeBudgetDecision(t *testing.T) {
+	value := strings.Repeat("A1b2C3d4E5f6G7h8", 3)
+	windows, err := collectValueWindowsBounded(value, 0, 0)
+	if err != nil {
+		t.Fatalf("fully repeated windows consumed budget: %v", err)
+	}
+	if len(windows) != 0 {
+		t.Fatalf("repeated windows = %d, want none", len(windows))
+	}
+}
+
+func TestNew_CanaryWindowBudgetFailsClosed(t *testing.T) {
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = false
+	cfg.CanaryTokens.Enabled = true
+	cfg.CanaryTokens.Tokens = []config.CanaryToken{{Name: "budget", Value: "Q7vP2mK9xR4nT8wB6cD3"}}
+
+	s, err := newWithOptionsAndWindowBudget(cfg, Options{}, 5)
+	if !errors.Is(err, errKnownValueWindowBudget) {
+		t.Fatalf("New error = %v, want canary window budget error", err)
+	}
+	if s != nil {
+		t.Fatal("New returned a partial scanner after canary budget failure")
+	}
+	if !strings.Contains(err.Error(), "canonical canary windows") {
+		t.Fatalf("New error = %v, want canonical canary propagation context", err)
+	}
+	if !strings.Contains(err.Error(), "reduce canary_tokens entries") {
+		t.Fatalf("New error = %v, want actionable canary budget remedy", err)
+	}
+}
+
+func TestNew_KnownSecretWindowBudgetFailsClosed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secrets.txt")
+	value := strings.Join([]string{"Q7vP2mK9xR4n", "T8wB6cD3"}, "")
+	if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig()
+	cfg.DLP.ScanEnv = false
+	cfg.DLP.SecretsFile = path
+
+	s, err := newWithOptionsAndWindowBudget(cfg, Options{}, 1)
+	if !errors.Is(err, errKnownValueWindowBudget) {
+		t.Fatalf("New error = %v, want known-secret window budget error", err)
+	}
+	if s != nil {
+		t.Fatal("New returned a partial scanner after known-secret budget failure")
+	}
+	if !strings.Contains(err.Error(), "build known-secret window index") {
+		t.Fatalf("New error = %v, want known-secret propagation context", err)
+	}
+	if !strings.Contains(err.Error(), "disable dlp.scan_env") {
+		t.Fatalf("New error = %v, want actionable known-secret budget remedy", err)
+	}
+	if !strings.Contains(err.Error(), "reduce canary_tokens") {
+		t.Fatalf("New error = %v, want shared canary budget remedy", err)
+	}
+	if !strings.Contains(err.Error(), "entries") || !strings.Contains(err.Error(), "bytes") {
+		t.Fatalf("New error = %v, want actionable entry and byte counts", err)
 	}
 }
 
