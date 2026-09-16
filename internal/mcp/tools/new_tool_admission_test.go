@@ -208,6 +208,23 @@ func syntheticToolName(i int) string {
 	return fmt.Sprintf("seed-%d", i)
 }
 
+// seedEstablishedBaseline runs one complete first inventory carrying alpha
+// through the real begin/end contract, so the baseline is established the way
+// production establishes it: when the first tools/list finishes, not when a
+// definition is promoted.
+func seedEstablishedBaseline(t *testing.T, tb *ToolBaseline, classify func(string, bool) []string) {
+	t.Helper()
+	first, established := tb.BeginInventoryResponse()
+	if established {
+		t.Fatal("seed expects an unestablished baseline")
+	}
+	tb.EvaluateDefinition(DefinitionEvaluation{Name: "alpha", Hash: "h1", PromoteNew: true, Classify: classify})
+	first.End()
+	if !tb.HasDriftBaseline() {
+		t.Fatal("seed must leave the baseline established")
+	}
+}
+
 // TestToolBaseline_EvaluateDefinition_NewToolMatrix drives EvaluateDefinition
 // directly across the admission matrix, independent of ScanTools plumbing.
 func TestToolBaseline_EvaluateDefinition_NewToolMatrix(t *testing.T) {
@@ -229,7 +246,7 @@ func TestToolBaseline_EvaluateDefinition_NewToolMatrix(t *testing.T) {
 
 	t.Run("new name after established baseline in warn mode promotes and reports non-blocking cue", func(t *testing.T) {
 		tb := NewToolBaseline()
-		tb.EvaluateDefinition(DefinitionEvaluation{Name: "alpha", Hash: "h1", PromoteNew: true, Classify: classify})
+		seedEstablishedBaseline(t, tb, classify)
 		eval := tb.EvaluateDefinition(DefinitionEvaluation{
 			Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: false,
 			EstablishedBeforeResponse: tb.HasDriftBaseline(), Classify: classify,
@@ -247,7 +264,7 @@ func TestToolBaseline_EvaluateDefinition_NewToolMatrix(t *testing.T) {
 
 	t.Run("new name after established baseline in block mode withholds with the new-tool cue", func(t *testing.T) {
 		tb := NewToolBaseline()
-		tb.EvaluateDefinition(DefinitionEvaluation{Name: "alpha", Hash: "h1", PromoteNew: true, Classify: classify})
+		seedEstablishedBaseline(t, tb, classify)
 		eval := tb.EvaluateDefinition(DefinitionEvaluation{
 			Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: true,
 			EstablishedBeforeResponse: tb.HasDriftBaseline(), Classify: classify,
@@ -265,7 +282,7 @@ func TestToolBaseline_EvaluateDefinition_NewToolMatrix(t *testing.T) {
 
 	t.Run("withheld name re-evaluates identically on a later call", func(t *testing.T) {
 		tb := NewToolBaseline()
-		tb.EvaluateDefinition(DefinitionEvaluation{Name: "alpha", Hash: "h1", PromoteNew: true, Classify: classify})
+		seedEstablishedBaseline(t, tb, classify)
 		tb.EvaluateDefinition(DefinitionEvaluation{Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: true, EstablishedBeforeResponse: true, Classify: classify})
 		eval := tb.EvaluateDefinition(DefinitionEvaluation{Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: true, EstablishedBeforeResponse: true, Classify: classify})
 		if !eval.Drifted || len(eval.Cues) != 1 || eval.Cues[0] != DriftCueNewTool {
@@ -275,7 +292,7 @@ func TestToolBaseline_EvaluateDefinition_NewToolMatrix(t *testing.T) {
 
 	t.Run("reset admits a previously withheld name on the next response", func(t *testing.T) {
 		tb := NewToolBaseline()
-		tb.EvaluateDefinition(DefinitionEvaluation{Name: "alpha", Hash: "h1", PromoteNew: true, Classify: classify})
+		seedEstablishedBaseline(t, tb, classify)
 		tb.EvaluateDefinition(DefinitionEvaluation{Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: true, EstablishedBeforeResponse: true, Classify: classify})
 		tb.ResetDriftState()
 		eval := tb.EvaluateDefinition(DefinitionEvaluation{Name: "beta", Hash: "h2", PromoteNew: true, BlockNewTools: true, EstablishedBeforeResponse: tb.HasDriftBaseline(), Classify: classify})
@@ -326,33 +343,102 @@ func TestScanTools_EmptyFirstInventoryEstablishesBaseline(t *testing.T) {
 	}
 }
 
-// TestToolBaseline_BeginInventoryResponse_CompetingFirstResponses pins that
-// establishment is atomic: of N concurrent first responses on one shared
-// baseline, exactly one observes an unestablished baseline.
+// TestToolBaseline_BeginInventoryResponse_CompetingFirstResponses pins the
+// establishment contract on a shared baseline: every response that begins
+// while no first inventory has yet ENDED is itself a first inventory, the
+// baseline becomes established only when the last in-flight first inventory
+// ends, and a response that begins after that reads established.
 func TestToolBaseline_BeginInventoryResponse_CompetingFirstResponses(t *testing.T) {
 	baseline := NewToolBaseline()
 	const n = 32
-	results := make(chan bool, n)
+	type begun struct {
+		resp        *InventoryResponse
+		established bool
+	}
+	results := make(chan begun, n)
 	start := make(chan struct{})
 	for i := 0; i < n; i++ {
 		go func() {
 			<-start
-			results <- baseline.BeginInventoryResponse()
+			resp, established := baseline.BeginInventoryResponse()
+			results <- begun{resp, established}
 		}()
 	}
 	close(start)
-	unestablished := 0
+	tokens := make([]*InventoryResponse, 0, n)
 	for i := 0; i < n; i++ {
-		if !<-results {
-			unestablished++
+		b := <-results
+		if b.established {
+			t.Fatal("a response that began before any first inventory ended must itself be a first inventory")
 		}
+		tokens = append(tokens, b.resp)
 	}
-	if unestablished != 1 {
-		t.Fatalf("exactly one competing first response must observe an unestablished baseline, got %d of %d", unestablished, n)
+	if baseline.HasDriftBaseline() {
+		t.Fatal("the baseline must not be established while first inventories are still in flight")
 	}
+	// Ending all but one leaves the baseline unestablished, and a response
+	// that begins now joins the in-flight set instead of reading established.
+	for _, tok := range tokens[:n-1] {
+		tok.End()
+	}
+	if baseline.HasDriftBaseline() {
+		t.Fatal("the baseline must not be established while one first inventory is still in flight")
+	}
+	straggler, established := baseline.BeginInventoryResponse()
+	if established {
+		t.Fatal("a response beginning while a first inventory is in flight must be a first inventory too")
+	}
+	tokens[n-1].End()
+	if baseline.HasDriftBaseline() {
+		t.Fatal("the straggler is still in flight; the baseline must not be established yet")
+	}
+	straggler.End()
+	straggler.End() // a second End is inert
+	if !baseline.HasDriftBaseline() {
+		t.Fatal("the last in-flight first inventory ending must establish the baseline")
+	}
+	late, established := baseline.BeginInventoryResponse()
+	if !established {
+		t.Fatal("a response beginning after establishment must read established")
+	}
+	late.End()
+	if !baseline.HasDriftBaseline() {
+		t.Fatal("ending a non-first response must not un-establish the baseline")
+	}
+
 	var nilBaseline *ToolBaseline
-	if nilBaseline.BeginInventoryResponse() {
-		t.Fatal("a nil baseline must report unestablished and record nothing")
+	resp, established := nilBaseline.BeginInventoryResponse()
+	if established || resp != nil {
+		t.Fatal("a nil baseline must report unestablished and return no token")
+	}
+	resp.End() // nil token is inert
+}
+
+// TestToolBaseline_ResetDuringFirstInventoryDoesNotLeakEstablishment pins
+// that an operator reset landing while a first inventory is in flight clears
+// the in-flight count, and that the stale token's End neither establishes the
+// post-reset baseline nor disturbs its count: the first post-reset inventory
+// is the one that establishes it.
+func TestToolBaseline_ResetDuringFirstInventoryDoesNotLeakEstablishment(t *testing.T) {
+	baseline := NewToolBaseline()
+	epoch := baseline.DriftEpoch()
+	stale, established, epochChanged := baseline.BeginInventoryResponseAtEpoch(&epoch)
+	if established || epochChanged {
+		t.Fatalf("first begin should be a first inventory at the current epoch, got established=%v epochChanged=%v", established, epochChanged)
+	}
+	baseline.ResetDriftState()
+	stale.End()
+	if baseline.HasDriftBaseline() {
+		t.Fatal("a stale token from before the reset must not establish the new epoch's baseline")
+	}
+	current := baseline.DriftEpoch()
+	fresh, established, epochChanged := baseline.BeginInventoryResponseAtEpoch(&current)
+	if established || epochChanged {
+		t.Fatalf("the first post-reset inventory must be a first inventory, got established=%v epochChanged=%v", established, epochChanged)
+	}
+	fresh.End()
+	if !baseline.HasDriftBaseline() {
+		t.Fatal("the first post-reset inventory must establish the baseline when it ends")
 	}
 }
 
@@ -408,21 +494,22 @@ func TestToolBaseline_BeginInventoryResponseAtEpoch_StaleEpochDoesNotEstablish(t
 	baseline.ResetDriftState()
 	stale := uint64(0)
 
-	established, epochChanged := baseline.BeginInventoryResponseAtEpoch(&stale)
-	if !epochChanged {
-		t.Fatalf("a stale epoch must report epochChanged, got established=%v", established)
+	resp, established, epochChanged := baseline.BeginInventoryResponseAtEpoch(&stale)
+	if !epochChanged || resp != nil {
+		t.Fatalf("a stale epoch must report epochChanged with no token, got established=%v resp=%v", established, resp)
 	}
 	if baseline.HasDriftBaseline() {
 		t.Fatal("a stale-epoch response must not establish the baseline")
 	}
 
 	current := baseline.DriftEpoch()
-	established, epochChanged = baseline.BeginInventoryResponseAtEpoch(&current)
+	resp, established, epochChanged = baseline.BeginInventoryResponseAtEpoch(&current)
 	if epochChanged || established {
-		t.Fatalf("the first post-reset inventory must establish the baseline, got established=%v epochChanged=%v", established, epochChanged)
+		t.Fatalf("the first post-reset inventory must be a first inventory, got established=%v epochChanged=%v", established, epochChanged)
 	}
+	resp.End()
 	if !baseline.HasDriftBaseline() {
-		t.Fatal("the post-reset inventory should have established the baseline")
+		t.Fatal("the post-reset inventory should have established the baseline when it ended")
 	}
 }
 
@@ -471,5 +558,154 @@ func TestScanTools_RejectedNewToolIsNotReportedAsAdmitted(t *testing.T) {
 	// not an empty map passing by default.
 	if _, promoted := baseline.hashes["alpha"]; !promoted {
 		t.Fatalf("the accepted tool is missing from the drift baseline, so the rejection check proves nothing: %#v", baseline.hashes)
+	}
+}
+
+// TestToolBaseline_OverlappingFirstInventoriesUnion pins the overlap
+// interleaving deterministically, without relying on the scheduler: two
+// responses both begin before either ends, each evaluates a different first
+// inventory under block admission, and neither withholds anything. Their
+// names form one union baseline, established when the second ends, and only
+// a name introduced after that is withheld. This is the exact sequence the
+// shared-listener race produces; the ScanTools test below exercises the same
+// property through the production path but can only make the overlap likely.
+func TestToolBaseline_OverlappingFirstInventoriesUnion(t *testing.T) {
+	classify := func(prevDesc string, structuralChanged bool) []string { return nil }
+	tb := NewToolBaseline()
+
+	respA, establishedA := tb.BeginInventoryResponse()
+	respB, establishedB := tb.BeginInventoryResponse()
+	if establishedA || establishedB {
+		t.Fatalf("both overlapping responses must be first inventories, got A=%v B=%v", establishedA, establishedB)
+	}
+	evalFirst := func(name string, established bool) DriftEvaluation {
+		return tb.EvaluateDefinition(DefinitionEvaluation{
+			Name: name, Hash: "h-" + name, PromoteNew: true, BlockNewTools: true,
+			EstablishedBeforeResponse: established, Classify: classify,
+		})
+	}
+	// A evaluates and ends while B is still in flight; B then evaluates a
+	// name A never saw. Before the fix B's names read as post-baseline.
+	for _, name := range []string{"alpha", "beta"} {
+		if ev := evalFirst(name, establishedA); ev.NewTool || len(ev.Cues) != 0 {
+			t.Fatalf("response A must admit %s silently, got %+v", name, ev)
+		}
+	}
+	respA.End()
+	if tb.HasDriftBaseline() {
+		t.Fatal("A ending must not establish the baseline while B is still in flight")
+	}
+	for _, name := range []string{"beta", "gamma"} {
+		if ev := evalFirst(name, establishedB); ev.NewTool || len(ev.Cues) != 0 {
+			t.Fatalf("response B must admit %s silently, got %+v", name, ev)
+		}
+	}
+	respB.End()
+	if !tb.HasDriftBaseline() {
+		t.Fatal("the last overlapping first inventory ending must establish the baseline")
+	}
+	for _, name := range []string{"alpha", "beta", "gamma"} {
+		if _, ok := tb.hashes[name]; !ok {
+			t.Fatalf("union baseline must carry %s", name)
+		}
+	}
+
+	respC, establishedC := tb.BeginInventoryResponse()
+	if !establishedC {
+		t.Fatal("a response beginning after establishment must read established")
+	}
+	ev := evalFirst("delta", establishedC)
+	respC.End()
+	if !ev.NewTool || len(ev.Cues) != 1 || ev.Cues[0] != DriftCueNewTool {
+		t.Fatalf("delta introduced after the union baseline must be withheld, got %+v", ev)
+	}
+}
+
+// TestInventoryResponse_EndTwiceFromTwoGoroutines pins that the token's
+// once-guard is taken under the baseline lock: two End calls racing on one
+// token decrement the in-flight count once, so a second in-flight first
+// inventory is not established out from under it.
+func TestInventoryResponse_EndTwiceFromTwoGoroutines(t *testing.T) {
+	for attempt := 0; attempt < 200; attempt++ {
+		tb := NewToolBaseline()
+		respA, _ := tb.BeginInventoryResponse()
+		respB, _ := tb.BeginInventoryResponse()
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				<-start
+				respA.End()
+				done <- struct{}{}
+			}()
+		}
+		close(start)
+		<-done
+		<-done
+		if tb.HasDriftBaseline() {
+			t.Fatalf("attempt %d: two Ends on one token established the baseline while B was still in flight", attempt)
+		}
+		respB.End()
+		if !tb.HasDriftBaseline() {
+			t.Fatalf("attempt %d: B ending must establish the baseline", attempt)
+		}
+	}
+}
+
+// TestScanTools_ConcurrentFirstInventoriesDoNotDenyEachOther exercises the
+// same property through the production ScanTools path with a shared
+// DriftBaseline. It synchronizes only the goroutine start, so it makes the
+// overlap likely rather than certain; the deterministic interleaving lives in
+// TestToolBaseline_OverlappingFirstInventoriesUnion. Identical inventories
+// are deliberate: a serial schedule must also pass, since a second identical
+// first inventory after establishment introduces no new name. Before the fix
+// this failed on attempt 0 of 200, because establishment was recorded when
+// the first response BEGAN rather than when it finished.
+func TestScanTools_ConcurrentFirstInventoriesDoNotDenyEachOther(t *testing.T) {
+	sc := testScanner(t)
+	line := makeToolsResponse(`[{"name":"alpha","description":"Alpha tool."},{"name":"beta","description":"Beta tool."}]`)
+	for attempt := 0; attempt < 200; attempt++ {
+		baseline := NewToolBaseline()
+		cfg := &ToolScanConfig{Action: "warn", DetectDrift: true, DriftBaseline: baseline, NewToolAction: "block"}
+		start := make(chan struct{})
+		results := make(chan ToolScanResult, 2)
+		for i := 0; i < 2; i++ {
+			go func() {
+				<-start
+				results <- ScanTools(line, sc, cfg)
+			}()
+		}
+		close(start)
+		for i := 0; i < 2; i++ {
+			r := <-results
+			for _, m := range r.Matches {
+				for _, c := range m.DriftCues {
+					if c == DriftCueNewTool {
+						t.Fatalf("attempt %d: a concurrent first inventory was denied as a new tool: %+v", attempt, r.Matches)
+					}
+				}
+			}
+		}
+		if !baseline.HasDriftBaseline() {
+			t.Fatalf("attempt %d: two completed first inventories must leave the baseline established", attempt)
+		}
+		// A name introduced AFTER both first inventories completed is still
+		// withheld: the fix must not widen the first-inventory window past
+		// the responses that actually overlapped.
+		later := makeToolsResponse(`[{"name":"alpha","description":"Alpha tool."},{"name":"beta","description":"Beta tool."},{"name":"gamma","description":"Gamma tool."}]`)
+		r := ScanTools(later, sc, cfg)
+		withheld := false
+		for _, m := range r.Matches {
+			if m.ToolName == "gamma" {
+				for _, c := range m.DriftCues {
+					if c == DriftCueNewTool {
+						withheld = true
+					}
+				}
+			}
+		}
+		if !withheld {
+			t.Fatalf("attempt %d: gamma introduced after the baseline must be withheld under block, got %+v", attempt, r.Matches)
+		}
 	}
 }
