@@ -111,6 +111,46 @@ jobs:
             --exclude sdk/conformance/testdata/aarp-corpus/ \
             < "${diff_file}"
 
+  # Pull requests skip the Go 1.26 lane by default (see the producer jobs
+  # below), but a PR that changes CI policy, Go pins, or the guard that checks
+  # them must still prove both versions before merge -- the whole reason the
+  # 1.26 lane is being skipped elsewhere is that it never catches anything
+  # OTHER than a real toolchain change, and this is exactly that case. Uses a
+  # job-level output (not a workflow-level `paths:` trigger filter) because a
+  # `paths:`-filtered workflow run is entirely skipped rather than reporting a
+  # check, and a skipped workflow leaves a required check permanently pending
+  # instead of green.
+  changed-files:
+    needs: [security-scan]
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ci_policy: ${{ steps.check.outputs.ci_policy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect CI-policy file changes
+        id: check
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
+            .github/workflows/ go.mod go.sum scripts/check-go-matrix.sh)"
+          if [ -n "$changed" ]; then
+            echo "PR touches CI-policy files:"
+            printf '%s\n' "$changed"
+            echo "ci_policy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "PR touches no CI-policy files"
+            echo "ci_policy=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # Keep each Go minor in a separate producer. A matrix-level aggregate cannot
   # distinguish which minor failed: its single result is red for either one.
   test-oss-go125:
@@ -168,7 +208,14 @@ jobs:
           exit "$test_status"
 
   test-oss-go126:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Pull requests run only the Go 1.25 floor unless the PR itself touches
+    # CI policy / Go pins (see the changed-files job); this Go 1.26 lane
+    # otherwise runs on push to main (and is proven again, pinned, in
+    # release.yaml before a tag). Three days of PR history showed this lane
+    # catching only timing flakes, never a version-specific failure, so
+    # duplicating it on every ordinary PR was pure runner-queue contention.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name != 'pull_request' || needs.changed-files.outputs.ci_policy == 'true') }}
     runs-on: ubuntu-latest
     name: test-oss (1.26, ${{ matrix.shard }})
     timeout-minutes: 20
@@ -282,7 +329,14 @@ jobs:
           fail_ci_if_error: false
 
   test-enterprise-go126:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Pull requests run only the Go 1.25 floor unless the PR itself touches
+    # CI policy / Go pins (see the changed-files job); this Go 1.26 lane
+    # otherwise runs on push to main (and is proven again, pinned, in
+    # release.yaml before a tag). Three days of PR history showed this lane
+    # catching only timing flakes, never a version-specific failure, so
+    # duplicating it on every ordinary PR was pure runner-queue contention.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name != 'pull_request' || needs.changed-files.outputs.ci_policy == 'true') }}
     runs-on: ubuntu-latest
     name: test-enterprise (1.26, ${{ matrix.shard }})
     timeout-minutes: 20
@@ -384,6 +438,14 @@ jobs:
 
   test-replay-go126:
     needs: [security-scan]
+    # NOT gated behind the changed-files check the two heavy shard matrices
+    # below use: the CI topology contract (scripts/test_ci_workflow_topology.py)
+    # requires this job's needs to be exactly {security-scan}, because the
+    # test-go126 aggregate's fail-closed gate must be able to demand this
+    # single cheap job's real success unconditionally. It is also five minutes
+    # of "make test-replay-harness" with no shard fan-out, so skipping it on
+    # ordinary PRs was never where the runner-queue contention came from --
+    # that was the twelve 20-minute race-test shard jobs below.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -421,18 +483,54 @@ jobs:
     needs: [security-scan, test-oss-go126, test-enterprise-go126, test-replay-go126]
     if: ${{ always() }}
     runs-on: ubuntu-latest
+    # "test (1.26)" is a required check name on every PR (see the branch
+    # ruleset), so it must exist and complete on pull_request events even
+    # though test-oss-go126/test-enterprise-go126 are skipped there on
+    # ordinary PRs. This job's `needs` is exactly {security-scan, the three
+    # go126 producers} per the CI topology contract
+    # (scripts/test_ci_workflow_topology.py) -- it does NOT also depend on
+    # changed-files, so it cannot read that job's output directly. It does
+    # not need to: a producer's own `if:` only ever lets it report "skipped"
+    # when the event is pull_request AND changed-files said no CI-policy file
+    # changed, so seeing "skipped" here on a pull_request already proves that
+    # was a safe, intentional skip -- there is no other way to reach it. A
+    # push to main, or a pull_request that DID touch CI policy (so the
+    # producer actually ran), still demands a real "success".
     name: test (1.26)
     timeout-minutes: 5
     steps:
       - name: Required check compatibility gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          echo "security-scan result: ${{ needs.security-scan.result }}"
-          echo "test-oss-go126 result: ${{ needs.test-oss-go126.result }}"
-          echo "test-enterprise-go126 result: ${{ needs.test-enterprise-go126.result }}"
-          echo "test-replay-go126 result: ${{ needs.test-replay-go126.result }}"
+          set -u
+          # A bare `test ... || { ... }` compound does NOT reliably exit under
+          # bash's real -e semantics: a failing command on the left of `||`
+          # never triggers errexit, and neither does the right-hand block when
+          # its own last command fails as part of a further `&&`
+          # short-circuit. That combination let this gate print its own
+          # per-producer diagnostics and still exit 0 -- reproduced with an
+          # actual `bash -eo pipefail` run (GitHub Actions' real default
+          # shell) for a failed, an unknown, and an unexpectedly-skipped
+          # producer result. Every non-success path below exits explicitly
+          # instead of relying on the compound's own exit status.
           test "${{ needs.security-scan.result }}" = "success"
-          test "${{ needs.test-oss-go126.result }}" = "success"
-          test "${{ needs.test-enterprise-go126.result }}" = "success"
+
+          echo "test-oss-go126 result: ${{ needs.test-oss-go126.result }}"
+          if ! test "${{ needs.test-oss-go126.result }}" = "success"; then
+            if [ "$EVENT_NAME" != "pull_request" ] || [ "${{ needs.test-oss-go126.result }}" != "skipped" ]; then
+              exit 1
+            fi
+          fi
+
+          echo "test-enterprise-go126 result: ${{ needs.test-enterprise-go126.result }}"
+          if ! test "${{ needs.test-enterprise-go126.result }}" = "success"; then
+            if [ "$EVENT_NAME" != "pull_request" ] || [ "${{ needs.test-enterprise-go126.result }}" != "skipped" ]; then
+              exit 1
+            fi
+          fi
+
+          echo "test-replay-go126 result: ${{ needs.test-replay-go126.result }}"
           test "${{ needs.test-replay-go126.result }}" = "success"
 
   test-macos:
@@ -794,6 +892,9 @@ jobs:
 
       - name: Codecov upload count matches the shard matrix
         run: bash scripts/check-codecov-upload-count.sh
+
+      - name: Release workflow proves every Go minor main proves
+        run: bash scripts/check-go-matrix.sh
 
       - name: Config example startability policy
         run: bash scripts/check-config-examples.sh
