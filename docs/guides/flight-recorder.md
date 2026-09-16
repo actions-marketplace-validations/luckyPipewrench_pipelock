@@ -17,13 +17,31 @@ and forensic replay.
 
 ## Whole-Corpus Auditor
 
-On Linux, `pipelock init` installs and enables the user-systemd
-`pipelock-evidence-corpus-auditor.timer`. Every 15 minutes it runs
-`pipelock evidence doctor` across the configured recorder directory and writes
-`pipelock_evidence_corpus_integrity_ok` plus its audit timestamp in Prometheus
-textfile format. The generated alert rule is
+On Linux, `pipelock init` prints a disclosure naming the unit and then installs
+and enables the user-systemd `pipelock-evidence-corpus-auditor.timer`. Every 15
+minutes it runs `pipelock evidence doctor` across the configured recorder
+directory and writes `pipelock_evidence_corpus_integrity_ok` plus its audit
+timestamp in Prometheus textfile format. The generated alert rule is
 `PipelockEvidenceCorpusIntegrityFailed` under
 `$XDG_CONFIG_HOME/pipelock/prometheus/rules/`.
+
+Pass `--no-auditor` to `pipelock init` to skip installing it, or `--dry-run` to
+see what would be installed without installing anything. If the host has no
+usable `systemd --user` session (no `systemctl` binary, no `XDG_RUNTIME_DIR`,
+or the session bus is unreachable), init skips the auditor with a printed
+notice instead of failing. Stop and disable an installed timer with
+`systemctl --user disable --now pipelock-evidence-corpus-auditor.timer`; that
+leaves the generated unit, alert and metric files in place but inert, so delete
+them under `$XDG_CONFIG_HOME/systemd/user/` and
+`$XDG_CONFIG_HOME/pipelock/prometheus/` if you want them gone. The
+init summary names the auditor's outcome either way (installed, skipped by
+flag, skipped because no user systemd session exists, skipped because an
+existing config configures no `flight_recorder.dir` to audit, skipped because
+an existing config could not be read, or skipped for a dry run). A cancelled
+run fails rather than reporting a skip, and a disclosure that cannot be written
+fails before anything is installed. Under `--json` the outcome is also reported in the
+`evidence_corpus_auditor` object, and the disclosure is written to stderr so
+stdout stays a single JSON document.
 
 Point the Prometheus node-exporter textfile collector at
 `$XDG_CONFIG_HOME/pipelock/prometheus/textfile/`, and add a rule-file GLOB such
