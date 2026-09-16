@@ -32,7 +32,7 @@
   <img src="assets/demo.gif" alt="Pipelock blocking a live secret-exfiltration attempt from an AI agent" width="900">
 </div>
 
-Pipelock sits between AI agents and the network. It inspects mediated HTTP, WebSocket, MCP, and A2A traffic, plus CONNECT tunnel contents when TLS interception is enabled, for secret exfiltration, prompt injection, SSRF, tool poisoning, and risky tool-call chains. Plain CONNECT without interception is scanned at the hostname and URL level.
+Pipelock sits between AI agents and the network. It inspects mediated HTTP, WebSocket, MCP, and A2A traffic, plus CONNECT tunnel contents when TLS interception is enabled, for secret exfiltration, prompt injection, SSRF, tool poisoning, and risky tool-call chains. Plain CONNECT without interception is scanned at the hostname and URL level. Configured MCP upstreams are an exception to private-address SSRF blocking: local/private servers are allowed, but cloud metadata endpoints remain blocked.
 
 Pipelock emits mediator-signed [action receipts](https://pipelab.org/learn/action-receipt-spec/) over content-aware boundary decisions, so a reviewer can verify what Pipelock decided outside the agent runtime. The public [agent-egress-bench](https://github.com/luckyPipewrench/agent-egress-bench) corpus exercises the detections. The [Gauntlet](https://github.com/luckyPipewrench/pipelock/actions/workflows/continuous-gauntlet.yaml) workflow is the product's scheduled candidate exam against a pinned corpus commit; it does not auto-publish a public score. Learn more: [Open-source AI firewall](https://pipelab.org/learn/open-source-ai-firewall/).
 
@@ -268,7 +268,7 @@ Canonical comparison hub: [AI runtime security comparison](https://pipelab.org/c
 |--------|----------|
 | ASI01 Agent Goal Hijack | **Strong:** bidirectional MCP + response scanning |
 | ASI02 Tool Misuse | **Partial:** proxy as controlled tool, MCP scanning |
-| ASI03 Identity & Privilege Abuse | **Strong:** capability separation + SSRF protection |
+| ASI03 Identity & Privilege Abuse | **Strong:** capability separation + SSRF protection; configured MCP upstreams allow local/private servers but still block cloud metadata endpoints |
 | ASI04 Supply Chain Vulnerabilities | **Partial:** integrity monitoring + MCP scanning |
 | ASI05 Unexpected Code Execution | **Moderate:** HITL approval, fail-closed defaults |
 | ASI06 Memory & Context Poisoning | **Moderate:** injection detection + session taint propagation |
@@ -431,7 +431,7 @@ All detection, enforcement, containment, receipt verification, and the free sing
 | Capability | Free | Pro | Enterprise |
 |---|:--:|:--:|:--:|
 | Scanning and detection (ordered URL pipeline, DLP, injection, SSRF, streaming SSE, redaction, address protection) | Yes | Yes | Yes |
-| MCP and A2A scanning (input, response, tool policy, tool chain, poisoning, integrity, authenticated listeners) | Yes | Yes | Yes |
+| MCP and A2A scanning (input, response, tool policy, tool chain, poisoning, integrity, authenticated listeners; configured upstreams allow local/private servers and still block cloud metadata) | Yes | Yes | Yes |
 | Containment, sandbox, host `contain`, 6-source kill switch | Yes | Yes | Yes |
 | Action receipts, flight recorder, anchors, free evidence viewer, `verify-cert`, standalone verifier | Yes | Yes | Yes |
 | Canary tokens, skill-scan, `explain`, single-instance Prometheus and Grafana | Yes | Yes | Yes |
