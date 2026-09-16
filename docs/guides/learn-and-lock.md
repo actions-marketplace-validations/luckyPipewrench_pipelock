@@ -316,8 +316,8 @@ Once an active manifest is promoted, the runtime gates every URL-bearing transpo
 | Intercept proxy | yes | n/a | TLS-intercepted CONNECT path. |
 | `/fetch` | yes | n/a | Target URL from query parameter. |
 | WebSocket `/ws` | yes (handshake) | n/a | Per-frame scanning unchanged. |
-| MCP HTTP listener (`--listen --upstream`) | yes (configured upstream) | yes (per `tools/call`) | |
-| MCP stdio-to-HTTP bridge (`--upstream`) | yes (configured upstream) | yes (per `tools/call`) | |
+| MCP HTTP listener (`--listen --upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed; cloud metadata endpoints blocked. |
+| MCP stdio-to-HTTP bridge (`--upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed; cloud metadata endpoints blocked. |
 | MCP stdio subprocess wrap (`-- COMMAND`) | n/a (no remote URL) | yes (per `tools/call`) | Denied tool calls return a JSON-RPC error with block-reason metadata; subprocess is not invoked. |
 
 **Block-reason vocabulary additions:**
