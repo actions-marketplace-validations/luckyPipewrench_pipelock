@@ -63,11 +63,31 @@ type initSetupResult struct {
 }
 
 type initAuditorResult struct {
-	ServicePath string `json:"service_path"`
-	TimerPath   string `json:"timer_path"`
-	AlertPath   string `json:"alert_path"`
-	MetricPath  string `json:"metric_path"`
+	Status      string `json:"status"`
+	Detail      string `json:"detail,omitempty"`
+	ServicePath string `json:"service_path,omitempty"`
+	TimerPath   string `json:"timer_path,omitempty"`
+	AlertPath   string `json:"alert_path,omitempty"`
+	MetricPath  string `json:"metric_path,omitempty"`
 }
+
+// Auditor phase status values reported in the init summary and JSON output.
+const (
+	auditorStatusInstalled        = "installed"
+	auditorStatusSkippedFlag      = "skipped_flag"
+	auditorStatusSkippedDryRun    = "skipped_dry_run"
+	auditorStatusSkippedNoSystemd = "skipped_no_systemd"
+	// An existing config that cannot be loaded, or that configures no
+	// flight_recorder.dir, leaves nothing for the auditor to watch. That
+	// outcome still gets a status: "not installed" must never be reported by
+	// saying nothing at all.
+	auditorStatusSkippedNoRecorderDir = "skipped_no_recorder_dir"
+	// An existing config that will not load at all is a different outcome from
+	// one that loads and configures no directory. Reporting both as
+	// "no recorder dir" hides a malformed or unreadable file behind a reason
+	// that is not true of it.
+	auditorStatusSkippedUnreadableConfig = "skipped_unreadable_config"
+)
 
 type initVerifyResult struct {
 	Passed  int    `json:"passed"`
@@ -93,6 +113,7 @@ func InitCmd() *cobra.Command {
 		output       string
 		jsonOutput   bool
 		scanHome     string
+		noAuditor    bool
 	)
 
 	cmd := &cobra.Command{
@@ -113,7 +134,8 @@ Examples:
   pipelock init --preset strict
   pipelock init --dry-run
   pipelock init --output ./pipelock.yaml
-  pipelock init --skip-canary --skip-validate`,
+  pipelock init --skip-canary --skip-validate
+  pipelock init --no-auditor`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runInit(cmd, initOptions{
@@ -125,6 +147,7 @@ Examples:
 				output:       output,
 				jsonOutput:   jsonOutput,
 				scanHome:     scanHome,
+				noAuditor:    noAuditor,
 			})
 		},
 	}
@@ -137,6 +160,7 @@ Examples:
 	cmd.Flags().StringVarP(&output, "output", "o", "", "config output path (default: OS config dir)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "machine-readable JSON output")
 	cmd.Flags().StringVar(&scanHome, "scan-home", "", "override home directory for discovery (default: $HOME)")
+	cmd.Flags().BoolVar(&noAuditor, "no-auditor", false, "skip installing the evidence corpus auditor timer")
 
 	cmd.AddCommand(SidecarCmd())
 
@@ -152,6 +176,7 @@ type initOptions struct {
 	output       string
 	jsonOutput   bool
 	scanHome     string
+	noAuditor    bool
 }
 
 func runInit(cmd *cobra.Command, opts initOptions) error {
@@ -262,33 +287,12 @@ func runInit(cmd *cobra.Command, opts initOptions) error {
 			}
 		}
 	}
-	if !opts.dryRun && runtime.GOOS == "linux" {
-		auditorRecorderDir := cfg.FlightRecorder.Dir
-		installAuditor := result.Setup.Written
-		if result.Setup.SkippedExsting {
-			// Preserve init's historic no-op behavior for an arbitrary existing
-			// config. A previously generated, valid config is enough to repair a
-			// missing managed auditor on rerun without rewriting the config.
-			if existing, loadErr := config.Load(configPath); loadErr == nil && existing.FlightRecorder.Dir != "" {
-				auditorRecorderDir = existing.FlightRecorder.Dir
-				installAuditor = true
-			}
+	if runtime.GOOS == "linux" {
+		auditorResult, auditorErr := runEvidenceAuditorPhase(cmd, opts, cfg, result, configPath, w)
+		if auditorErr != nil {
+			return cliutil.ExitCodeError(initExitError, fmt.Errorf("installing evidence corpus auditor: %w", auditorErr))
 		}
-		if installAuditor {
-			installed, installErr := installEvidenceCorpusAuditor(cmd.Context(), auditorRecorderDir)
-			if installErr != nil {
-				return cliutil.ExitCodeError(initExitError, fmt.Errorf("installing evidence corpus auditor: %w", installErr))
-			}
-			result.Auditor = &initAuditorResult{
-				ServicePath: installed.ServicePath,
-				TimerPath:   installed.TimerPath,
-				AlertPath:   installed.AlertPath,
-				MetricPath:  installed.MetricPath,
-			}
-			if !opts.jsonOutput {
-				_, _ = fmt.Fprintf(w, "  Evidence corpus auditor timer installed: %s\n\n", installed.TimerPath)
-			}
-		}
+		result.Auditor = auditorResult
 	}
 
 	// Phase 3: Validate config
@@ -356,6 +360,124 @@ func runInit(cmd *cobra.Command, opts initOptions) error {
 	}
 
 	return nil
+}
+
+// evidenceAuditorInstall is the seam for the install itself. The disclosure
+// contract is "nothing lands before it is named", and the first thing that
+// lands is a managed file written inside the installer -- well before it runs
+// systemctl. Asserting order against the systemctl seam or the post-install
+// message therefore cannot catch a disclosure printed after the first write,
+// so the ordering test hooks the installer entry point instead.
+var evidenceAuditorInstall = installEvidenceCorpusAuditor
+
+// runEvidenceAuditorPhase decides and, unless skipped, performs the evidence
+// corpus auditor install for `pipelock init`. It is on Linux by default:
+// --no-auditor opts out, --dry-run installs nothing, and a host with no
+// usable systemd --user session is skipped with a printed notice rather than
+// failing init outright. The disclosure is printed before any install call so
+// nothing lands on the system unannounced.
+func runEvidenceAuditorPhase(cmd *cobra.Command, opts initOptions, cfg *config.Config, result *initResult, configPath string, w io.Writer) (*initAuditorResult, error) {
+	if opts.noAuditor {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintln(w, "  Evidence corpus auditor: skipped (--no-auditor)")
+			_, _ = fmt.Fprintln(w)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedFlag}, nil
+	}
+
+	if opts.dryRun {
+		// Both surfaces must read as a plan, not as an action. The bare
+		// disclosure starts with "Installing", which is false under --dry-run
+		// and was previously handed to JSON consumers verbatim.
+		// The plan is conditional and must say so. Dry run deliberately runs no
+		// probe (so it starts nothing and writes nothing), which means it
+		// cannot know whether this host has a usable systemd --user session;
+		// claiming a flat "would install" told operators on a container or a
+		// recorder-less config that a real run would install something it
+		// would in fact skip.
+		planned := "Would install " + evidenceAuditorDisclosure[len("Installing "):]
+		planned += " A real run installs it only on Linux with a usable systemd --user session and a configured flight_recorder.dir, and names the skip reason otherwise."
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  %s\n\n", planned)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedDryRun, Detail: planned}, nil
+	}
+
+	if unavailable, reason := evidenceAuditorUserSystemdUnavailable(cmd.Context()); unavailable {
+		// The probe reports one boolean, so it cannot distinguish "this host
+		// has no user session" from "we were cancelled while asking". Only the
+		// context can. Without this check an interrupted init exits zero and
+		// reports a clean skip, which tells the operator the host lacks
+		// systemd when nothing of the sort was established.
+		if ctxErr := cmd.Context().Err(); ctxErr != nil {
+			return nil, fmt.Errorf("probing systemd --user: %w", ctxErr)
+		}
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Evidence corpus auditor: skipped (%s)\n\n", reason)
+		}
+		return &initAuditorResult{Status: auditorStatusSkippedNoSystemd, Detail: reason}, nil
+	}
+
+	auditorRecorderDir := cfg.FlightRecorder.Dir
+	installAuditor := result.Setup.Written
+	skipStatus := auditorStatusSkippedNoRecorderDir
+	skipReason := "existing config configures no flight_recorder.dir to audit"
+	if result.Setup.SkippedExsting {
+		// Preserve init's historic no-op behavior for an arbitrary existing
+		// config. A previously generated, valid config is enough to repair a
+		// missing managed auditor on rerun without rewriting the config.
+		existing, loadErr := config.Load(configPath)
+		switch {
+		case loadErr != nil:
+			skipStatus = auditorStatusSkippedUnreadableConfig
+			skipReason = fmt.Sprintf("existing config could not be read: %v", loadErr)
+		case existing.FlightRecorder.Dir != "":
+			auditorRecorderDir = existing.FlightRecorder.Dir
+			installAuditor = true
+		}
+	}
+	if !installAuditor {
+		if !opts.jsonOutput {
+			_, _ = fmt.Fprintf(w, "  Evidence corpus auditor: skipped (%s)\n\n", skipReason)
+		}
+		return &initAuditorResult{Status: skipStatus, Detail: skipReason}, nil
+	}
+
+	// Disclose BEFORE installing: name the unit, what it does, and how to
+	// remove it, so an operator sees this before anything is enabled. Under
+	// --json the disclosure goes to stderr rather than being dropped: stdout
+	// stays a single valid JSON document for machine consumers, and the
+	// consent contract still holds for the operator watching the terminal.
+	// Suppressing it entirely meant --json enabled a timer having named it
+	// nowhere until after the unit was already running.
+	// The disclosure is the whole consent boundary, so a write that failed
+	// means the operator was never told. Discarding that error installed the
+	// timer anyway against a broken pipe or a rejecting writer, which is the
+	// one outcome this phase exists to prevent.
+	var disclosureErr error
+	if opts.jsonOutput {
+		_, disclosureErr = fmt.Fprintf(cmd.ErrOrStderr(), "%s\n", evidenceAuditorDisclosure)
+	} else {
+		_, disclosureErr = fmt.Fprintf(w, "  %s\n", evidenceAuditorDisclosure)
+	}
+	if disclosureErr != nil {
+		return nil, fmt.Errorf("writing evidence auditor disclosure: %w", disclosureErr)
+	}
+
+	installed, err := evidenceAuditorInstall(cmd.Context(), auditorRecorderDir)
+	if err != nil {
+		return nil, err
+	}
+	if !opts.jsonOutput {
+		_, _ = fmt.Fprintf(w, "  Evidence corpus auditor timer installed: %s\n\n", installed.TimerPath)
+	}
+	return &initAuditorResult{
+		Status:      auditorStatusInstalled,
+		ServicePath: installed.ServicePath,
+		TimerPath:   installed.TimerPath,
+		AlertPath:   installed.AlertPath,
+		MetricPath:  installed.MetricPath,
+	}, nil
 }
 
 func printDiscoverPhase(w io.Writer, report *discover.Report) {
@@ -614,6 +736,20 @@ func printProof(w interface{ Write([]byte) (int, error) }, result *initResult) {
 		} else {
 			_, _ = fmt.Fprintf(w, "  Validate:           %d passed, %d failed\n",
 				result.Verify.Passed, result.Verify.Failed)
+		}
+	}
+
+	// Auditor
+	if result.Auditor != nil {
+		switch result.Auditor.Status {
+		case auditorStatusInstalled:
+			_, _ = fmt.Fprintf(w, "  Evidence auditor:   installed (%s)\n", result.Auditor.TimerPath)
+		case auditorStatusSkippedFlag:
+			_, _ = fmt.Fprintln(w, "  Evidence auditor:   skipped (--no-auditor)")
+		case auditorStatusSkippedDryRun:
+			_, _ = fmt.Fprintln(w, "  Evidence auditor:   skipped (dry run)")
+		case auditorStatusSkippedNoSystemd, auditorStatusSkippedNoRecorderDir:
+			_, _ = fmt.Fprintf(w, "  Evidence auditor:   skipped (%s)\n", result.Auditor.Detail)
 		}
 	}
 
