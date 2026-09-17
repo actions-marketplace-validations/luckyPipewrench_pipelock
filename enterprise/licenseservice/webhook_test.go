@@ -12,7 +12,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -105,6 +104,31 @@ func newTestSetup(t *testing.T) *testSetup {
 		w.Header().Set("Content-Type", "application/json")
 		if strings.HasPrefix(r.URL.Path, "/v1/orders/") {
 			orderID := strings.TrimPrefix(r.URL.Path, "/v1/orders/")
+			// order_trial_refund_<full|partial>_<label>: a paid Pro trial
+			// order already refunded (full or partial) so tests can drive
+			// HandleOrderRefundEvent's revocation path directly, the way
+			// the slot-immutability tests do.
+			if rest, ok := strings.CutPrefix(orderID, "order_trial_refund_"); ok {
+				status := orderStatusRefunded
+				refundedAmount := 100
+				if strings.HasPrefix(rest, "partial_") {
+					status = orderStatusPartiallyRefunded
+					refundedAmount = 40
+				}
+				_, _ = fmt.Fprintf(w, `{
+					"id": %q,
+					"billing_reason": "purchase",
+					"status": %q,
+					"paid": true,
+					"total_amount": 100,
+					"net_amount": 100,
+					"refunded_amount": %d,
+					"currency": "usd",
+					"customer": {"email": "trial-slot-immutable@example.com", "metadata": {}},
+					"product": {"id": "prod_trial", "name": "Pipelock Pro Trial", "metadata": {"pipelock_tier": "trial"}}
+				}`, orderID, status, refundedAmount)
+				return
+			}
 			if strings.HasPrefix(orderID, "order_enterprise_trial_") {
 				tier := tierEnterpriseTrial
 				if orderID == "order_enterprise_trial_unknown_tier" {
@@ -3263,9 +3287,41 @@ func TestHandleOrderEvent_EnterpriseTrial(t *testing.T) {
 		t.Fatalf("second active enterprise trial minted an entitlement: %+v", duplicate)
 	}
 
-	first.CurrentPeriodEnd = time.Now().Add(-time.Minute)
-	if err := ts.db.Upsert(ctx, first); err != nil {
-		t.Fatalf("expire first enterprise trial: %v", err)
+	// Simulate that the slot-owned claim window has passed.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE subscription_id = ?`,
+		first.SubscriptionID,
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial enterprise trial slot: %v", err)
+	}
+	if initialSlotOwner != first.SubscriptionID {
+		t.Fatalf("initial enterprise trial slot owner = %q, want %q", initialSlotOwner, first.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE subscription_id = ?`,
+		expiredAt, first.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("expire first enterprise trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("expire first enterprise trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, first.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the first enterprise trial: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the first enterprise trial affected %d rows, want 1: %v", affected, err)
 	}
 	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_after_expiry")); err != nil {
 		t.Fatalf("HandleOrderEvent enterprise trial after expiry: %v", err)
@@ -3352,9 +3408,46 @@ func TestHandleOrderRefund_RevokesMintedEnterpriseTrial(t *testing.T) {
 		t.Fatalf("replacement enterprise trial minted before original period ended: %+v", replacement)
 	}
 
-	refunded.CurrentPeriodEnd = time.Now().Add(-time.Minute)
-	if err := ts.db.Upsert(ctx, refunded); err != nil {
-		t.Fatalf("expire revoked enterprise trial: %v", err)
+	// Revocation must not have moved the slot's expiry (it is immutable once
+	// claimed), so aging the trial out requires advancing the SLOT itself,
+	// not the entitlement's CurrentPeriodEnd. Mutating the entitlement alone
+	// used to reopen the slot early through a since-removed sync path; this
+	// advances the slot-owned expiry to simulate a healthy expiry and prove the
+	// removed sync path does not reopen a slot early.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE normalized_email = ?`,
+		"enterprise-trial@example.com",
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial enterprise trial slot: %v", err)
+	}
+	if initialSlotOwner != entitlement.SubscriptionID {
+		t.Fatalf("initial enterprise trial slot owner = %q, want %q", initialSlotOwner, entitlement.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE normalized_email = ?`,
+		expiredAt, "enterprise-trial@example.com",
+	)
+	if err != nil {
+		t.Fatalf("age enterprise trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("age enterprise trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, entitlement.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the enterprise trial owner: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the enterprise trial owner affected %d rows, want 1: %v", affected, err)
 	}
 	if err := ts.handler.HandleOrderEvent(ctx, enterpriseTrialOrderEvent(t, "order_enterprise_trial_replacement_after_expiry")); err != nil {
 		t.Fatalf("replacement enterprise trial after original period expiry: %v", err)
@@ -3365,6 +3458,180 @@ func TestHandleOrderRefund_RevokesMintedEnterpriseTrial(t *testing.T) {
 	}
 	if replacement == nil || replacement.LastLicenseID == "" {
 		t.Fatalf("replacement enterprise trial after original period expiry did not mint: %+v", replacement)
+	}
+}
+
+// TestOneTimeTrialRevocation_SlotExpiryIsImmutable proves the decided
+// behavior for a FULL refund on a Pro trial: revoking the trial (status ->
+// revoked) must not move the trial slot's expiry. A second trial for the same
+// email stays denied until the ORIGINAL slot expiry passes, then a new trial
+// is allowed without consulting mutable entitlement state.
+func TestOneTimeTrialRevocation_SlotExpiryIsImmutable(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	const email = "trial-slot-immutable@example.com"
+	originalExpiry := time.Now().Add(30 * 24 * time.Hour).UTC()
+
+	entitlement := &Entitlement{
+		SubscriptionID:   "order_trial_refund_full_1",
+		CustomerEmail:    email,
+		ProductID:        "prod_trial",
+		Tier:             tierTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusActive,
+		CurrentPeriodEnd: originalExpiry,
+		Features:         `[]`,
+	}
+	issuance := LicenseIssuance{
+		LicenseID:      "lic_trial_refund_full_1",
+		SubscriptionID: entitlement.SubscriptionID,
+		IssuedAt:       time.Now().UTC(),
+		ExpiresAt:      originalExpiry,
+	}
+	if err := ts.db.UpsertWithLicenseIssuance(ctx, entitlement, issuance); err != nil {
+		t.Fatalf("seed pro trial: %v", err)
+	}
+
+	// Revoke via a full refund.
+	event := &PolarWebhookEvent{Type: EventOrderRefunded, Data: json.RawMessage(`{"id":"order_trial_refund_full_1"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(ctx, event, "msg_trial_refund_full_1"); err != nil {
+		t.Fatalf("HandleOrderRefundEvent: %v", err)
+	}
+	revoked, err := ts.db.GetBySubscriptionID(ctx, entitlement.SubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if revoked == nil || revoked.Status != statusRevoked {
+		t.Fatalf("revoked trial status = %+v, want %q", revoked, statusRevoked)
+	}
+
+	// The slot must still hold the ORIGINAL expiry, unmoved by revocation.
+	var gotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM active_trial_slots WHERE normalized_email = ?`, email,
+	).Scan(&gotExpiry); err != nil {
+		t.Fatalf("read slot expiry: %v", err)
+	}
+	if !gotExpiry.UTC().Equal(originalExpiry) {
+		t.Fatalf("slot expires_at = %s, want unchanged original %s", gotExpiry.UTC(), originalExpiry)
+	}
+
+	// Retry within the original window: denied.
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_20_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry within window: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_20_trial-slot-immutable"); err != nil || retry != nil {
+		t.Fatalf("retry minted before original expiry: ent=%+v err=%v", retry, err)
+	}
+
+	// Age the healthy slot past the original expiry and confirm a new trial is
+	// allowed.
+	expiredAt := time.Now().Add(-time.Minute).UTC()
+	var initialSlotOwner string
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT subscription_id FROM active_trial_slots WHERE normalized_email = ?`,
+		email,
+	).Scan(&initialSlotOwner); err != nil {
+		t.Fatalf("read initial trial slot: %v", err)
+	}
+	if initialSlotOwner != entitlement.SubscriptionID {
+		t.Fatalf("initial trial slot owner = %q, want %q", initialSlotOwner, entitlement.SubscriptionID)
+	}
+	result, err := ts.db.db.ExecContext(ctx,
+		`UPDATE active_trial_slots SET expires_at = ? WHERE normalized_email = ?`,
+		expiredAt, email,
+	)
+	if err != nil {
+		t.Fatalf("age trial slot: %v", err)
+	}
+	if affected, err := result.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("age trial slot affected %d rows, want 1: %v", affected, err)
+	}
+
+	// The slot is only half the state: aging it alone leaves the owner's trial
+	// running, and takeover refuses a slot whose owner trial has not ended. End
+	// the owner entitlement too, which is what "the first trial is over" means.
+	ownerResult, err := ts.db.db.ExecContext(ctx,
+		`UPDATE entitlements SET current_period_end = ? WHERE subscription_id = ?`,
+		expiredAt, entitlement.SubscriptionID,
+	)
+	if err != nil {
+		t.Fatalf("end the trial owner: %v", err)
+	}
+	if affected, err := ownerResult.RowsAffected(); err != nil || affected != 1 {
+		t.Fatalf("end the trial owner affected %d rows, want 1: %v", affected, err)
+	}
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_21_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry after original expiry: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_21_trial-slot-immutable"); err != nil || retry == nil || retry.LastLicenseID == "" {
+		t.Fatalf("retry after original expiry did not mint: ent=%+v err=%v", retry, err)
+	}
+}
+
+// TestOneTimeTrialCancellation_PartialRefundSlotExpiryIsImmutable mirrors the
+// revocation test above for a PARTIAL refund, the cancellation-shaped case:
+// same code path, same immutability requirement, different revocation reason.
+func TestOneTimeTrialCancellation_PartialRefundSlotExpiryIsImmutable(t *testing.T) {
+	ts := newTestSetup(t)
+	ctx := t.Context()
+	const email = "trial-slot-immutable@example.com"
+	originalExpiry := time.Now().Add(30 * 24 * time.Hour).UTC()
+
+	entitlement := &Entitlement{
+		SubscriptionID:   "order_trial_refund_partial_1",
+		CustomerEmail:    email,
+		ProductID:        "prod_trial",
+		Tier:             tierTrial,
+		BillingInterval:  billingIntervalOneTime,
+		Status:           statusActive,
+		CurrentPeriodEnd: originalExpiry,
+		Features:         `[]`,
+	}
+	issuance := LicenseIssuance{
+		LicenseID:      "lic_trial_refund_partial_1",
+		SubscriptionID: entitlement.SubscriptionID,
+		IssuedAt:       time.Now().UTC(),
+		ExpiresAt:      originalExpiry,
+	}
+	if err := ts.db.UpsertWithLicenseIssuance(ctx, entitlement, issuance); err != nil {
+		t.Fatalf("seed pro trial: %v", err)
+	}
+
+	event := &PolarWebhookEvent{Type: EventOrderUpdated, Data: json.RawMessage(`{"id":"order_trial_refund_partial_1"}`)}
+	if err := ts.handler.HandleOrderRefundEvent(ctx, event, "msg_trial_refund_partial_1"); err != nil {
+		t.Fatalf("HandleOrderRefundEvent: %v", err)
+	}
+	canceled, err := ts.db.GetBySubscriptionID(ctx, entitlement.SubscriptionID)
+	if err != nil {
+		t.Fatalf("GetBySubscriptionID: %v", err)
+	}
+	if canceled == nil || canceled.Status != statusRevoked {
+		t.Fatalf("partially-refunded trial status = %+v, want %q", canceled, statusRevoked)
+	}
+	revocations, err := ts.db.ListLicenseRevocations(ctx)
+	if err != nil {
+		t.Fatalf("ListLicenseRevocations: %v", err)
+	}
+	if len(revocations) != 1 || revocations[0].Reason != "order_partially_refunded" {
+		t.Fatalf("revocations = %+v, want one partial-refund revocation", revocations)
+	}
+
+	var gotExpiry time.Time
+	if err := ts.db.db.QueryRowContext(ctx,
+		`SELECT expires_at FROM active_trial_slots WHERE normalized_email = ?`, email,
+	).Scan(&gotExpiry); err != nil {
+		t.Fatalf("read slot expiry: %v", err)
+	}
+	if !gotExpiry.UTC().Equal(originalExpiry) {
+		t.Fatalf("slot expires_at = %s, want unchanged original %s", gotExpiry.UTC(), originalExpiry)
+	}
+
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_22_trial-slot-immutable", email)); err != nil {
+		t.Fatalf("retry within window: %v", err)
+	}
+	if retry, err := ts.db.GetBySubscriptionID(ctx, "order_free_22_trial-slot-immutable"); err != nil || retry != nil {
+		t.Fatalf("retry minted before original expiry: ent=%+v err=%v", retry, err)
 	}
 }
 
@@ -3535,22 +3802,57 @@ func TestHandleOrderEvent_EnterpriseTrialRefusesUnknownMetadataTier(t *testing.T
 	}
 }
 
-func TestHandleOrderEvent_EnterpriseTrialCountErrorFailsClosed(t *testing.T) {
+// TestHandleOrderEvent_EnterpriseTrialCountEligibilityRetired proves the
+// retired entitlements-table pre-count is no longer consulted for
+// eligibility: forcing it to fail no longer affects whether a trial mints,
+// because the atomic slot claim is the sole authority now.
+type countEligibilityError struct {
+	calls atomic.Int32
+}
+
+func (e *countEligibilityError) Error() string {
+	e.calls.Add(1)
+	return "forced count failure"
+}
+
+// assertCountEligibilityNotConsulted proves the mint path never consults the
+// retired entitlements-table count. The injected error counts Error() calls:
+// production formats the error into its wrapper ("count active %s for %s: %w"),
+// so any consultation by the mint path increments the counter. A direct call
+// through the same helper is the positive control: if the counting error or the
+// read path is ever too broken to detect a call, the assertion reports that
+// instead of passing vacuously.
+func assertCountEligibilityNotConsulted(t *testing.T, db *EntitlementDB, countErr *countEligibilityError, tier, email string) {
+	t.Helper()
+	calls := countErr.calls.Load()
+	if calls != 0 {
+		t.Fatalf("retired count helper was consulted %d time(s) during mint; eligibility must come from the atomic slot claim alone", calls)
+	}
+	if _, err := db.CountActiveTierForEmail(t.Context(), tier, email, time.Now()); err == nil {
+		t.Fatal("counting error stopped being returned by the count helper; this assertion can no longer detect consultation")
+	}
+	if got := countErr.calls.Load(); got <= calls {
+		t.Fatalf("count-helper probe did not register (calls %d -> %d); consultation would go undetected", calls, got)
+	}
+}
+
+func TestHandleOrderEvent_EnterpriseTrialCountEligibilityRetired(t *testing.T) {
 	ts := newTestSetup(t)
-	errForceCountActiveTier = errors.New("forced count failure")
+	countErr := &countEligibilityError{}
+	errForceCountActiveTier = countErr
 	t.Cleanup(func() { errForceCountActiveTier = nil })
 
-	err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, "order_enterprise_trial_count_error"))
-	if err == nil || !strings.Contains(err.Error(), "count active enterprise_trial") {
-		t.Fatalf("expected enterprise trial count failure, got %v", err)
+	if err := ts.handler.HandleOrderEvent(t.Context(), enterpriseTrialOrderEvent(t, "order_enterprise_trial_count_error")); err != nil {
+		t.Fatalf("HandleOrderEvent must not consult the retired count path: %v", err)
 	}
 	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_enterprise_trial_count_error")
 	if dbErr != nil {
 		t.Fatalf("GetBySubscriptionID: %v", dbErr)
 	}
-	if ent != nil {
-		t.Fatalf("enterprise trial minted after a count error: %+v", ent)
+	if ent == nil {
+		t.Fatal("enterprise trial did not mint despite a forced, now-irrelevant count failure")
 	}
+	assertCountEligibilityNotConsulted(t, ts.db, countErr, tierEnterpriseTrial, ent.CustomerEmail)
 }
 
 func TestHandleOrderEvent_ZeroAmountTrialMintsOncePerEmail(t *testing.T) {
@@ -3632,9 +3934,10 @@ func TestHandleOrderEvent_ZeroAmountTrialMintsOncePerEmail(t *testing.T) {
 }
 
 func TestHandleOrderEvent_TrialDenialSurvivesAuditLedgerFailure(t *testing.T) {
-	// A duplicate trial is still acknowledged without a mint when the audit
-	// ledger cannot record the denial; the failure is surfaced in the
-	// structured log instead of aborting webhook handling.
+	// The slot claim is now the sole eligibility authority, and its denial
+	// path (handleActiveDelivery's ErrActiveTrialExists handling) refuses to
+	// acknowledge a denial the ledger cannot record, so the provider retries
+	// rather than an unaudited refusal being silently accepted.
 	ts := newTestSetup(t)
 	ctx := t.Context()
 
@@ -3644,8 +3947,8 @@ func TestHandleOrderEvent_TrialDenialSurvivesAuditLedgerFailure(t *testing.T) {
 	if err := ts.handler.ledger.Close(); err != nil {
 		t.Fatalf("close ledger: %v", err)
 	}
-	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_8_delta", "delta@example.com")); err != nil {
-		t.Fatalf("duplicate trial with a failed ledger must still acknowledge: %v", err)
+	if err := ts.handler.HandleOrderEvent(ctx, zeroTrialOrderEvent(t, "order_free_8_delta", "delta@example.com")); err == nil {
+		t.Fatal("duplicate trial denial with a failed ledger must not be acknowledged")
 	}
 	dup, err := ts.db.GetBySubscriptionID(ctx, "order_free_8_delta")
 	if err != nil {
@@ -3751,22 +4054,25 @@ func TestHandleOrderEvent_TrialLegacyNonASCIICaseVariantRowStillCounts(t *testin
 	}
 }
 
-func TestHandleOrderEvent_TrialCountErrorFailsClosed(t *testing.T) {
+// TestHandleOrderEvent_TrialCountEligibilityRetired mirrors the enterprise
+// trial case above for the Pro trial tier.
+func TestHandleOrderEvent_TrialCountEligibilityRetired(t *testing.T) {
 	ts := newTestSetup(t)
-	errForceCountActiveTier = errors.New("forced count failure")
+	countErr := &countEligibilityError{}
+	errForceCountActiveTier = countErr
 	t.Cleanup(func() { errForceCountActiveTier = nil })
 
-	err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, "order_free_12_epsilon", "epsilon@example.com"))
-	if err == nil || !strings.Contains(err.Error(), "count active trial") {
-		t.Fatalf("expected count active trial failure, got %v", err)
+	if err := ts.handler.HandleOrderEvent(t.Context(), zeroTrialOrderEvent(t, "order_free_12_epsilon", "epsilon@example.com")); err != nil {
+		t.Fatalf("HandleOrderEvent must not consult the retired count path: %v", err)
 	}
 	ent, dbErr := ts.db.GetBySubscriptionID(t.Context(), "order_free_12_epsilon")
 	if dbErr != nil {
 		t.Fatalf("GetBySubscriptionID: %v", dbErr)
 	}
-	if ent != nil {
-		t.Fatalf("trial minted after a count error: %+v", ent)
+	if ent == nil {
+		t.Fatal("trial did not mint despite a forced, now-irrelevant count failure")
 	}
+	assertCountEligibilityNotConsulted(t, ts.db, countErr, tierTrial, ent.CustomerEmail)
 }
 
 func TestHandleOrderEvent_TrialUnnormalizableEmailFailsClosed(t *testing.T) {
