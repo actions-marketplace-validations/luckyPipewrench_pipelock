@@ -210,6 +210,13 @@ type Recorder struct {
 	durableBatch   *durableBatch
 	durableSyncing bool
 	durablePending map[uint64]int
+	// rotating is set while a size rotation inside a write waits for the old
+	// file's syncs. That wait releases mu, so every path that takes a sequence
+	// waits for it first (see awaitRotationLocked).
+	rotating bool
+	// rotationWaitHook, when set by tests, runs each time a caller starts
+	// waiting for a rotation. Callers hold mu.
+	rotationWaitHook func()
 	// lastFileName and lastFileSize describe the session's evidence file
 	// when none is open: the file closed by the last rotation, or the file a
 	// resumed session continues from. SessionWriteEnd reports them so a
@@ -707,6 +714,7 @@ func (r *Recorder) prepareAndWriteEntryWithScanLocked(e Entry, notify bool, scan
 }
 
 func (r *Recorder) prepareAndWriteEntryWithScanAndAdvanceLocked(e Entry, notify bool, scan *ReceiptScan, advance func()) (Entry, error) {
+	r.awaitRotationLocked()
 	if r.closed {
 		return Entry{}, fmt.Errorf("recorder is closed")
 	}
@@ -919,6 +927,12 @@ func (r *Recorder) runPostRecordMaintenanceLocked() error {
 		}
 	}
 	if r.fileEntryCount >= r.cfg.MaxEntriesPerFile {
+		// A size rotation in progress replaces the file; rotate only if the
+		// count still calls for it afterwards.
+		r.awaitRotationLocked()
+		if r.fileEntryCount < r.cfg.MaxEntriesPerFile {
+			return nil
+		}
 		if err := r.rotateFile(); err != nil {
 			return fmt.Errorf("rotating file: %w", err)
 		}
@@ -1148,6 +1162,7 @@ func (r *Recorder) close() (retErr error) {
 
 // checkpointLocked writes a signed checkpoint entry. Must be called with mu held.
 func (r *Recorder) checkpointLocked() error {
+	r.awaitRotationLocked()
 	if r.durableFailure != nil {
 		// A signed checkpoint would attest entries whose sync failed.
 		return fmt.Errorf("checkpoint refused: %w: %w", ErrDurabilityInherited, r.durableFailure)
@@ -1698,7 +1713,16 @@ func (r *Recorder) ensureEntryCapacityLocked(sessionID string, seq uint64, lineB
 	if info.Size()+lineBytes <= MaxEvidenceReadFileBytes {
 		return nil
 	}
-	if err := r.rotateFile(); err != nil {
+	// The caller already holds this entry's sequence. Closing the old file
+	// waits for its syncs and releases mu, so hold every other sequence-taking
+	// path until the rotation is done.
+	r.rotating = true
+	err = r.rotateFile()
+	r.rotating = false
+	if r.durableCond != nil {
+		r.durableCond.Broadcast()
+	}
+	if err != nil {
 		return err
 	}
 	if err := r.ensureFile(sessionID, seq); err != nil {
@@ -1748,7 +1772,12 @@ func (r *Recorder) closeFile() error {
 	if r.file == nil {
 		return nil
 	}
+	f := r.file
 	r.waitDurableForCurrentFileLocked()
+	if r.file != f {
+		// The wait releases mu, and another caller closed this file meanwhile.
+		return nil
+	}
 	defer func(name string) {
 		r.lastFileName = filepath.Base(name)
 		if info, err := os.Stat(name); err == nil {
@@ -1777,6 +1806,18 @@ func (r *Recorder) rotateFile() error {
 		return fmt.Errorf("rotation refused: %w: %w", ErrDurabilityInherited, r.durableFailure)
 	}
 	return r.closeFile()
+}
+
+// awaitRotationLocked waits while a write's size rotation waits for the old
+// file's syncs. A sequence taken during that wait would be the rotating
+// entry's. Callers hold mu.
+func (r *Recorder) awaitRotationLocked() {
+	for r.rotating && r.durableCond != nil {
+		if r.rotationWaitHook != nil {
+			r.rotationWaitHook()
+		}
+		r.durableCond.Wait()
+	}
 }
 
 func (r *Recorder) waitDurableForCurrentFileLocked() {
