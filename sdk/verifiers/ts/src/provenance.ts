@@ -11,7 +11,9 @@ export const EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST =
   "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7";
 export const EVIDENCE_PROVENANCE_PROFILE_V3_DIGEST =
   "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e";
-type ProfileVersion = "v1" | "v2" | "v3";
+export const EVIDENCE_PROVENANCE_PROFILE_V4_DIGEST =
+  "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37";
+type ProfileVersion = "v1" | "v2" | "v3" | "v4";
 
 const MAX_INPUT_BYTES = 2 << 20;
 const MAX_OUTPUT_BYTES = 1 << 20;
@@ -61,7 +63,9 @@ export function supportedOperationKindsForProfile(digest: string): string[] {
   return [...kinds].filter(
     (kind) =>
       (profile !== "v1" || kind !== "ascii_alphanumeric_strip") &&
-      (profile === "v3" || (kind !== "ascii_upper" && kind !== "json_unicode_escape")),
+      (profile === "v3" ||
+        profile === "v4" ||
+        (kind !== "ascii_upper" && kind !== "json_unicode_escape")),
   );
 }
 
@@ -204,6 +208,7 @@ function resolveEvidenceProvenanceProfile(digest: unknown): ProfileVersion {
   if (digest === EVIDENCE_PROVENANCE_PROFILE_V1_DIGEST) return "v1";
   if (digest === EVIDENCE_PROVENANCE_PROFILE_V2_DIGEST) return "v2";
   if (digest === EVIDENCE_PROVENANCE_PROFILE_V3_DIGEST) return "v3";
+  if (digest === EVIDENCE_PROVENANCE_PROFILE_V4_DIGEST) return "v4";
   fail("recipe: transform profile digest: unknown profile");
 }
 
@@ -226,12 +231,17 @@ export function validateEvidenceProvenanceRecipe(
     validateOperation(op, kind);
     if (kind === "ascii_alphanumeric_strip" && profile === "v1")
       fail(`recipe operation ${index} (${kind}): unsupported by transform profile`);
-    if ((kind === "ascii_upper" || kind === "json_unicode_escape") && profile !== "v3")
+    if (
+      (kind === "ascii_upper" || kind === "json_unicode_escape") &&
+      profile !== "v3" &&
+      profile !== "v4"
+    )
       fail(`recipe operation ${index} (${kind}): unsupported by transform profile`);
     if (
       (kind === "base32_decode" || kind === "base32_decode_liberal") &&
       op.alphabet !== undefined &&
-      profile !== "v3"
+      profile !== "v3" &&
+      profile !== "v4"
     )
       fail(`recipe operation ${index} (${kind}): unsupported by transform profile`);
   }
@@ -360,8 +370,8 @@ export function applyEvidenceProvenanceRecipe(
   const profile = resolveEvidenceProvenanceProfile(recipe.transform_profile_digest);
   let value = source;
   let remaining = MAX_CUMULATIVE_PROCESSED_BYTES;
-  const charge = (processed: string): void => {
-    const size = byteLength(processed);
+  const charge = (processed: string | Uint8Array): void => {
+    const size = typeof processed === "string" ? byteLength(processed) : processed.length;
     if (size > remaining) fail("recipe: exceeds cumulative processing budget");
     chargeFixtureWork(size);
     remaining -= size;
@@ -398,7 +408,38 @@ function percentDecode(value: string): string {
 function queryUnescapeOnce(value: string): string {
   return percentDecode(value.replaceAll("+", " "));
 }
-function queryUnescape(value: string, charge: (value: string) => void): string {
+function queryUnescape(
+  value: string,
+  charge: (value: string | Uint8Array) => void,
+  partial = false,
+): string {
+  if (partial) {
+    // Intermediate passes may contain an incomplete UTF-8 sequence. The
+    // profile validates UTF-8 at operation boundaries, not pass boundaries.
+    let bytes = Buffer.from(encoder.encode(value));
+    const hex = (b: number | undefined): number => {
+      if (b !== undefined && b >= 48 && b <= 57) return b - 48;
+      if (b !== undefined && b >= 65 && b <= 70) return b - 65 + 10;
+      if (b !== undefined && b >= 97 && b <= 102) return b - 97 + 10;
+      return -1;
+    };
+    for (let pass = 0; pass < 500; pass++) {
+      charge(bytes);
+      const next: number[] = [];
+      for (let i = 0; i < bytes.length; i++) {
+        const high = hex(bytes[i + 1]);
+        const low = hex(bytes[i + 2]);
+        if (bytes[i] === 37 && high >= 0 && low >= 0) {
+          next.push((high << 4) | low);
+          i += 2;
+        } else next.push(bytes[i] === 43 ? 32 : bytes[i]!);
+      }
+      const decoded = Buffer.from(next);
+      if (decoded.equals(bytes)) break;
+      bytes = decoded;
+    }
+    return text(bytes, "output");
+  }
   for (let i = 0; i < 500; i++) {
     charge(value);
     try {
@@ -565,7 +606,7 @@ function matching(value: string, profile: ProfileVersion): string {
     unicode15Normalize(confusableAscii(unicode15Normalize(stripInvisible(value), "NFKC")), "NFD"),
   );
   return mapUnicode15ExoticWhitespace(
-    profile === "v3" ? unicode15Normalize(stripped, "NFC") : stripped,
+    profile === "v3" || profile === "v4" ? unicode15Normalize(stripped, "NFC") : stripped,
   );
 }
 
@@ -684,7 +725,7 @@ function encodedTokenV1(value: string, alphabet: string): string {
   }
   return changed && result.length >= 4 ? result : "";
 }
-function htmlDecode(value: string, charge: (value: string) => void): string {
+function htmlDecode(value: string, charge: (value: string | Uint8Array) => void): string {
   // `he` ships the full WHATWG/HTML5 named-character-reference table. Its
   // non-strict text-mode decoding matches Go html.UnescapeString's liberal
   // treatment of malformed and semicolon-less references.
@@ -726,7 +767,7 @@ function rawHostname(value: string): string {
 function apply(
   value: string,
   op: Record<string, unknown>,
-  charge: (value: string) => void,
+  charge: (value: string | Uint8Array) => void,
   profile: ProfileVersion,
 ): string {
   const kind = op.kind as string;
@@ -797,7 +838,7 @@ function apply(
     case "vowel_fold":
       return value.replace(/[aeiouAEIOU]/gu, (c) => (c >= "A" && c <= "Z" ? "A" : "a"));
     case "query_unescape":
-      return queryUnescape(value, charge);
+      return queryUnescape(value, charge, profile === "v4");
     case "invisible_space":
       return stripInvisible(value, " ");
     case "matching_normalize":
@@ -841,7 +882,7 @@ function apply(
         .split("&")
         .map((x) => (x.includes("=") ? x.slice(x.indexOf("=") + 1) : ""))
         .filter(Boolean)
-        .map((item) => queryUnescape(item, charge))
+        .map((item) => queryUnescape(item, charge, profile === "v4"))
         .join("");
     case "query_subsequence": {
       const values = value
@@ -849,7 +890,7 @@ function apply(
         .map((x) => (x.includes("=") ? x.slice(x.indexOf("=") + 1) : ""))
         .filter(Boolean)
         .slice(0, 20)
-        .map((item) => queryUnescape(item, charge));
+        .map((item) => queryUnescape(item, charge, profile === "v4"));
       return (op.indices as number[])
         .map((i) => values[i] ?? fail(`query subsequence: index ${i} unavailable`))
         .join("");

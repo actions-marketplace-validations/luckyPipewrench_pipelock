@@ -783,17 +783,29 @@ func (s *Scanner) checkCoreDLPWithDecodes(parsed *url.URL, decodes *decodingMemo
 	}
 
 	// Individual query keys and values (decoded + encoding variants).
-	for key, values := range parsed.Query() {
+	for _, pair := range rawQuerySecurityPairs(parsed.RawQuery) {
+		key := pair.key
 		decodedKey := IterativeDecode(key)
-		targets = append(targets, dlpTarget{decodedKey, dlpViewLabel("url_query_key"), ""})
-		for _, d := range decodes.decode(decodedKey, false) {
-			targets = append(targets, dlpTarget{d.text, dlpViewLabel(d.encoding), ""})
+		onceKey := normalize.QueryUnescapePartial(key)
+		targets = append(targets, dlpTarget{onceKey, dlpViewLabel("url_query_key"), ""})
+		targets = append(targets, queryValueDecodedTargetsWithDecodes(onceKey, decodes)...)
+		if decodedKey != key {
+			targets = append(targets, queryValueDecodedTargetsWithDecodes(key, decodes)...)
 		}
+		targets = append(targets, dlpTarget{decodedKey, dlpViewLabel("url_query_key"), ""})
+		targets = append(targets, queryValueDecodedTargetsWithDecodes(decodedKey, decodes)...)
 		if stripped := stripURLNoise(decodedKey); stripped != decodedKey {
 			targets = append(targets, dlpTarget{stripped, dlpViewLabel("url_noise_stripped"), decodedKey})
 		}
-		for _, v := range values {
+		{
+			v := pair.value
+			once := normalize.QueryUnescapePartial(v)
+			targets = append(targets, dlpTarget{once, dlpViewLabel("url_query_value"), ""})
+			targets = append(targets, queryValueDecodedTargetsWithDecodes(once, decodes)...)
 			decoded := IterativeDecode(v)
+			if decoded != v {
+				targets = append(targets, queryValueDecodedTargetsWithDecodes(v, decodes)...)
+			}
 			targets = append(targets, dlpTarget{decoded, dlpViewLabel("url_query_value"), ""})
 			// The floor sees the same decoded views configured DLP does, so an
 			// empty configured pattern list cannot reopen an encoding.
@@ -807,6 +819,9 @@ func (s *Scanner) checkCoreDLPWithDecodes(parsed *url.URL, decodes *decodingMemo
 	// Dot-collapse hostname.
 	if hostname := parsed.Hostname(); strings.Contains(hostname, ".") {
 		targets = append(targets, dlpTarget{removeHostnameDots(hostname), dlpViewLabel("subdomain"), hostname})
+		for _, d := range decodes.decode(hostname, false) {
+			targets = append(targets, dlpTarget{d.text, dlpViewLabel(d.encoding), ""})
+		}
 	}
 
 	// Noise-stripped path.

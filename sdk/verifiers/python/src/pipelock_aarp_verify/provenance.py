@@ -28,6 +28,7 @@ PROFILE_DIGEST_V2 = (
 PROFILE_DIGEST_V3 = (
     "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
 )
+PROFILE_DIGEST_V4 = "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37"
 # Compatibility name for v1-focused callers. Recipes always dispatch from the
 # exact digest supplied on the wire and never fall back to this value.
 PROFILE_DIGEST = PROFILE_DIGEST_V1
@@ -89,6 +90,8 @@ def profile_version(digest: str) -> str:
         return "v2"
     if digest == PROFILE_DIGEST_V3:
         return "v3"
+    if digest == PROFILE_DIGEST_V4:
+        return "v4"
     raise ProvenanceError(
         f"recipe: transform profile digest: unknown profile {digest!r}"
     )
@@ -213,7 +216,7 @@ def supported_operation_kinds_for_profile(digest: str) -> tuple[str, ...]:
         kind
         for kind in _KINDS
         if (version != "v1" or kind != "ascii_alphanumeric_strip")
-        and (version == "v3" or kind not in {"ascii_upper", "json_unicode_escape"})
+        and (version in {"v3", "v4"} or kind not in {"ascii_upper", "json_unicode_escape"})
     )
 
 
@@ -316,7 +319,22 @@ def _strict_percent(value: str, plus: bool = False) -> str:
         raise ProvenanceError("output: invalid UTF-8") from exc
 
 
-def _query_unescape(value: str, charge: Callable[[str], None]) -> str:
+def _query_unescape(
+    value: str, charge: Callable[[str | bytes], None], partial: bool = False
+) -> str:
+    if partial:
+        # The profile checks UTF-8 after the operation, not between passes.
+        raw = value.encode("utf-8")
+        for _ in range(500):
+            charge(raw)
+            decoded_bytes = unquote_to_bytes(raw.replace(b"+", b" "))
+            if decoded_bytes == raw:
+                break
+            raw = decoded_bytes
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProvenanceError("output: invalid UTF-8") from exc
     for _ in range(500):
         charge(value)
         try:
@@ -444,7 +462,7 @@ class Recipe:
             raise ProvenanceError(
                 "ascii_alphanumeric_strip is unsupported by transform profile"
             )
-        if kind in {"ascii_upper", "json_unicode_escape"} and profile != "v3":
+        if kind in {"ascii_upper", "json_unicode_escape"} and profile not in {"v3", "v4"}:
             raise ProvenanceError(f"{kind} is unsupported by transform profile")
         for field in ("selector", "profile"):
             if field in op and (not isinstance(op[field], str) or _control(op[field])):
@@ -493,7 +511,7 @@ class Recipe:
         elif kind in {"base32_decode", "base64_decode", "base32_decode_liberal"}:
             allowed.add("decode_padding")
             if kind.startswith("base32") and "alphabet" in op:
-                if profile != "v3":
+                if profile not in {"v3", "v4"}:
                     raise ProvenanceError(
                         "alphabet is unsupported by transform profile"
                     )
@@ -573,9 +591,9 @@ class Recipe:
             raise ProvenanceError("recipe input: exceeds profile byte limit")
         remaining = MAX_CUMULATIVE_PROCESSED_BYTES
 
-        def charge(processed: str) -> None:
+        def charge(processed: str | bytes) -> None:
             nonlocal remaining
-            size = len(processed.encode())
+            size = len(processed.encode() if isinstance(processed, str) else processed)
             if size > remaining:
                 raise ProvenanceError("recipe: exceeds cumulative processing budget")
             if charge_fixture_work is not None:
@@ -601,7 +619,7 @@ class Recipe:
         self,
         v: str,
         op: dict[str, Any],
-        charge: Callable[[str], None],
+        charge: Callable[[str | bytes], None],
         profile: str,
     ) -> str:
         k = op["kind"]
@@ -652,7 +670,7 @@ class Recipe:
         if k == "vowel_fold":
             return v.translate(str.maketrans("aeiouAEIOU", "aaaaaAAAAA"))
         if k == "query_unescape":
-            return _query_unescape(v, charge)
+            return _query_unescape(v, charge, profile == "v4")
         if k == "invisible_space":
             return "".join(" " if _invisible(ch) else ch for ch in v)
         if k == "matching_normalize":
@@ -666,7 +684,7 @@ class Recipe:
                 for ch in unicode.normalize("NFD", normalized)
                 if unicode.category(ch) != "Mn"
             )
-            if profile == "v3":
+            if profile in {"v3", "v4"}:
                 normalized = unicode.normalize("NFC", normalized)
             return _matching_whitespace(normalized)
         if k.endswith("_liberal"):
@@ -717,13 +735,13 @@ class Recipe:
             )
         if k == "ordered_query_concat":
             return "".join(
-                _query_unescape(x.partition("=")[2], charge)
+                _query_unescape(x.partition("=")[2], charge, profile == "v4")
                 for x in v.split("&")
                 if x.partition("=")[2]
             )
         if k == "query_subsequence":
             values = [
-                _query_unescape(x.partition("=")[2], charge)
+                _query_unescape(x.partition("=")[2], charge, profile == "v4")
                 for x in v.split("&")
                 if x.partition("=")[2]
             ][:20]

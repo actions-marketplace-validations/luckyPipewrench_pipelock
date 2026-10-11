@@ -256,17 +256,16 @@ func SupportedOperationKinds() []OperationKind {
 // registered transform profile. V1 stays frozen even when a later profile adds
 // an operation.
 func SupportedOperationKindsForProfile(digest string) []OperationKind {
-	// The vocabulary is one ordered list. v1 drops the last three kinds
-	// (ascii_alphanumeric_strip, ascii_upper, json_unicode_escape). v2 drops
-	// the last two. v3 is the full list. Inserting a kind anywhere but at the
-	// end changes a published profile.
+	// Published vocabularies have fixed lengths; new kinds append to the list.
 	kinds := SupportedOperationKinds()
 	switch digest {
 	case EvidenceProvenanceProfileV1Digest:
-		return kinds[:len(kinds)-3]
+		return kinds[:27]
 	case EvidenceProvenanceProfileV2Digest:
-		return kinds[:len(kinds)-2]
+		return kinds[:28]
 	case EvidenceProvenanceProfileV3Digest:
+		return kinds[:30]
+	case EvidenceProvenanceProfileV4Digest:
 		return kinds
 	default:
 		return nil
@@ -323,7 +322,9 @@ const (
 	// EvidenceProvenanceProfileV3Digest identifies the profile that adds ASCII
 	// uppercase folding, JSON unicode-escape decoding, base32hex, and NFC
 	// recomposition of matching_normalize.
-	EvidenceProvenanceProfileV3Digest       = "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
+	EvidenceProvenanceProfileV3Digest = "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
+	// EvidenceProvenanceProfileV4Digest preserves malformed escapes during query decoding.
+	EvidenceProvenanceProfileV4Digest       = "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37"
 	evidenceProvenanceProfileMaxInputBytes  = 2 << 20
 	evidenceProvenanceProfileMaxOutputBytes = 1 << 20
 )
@@ -334,6 +335,7 @@ const (
 	transformProfileV1 transformProfileVersion = iota + 1
 	transformProfileV2
 	transformProfileV3
+	transformProfileV4
 )
 
 type transformProfile struct {
@@ -353,6 +355,9 @@ var evidenceProvenanceProfiles = map[string]transformProfile{
 	},
 	EvidenceProvenanceProfileV3Digest: {
 		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV3,
+	},
+	EvidenceProvenanceProfileV4Digest: {
+		maxInputBytes: evidenceProvenanceProfileMaxInputBytes, maxOutputBytes: evidenceProvenanceProfileMaxOutputBytes, version: transformProfileV4,
 	},
 }
 
@@ -603,7 +608,7 @@ func (op Operation) apply(value string, budget chargeBudget, profile transformPr
 	case OperationVowelFold:
 		return FoldVowels(value), nil
 	case OperationQueryUnescape:
-		return scannerQueryUnescape(value, budget)
+		return scannerQueryUnescape(value, budget, profile.version)
 	case OperationInvisibleSpace:
 		return ReplaceInvisibleWithSpace(value), nil
 	case OperationMatchingNormalize:
@@ -649,9 +654,9 @@ func (op Operation) apply(value string, budget chargeBudget, profile transformPr
 	case OperationURLNoiseStrip:
 		return scannerURLNoiseStrip(value, profile.version), nil
 	case OperationOrderedQueryConcat:
-		return scannerOrderedQueryConcat(value, budget)
+		return scannerOrderedQueryConcat(value, budget, profile.version)
 	case OperationQuerySubsequence:
-		return scannerQuerySubsequence(value, op.Indices, budget)
+		return scannerQuerySubsequence(value, op.Indices, budget, profile.version)
 	case OperationHostnameDotRemove:
 		return strings.ReplaceAll(value, ".", ""), nil
 	case OperationEncodedRun:
@@ -840,12 +845,15 @@ func (op Operation) selectURLComponent(value string) (string, error) {
 	}
 }
 
-func scannerQueryUnescape(value string, budget chargeBudget) (string, error) {
+func scannerQueryUnescape(value string, budget chargeBudget, version transformProfileVersion) (string, error) {
 	for range evidenceProvenanceScannerMaxDecodeRounds {
 		if err := budget.charge(value); err != nil {
 			return "", err
 		}
 		decoded, err := url.QueryUnescape(value)
+		if version >= transformProfileV4 {
+			decoded, err = QueryUnescapePartial(value), nil
+		}
 		if err != nil || decoded == value {
 			break
 		}
@@ -1135,12 +1143,12 @@ func scannerURLNoiseStripV1(value string) string {
 	}, value)
 }
 
-func scannerOrderedQueryConcat(rawQuery string, budget chargeBudget) (string, error) {
+func scannerOrderedQueryConcat(rawQuery string, budget chargeBudget, version transformProfileVersion) (string, error) {
 	var result strings.Builder
 	for _, pair := range strings.Split(rawQuery, "&") {
 		_, value, _ := strings.Cut(pair, "=")
 		if value != "" {
-			decoded, err := scannerQueryUnescape(value, budget)
+			decoded, err := scannerQueryUnescape(value, budget, version)
 			if err != nil {
 				return "", err
 			}
@@ -1150,12 +1158,12 @@ func scannerOrderedQueryConcat(rawQuery string, budget chargeBudget) (string, er
 	return result.String(), nil
 }
 
-func scannerQuerySubsequence(rawQuery string, indices []uint8, budget chargeBudget) (string, error) {
+func scannerQuerySubsequence(rawQuery string, indices []uint8, budget chargeBudget, version transformProfileVersion) (string, error) {
 	values := make([]string, 0, evidenceProvenanceQueryMaxValues)
 	for _, pair := range strings.Split(rawQuery, "&") {
 		_, value, _ := strings.Cut(pair, "=")
 		if value != "" {
-			decoded, err := scannerQueryUnescape(value, budget)
+			decoded, err := scannerQueryUnescape(value, budget, version)
 			if err != nil {
 				return "", err
 			}

@@ -5,7 +5,7 @@
 
 use base64::{alphabet, engine::general_purpose, Engine};
 use data_encoding::BASE32;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode, percent_decode_str};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
@@ -17,6 +17,8 @@ pub const PROFILE_DIGEST_V2: &str =
     "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7";
 pub const PROFILE_DIGEST_V3: &str =
     "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e";
+pub const PROFILE_DIGEST_V4: &str =
+    "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37";
 // Retained for v1-oriented callers; receipt replay always resolves the exact
 // supplied digest rather than falling back to this value.
 pub const PROFILE_DIGEST: &str = PROFILE_DIGEST_V1;
@@ -42,12 +44,13 @@ enum ProfileVersion {
     V1,
     V2,
     V3,
+    V4,
 }
 
 pub fn is_known_profile_digest(digest: &str) -> bool {
     matches!(
         digest,
-        PROFILE_DIGEST_V1 | PROFILE_DIGEST_V2 | PROFILE_DIGEST_V3
+        PROFILE_DIGEST_V1 | PROFILE_DIGEST_V2 | PROFILE_DIGEST_V3 | PROFILE_DIGEST_V4
     )
 }
 
@@ -70,9 +73,9 @@ impl Recipe {
             .collect::<Result<Vec<_>, _>>()?;
         for operation in &operations {
             if (profile == ProfileVersion::V1 && operation.kind == "ascii_alphanumeric_strip")
-                || (profile != ProfileVersion::V3
+                || (!matches!(profile, ProfileVersion::V3 | ProfileVersion::V4)
                     && ["ascii_upper", "json_unicode_escape"].contains(&operation.kind.as_str()))
-                || (profile != ProfileVersion::V3
+                || (!matches!(profile, ProfileVersion::V3 | ProfileVersion::V4)
                     && ["base32_decode", "base32_decode_liberal"]
                         .contains(&operation.kind.as_str())
                     && operation.fields.contains_key("alphabet"))
@@ -160,11 +163,14 @@ impl ProcessingBudget {
 }
 
 trait Budget {
-    fn charge(&mut self, value: &str) -> Result<(), String>;
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String>;
+    fn charge(&mut self, value: &str) -> Result<(), String> {
+        self.charge_bytes(value.as_bytes())
+    }
 }
 
 impl Budget for ProcessingBudget {
-    fn charge(&mut self, value: &str) -> Result<(), String> {
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String> {
         self.remaining = match self.remaining.checked_sub(value.len()) {
             Some(remaining) => remaining,
             None => {
@@ -182,9 +188,9 @@ struct CombinedBudget<'a> {
 }
 
 impl Budget for CombinedBudget<'_> {
-    fn charge(&mut self, value: &str) -> Result<(), String> {
-        self.per_recipe.charge(value)?;
-        self.total.charge(value)
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String> {
+        self.per_recipe.charge_bytes(value)?;
+        self.total.charge_bytes(value)
     }
 }
 
@@ -443,7 +449,7 @@ impl Operation {
                     x => x,
                 })
                 .collect()),
-            "query_unescape" => query_unescape(value, budget),
+            "query_unescape" => query_unescape(value, budget, profile == ProfileVersion::V4),
             "invisible_space" => Ok(map_invisible(value, Some(' '))),
             "matching_normalize" => Ok(matching_normalize(value, profile)),
             "hex_decode_liberal" => strict_hex(value, false, "liberal hex decode"),
@@ -480,13 +486,13 @@ impl Operation {
             "url_noise_strip" => Ok(url_noise_strip(value, profile)),
             "ordered_query_concat" => query_values(value)
                 .into_iter()
-                .map(|v| query_unescape(&v, budget))
+                .map(|v| query_unescape(&v, budget, profile == ProfileVersion::V4))
                 .collect(),
             "query_subsequence" => {
                 let values = query_values(value)
                     .into_iter()
                     .take(20)
-                    .map(|v| query_unescape(&v, budget))
+                    .map(|v| query_unescape(&v, budget, profile == ProfileVersion::V4))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.fields["indices"]
                     .as_array()
@@ -534,6 +540,7 @@ fn validate_digest(digest: &str) -> Result<ProfileVersion, String> {
         PROFILE_DIGEST_V1 => Ok(ProfileVersion::V1),
         PROFILE_DIGEST_V2 => Ok(ProfileVersion::V2),
         PROFILE_DIGEST_V3 => Ok(ProfileVersion::V3),
+        PROFILE_DIGEST_V4 => Ok(ProfileVersion::V4),
         _ => Err("recipe: transform profile digest: unknown profile".to_string()),
     }
 }
@@ -583,7 +590,24 @@ fn strict_percent_decode(s: &str, plus: bool) -> Result<String, String> {
     String::from_utf8(percent_decode_str(&bytes).collect())
         .map_err(|_| "output: invalid UTF-8".to_string())
 }
-fn query_unescape<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> {
+fn query_unescape<B: Budget>(s: &str, budget: &mut B, partial: bool) -> Result<String, String> {
+    if partial {
+        // Keep intermediate bytes until the operation's UTF-8 boundary.
+        let mut value = s.as_bytes().to_vec();
+        for _ in 0..500 {
+            budget.charge_bytes(&value)?;
+            let plus_decoded: Vec<u8> = value
+                .iter()
+                .map(|b| if *b == b'+' { b' ' } else { *b })
+                .collect();
+            let next: Vec<u8> = percent_decode(&plus_decoded).collect();
+            if next == value {
+                break;
+            }
+            value = next;
+        }
+        return String::from_utf8(value).map_err(|_| "output: invalid UTF-8".to_string());
+    }
     let mut v = s.to_string();
     for _ in 0..500 {
         budget.charge(&v)?;
@@ -594,6 +618,7 @@ fn query_unescape<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> 
     }
     Ok(v)
 }
+
 fn url_component(
     value: &str,
     component: &str,
@@ -991,7 +1016,7 @@ fn matching_normalize(s: &str, profile: ProfileVersion) -> String {
         .collect::<String>();
     // ForMatching maps the explicit exotic set to spaces, but deliberately
     // preserves leading/trailing and repeated ordinary whitespace.
-    let x = if profile == ProfileVersion::V3 {
+    let x = if matches!(profile, ProfileVersion::V3 | ProfileVersion::V4) {
         x.nfc().collect::<String>()
     } else {
         x
@@ -1130,7 +1155,7 @@ fn encoded_token_normalize_v1(s: &str, a: &str) -> String {
 fn url_noise_strip(value: &str, profile: ProfileVersion) -> String {
     match profile {
         ProfileVersion::V1 => strip_chars(value, "./ \t\n\r+,;|"),
-        ProfileVersion::V2 | ProfileVersion::V3 => value
+        ProfileVersion::V2 | ProfileVersion::V3 | ProfileVersion::V4 => value
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '='))
             .collect(),
@@ -1221,6 +1246,24 @@ fn encoded_run(s: &str, n: u32, min: u32) -> Result<String, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn v4_nested_utf8_charges_intermediate_bytes() {
+        let recipe =
+            Recipe::from_json(PROFILE_DIGEST_V4, &json!([{"kind": "query_unescape"}])).unwrap();
+        let mut budget = ProcessingBudget::new(22);
+        assert_eq!(
+            recipe
+                .apply_with_budget_impl("%C3%25A9", &mut budget)
+                .unwrap(),
+            "é"
+        );
+        assert_eq!(budget.remaining, 0);
+        let mut exhausted = ProcessingBudget::new(21);
+        assert!(recipe
+            .apply_with_budget_impl("%C3%25A9", &mut exhausted)
+            .is_err());
+    }
 
     #[test]
     fn recipe_limits_reject_unbounded_verifier_work() {

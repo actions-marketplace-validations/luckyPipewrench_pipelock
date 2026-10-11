@@ -243,6 +243,12 @@ func (s *Scanner) ScanURLCoreFloor(rawURL string) Result {
 				Score:   1.0,
 			}
 		}
+		// Parsing a different URL component must not discard recoverable
+		// query credentials. Inspection cannot grant trust to this URL.
+		sent, _, _ := strings.Cut(rawURL, "#")
+		if _, query, ok := strings.Cut(sent, "?"); ok {
+			return s.checkCoreDLPWithDecodes(&url.URL{RawQuery: query}, &decodes)
+		}
 		return Result{Allowed: true}
 	}
 	if sigV4 := detectValidSigV4(parsed); sigV4.Valid {
@@ -1672,11 +1678,8 @@ func nestedURLCandidates(rawQuery string, maxLen int) []nestedURLCandidate {
 		}
 		out = append(out, nestedURLCandidate{key: key, text: text})
 	}
-	for _, pair := range strings.Split(rawQuery, "&") {
-		if pair == "" {
-			continue
-		}
-		key, value, _ := strings.Cut(pair, "=")
+	for _, pair := range rawQuerySecurityPairs(rawQuery) {
+		key, value := pair.key, pair.value
 		decodedKey := IterativeDecode(key)
 		for _, component := range []string{key, value} {
 			if component == "" {
@@ -1961,8 +1964,8 @@ const maxDecodeRounds = normalize.ScannerQueryUnescapeMaxRounds
 //pipelock:provenance-transform query_unescape
 func IterativeDecode(s string) string {
 	for range maxDecodeRounds {
-		decoded, err := url.QueryUnescape(s)
-		if err != nil || decoded == s {
+		decoded := normalize.QueryUnescapePartial(s)
+		if decoded == s {
 			break
 		}
 		s = decoded
@@ -2750,17 +2753,29 @@ func (s *Scanner) checkDLPWithDecodesAt(parsed *url.URL, decodes *decodingMemo, 
 	// Noise-strip each value to catch dot-separated keys (e.g. "s.k.-.a.n.t.-..." → "sk-ant-...").
 	// Try hex/base64/base32 decoding to catch encoded secrets
 	// (e.g. ?key=736b2d616e742d... is hex-encoded sk-ant-...).
-	for key, values := range parsed.Query() {
+	for _, pair := range rawQuerySecurityPairs(parsed.RawQuery) {
+		key := pair.key
 		decodedKey := IterativeDecode(key)
-		targets = append(targets, dlpTarget{decodedKey, dlpViewLabel("url_query_key"), ""})
-		for _, d := range decodes.decode(decodedKey, false) {
-			targets = append(targets, dlpTarget{d.text, dlpViewLabel(d.encoding), ""})
+		onceKey := normalize.QueryUnescapePartial(key)
+		targets = append(targets, dlpTarget{onceKey, dlpViewLabel("url_query_key"), ""})
+		targets = append(targets, queryValueDecodedTargetsWithDecodes(onceKey, decodes)...)
+		if decodedKey != key {
+			targets = append(targets, queryValueDecodedTargetsWithDecodes(key, decodes)...)
 		}
+		targets = append(targets, dlpTarget{decodedKey, dlpViewLabel("url_query_key"), ""})
+		targets = append(targets, queryValueDecodedTargetsWithDecodes(decodedKey, decodes)...)
 		if stripped := stripURLNoise(decodedKey); stripped != decodedKey {
 			targets = append(targets, dlpTarget{stripped, dlpViewLabel("url_noise_stripped"), decodedKey})
 		}
-		for _, v := range values {
+		{
+			v := pair.value
+			once := normalize.QueryUnescapePartial(v)
+			targets = append(targets, dlpTarget{once, dlpViewLabel("url_query_value"), ""})
+			targets = append(targets, queryValueDecodedTargetsWithDecodes(once, decodes)...)
 			decoded := IterativeDecode(v)
+			if decoded != v {
+				targets = append(targets, queryValueDecodedTargetsWithDecodes(v, decodes)...)
+			}
 			targets = append(targets, dlpTarget{decoded, dlpViewLabel("url_query_value"), ""})
 			targets = append(targets, queryValueDecodedTargetsWithDecodes(decoded, decodes)...)
 			if stripped := stripURLNoise(decoded); stripped != decoded {
@@ -2795,6 +2810,9 @@ func (s *Scanner) checkDLPWithDecodesAt(parsed *url.URL, decodes *decodingMemo, 
 	// Dots break regex character classes, so individual labels pass DLP checks.
 	if hostname := parsed.Hostname(); strings.Contains(hostname, ".") {
 		targets = append(targets, dlpTarget{removeHostnameDots(hostname), dlpViewLabel("subdomain"), hostname})
+		for _, d := range decodes.decode(hostname, false) {
+			targets = append(targets, dlpTarget{d.text, dlpViewLabel(d.encoding), ""})
+		}
 	}
 
 	// Strip URL noise from path to catch secrets split by dots, slashes, and
@@ -2892,13 +2910,11 @@ func (s *Scanner) checkDLPWithDecodesAt(parsed *url.URL, decodes *decodingMemo, 
 			{parsed.Path, "url_path", ""},
 		}
 		// Individual query values: raw decoded + encoding variants (base64/hex/base32).
-		for _, values := range parsed.Query() {
-			for _, v := range values {
-				decoded := IterativeDecode(v)
-				seedTargets = append(seedTargets, dlpTarget{decoded, spanViewLabel("url_decoded", "url_query_value"), ""})
-				for _, d := range decodes.decode(decoded, false) {
-					seedTargets = append(seedTargets, dlpTarget{d.text, spanViewLabel(d.encoding+"_decoded", "url_query_value"), ""})
-				}
+		for _, pair := range rawQuerySecurityPairs(parsed.RawQuery) {
+			decoded := IterativeDecode(pair.value)
+			seedTargets = append(seedTargets, dlpTarget{decoded, spanViewLabel("url_decoded", "url_query_value"), ""})
+			for _, view := range queryValueDecodedTargetsWithDecodes(decoded, decodes) {
+				seedTargets = append(seedTargets, dlpTarget{view.text, spanViewLabel(strings.TrimPrefix(view.viewLabel, ViewDLPNormalized+":")+"_decoded", "url_query_value"), ""})
 			}
 		}
 		// The whole decoded query follows the per-value targets. "=" and "&"
@@ -2909,10 +2925,10 @@ func (s *Scanner) checkDLPWithDecodesAt(parsed *url.URL, decodes *decodingMemo, 
 		// split across params (e.g., ?w1=abandon&w2=abandon&...&w12=about).
 		// orderedQueryConcat joins without separators (for regex DLP), so we
 		// build a space-separated version for seed word tokenization.
-		if parsed.RawQuery != "" && strings.Contains(parsed.RawQuery, "&") {
+		if parsed.RawQuery != "" && strings.ContainsAny(parsed.RawQuery, "&;") {
 			var seedConcat strings.Builder
-			for i, pair := range strings.Split(parsed.RawQuery, "&") {
-				_, value, _ := strings.Cut(pair, "=")
+			for i, pair := range rawQuerySecurityPairs(parsed.RawQuery) {
+				value := pair.value
 				if value != "" {
 					if i > 0 {
 						seedConcat.WriteByte(' ')
@@ -3219,23 +3235,39 @@ func (s *Scanner) checkSecretsInURL(secrets []string, parsed *url.URL, reasonPre
 		{text: strings.ToLower(decodedURL), viewLabel: lowerViewLabel("control_stripped_url:url_decoded")},
 	}
 
-	hits := newKnownValueWindowHits(texts)
-	for _, secret := range secrets {
-		if match, start, end, viewLabel, matched := matchSecretEncodingSpanWithHits(secret, s.knownSecretWindows[secret], s.knownSecretEncodings[secret], texts, lowerTexts, hits); matched {
-			reason := reasonPrefix
-			if match.partialLen > 0 {
-				reason += fmt.Sprintf(" (partial %d)", match.partialLen)
-			} else if match.encoding != "" {
-				reason += " (" + match.encoding + "-encoded)"
+	for phase := range 2 {
+		if phase == 1 {
+			var decodes decodingMemo
+			texts = s.decodedKnownSecretViews(decodedURL, &decodes)
+		}
+
+		hits := newKnownValueWindowHits(texts)
+		for _, secret := range secrets {
+			var match knownSecretMatch
+			var start, end int
+			var viewLabel string
+			var matched bool
+			if phase == 0 {
+				match, start, end, viewLabel, matched = matchSecretEncodingSpanWithHits(secret, s.knownSecretWindows[secret], s.knownSecretEncodings[secret], texts, lowerTexts, hits)
+			} else {
+				match, start, end, viewLabel, matched = matchDecodedKnownSecret(secret, s.knownSecretWindows[secret], texts, hits)
 			}
-			return Result{
-				Allowed: false,
-				Reason:  reason,
-				Scanner: ScannerDLP,
-				Score:   1.0,
-				spans: []MatchSpan{
-					newMatchSpan(start, end, viewLabel, reasonPrefix, "", ""),
-				},
+			if matched {
+				reason := reasonPrefix
+				if match.partialLen > 0 {
+					reason += fmt.Sprintf(" (partial %d)", match.partialLen)
+				} else if match.encoding != "" {
+					reason += " (" + match.encoding + "-encoded)"
+				}
+				return Result{
+					Allowed: false,
+					Reason:  reason,
+					Scanner: ScannerDLP,
+					Score:   1.0,
+					spans: []MatchSpan{
+						newMatchSpan(start, end, viewLabel, reasonPrefix, "", ""),
+					},
+				}
 			}
 		}
 	}
@@ -3327,8 +3359,14 @@ func urlCredentialWindowsBounded(value string, maxEntries int) (map[string][]int
 			parts = append(parts, password)
 		}
 	}
-	for _, vs := range u.Query() {
-		parts = append(parts, vs...)
+	for _, pair := range rawQuerySecurityPairs(u.RawQuery) {
+		decoded := normalize.QueryUnescapePartial(pair.value)
+		// Existing window construction adds the encoded counterpart when it
+		// can locate the decoded part. Otherwise retain the original pair.
+		if offset, _ := locateURLPart(value, decoded); offset < 0 {
+			decoded = pair.value
+		}
+		parts = append(parts, decoded)
 	}
 	if u.Fragment != "" {
 		parts = append(parts, u.Fragment)
@@ -3363,7 +3401,6 @@ func urlCredentialWindowsBounded(value string, maxEntries int) (map[string][]int
 			totalSpan += len(raw) - minKnownSecretSubstringLen + 1
 		}
 	}
-	// u.Query() is a map, so eligible holds query values in a random order.
 	// Sampling follows the order the parts appear in the value, which keeps
 	// the retained anchors the same on every build of the scanner. Two parts
 	// can be located at one offset when one is a prefix of the other, so the
@@ -5597,6 +5634,26 @@ func queryValueDecodedTargetsWithDecodes(decoded string, decodes *decodingMemo) 
 		}
 	}
 	addDecoded(decoded)
+	// A malformed escape delimits independently encoded query runs. Keep
+	// the intact view too; this does not filter arbitrary encoding junk.
+	start := 0
+	for i := 0; i < len(decoded); i++ {
+		if decoded[i] != '%' {
+			continue
+		}
+		if i+2 < len(decoded) && isHexDigitByte(decoded[i+1]) && isHexDigitByte(decoded[i+2]) {
+			continue
+		}
+		if i > start {
+			addDecoded(decoded[start:i])
+		}
+		start = min(i+3, len(decoded))
+		i = start - 1
+	}
+	if start > 0 && start < len(decoded) {
+		addDecoded(decoded[start:])
+	}
+
 	if htmlDecoded := decodeHTMLEntities(decoded); htmlDecoded != decoded {
 		targets = append(targets, dlpTarget{htmlDecoded, dlpViewLabel(encodingHTML), decoded})
 		addDecoded(htmlDecoded)
