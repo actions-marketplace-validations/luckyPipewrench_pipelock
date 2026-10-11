@@ -2739,6 +2739,11 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	}
 
 	if prevEdSnap := p.editionPtr.Swap(&editionSnapshot{newEd}); prevEdSnap != nil {
+		if !config.SameLicenseInputs(oldCfg, cfg) {
+			if receiver, ok := prevEdSnap.Edition.(edition.LicenseRevocationReceiver); ok {
+				receiver.SetLicenseRevoked(true)
+			}
+		}
 		prevEdSnap.Close()
 	}
 
@@ -2962,13 +2967,15 @@ func (p *Proxy) RegisterAgentServer(srv *http.Server) {
 	p.agentServers = append(p.agentServers, srv)
 }
 
-// SetLicenseRevoked publishes a runtime license check only if its config is
-// still current. Serializing with reload prevents a stale check from revoking
-// a replacement token or missing the newly published edition.
+// SetLicenseRevoked publishes a runtime license check serialized with reload.
+// A failure remains applicable across unrelated reloads of the same license
+// verification inputs. Recovery must use the current snapshot so an old check
+// cannot clear a newer revocation.
 func (p *Proxy) SetLicenseRevoked(cfg *config.Config, revoked bool) bool {
 	p.reloadSerialMu.Lock()
 	defer p.reloadSerialMu.Unlock()
-	if p.cfgPtr.Load() != cfg {
+	current := p.cfgPtr.Load()
+	if current != cfg && (!revoked || !config.SameLicenseInputs(current, cfg)) {
 		return false
 	}
 	if receiver, ok := p.Edition().(edition.LicenseRevocationReceiver); ok {
@@ -3245,12 +3252,14 @@ func (p *Proxy) resolveAgentFromRequest(r *http.Request) (*edition.ResolvedAgent
 // resolveAgentRuntimeFromRequest snapshots the request's resolved agent state
 // and envelope emitter under the reload lock. The request then keeps that
 // emitter for its forwarding and redirect path so a reload cannot pair the
-// old config with a newly disabled or rotated emitter.
-func (p *Proxy) resolveAgentRuntimeFromRequest(r *http.Request) (*edition.ResolvedAgent, edition.AgentIdentity, *envelope.Emitter, *contractruntime.Loader) {
+// old config with a newly disabled or rotated emitter. Every consumer receives
+// the entitlement-bound request context and releases it when handling ends.
+func (p *Proxy) resolveAgentRuntimeFromRequest(r *http.Request) (*edition.ResolvedAgent, edition.AgentIdentity, *envelope.Emitter, *contractruntime.Loader, *http.Request, context.CancelFunc) {
 	p.reloadMu.RLock()
 	defer p.reloadMu.RUnlock()
 	resolved, id := p.resolveAgentFromRequest(r)
-	return resolved, id, p.envelopeEmitterPtr.Load(), p.contractLoaderPtr.Load()
+	ctx, release := agentLicenseContext(r.Context(), resolved)
+	return resolved, id, p.envelopeEmitterPtr.Load(), p.contractLoaderPtr.Load(), r.WithContext(ctx), release
 }
 
 // pinResolvedScanner registers in-flight scanner use on a resolved-agent
@@ -3331,6 +3340,8 @@ func inboundEnvelopeFailurePattern(err error) string {
 			return "inbound_verify_replay"
 		case envelope.VerificationFailureReplayCapacity:
 			return "inbound_verify_replay_capacity"
+		case envelope.VerificationFailureReplayState:
+			return "inbound_verify_replay_state"
 		case envelope.VerificationFailureExpired:
 			return "inbound_verify_expired"
 		case envelope.VerificationFailureNotTrusted:
@@ -5281,7 +5292,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// and resolveAgent() could read different registries. The contract
 	// loader is captured here too so the URL scan and contract gate use
 	// one coherent policy revision.
-	resolved, id, envEmitter, snapshotContractLoader := p.resolveAgentRuntimeFromRequest(r)
+	resolved, id, envEmitter, snapshotContractLoader, r, releaseLicense := p.resolveAgentRuntimeFromRequest(r)
+	defer releaseLicense()
 	cfg := resolved.Config
 	agent := id.Name
 	if agent == "" {

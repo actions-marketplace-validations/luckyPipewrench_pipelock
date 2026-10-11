@@ -68,6 +68,13 @@ type ResolvedAgent struct {
 	Config  *config.Config
 	Scanner *scanner.Scanner
 	Budget  BudgetChecker
+	// LicenseRevoked closes when this paid entitlement is revoked. Long-lived
+	// handlers must terminate when it closes. Nil means the free/default path.
+	// Recovery creates a new signal; a revoked snapshot never becomes valid again.
+	LicenseRevoked <-chan struct{}
+	// LicenseExpiresAt is the root entitlement's Unix deadline. Merged profile
+	// configs do not carry all runtime-derived license metadata.
+	LicenseExpiresAt int64
 }
 
 // BudgetChecker enforces per-agent request/byte budgets.

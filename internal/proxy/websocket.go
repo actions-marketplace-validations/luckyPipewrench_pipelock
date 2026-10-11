@@ -83,7 +83,10 @@ type wsRelay struct {
 	// upstreamCancelled records that the upstream direction ended because the
 	// relay or a local close stopped it, not because the upstream finished or
 	// broke off. Written only by upstreamToClient, read after it returns.
-	upstreamCancelled bool
+	upstreamCancelled   bool
+	panicked            atomic.Bool               // either pump can panic; read after both return
+	clientClosing       atomic.Bool               // client sent Close; only the upstream Close reply may follow
+	clientCloseDeadline atomic.Pointer[time.Time] // one grace deadline, never renewed by discarded frames
 	// reqPolicyHeaders and reqPolicyPath are the handshake route inputs reused
 	// for per-frame request_policy evaluation, so a frame is judged against the
 	// same escaped path and method-override headers as the handshake gate.
@@ -252,8 +255,37 @@ type wsRelayStats struct {
 	textFrames     int64
 	binaryFrames   int64
 	blocked        bool // true if relay terminated due to a policy/DLP/injection block
+	panicked       bool // unexpected internal failure, distinct from policy denial
 	incomplete     bool // upstream ended without completing its WebSocket stream
 	cancelled      bool // the relay or a local close ended the upstream direction
+}
+
+func (s wsRelayStats) closeOutcome() (ws.StatusCode, string) {
+	switch {
+	case s.panicked:
+		return ws.StatusInternalServerError, "relay_panic"
+	case s.blocked:
+		return ws.StatusPolicyViolation, "policy_blocked"
+	case s.incomplete:
+		return ws.StatusAbnormalClosure, receiptReasonIncomplete
+	case s.cancelled:
+		return ws.StatusGoingAway, httpstream.Cancelled
+	default:
+		return ws.StatusNormalClosure, "complete"
+	}
+}
+
+// recordWSRelayCompletion counts policy blocks separately from internal
+// failures and entitlement teardown. Neither is a normal completion.
+func (p *Proxy) recordWSRelayCompletion(stats wsRelayStats, revoked bool) {
+	if stats.panicked || revoked {
+		return
+	}
+	if stats.blocked {
+		p.metrics.RecordWSBlocked()
+	} else {
+		p.metrics.RecordWSCompleted()
+	}
 }
 
 // handleWebSocket handles /ws WebSocket proxy requests.
@@ -269,7 +301,8 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// and resolveAgent() could read different registries. The contract
 	// loader is captured for the handshake gate; per-frame scanning stays
 	// independent and unchanged.
-	resolved, id, envEmitter, snapshotContractLoader := p.resolveAgentRuntimeFromRequest(r)
+	resolved, id, envEmitter, snapshotContractLoader, r, releaseLicense := p.resolveAgentRuntimeFromRequest(r)
+	defer releaseLicense()
 	cfg := resolved.Config
 	agent := id.Name
 	if agent == "" {
@@ -286,6 +319,7 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if err := p.verifyInboundEnvelope(r, cfg); err != nil {
+		p.logger.LogError(audit.NewMethodLogContext(r.Method), fmt.Errorf("inbound envelope verify rejected WebSocket: %w", err))
 		pattern := inboundEnvelopeFailurePattern(err)
 		p.recordDecision(config.ActionBlock, blockLayerMediationEnvelope, pattern, TransportWS, requestID)
 		emitWebSocketReceipt(receipt.EmitOpts{
@@ -1150,7 +1184,6 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer safeClose(upstreamConn, "ws.upstreamConn", log)
-
 	wsAirlockSessions = retainAirlockSessions(wsAirlockSessions, p.airlockSessionForIdentity(cfg, agent, clientIP, id.Auth))
 	for _, wsSess := range wsAirlockSessions {
 		// Register airlock cancel for WebSocket connections. When the session
@@ -1209,14 +1242,14 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats := relay.run(r.Context())
+	licenseRevoked := errors.Is(context.Cause(r.Context()), errAgentLicenseRevoked)
+	if licenseRevoked {
+		stats.blocked = true
+	}
 
 	p.metrics.DecrActiveWS()
 	duration := time.Since(start)
-	if stats.blocked {
-		p.metrics.RecordWSBlocked()
-	} else {
-		p.metrics.RecordWSCompleted()
-	}
+	p.recordWSRelayCompletion(stats, licenseRevoked)
 	p.metrics.RecordWSStats(duration, stats.clientToServer, stats.serverToClient)
 	log.LogWSClose(audit.WSCloseEvent{
 		Target:    targetURL,
@@ -1229,19 +1262,10 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		BinaryFrames:   stats.binaryFrames,
 		Duration:       duration,
 	})
-	outcomeCloseCode := ws.StatusNormalClosure
-	outcomeReason = "complete"
-	switch {
-	case stats.incomplete:
-		outcomeCloseCode = ws.StatusAbnormalClosure
-		outcomeReason = receiptReasonIncomplete
-	case stats.cancelled:
-		outcomeCloseCode = ws.StatusGoingAway
-		outcomeReason = httpstream.Cancelled
-	}
-	if stats.blocked {
-		outcomeCloseCode = ws.StatusPolicyViolation
-		outcomeReason = "policy_blocked"
+	outcomeCloseCode, closeReason := stats.closeOutcome()
+	outcomeReason = closeReason
+	if licenseRevoked && !stats.panicked {
+		outcomeReason = "license_revoked"
 	}
 	p.emitOutcomeReceipt(cfg, admissionReceipt, strconv.Itoa(int(outcomeCloseCode)), stats.clientToServer+stats.serverToClient, outcomeReason)
 	outcomeEmitted = true
@@ -1261,6 +1285,11 @@ func (p *Proxy) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		Agent:            agent,
 		RedactionProfile: cfg.Redaction.DefaultProfile,
 		RedactionReport:  relay.redactionLog,
+	}
+	if stats.panicked {
+		closeReceipt.Pattern = "relay_panic"
+	} else if licenseRevoked {
+		closeReceipt.Pattern = "license_revoked"
 	}
 	if wsGate.HasContractContext() {
 		closeReceipt = withContractReceipt(wsGate, closeReceipt)
@@ -1491,7 +1520,10 @@ const relayCloseGrace = time.Second
 // hold the relay open. A final close frame still goes out: the close-frame
 // writers set their own write deadline first.
 func wakeRelayConn(conn net.Conn) {
-	deadline := time.Now().Add(relayCloseGrace)
+	wakeRelayConnUntil(conn, time.Now().Add(relayCloseGrace))
+}
+
+func wakeRelayConnUntil(conn net.Conn, deadline time.Time) {
 	_ = conn.SetReadDeadline(deadline)
 	_ = conn.SetWriteDeadline(deadline)
 }
@@ -1503,9 +1535,19 @@ func wakeRelayConn(conn net.Conn) {
 // and one that landed before it is caught by the check.
 func (r *wsRelay) armReadDeadline(ctx context.Context, conn net.Conn, idleTimeout time.Duration) {
 	_ = conn.SetReadDeadline(r.idleDeadline(idleTimeout))
-	if ctx.Err() != nil {
+	if r.clientClosing.Load() {
+		_ = conn.SetReadDeadline(r.closeGraceDeadline())
+	} else if ctx.Err() != nil {
 		_ = conn.SetReadDeadline(time.Now().Add(relayCloseGrace))
 	}
+}
+
+func (r *wsRelay) closeGraceDeadline() time.Time {
+	if r.clientCloseDeadline.Load() == nil {
+		deadline := time.Now().Add(relayCloseGrace)
+		r.clientCloseDeadline.CompareAndSwap(nil, &deadline)
+	}
+	return *r.clientCloseDeadline.Load()
 }
 
 // recoverRelayPanic contains unexpected scanner or relay failures to this
@@ -1515,15 +1557,28 @@ func (r *wsRelay) recoverRelayPanic(cancel context.CancelFunc, blocked *bool) {
 		return
 	}
 	*blocked = true
+	if r.panicked.Swap(true) {
+		cancel()
+		return
+	}
 	cancel()
-	if r.clientConn != nil {
-		_ = r.clientConn.Close()
-	}
-	if r.upstreamConn != nil {
-		_ = r.upstreamConn.Close()
-	}
+	closePanickedRelayConn(r.clientConn, true)
+	closePanickedRelayConn(r.upstreamConn, false)
 	if r.proxy != nil && r.proxy.logger != nil {
 		r.proxy.logger.LogError(audit.NewMethodLogContext("WS"), errors.New("WebSocket relay panic; connection closed"))
+	}
+}
+
+// Recovery must also contain a connection implementation that panics while
+// writing or closing. The client gets a best-effort internal-error Close first.
+func closePanickedRelayConn(conn net.Conn, notifyClient bool) {
+	if conn == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	defer func() { _ = conn.Close() }()
+	if notifyClient {
+		plwsutil.WriteCloseFrame(conn, ws.StatusInternalServerError, "relay panic")
 	}
 }
 
@@ -1567,6 +1622,7 @@ func (r *wsRelay) run(ctx context.Context) wsRelayStats {
 		textFrames:     c2sText + s2cText,
 		binaryFrames:   c2sBinary + s2cBinary,
 		blocked:        c2sBlocked || s2cBlocked,
+		panicked:       r.panicked.Load(),
 		incomplete:     r.upstreamIncomplete,
 		cancelled:      r.upstreamCancelled,
 	}
@@ -2467,7 +2523,15 @@ func (r *wsRelay) blockIdentityReload() bool {
 
 // clientToUpstream reads frames from client, DLP-scans text, writes to upstream.
 func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFunc, idleTimeout time.Duration) (bytesTransferred, textFrames, binaryFrames int64, blocked bool) {
-	defer cancel()
+	defer func() {
+		if r.clientClosing.Load() {
+			// Keep the context live for the close reply, bounded by the close
+			// grace. Revocation still cancels the parent and stops both pumps.
+			wakeRelayConnUntil(r.upstreamConn, r.closeGraceDeadline())
+		} else {
+			cancel()
+		}
+	}()
 	defer r.recoverRelayPanic(cancel, &blocked)
 	frag := &plwsutil.FragmentState{MaxBytes: r.maxMsg}
 	var crossMsgTail []byte   // rolling tail for text-message DLP scanning
@@ -2602,6 +2666,9 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 				return
 			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
 
 		if r.blockIdentityReload() {
 			blocked = true
@@ -2619,11 +2686,19 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 		if hdr.OpCode.IsControl() {
 			if hdr.OpCode == ws.OpClose {
 				// Forward close frame to upstream, then exit.
+				r.closeGraceDeadline()
+				r.clientClosing.Store(true)
 				plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusNormalClosure, "client closed")
+				return
+			}
+			if ctx.Err() != nil {
 				return
 			}
 			if r.enforceClientControlPayload(ctx, log, payload, &controlMsgTail) {
 				blocked = true
+				return
+			}
+			if ctx.Err() != nil {
 				return
 			}
 			// Ping/Pong: forward to upstream (proxy is CLIENT to upstream).
@@ -2745,6 +2820,9 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 
 		if r.cfg.RequestBodyScanning.Enabled && r.scanText {
 			buf, bodyResult := r.scanClientMessageBody(ctx, msg)
+			if ctx.Err() != nil {
+				return
+			}
 			wsMergeRedactionReport(&r.redactionLog, bodyResult.RedactionReport)
 			if r.proxy != nil {
 				recordBodyRedactionMetrics(r.proxy.metrics, TransportWS, r.metricAgent, bodyResult.RedactionReport)
@@ -2782,6 +2860,9 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
+		if ctx.Err() != nil {
+			return
+		}
 		// CEE: record outbound frame for cross-request exfiltration detection.
 		// Entropy tracking applies to all frame types (text + binary) since
 		// binary frames can carry high-entropy exfiltrated data. Fragment
@@ -2819,6 +2900,9 @@ func (r *wsRelay) enforceUpstreamTextPayload(ctx context.Context, log *audit.Log
 	// to warn with no adaptive scoring or action upgrade.
 	wsRespExempt := isResponseScanExempt(r.hostname, r.cfg.ResponseScanning.ExemptDomains)
 	scanResult := r.scanner.ScanResponseWithSuppress(ctx, string(msg), r.targetURL, r.cfg.Suppress)
+	if ctx.Err() != nil {
+		return nil, false
+	}
 	if !r.observeUpstreamResponseTaint(!scanResult.Clean && !scanResult.Failed()) {
 		return nil, true
 	}
@@ -2994,6 +3078,10 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 	log := r.proxy.logger.With("agent", r.agent).WithCorrelation(r.correlation)
 
 	for {
+		if r.clientClosing.Load() && !time.Now().Before(r.closeGraceDeadline()) {
+			r.upstreamCancelled = true
+			return
+		}
 		if r.blockIdentityReload() {
 			blocked = true
 			return
@@ -3077,7 +3165,7 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			// active (it advanced the shared clock), re-arm instead of tearing
 			// down an actively streaming socket.
 			var nerr net.Error
-			if errors.As(err, &nerr) && nerr.Timeout() && !r.idleExpired(idleTimeout) {
+			if errors.As(err, &nerr) && nerr.Timeout() && !r.idleExpired(idleTimeout) && !r.clientClosing.Load() {
 				continue
 			}
 			// An idle or relay-ending deadline is the proxy closing an idle
@@ -3143,6 +3231,21 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
+		if ctx.Err() != nil {
+			r.upstreamCancelled = true
+			return
+		}
+		if r.clientClosing.Load() && hdr.OpCode != ws.OpClose {
+			// These bounded frames may have been in flight before our Close.
+			// Discard them without scanning or forwarding, then await the reply
+			// under the original grace deadline.
+			if !time.Now().Before(r.closeGraceDeadline()) {
+				r.upstreamCancelled = true
+				return
+			}
+			continue
+		}
+
 		if r.blockIdentityReload() {
 			blocked = true
 			return
@@ -3165,6 +3268,13 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			if responseBlocked {
 				blocked = true
 				return
+			}
+			if ctx.Err() != nil {
+				r.upstreamCancelled = true
+				return
+			}
+			if r.clientClosing.Load() {
+				continue
 			}
 			// Forward Ping/Pong to client (proxy is SERVER to client, no masking).
 			err = wsutil.WriteServerMessage(r.clientConn, hdr.OpCode, payload)
@@ -3306,6 +3416,13 @@ func (r *wsRelay) upstreamToClient(ctx context.Context, cancel context.CancelFun
 			}
 		}
 
+		if ctx.Err() != nil {
+			r.upstreamCancelled = true
+			return
+		}
+		if r.clientClosing.Load() {
+			continue
+		}
 		// Forward complete message to client (proxy is SERVER, no masking).
 		err = wsutil.WriteServerMessage(r.clientConn, opCode, msg)
 		if err != nil {

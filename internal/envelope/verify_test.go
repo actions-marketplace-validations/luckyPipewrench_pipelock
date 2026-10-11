@@ -306,8 +306,8 @@ func TestReplayCacheDefaultsAndNoopPaths(t *testing.T) {
 	if cache.nowFn == nil {
 		t.Fatal("default nowFn was not installed")
 	}
-	if err := (*ReplayCache)(nil).CheckAndStore("nonce", now); err != nil {
-		t.Fatalf("nil cache should be a noop: %v", err)
+	if err := (*ReplayCache)(nil).CheckAndStore("nonce", now); !errors.Is(err, ErrReplayCacheRequired) {
+		t.Fatalf("nil cache must fail closed: %v", err)
 	}
 
 	cache = newReplayCache(time.Minute, 2, func() time.Time { return now })
@@ -490,13 +490,14 @@ func TestVerifierConfigAndErrorHelpers(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.ReplayCache = NewReplayCache(time.Minute, 100)
 			if _, err := NewVerifier(tc.cfg); err == nil {
 				t.Fatal("NewVerifier should fail")
 			}
 		})
 	}
 
-	verifier, err := NewVerifier(VerifierConfig{TrustedKeys: []TrustedKey{{KeyID: "k", PublicKey: pub}}})
+	verifier, err := NewVerifier(VerifierConfig{TrustedKeys: []TrustedKey{{KeyID: "k", PublicKey: pub}}, ReplayCache: NewReplayCache(time.Minute, 100)})
 	if err != nil {
 		t.Fatalf("NewVerifier default nowFn: %v", err)
 	}

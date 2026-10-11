@@ -4,7 +4,6 @@
 package runtime
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -127,6 +126,7 @@ func (s *Server) reloadLockedWithPolicyRestore(newCfg *config.Config, restoringP
 	}
 	loopbackServicesChanged := false
 	publishedServicesChanged := false
+	agentEntitlementLost := false
 	flightRecorderAnchorChanged := oldCfg != nil && !reflect.DeepEqual(oldCfg.FlightRecorder.Anchor, newCfg.FlightRecorder.Anchor)
 	if oldCfg != nil {
 		// Block fetch_proxy.listen changes via reload. The listener binds at
@@ -382,22 +382,7 @@ func (s *Server) reloadLockedWithPolicyRestore(newCfg *config.Config, restoringP
 		// _default. Detect loss of non-default profiles instead of a nil agents
 		// map so reload cannot re-add stripped named agents when _default remains.
 		agentsRevokedByLicense := hasNamedAgentProfiles(oldCfg.Agents) && !hasNamedAgentProfiles(newCfg.Agents)
-		licenseInputsChanged := oldCfg.LicenseKey != newCfg.LicenseKey ||
-			oldCfg.LicensePublicKey != newCfg.LicensePublicKey ||
-			oldCfg.LicenseFile != newCfg.LicenseFile ||
-			oldCfg.LicenseCRLFile != newCfg.LicenseCRLFile ||
-			oldCfg.LicenseIntermediateFile != newCfg.LicenseIntermediateFile ||
-			!bytes.Equal(oldCfg.LicenseIntermediateCert, newCfg.LicenseIntermediateCert) ||
-			oldCfg.LicenseIntermediateLoadError != newCfg.LicenseIntermediateLoadError ||
-			// A require-intermediate flip is a license-trust change: compare the
-			// MATERIALIZED value so a reload that turns require on/off (via config
-			// or env) re-verifies and can tear down a surface that no longer
-			// satisfies the required trust tier.
-			oldCfg.LicenseRequireIntermediateResolved != newCfg.LicenseRequireIntermediateResolved ||
-			// A CRL freshness-window change is also a license-trust change: shrinking
-			// it can make a previously-fresh CRL stale, which under require mode is
-			// proven loss. Compare the materialized window.
-			oldCfg.LicenseCRLMaxAgeResolved != newCfg.LicenseCRLMaxAgeResolved
+		licenseInputsChanged := !config.SameLicenseInputs(oldCfg, newCfg)
 
 		// Re-verify the NEW license inputs ONCE and classify the result so both
 		// paid surfaces — agent listeners and the Conductor follower — make the
@@ -435,6 +420,7 @@ func (s *Server) reloadLockedWithPolicyRestore(newCfg *config.Config, restoringP
 
 		switch {
 		case agentsRevokedByLicense && reloadClass.ProvesLoss(reloadLic, license.FeatureAgents):
+			agentEntitlementLost = true
 			// License gate disabled agents on reload and the loss is PROVEN
 			// (revoked / expired / downgraded). Shut down already-bound listener
 			// servers so the agent ports stop accepting traffic.
@@ -673,6 +659,11 @@ func (s *Server) reloadLockedWithPolicyRestore(newCfg *config.Config, restoringP
 	if !s.proxy.Reload(newCfg, newSc) {
 		s.killswitch.AbortReload()
 		return errors.New("reload failed: proxy kept previous config")
+	}
+	if agentEntitlementLost {
+		// Same-input reloads share the license generation. End it only once
+		// proven entitlement loss has committed, never for profile edits.
+		s.proxy.SetLicenseRevoked(newCfg, true)
 	}
 	if s.containmentManaged {
 		s.containmentMetricsDenied.Store(false)
