@@ -53,6 +53,7 @@ type doctorEnv struct {
 	agentUserName  string
 	proxyUserName  string
 	pipelockTarget string
+	bashPath       string
 	lookupUser     lookupUserFunc
 	lstat          func(string) (os.FileInfo, error)
 	wrapperDir     string
@@ -73,17 +74,18 @@ type doctorEnv struct {
 	configPath     string
 	// displayUnitPath locates the managed display unit and, beside it, the
 	// viewer units. Empty means the installed default.
-	displayUnitPath  string
-	agentHome        string
-	rfbSocketPath    string
-	lookPath         func(string) (string, error)
-	platformFamily   string
-	filesystemProbe  func(context.Context, *probeEnv) (string, string)
-	operatorUser     string
-	workspaceInvPath string
-	configDir        string
-	groupIDs         groupIDsFunc
-	now              func() time.Time
+	displayUnitPath    string
+	agentHome          string
+	rfbSocketPath      string
+	lookPath           func(string) (string, error)
+	platformFamily     string
+	filesystemProbe    func(context.Context, *probeEnv) (string, string)
+	runtimeSocketProbe func(context.Context, *doctorEnv) doctorResult
+	operatorUser       string
+	workspaceInvPath   string
+	configDir          string
+	groupIDs           groupIDsFunc
+	now                func() time.Time
 }
 
 // doctorEnvFactory builds the live doctor environment. It is a package var so
@@ -100,6 +102,7 @@ func defaultDoctorEnv() *doctorEnv {
 		port:             defaultProxyPort,
 		proxyUserName:    defaultProxyUser,
 		pipelockTarget:   defaultPipelockTarget,
+		bashPath:         platform.bashPath,
 		lookupUser:       user.Lookup,
 		lstat:            os.Lstat,
 		agentUserName:    defaultAgentUser,
@@ -353,7 +356,15 @@ func allDoctorChecks() []doctorCheck {
 		{7, "managed_chain_structure", "managed nftables chain has the installed structure (a definite agent bypass is a FAIL)", checkManagedChainStructure},
 		{8, "managed_doorway_sockets", "managed containment doorway sockets and namespace forwarders are active", checkManagedDoorwaySockets},
 		{9, "filesystem_confinement", "contained-agent filesystem profile", checkFilesystemConfinement},
+		{14, "runtime_socket_isolation", "managed wrappers and configured units specify runtime socket masks", checkRuntimeSocketIsolation},
 	}
+}
+
+func checkRuntimeSocketIsolation(ctx context.Context, env *doctorEnv) doctorResult {
+	if env.runtimeSocketProbe != nil {
+		return env.runtimeSocketProbe(ctx, env)
+	}
+	return probeDoctorRuntimeSockets(ctx, env)
 }
 
 // filesystemProbeEnvForDoctor starts from the same defaults verify and

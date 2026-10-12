@@ -30,6 +30,7 @@ Type=simple
 User=pipelock-agent
 Group=pipelock-agent
 UMask=0077
+` + strings.Join(runtimeSocketMountProperties(), "\n") + `
 ExecStart=/usr/bin/Xvfb :99 -auth /var/lib/pipelock-agent/Xauthority -screen 0 1280x1024x24 -nolisten tcp -nolisten local -listen unix
 ExecStartPost=/usr/bin/bash -c 'for i in {1..200}; do if [ -S "$1" ]; then chmod 0700 "$1"; exit; fi; sleep 0.1; done; exit 1' _ /tmp/.X11-unix/X99
 Restart=on-failure
@@ -689,16 +690,16 @@ func TestDoctorDisplayChecksFollowConfiguredViewer(t *testing.T) {
 	// Keep the viewer unit lookup off the host: a workstation with a real
 	// contained viewer installed would otherwise decide the disabled case.
 	env.displayUnitPath = filepath.Join(root, "pipelock-contain-display.service")
-	if got := doctorChecksForEnv(&doctorEnv{}); len(got) != 9 {
+	if got := doctorChecksForEnv(&doctorEnv{}); len(got) != 10 {
 		t.Fatalf("unconfigured checks = %d", len(got))
 	}
 	for _, tc := range []struct {
 		name, body string
 		want       int
 	}{
-		{"invalid", "containment: [", 9},
-		{"xvfb", "containment:\n  display:\n    enabled: true\n    backend: xvfb\n", 10},
-		{"xvnc", "containment:\n  display:\n    enabled: true\n    backend: xvnc\n", 13},
+		{"invalid", "containment: [", 10},
+		{"xvfb", "containment:\n  display:\n    enabled: true\n    backend: xvfb\n", 11},
+		{"xvnc", "containment:\n  display:\n    enabled: true\n    backend: xvnc\n", 14},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := os.WriteFile(cfgPath, []byte(tc.body), 0o600); err != nil {
@@ -708,8 +709,8 @@ func TestDoctorDisplayChecksFollowConfiguredViewer(t *testing.T) {
 			if len(checks) != tc.want {
 				t.Fatalf("checks = %d, want %d", len(checks), tc.want)
 			}
-			if tc.want == 13 && (checks[9].name != "agent_display_rfb" || checks[11].name != "viewer_rfb_access" || checks[12].name != "legacy_viewer_acl") {
-				t.Fatalf("display checks = %+v", checks[9:])
+			if tc.want == 14 && (checks[10].name != "agent_display_rfb" || checks[12].name != "viewer_rfb_access" || checks[13].name != "legacy_viewer_acl") {
+				t.Fatalf("display checks = %+v", checks[10:])
 			}
 		})
 	}

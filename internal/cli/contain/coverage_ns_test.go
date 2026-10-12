@@ -1401,12 +1401,12 @@ func TestCovNSContainedRelayTargetFallbacks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestCovNSManagedDoorwaySocketNamesIncludesDeclaredServices(t *testing.T) {
-	names := managedDoorwaySocketNames("/run/pipelock-agent-proxy.sock", []config.ContainmentLoopbackService{
+	names := managedDoorwaySocketNames(defaultProxyForwarderSocketPath, []config.ContainmentLoopbackService{
 		{Host: "127.0.0.1", Port: 9200},
 		{Host: "::1", Port: 9300},
 	})
 	for _, want := range []string{
-		"pipelock-agent-proxy.sock",
+		"pipelock-agent-proxy.socket",
 		loopbackForwarderUnitBase("127.0.0.1", 9200) + ".socket",
 		loopbackForwarderUnitBase("::1", 9300) + ".socket",
 	} {
@@ -1487,10 +1487,7 @@ func TestCovNSAssertManagedNetworkNamespaceMalformedIdentityPrefix(t *testing.T)
 	env := netnsAssertEnv{
 		agentUser: testAgentUser,
 		proxyPort: 8888,
-		runCmd: func(context.Context, string, ...string) (string, int, error) {
-			return "", 0, nil
-		},
-		readFile: func(string) ([]byte, error) { return []byte("garbage-without-brackets\n"), nil },
+		readFile:  func(string) ([]byte, error) { return []byte("garbage-without-brackets\n"), nil },
 	}
 	err := assertManagedNetworkNamespace(context.Background(), env)
 	if err == nil || !strings.Contains(err.Error(), "is malformed") {

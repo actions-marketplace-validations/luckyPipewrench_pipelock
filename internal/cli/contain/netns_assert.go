@@ -27,8 +27,8 @@ type netnsAssertEnv struct {
 	proxyPort   int
 	euid        func() int
 	lookup      lookupUserFunc
-	runCmd      runCommand
 	readFile    func(string) ([]byte, error)
+	readDir     func(string) ([]os.DirEntry, error)
 	readLink    func(string) (string, error)
 	interfaces  func() ([]net.Interface, error)
 	proxyHealth func(context.Context, int) error
@@ -40,8 +40,8 @@ func defaultNetnsAssertEnv() netnsAssertEnv {
 		proxyPort:   defaultProxyPort,
 		euid:        os.Geteuid,
 		lookup:      user.Lookup,
-		runCmd:      realRunCommand,
 		readFile:    os.ReadFile,
+		readDir:     os.ReadDir,
 		readLink:    os.Readlink,
 		interfaces:  net.Interfaces,
 		proxyHealth: directContainedProxyHealth,
@@ -92,16 +92,11 @@ func assertAgentNetworkNamespace(ctx context.Context, env netnsAssertEnv) error 
 // not constrain the caller's uid, so a short root pre-start signer can attest
 // what it directly observed before the unprivileged service body starts.
 func assertManagedNetworkNamespace(ctx context.Context, env netnsAssertEnv) error {
-	out, code, err := env.runCmd(ctx, containSystemctlPath, "is-active", "--quiet", containedNetworkNamespaceUnit)
-	if err != nil {
-		return fmt.Errorf("check managed network namespace: %w", err)
-	}
-	if code != 0 {
-		return fmt.Errorf("managed network namespace is not active (systemctl exit %d: %s); run `pipelock contain install`", code, oneLine(out))
-	}
+	// Service activity is checked by the host-side preflight. This half
+	// runs with host runtime sockets hidden, including the service manager.
 	identity, err := env.readFile(containedNamespaceIdentityPath)
 	if err != nil {
-		return fmt.Errorf("read managed network namespace identity: %w", err)
+		return runtimeMountRefusal(fmt.Errorf("read managed network namespace identity: %w", err))
 	}
 	wantNamespace := strings.TrimSpace(string(identity))
 	if !strings.HasPrefix(wantNamespace, "net:[") || !strings.HasSuffix(wantNamespace, "]") {
@@ -117,6 +112,9 @@ func assertManagedNetworkNamespace(ctx context.Context, env netnsAssertEnv) erro
 	}
 	if selfNamespace != wantNamespace {
 		return fmt.Errorf("launcher network namespace %s does not match managed namespace %s; refusing tool launch", selfNamespace, wantNamespace)
+	}
+	if err := assertManagedRuntimeMounts(env); err != nil {
+		return err
 	}
 
 	interfaces, err := env.interfaces()
