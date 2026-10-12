@@ -7,11 +7,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -602,6 +604,155 @@ func TestYAMLScalarQuotesWhenNeeded(t *testing.T) {
 			t.Parallel()
 			if got := yamlScalar(tt.in); got != tt.want {
 				t.Errorf("yamlScalar(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMCPIdentityRegisterReplacedCopy(t *testing.T) {
+	t.Parallel()
+	verified := localservice.ObservedFile{Path: testIdentityModule, Dev: 1, Ino: 2, SHA256: testIdentityModDigest}
+	sameInode := localservice.ObservedFile{Path: testIdentityModule, Dev: 1, Ino: 2}
+	splitDevice := sameInode
+	splitDevice.Dev = 3
+	stale := sameInode
+	stale.Ino = 4
+	other := localservice.ObservedFile{Path: "/opt/vendor/lib/other.so", Dev: 1, Ino: 5, SHA256: testIdentityOtherHash}
+	refusal := fmt.Sprintf("--mapped-file %q cannot be pinned: the service still holds a replaced copy of it; restart the service so it holds only the current file before registering", testIdentityModule)
+	tests := []struct {
+		name    string
+		files   []localservice.ObservedFile
+		chosen  []string
+		wantErr string
+	}{
+		// Descriptors precede mappings in the production observation.
+		{name: "stale replaced", files: []localservice.ObservedFile{verified, stale}, chosen: []string{testIdentityModule}, wantErr: refusal},
+		{name: "same inode different device", files: []localservice.ObservedFile{verified, splitDevice}, chosen: []string{testIdentityModule}},
+		{name: "same inode unverified mapping", files: []localservice.ObservedFile{verified, sameInode}, chosen: []string{testIdentityModule}},
+		{name: "two distinct paths", files: []localservice.ObservedFile{verified, other}, chosen: []string{testIdentityModule, other.Path}},
+		{name: "single verified", files: []localservice.ObservedFile{verified}, chosen: []string{testIdentityModule}},
+		{name: "single unverified", files: []localservice.ObservedFile{sameInode}, chosen: []string{testIdentityModule}, wantErr: fmt.Sprintf("--mapped-file %q is held but its digest could not be tied to the held file, so it cannot be pinned", testIdentityModule)},
+		{name: "unselected replaced path", files: []localservice.ObservedFile{verified, other, stale}, chosen: []string{other.Path}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			obs := localservice.Observation{UID: 1000, ExecutableSHA256: testIdentityDigest, Files: tt.files}
+			probe, _ := fakeIdentityProbe(t, obs, nil, nil)
+			args := []string{"register", "--upstream", testIdentityUpstream, "--name", testIdentityName}
+			for _, path := range tt.chosen {
+				args = append(args, "--mapped-file", path)
+			}
+			out, err := runIdentityCmd(t, probe, args...)
+			if tt.wantErr != "" {
+				if err == nil || err.Error() != tt.wantErr {
+					t.Fatalf("error = %v, want %q", err, tt.wantErr)
+				}
+				if strings.Contains(out, "mcp_identities:") {
+					t.Fatalf("refusal printed a registration:\n%s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range tt.chosen {
+				if !strings.Contains(out, "        - path: "+path+"\n") {
+					t.Fatalf("missing pin for %q:\n%s", path, out)
+				}
+			}
+			if strings.Count(out, "        - path: ") != len(tt.chosen) {
+				t.Fatalf("unexpected pins:\n%s", out)
+			}
+			if tt.chosen[0] == testIdentityModule && !strings.Contains(out, "          sha256: "+testIdentityModDigest+"\n") {
+				t.Fatalf("missing tied digest:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestSplitObservedFilesReplacedCopyShuffled(t *testing.T) {
+	t.Parallel()
+	orders := make(map[bool]bool)
+	for seed := range 20 {
+		t.Run(strconv.Itoa(seed), func(t *testing.T) {
+			files := []localservice.ObservedFile{
+				{Path: testIdentityModule, Dev: 1, Ino: 2, SHA256: testIdentityModDigest},
+				{Path: testIdentityModule, Dev: 1, Ino: 3},
+			}
+			for i := range 16 {
+				files = append(files, localservice.ObservedFile{Path: fmt.Sprintf("/usr/lib/vendor-%02d.so", i), SHA256: testIdentityOtherHash})
+			}
+			for i := len(files) - 1; i > 0; i-- {
+				j := (seed + i*i) % (i + 1)
+				files[i], files[j] = files[j], files[i]
+			}
+			// Match Observe's unstable path sort with more than twelve entries.
+			sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+			orders[files[0].SHA256 != ""] = true
+			pinned, held, err := splitObservedFiles(localservice.Observation{Files: files}, []string{testIdentityModule})
+			want := fmt.Sprintf("--mapped-file %q cannot be pinned: the service still holds a replaced copy of it; restart the service so it holds only the current file before registering", testIdentityModule)
+			if err == nil || err.Error() != want || pinned != nil || held != nil {
+				t.Fatalf("pinned = %+v, held = %+v, error = %v; want refusal %q", pinned, held, err, want)
+			}
+		})
+	}
+	if len(orders) != 2 {
+		t.Fatal("permutations must exercise both digest-bearing and digest-less entries first")
+	}
+}
+
+func TestSplitObservedFilesVerifiedDuplicate(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		verified bool
+	}{
+		{name: "verified digest wins", verified: true},
+		{name: "only unverified entries refuse"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			orders := make(map[bool]bool)
+			for seed := 0; seed < 20; seed++ {
+				files := []localservice.ObservedFile{{Path: testIdentityModule, Dev: 1, Ino: 2}}
+				duplicate := files[0]
+				if tt.verified {
+					duplicate.SHA256 = testIdentityModDigest
+				}
+				files = append(files, duplicate)
+				for i := range 16 {
+					files = append(files, localservice.ObservedFile{Path: fmt.Sprintf("/usr/lib/vendor-%02d.so", i), SHA256: testIdentityOtherHash})
+				}
+				// Deterministic permutations exercise both duplicate orders without
+				// making a regression depend on a random seed from the host.
+				for i := len(files) - 1; i > 0; i-- {
+					j := (seed + i*i) % (i + 1)
+					files[i], files[j] = files[j], files[i]
+				}
+				// Observe sorts by path using the same unstable sort before this consumer.
+				sort.Slice(files, func(i, j int) bool { return files[i].Path < files[j].Path })
+				orders[files[0].SHA256 != ""] = true
+				pinned, held, err := splitObservedFiles(localservice.Observation{Files: files}, []string{testIdentityModule})
+				if !tt.verified {
+					if err == nil || !strings.Contains(err.Error(), "cannot be pinned") {
+						t.Fatalf("seed %d: error = %v, want refusal", seed, err)
+					}
+					continue
+				}
+				if err != nil {
+					t.Fatalf("seed %d: %v", seed, err)
+				}
+				if len(pinned) != 1 || pinned[0].Path != testIdentityModule || pinned[0].SHA256 != testIdentityModDigest {
+					t.Fatalf("seed %d: pinned = %+v", seed, pinned)
+				}
+				if len(held) != 16 {
+					t.Fatalf("seed %d: held = %+v", seed, held)
+				}
+			}
+			if tt.verified && len(orders) != 2 {
+				t.Fatal("permutations must exercise both digest-bearing and digest-less entries first")
 			}
 		})
 	}
