@@ -9,7 +9,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 from scripts.release_doc_versions import check
+from scripts.yaml_contracts import WorkflowLoader
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 CURRENT = """\
@@ -29,6 +35,14 @@ def write_tree(root: Path, *, current: str = CURRENT, health: str = '  "version"
 
 
 class ReleaseDocVersionTests(unittest.TestCase):
+    def test_repository_matches_chart_app_version(self) -> None:
+        """Exercise the release gate on the shipped tree, not only fixtures."""
+        chart = yaml.load(
+            (ROOT / "charts/pipelock/Chart.yaml").read_text(encoding="utf-8"),
+            Loader=WorkflowLoader,
+        )
+        self.assertEqual(check(ROOT, f"v{chart['appVersion']}"), [])
+
     def test_known_current_pins_pass(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -200,6 +214,22 @@ class ReleaseDocVersionTests(unittest.TestCase):
                 root = Path(temporary)
                 write_tree(root, current=CURRENT.replace(before, after))
                 self.assertTrue(any("release archive URL" in item for item in check(root, "v3.6.0")))
+
+    def test_archive_consumers_and_init_image_stay_on_the_release(self) -> None:
+        commands = (
+            "gh release download v3.6.0 --pattern pipelock_3.5.0_linux_amd64.tar.gz",
+            "gh release download --pattern=pipelock_3.5.0_linux_amd64.tar.gz v3.6.0",
+            "gh attestation verify pipelock_3.5.0_linux_amd64.tar.gz --owner luckyPipewrench",
+            "tar xzf pipelock_3.5.0_linux_amd64.tar.gz",
+            "image: ghcr.io/luckypipewrench/pipelock-init:3.5.0",
+        )
+        for source in commands:
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                write_tree(root, current=CURRENT + source + "\n")
+                self.assertTrue(any("3.5.0" in issue for issue in check(root, "v3.6.0")))
+                write_tree(root, current=CURRENT + source.replace("3.5.0", "3.6.0") + "\n")
+                self.assertEqual(check(root, "v3.6.0"), [])
 
     def test_missing_required_surface_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
