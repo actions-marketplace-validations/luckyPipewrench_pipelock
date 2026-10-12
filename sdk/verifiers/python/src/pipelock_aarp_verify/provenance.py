@@ -28,7 +28,12 @@ PROFILE_DIGEST_V2 = (
 PROFILE_DIGEST_V3 = (
     "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e"
 )
-PROFILE_DIGEST_V4 = "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37"
+PROFILE_DIGEST_V4 = (
+    "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37"
+)
+PROFILE_DIGEST_V5 = (
+    "sha256:1ba7ea1a9a18622e259531bab86e4e2671fbfabe8259fde38223b0d80ca6d441"
+)
 # Compatibility name for v1-focused callers. Recipes always dispatch from the
 # exact digest supplied on the wire and never fall back to this value.
 PROFILE_DIGEST = PROFILE_DIGEST_V1
@@ -37,6 +42,68 @@ MAX_INPUT_BYTES = 2 << 20
 MAX_OUTPUT_BYTES = 1 << 20
 MAX_OPERATIONS = 32
 MAX_CUMULATIVE_PROCESSED_BYTES = 16 << 20
+
+
+def _html_decode_v5(value: str) -> str:
+    c1 = (
+        0x20AC,
+        0x81,
+        0x201A,
+        0x192,
+        0x201E,
+        0x2026,
+        0x2020,
+        0x2021,
+        0x2C6,
+        0x2030,
+        0x160,
+        0x2039,
+        0x152,
+        0x8D,
+        0x17D,
+        0x8F,
+        0x90,
+        0x2018,
+        0x2019,
+        0x201C,
+        0x201D,
+        0x2022,
+        0x2013,
+        0x2014,
+        0x2DC,
+        0x2122,
+        0x161,
+        0x203A,
+        0x153,
+        0x9D,
+        0x17E,
+        0x178,
+    )
+
+    def decode(match: re.Match[str]) -> str:
+        part = match[0]
+        if not part.startswith("&#"):
+            return html.unescape(part)
+        numeric = re.match(r"&#(?:[xX]([0-9a-fA-F]+)|([0-9]+));?", part)
+        if numeric is None:
+            return part
+        digits, radix = (numeric[1], 16) if numeric[1] is not None else (numeric[2], 10)
+        scalar = 0
+        for digit in digits:
+            # Saturation consumes arbitrarily long references without relying
+            # on Python's bounded decimal-string conversion or integer width.
+            scalar = min(scalar * radix + int(digit, radix), 0x110000)
+        if 0x80 <= scalar <= 0x9F:
+            scalar = c1[scalar - 0x80]
+        if scalar == 0 or scalar > 0x10FFFF or 0xD800 <= scalar <= 0xDFFF:
+            scalar = 0xFFFD
+        return chr(scalar) + part[numeric.end() :]
+
+    # Each reference sees the original pass input. Generated ampersands must
+    # wait for the next charged pass, and named references never reach numerics.
+    return re.sub(r"&[^&]*", decode, value)
+
+
 _KINDS = (
     "identity",
     "url_component",
@@ -92,6 +159,8 @@ def profile_version(digest: str) -> str:
         return "v3"
     if digest == PROFILE_DIGEST_V4:
         return "v4"
+    if digest == PROFILE_DIGEST_V5:
+        return "v5"
     raise ProvenanceError(
         f"recipe: transform profile digest: unknown profile {digest!r}"
     )
@@ -216,7 +285,10 @@ def supported_operation_kinds_for_profile(digest: str) -> tuple[str, ...]:
         kind
         for kind in _KINDS
         if (version != "v1" or kind != "ascii_alphanumeric_strip")
-        and (version in {"v3", "v4"} or kind not in {"ascii_upper", "json_unicode_escape"})
+        and (
+            version in {"v3", "v4", "v5"}
+            or kind not in {"ascii_upper", "json_unicode_escape"}
+        )
     )
 
 
@@ -315,6 +387,30 @@ def _strict_percent(value: str, plus: bool = False) -> str:
         value = value.replace("+", " ")
     try:
         return unquote_to_bytes(value).decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProvenanceError("output: invalid UTF-8") from exc
+
+
+def _percent_bytes(value: bytes, plus: bool = False, strict: bool = True) -> bytes:
+    if strict and re.search(rb"%(?![0-9A-Fa-f]{2})", value):
+        raise ProvenanceError("percent decode: invalid URL escape")
+    return unquote_to_bytes(value.replace(b"+", b" ") if plus else value)
+
+
+def _query_unescape_bytes(value: str, charge: Callable[[str | bytes], None]) -> bytes:
+    raw = value.encode("utf-8")
+    for _ in range(500):
+        charge(raw)
+        decoded = _percent_bytes(raw, plus=True, strict=False)
+        if decoded == raw:
+            break
+        raw = decoded
+    return raw
+
+
+def _operation_text(value: bytes) -> str:
+    try:
+        return value.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ProvenanceError("output: invalid UTF-8") from exc
 
@@ -462,7 +558,11 @@ class Recipe:
             raise ProvenanceError(
                 "ascii_alphanumeric_strip is unsupported by transform profile"
             )
-        if kind in {"ascii_upper", "json_unicode_escape"} and profile not in {"v3", "v4"}:
+        if kind in {"ascii_upper", "json_unicode_escape"} and profile not in {
+            "v3",
+            "v4",
+            "v5",
+        }:
             raise ProvenanceError(f"{kind} is unsupported by transform profile")
         for field in ("selector", "profile"):
             if field in op and (not isinstance(op[field], str) or _control(op[field])):
@@ -511,7 +611,7 @@ class Recipe:
         elif kind in {"base32_decode", "base64_decode", "base32_decode_liberal"}:
             allowed.add("decode_padding")
             if kind.startswith("base32") and "alphabet" in op:
-                if profile not in {"v3", "v4"}:
+                if profile not in {"v3", "v4", "v5"}:
                     raise ProvenanceError(
                         "alphabet is unsupported by transform profile"
                     )
@@ -626,8 +726,14 @@ class Recipe:
         if k == "identity":
             return v
         if k == "url_component":
-            return _url_component(v, op)
+            return _url_component(v, op, profile == "v5")
         if k == "percent_decode":
+            if profile == "v5":
+                raw = v.encode("utf-8")
+                for _ in range(op["passes"]):
+                    charge(raw)
+                    raw = _percent_bytes(raw)
+                return _operation_text(raw)
             for _ in range(op["passes"]):
                 charge(v)
                 v = _strict_percent(v)
@@ -670,6 +776,8 @@ class Recipe:
         if k == "vowel_fold":
             return v.translate(str.maketrans("aeiouAEIOU", "aaaaaAAAAA"))
         if k == "query_unescape":
+            if profile == "v5":
+                return _operation_text(_query_unescape_bytes(v, charge))
             return _query_unescape(v, charge, profile == "v4")
         if k == "invisible_space":
             return "".join(" " if _invisible(ch) else ch for ch in v)
@@ -684,7 +792,7 @@ class Recipe:
                 for ch in unicode.normalize("NFD", normalized)
                 if unicode.category(ch) != "Mn"
             )
-            if profile in {"v3", "v4"}:
+            if profile in {"v3", "v4", "v5"}:
                 normalized = unicode.normalize("NFC", normalized)
             return _matching_whitespace(normalized)
         if k.endswith("_liberal"):
@@ -707,9 +815,11 @@ class Recipe:
             parts = [x for x in re.split(pattern, v) if x]
             return _at(parts, op.get("occurrence", 0), "text segment")
         if k == "html_entity_decode":
+            if profile == "v5" and "&" not in v:
+                return v
             for _ in range(16):
                 charge(v)
-                out = html.unescape(v)
+                out = _html_decode_v5(v) if profile == "v5" else html.unescape(v)
                 if out == v:
                     break
                 v = out
@@ -734,12 +844,33 @@ class Recipe:
                 ch for ch in v if ch.isascii() and (ch.isalnum() or ch in "_-=")
             )
         if k == "ordered_query_concat":
+            if profile == "v5":
+                return _operation_text(
+                    b"".join(
+                        _query_unescape_bytes(x.partition("=")[2], charge)
+                        for x in v.split("&")
+                        if x.partition("=")[2]
+                    )
+                )
             return "".join(
                 _query_unescape(x.partition("=")[2], charge, profile == "v4")
                 for x in v.split("&")
                 if x.partition("=")[2]
             )
         if k == "query_subsequence":
+            if profile == "v5":
+                raw_values = [
+                    x.partition("=")[2] for x in v.split("&") if x.partition("=")[2]
+                ][:20]
+                decoded_values = [_query_unescape_bytes(x, charge) for x in raw_values]
+                selected = []
+                for index in op["indices"]:
+                    if index >= len(decoded_values):
+                        raise ProvenanceError(
+                            f"query subsequence: index {index} unavailable"
+                        )
+                    selected.append(decoded_values[index])
+                return _operation_text(b"".join(selected))
             values = [
                 _query_unescape(x.partition("=")[2], charge, profile == "v4")
                 for x in v.split("&")
@@ -869,7 +1000,7 @@ def _at(values: list[str], index: int, name: str) -> str:
     return values[index]
 
 
-def _url_component(value: str, op: dict[str, Any]) -> str:
+def _url_component(value: str, op: dict[str, Any], portable: bool = False) -> str:
     parsed = urlsplit(value)
     if not parsed.scheme or not parsed.netloc:
         raise ProvenanceError("URL parse: invalid absolute URL")
@@ -885,6 +1016,29 @@ def _url_component(value: str, op: dict[str, Any]) -> str:
         return parsed.path
     if component == "raw_query":
         return parsed.query
+    if portable:
+        byte_values = []
+        for raw in parsed.query.split("&"):
+            if ";" in raw:
+                raise ProvenanceError("query parse: invalid semicolon separator")
+            key, _, raw_value = raw.partition("=")
+            try:
+                key_bytes = _percent_bytes(key.encode(), plus=True)
+                value_bytes = _percent_bytes(raw_value.encode(), plus=True)
+            except ProvenanceError as exc:
+                raise ProvenanceError("query parse: invalid URL escape") from exc
+            if key_bytes == op["selector"].encode():
+                byte_values.append(value_bytes)
+        occurrence = op.get("occurrence", 0)
+        if occurrence >= len(byte_values):
+            raise ProvenanceError(
+                f"query component: occurrence {occurrence} unavailable"
+            )
+        return (
+            op["selector"]
+            if component == "query_key"
+            else _operation_text(byte_values[occurrence])
+        )
     pairs = []
     for raw in parsed.query.split("&"):
         key, _, raw_value = raw.partition("=")

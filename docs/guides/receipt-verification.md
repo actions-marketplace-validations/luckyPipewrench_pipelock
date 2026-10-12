@@ -173,7 +173,7 @@ The `evidence-proxy-0.jsonl` filenames in the historical examples below are lega
 pipelock verify-receipt evidence-proxy-0.jsonl --key 70b991eb...
 ```
 
-Output on success:
+Output when a terminal signed session close proves the selected action-chain endpoint:
 
 ```text
 CHAIN VALID: evidence-proxy-0.jsonl
@@ -206,13 +206,19 @@ Chain verification checks:
   covers it and its value never contributes to a verified claim; only its
   bytes join the chain link hash.
 - In a flight-recorder file, the chain is the `action_receipt` subsequence.
-  `evidence_receipt` entries interleaved in the same file are skipped, as in
-  the Go verifier; a file with only `evidence_receipt` entries is verified as
-  an EvidenceReceipt v2 chain by the SDK verifiers.
+  `evidence_receipt` entries form a separate signed chain. Every verifier checks both chains when both are present. A file with only `evidence_receipt` entries is verified as an EvidenceReceipt v2 chain.
 
-Without `--whole-recorder`, verification checks only the receipt subsequence. Add `--whole-recorder` to check every present recorder entry, reject unknown entry types and hash-chain breaks, and verify the commitment in a `transcript_root`.
+Receipt mode verifies both signed receipt subsequences and checks the recorder hash chain when recorder metadata is present. Historical receipt-only wrappers have no outer chain to check; mixed receipt-only and recorder entries are refused. Add `--whole-recorder` to authenticate the outer boundary with a `transcript_root` and its trailing signed checkpoint.
 
-With `--chain DIR` and no `--session`, unsealed runs are listed under `INCOMPLETE RUNS` but don't cause a non-zero exit by themselves. Add `--require-seal` to fail if any run lacks a seal.
+A valid receipt prefix prints `VALID PREFIX, END UNPROVEN` and exits 3. Exit 0 requires proof of the endpoint for the declared scope: a terminal signed `session_close` binding the final head, sequence, and count; a whole-recorder transcript root covered by its trailing signed checkpoint (both only in a per-run session); a complete receipt-group close; or an independently known final receipt hash or sequence supplied with `--expect-head` or `--expect-seq`. A signer key establishes trust in the signer, not the endpoint. Restart links and recovery seals don't prove an end.
+
+Pipelock has recorded each run under its own per-run session (`<base>.run.<id>`) since v3.6.0. Older releases recorded every run under one shared session such as `proxy` and resumed that chain after each restart, so a close or seal there doesn't show that nothing came after it. Those chains exit 3. In receipt-chain mode, pin the endpoint with `--expect-head` or `--expect-seq`. Under `--whole-recorder` a receipt pin can't authenticate the recorder entries, so it never proves the end there; use `--allow-prefix` to accept the prefix.
+
+`--allow-prefix` accepts a valid prefix with exit 0 while keeping the same prefix label in text and JSON. It never accepts invalid evidence or a mismatching endpoint pin. In mixed v1/v2 input, both chains need end proof; an endpoint pin applies to the v2 chain. Directory verification requires proof for every selected run. It doesn't prove that no run is missing: deleting a whole run together with its restart link file isn't detected. Select one run with `--session` before supplying a pin when several runs are present.
+
+With `--whole-recorder`, unsealed runs are listed under `INCOMPLETE RUNS` and return exit 3 unless `--allow-prefix` is set. Add `--require-seal` to make a missing seal invalid evidence (exit 1), even with `--allow-prefix`. Receipt-only pins don't authenticate unsigned recorder entries, so whole-recorder success still requires its signed outer boundary.
+
+`--json` exposes `integrity`, `end_proof` (`proven` and the evidence checked), `scope`, and `status`. Signer trust remains separate in the chain reports. The scope is `receipt_chain`, `whole_recorder`, `receipt_group`, or `chain_set`.
 
 Full chain verification with `--chain DIR` or `--whole-recorder` is for a recorder that isn't being written while it's verified. Stop the writer first, or verify an atomic filesystem snapshot of the recorder directory. A plain copy taken while the writer is still running can capture shards at different moments, so a clean result on it proves the integrity of what was copied, not that the recorder's full evidence was checked. Concurrent modification is detected on a best-effort basis: a shard or `chain-link-*.json` file that is added, removed, replaced, or resized, or a link file whose bytes change, fails the result with `RECORDER CHANGED DURING VERIFICATION` instead of a verdict on the evidence. A same-size in-place rewrite of a shard by a process with write access to the evidence directory is outside what an offline verifier can rule out. To check a live recorder, run `pipelock evidence doctor DIR`, which checks link files and chain structure and tolerates a recorder that is still being written.
 
@@ -224,7 +230,7 @@ Signed checkpoints authenticate entries that aren't receipts, such as decisions 
 
 The seal must be covered by the signed checkpoint written after the root. By default, verification refuses when no signed checkpoint follows the seal, since an older checkpoint doesn't prove the seal was included.
 
-If `flight_recorder.sign_checkpoints` is `false`, or the last entry filled a shard so no trailing checkpoint was written, pass `--allow-unanchored-seal` to accept the recorder. The output identifies entries that are hash-linked but not authenticated.
+If `flight_recorder.sign_checkpoints` is `false`, or the last entry filled a shard so no trailing checkpoint was written, pass `--allow-unanchored-seal` to inspect the recorder. Its endpoint remains unproven, and it exits 3 unless `--allow-prefix` is also set. The output identifies entries that are hash-linked but not authenticated.
 
 As with a single receipt, an unpinned chain run (no `--key`) prints
 `CHAIN UNPINNED` and exits non-zero unless you pass `--allow-unpinned`; pinning
@@ -251,20 +257,14 @@ When a run starts after recovering a torn predecessor shard, its signed `recover
 The runnable [receipt verification example](../../examples/receipt-verify/README.md)
 captures a blocked request, verifies it with a pinned key, then in step 5 changes
 the blocked receipt's `detail.action_record.verdict` from `block` to `allow`.
-The verifier fails closed (exit 1) with this output shape from an actual run:
+The verifier refuses the modified capture (exit 1) with a recorder hash mismatch. The next step changes the standalone receipt and requires a signature failure. The captured-file check produces this output excerpt:
 
 ```text
-CHAIN BROKEN: /tmp/.../evidence-proxy-0.tampered.jsonl
-  Error:    seq 2: signature: signature verification failed
-  Broke at: seq 2
+CHAIN BROKEN: /tmp/.../tampered/evidence-proxy.run.<id>-0.jsonl
+  Error:    recorder entry hash chain: entry seq 0: hash mismatch: ...
 ```
 
-Receipt-chain verification authenticates the signed `action_record` (including
-the action, policy hash, verdict, target, and chain linkage), not the outer
-flight-recorder hash chain. An entry's `seq` and `summary` are not checked in
-this mode. Its `type` is not signed, but it does select whether the entry is
-extracted as an action receipt; unknown types fail closed. Changing an outer
-field is therefore not a tamper demonstration for receipt-chain verification.
+Receipt-chain verification authenticates the signed `action_record`, including the action, policy hash, verdict, target, and chain linkage. It also checks the outer recorder hash chain when present, but unsigned outer fields don't gain signer authentication from hash linkage alone. An entry's `type` selects which receipt chain is extracted; unknown types fail closed. Changing a signed receipt field demonstrates a signature failure even if an editor recomputes the outer hashes.
 
 ### Compacting an over-cap recorder directory
 
@@ -402,14 +402,21 @@ verified.
 report describes one chain: `--clean-report` selects a lone run, and requires
 `--session` when several runs are present. An empty report is an error.
 
-Clean report v1 requires `schema_version: pipelock.clean_report.v1` and an explicit
-`verification_mode`: `pinned_provenance` means the receipt signer matched an
-operator-supplied key; `unpinned_structural` means `--allow-unpinned` accepted
-a self-consistent chain without signer provenance. The required fields are in
-[`clean-report-v1.schema.json`](../evidence/clean-report-v1.schema.json).
-The terminal label also says `CLEAN REPORT UNPINNED` for structural verification.
-Upgrade report parsers to require both fields. For older reports with no mode,
-treat trust as unknown and require re-verification before accepting provenance.
+New clean reports use `schema_version: pipelock.clean_report.v2`. The
+[v2 schema](../evidence/clean-report-v2.schema.json) requires `integrity`,
+`end_proof`, `scope`, and `status`, along with `verification_mode`, `chain`, and
+`actions`. `pinned_provenance` means the signer matched an operator-supplied key;
+`unpinned_structural` means `--allow-unpinned` accepted a self-consistent chain
+without signer provenance. `CHAIN UNPINNED` requires valid integrity and a proven
+end. An open prefix keeps `VALID PREFIX, END UNPROVEN` and returns 3 after writing
+the report. `--allow-prefix` changes that exit to 0 while preserving the status.
+
+Readers must dispatch by `schema_version` and reject unknown versions. Historical
+`pipelock.clean_report.v1` reports still use the unchanged
+[v1 schema](../evidence/clean-report-v1.schema.json), which has no top-level
+integrity or endpoint fields and rejects extended reports. Do not infer end proof
+from v1 reports. For older reports with no verification mode, treat signer trust
+as unknown and require re-verification before accepting provenance.
 
 ## Anchoring receipts
 
@@ -795,8 +802,7 @@ checked because v2 receipts do not embed public keys.
 
 **A valid chain is not a complete chain.** Structure, linkage, sequence, and
 signatures are all satisfied by any prefix of a chain, so a file with its
-trailing entries removed still verifies. The verifier reports this as
-`completeness: not proven` and returns `head_verified: false` in `--json`
+trailing entries removed still passes the integrity check. The CLI reports `VALID PREFIX, END UNPROVEN`, exits 3 by default, and returns `end_proof.proven: false` and `head_verified: false` in `--json`
 output. Pass `--expect-head` with the receipt hash of the entry the chain should
 end on to close it: a truncated or forked chain is then rejected, and the report
 reads `completeness: head verified`. Source that hash from trusted context
@@ -806,8 +812,7 @@ entries can rewrite an unsigned value stored beside them.
 
 The standalone binary reads the same Audit Packet v0 schema and receipt signing
 conventions as the in-tree `pipelock verify-receipt` subcommand, plus the
-EvidenceReceipt v2 schema used by learn-and-lock. It returns exit 0 for valid
-evidence, exit 1 for invalid evidence, exit 2 for runtime errors, and exit 64
+EvidenceReceipt v2 schema used by learn-and-lock. For chain verification it returns exit 0 only with a proven end, exit 3 for a valid prefix with an unproven end, and exit 1 for invalid evidence. `--allow-prefix` accepts exit 3 as exit 0 while retaining the prefix status. Other commands retain their contracts. It returns exit 2 for runtime errors, and exit 64
 for CLI usage errors. Use this binary in post-incident review and nightly audit
 jobs.
 

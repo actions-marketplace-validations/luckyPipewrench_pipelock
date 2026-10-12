@@ -31,7 +31,7 @@ It provides these commands:
 
 ```text
 pipelock-verifier-rs audit-packet PATH [--json] [--key HEX_OR_FILE]... [--offline] [--allow-self-consistent-only] [--no-trust-required] [--expect-sha256 HEX]
-pipelock-verifier-rs chain PATH [--json] [--key HEX_OR_FILE]... [--rotation-endorsement FILE]... [--dir] [--session-id ID]
+pipelock-verifier-rs chain PATH [--json] [--key HEX_OR_FILE]... [--rotation-endorsement FILE]... [--allow-unpinned] [--allow-prefix] [--expect-head HASH] [--expect-seq N] [--dir] [--session-id ID]
 pipelock-verifier-rs group EVIDENCE_DIR --group-id ID --key HEX_OR_FILE... [--json]
 pipelock-verifier-rs receipt PATH [--json] [--key HEX_OR_FILE]
 ```
@@ -48,6 +48,7 @@ Exit codes match the Go and TypeScript verifiers:
 
 - `0` valid
 - `1` invalid
+- `3` valid prefix, end unproven (chain commands)
 - `2` runtime error
 - `64` usage error
 
@@ -109,3 +110,11 @@ bound. Insignificant whitespace and object key order remain permitted. Library
 callers handling untrusted JSON should use `run_receipt` or
 `util::parse_json_text` before verification; an independently constructed
 `serde_json::Value` cannot retain duplicate keys or original numeric spelling.
+
+## Receipt-chain endpoints
+
+Receipt-chain CLI verification returns 0 only when integrity verifies and the end is proven for the declared scope. A valid open prefix returns 3 with `VALID PREFIX, END UNPROVEN`. Invalid evidence returns 1. `--allow-prefix` returns 0 for that prefix while preserving the label and JSON status; it never accepts a broken chain or a mismatching pin.
+
+A terminal signed `session_close` proves the action-chain endpoint when its run's `session_open` names a per-run recorder session (`<base>.run.<id>`). Chains written before Pipelock v3.6.0 recorded every run under one shared session and resumed it after each restart, so their closes don't prove the end; pin those or accept the prefix. A complete receipt-group close proves its group scope. `--expect-head HASH` or `--expect-seq N` checks an independently known final receipt hash or sequence. A signer key, restart link, or recovery seal alone doesn't prove an end. Mixed action/evidence input verifies both chains, with pins applied to the evidence chain. Directory verification requires proof for every selected run; select one run before supplying a pin across several runs.
+
+JSON separates `integrity`, `end_proof` (`proven` and checked `evidence`), `scope`, and `status` from signer trust. Low-level prefix-verification APIs and signed formats retain their existing contracts. Audit Packet, AARP, provenance, and single-receipt commands retain their existing exit codes.

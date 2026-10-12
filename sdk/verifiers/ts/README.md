@@ -34,18 +34,19 @@ The package exposes `pipelock-verifier-ts` after build.
 
 ```bash
 pipelock-verifier-ts audit-packet PATH [--json] [--key HEX_OR_FILE]... [--offline]
-pipelock-verifier-ts chain PATH [--json] [--key HEX_OR_FILE]... [--rotation-endorsement FILE]... [--dir] [--session-id ID] [--group ID]
+pipelock-verifier-ts chain PATH [--json] [--key HEX_OR_FILE]... [--rotation-endorsement FILE]... [--allow-unpinned] [--allow-prefix] [--expect-head HASH] [--expect-seq N] [--dir] [--session-id ID] [--group ID]
 pipelock-verifier-ts receipt PATH [--json] [--key HEX_OR_FILE]
 ```
 
 Exit codes match the Go verifier:
 
-| Code | Meaning         |
-| ---- | --------------- |
-| 0    | valid           |
-| 1    | invalid         |
-| 2    | runtime error   |
-| 64   | CLI usage error |
+| Code | Meaning                                     |
+| ---- | ------------------------------------------- |
+| 0    | valid                                       |
+| 1    | invalid                                     |
+| 2    | runtime error                               |
+| 3    | valid prefix, end unproven (chain commands) |
+| 64   | CLI usage error                             |
 
 `audit-packet` validates `packet.json` against `sdk/audit-packet/v0.json`, applies the structural v0 checks, and re-verifies the referenced receipt chain unless `--offline` is set. `chain` accepts either an `evidence.jsonl` file or a recorder session directory with `--dir`. `receipt` verifies one receipt JSON file. For EvidenceReceipt v2, `receipt` requires a pinned `--key`, verifies the JCS preimage, and enforces strict validation for supported v2 payload kinds, including source-span rules for `proxy_decision_with_spans`.
 
@@ -126,3 +127,11 @@ The source profile permits JCS-equivalent whitespace, property order and escaped
 property names. It is not a byte-for-byte comparison with Go's emitted JSON;
 Go's separate `VerifyV2BytesWithKey` API supplies that stronger check. The
 new-kind integer, timestamp and signature-string restrictions still apply.
+
+## Receipt-chain endpoints
+
+Receipt-chain CLI verification returns 0 only when integrity verifies and the end is proven for the declared scope. A valid open prefix returns 3 with `VALID PREFIX, END UNPROVEN`. Invalid evidence returns 1. `--allow-prefix` returns 0 for that prefix while preserving the label and JSON status; it never accepts a broken chain or a mismatching pin.
+
+A terminal signed `session_close` proves the action-chain endpoint when its run's `session_open` names a per-run recorder session (`<base>.run.<id>`). Chains written before Pipelock v3.6.0 recorded every run under one shared session and resumed it after each restart, so their closes don't prove the end; pin those or accept the prefix. A complete receipt-group close proves its group scope. `--expect-head HASH` or `--expect-seq N` checks an independently known final receipt hash or sequence. A signer key, restart link, or recovery seal alone doesn't prove an end. Mixed action/evidence input verifies both chains, with pins applied to the evidence chain. Directory verification requires proof for every selected run; select one run before supplying a pin across several runs.
+
+JSON separates `integrity`, `end_proof` (`proven` and checked `evidence`), `scope`, and `status` from signer trust. Low-level prefix-verification APIs and signed formats retain their existing contracts. Audit Packet, AARP, provenance, and single-receipt commands retain their existing exit codes.

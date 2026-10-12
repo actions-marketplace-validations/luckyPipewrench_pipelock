@@ -190,7 +190,7 @@ test("shared native AEL matrix", async () => {
 
 test("torn gated shard without opening cannot fall back to legacy directory verification", () => {
   const dir = join(matrixFixtures, "cases", "shard__torn-gate-missing-open");
-  const result = runCLI(["chain", dir, "--dir", "--json"]);
+  const result = runCLI(["chain", "--allow-prefix", dir, "--dir", "--json"]);
   assert.equal(result.status, 1, result.stderr);
   const report = JSON.parse(result.stdout) as { error?: string };
   assert.match(report.error ?? "", /GROUP_INVALID/u);
@@ -539,7 +539,17 @@ test("CLI group mode prints the group verdict and exits nonzero when incomplete"
     id = groupID(dir),
     key = keys(dir)[0];
   assert.ok(key);
-  const valid = runCLI(["chain", dir, "--dir", "--group", id, "--key", key, "--json"]);
+  const valid = runCLI([
+    "chain",
+    "--allow-prefix",
+    dir,
+    "--dir",
+    "--group",
+    id,
+    "--key",
+    key,
+    "--json",
+  ]);
   assert.equal(valid.status, 0, `${valid.stdout}\n${valid.stderr}\n${String(valid.error)}`);
   assert.equal((JSON.parse(valid.stdout) as { verdict: string }).verdict, "GROUP_VALID");
   const temp = mkdtempSync(join(tmpdir(), "ts-receipt-group-cli-"));
@@ -547,7 +557,17 @@ test("CLI group mode prints the group verdict and exits nonzero when incomplete"
     const incomplete = join(temp, "incomplete");
     cpSync(dir, incomplete, { recursive: true });
     rmSync(join(incomplete, `receipt-group-${id}-close.json`));
-    const result = runCLI(["chain", incomplete, "--dir", "--group", id, "--key", key, "--json"]);
+    const result = runCLI([
+      "chain",
+      "--allow-prefix",
+      incomplete,
+      "--dir",
+      "--group",
+      id,
+      "--key",
+      key,
+      "--json",
+    ]);
     assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}\n${String(result.error)}`);
     assert.ok(result.stdout, result.stderr);
     assert.equal((JSON.parse(result.stdout) as { verdict: string }).verdict, "GROUP_INCOMPLETE");
@@ -635,10 +655,10 @@ test("a group shard file is not a skippable receipt chain outside group mode", (
   const trusted = (
     JSON.parse(readFileSync(join(dir, "trust.json"), "utf8")) as { trusted_keys: string[] }
   ).trusted_keys[0] as string;
-  const single = runCLI(["chain", join(dir, shard), "--key", trusted]);
+  const single = runCLI(["chain", "--allow-prefix", join(dir, shard), "--key", trusted]);
   assert.notEqual(single.status, 0, `${single.stdout}\n${single.stderr}`);
   assert.doesNotMatch(single.stdout, /CHAIN VALID/u);
-  const asDir = runCLI(["chain", dir, "--dir", "--key", trusted]);
+  const asDir = runCLI(["chain", "--allow-prefix", dir, "--dir", "--key", trusted]);
   assert.notEqual(asDir.status, 0, `${asDir.stdout}\n${asDir.stderr}`);
 });
 
@@ -661,14 +681,20 @@ test("legacy chain --dir and single-file verification reject a torn final fragme
       "--rotation-endorsement",
       join(intact, "rotation-endorsement.json"),
     ];
-    const ok = runCLI(args(intact, true));
+    // An intact open run verifies but cannot prove its end: exit 3 by
+    // default, and 0 only when the caller explicitly accepts the prefix.
+    const prefix = runCLI(args(intact, true));
+    assert.equal(prefix.status, 3, `${prefix.stdout}\n${prefix.stderr}`);
+    assert.match(prefix.stdout, /VALID PREFIX, END UNPROVEN/u);
+    const ok = runCLI([...args(intact, true), "--allow-prefix"]);
     assert.equal(ok.status, 0, `${ok.stdout}\n${ok.stderr}`);
+    assert.match(ok.stdout, /VALID PREFIX, END UNPROVEN/u);
     const torn = join(temp, "torn");
     cpSync(parity, torn, { recursive: true });
     writeFileSync(join(torn, shard), `${readFileSync(join(torn, shard), "utf8")}{"torn":`);
     const dirResult = runCLI(args(torn, true));
     assert.equal(dirResult.status, 1, `${dirResult.stdout}\n${dirResult.stderr}`);
-    assert.match(dirResult.stdout, /result:\s+INVALID/u);
+    assert.match(dirResult.stdout, /result:\s+CHAIN BROKEN/u);
     const fileResult = runCLI(args(join(torn, shard), false));
     assert.notEqual(fileResult.status, 0, `${fileResult.stdout}\n${fileResult.stderr}`);
     assert.doesNotMatch(fileResult.stdout, /CHAIN VALID/u);
