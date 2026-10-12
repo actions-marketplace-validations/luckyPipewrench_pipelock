@@ -82,6 +82,10 @@ func HasSingleSSEContentType(header http.Header) bool {
 // transport specification, handling both JSON and SSE response types,
 // session ID tracking, and 202 Accepted for notifications.
 type HTTPClient struct {
+	// ResponseKeyValidator is installed by the MCP pipeline before use. It
+	// gates transport state while leaving rejected bytes for pipeline diagnostics.
+	ResponseKeyValidator func([]byte) error
+
 	url                  string
 	headers              http.Header
 	client               *http.Client
@@ -282,9 +286,18 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	if err := trackSessionID(); err != nil {
+	// Header syntax is checked immediately, but response-derived session state
+	// is admitted only after the first message passes key validation.
+	if token := resp.Header.Get(pipelockSessionTokenHeader); token != "" && !validPipelockSessionToken(token) {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, ErrInvalidPipelockSessionToken
+	}
+
+	if c.ResponseKeyValidator == nil {
+		if err := trackSessionID(); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
 	}
 
 	// Decode supported buffered JSON responses before scanning. Compressed SSE,
@@ -313,10 +326,56 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 	} else {
 		reader = &SingleMessageReader{Body: resp.Body}
 	}
+	if c.ResponseKeyValidator != nil {
+		reader = &sessionResponseReader{reader: reader, validate: c.ResponseKeyValidator, commit: trackSessionID}
+	}
 	if initializeID != nil {
 		reader = &initializeResponseReader{reader: reader, client: c, id: initializeID, generation: generation}
 	}
 	return reader, nil
+}
+
+// sessionResponseReader defers header-state admission until a framed message
+// passes the caller's key guard. Invalid bytes still reach the response scanner.
+type sessionResponseReader struct {
+	reader interface {
+		MessageReader
+		io.Closer
+	}
+	validate func([]byte) error
+	commit   func() error
+	mu       sync.Mutex // guards admission against concurrent timeout cleanup
+	done     bool
+	closed   bool
+}
+
+func (r *sessionResponseReader) ReadMessage() ([]byte, error) {
+	msg, err := r.reader.ReadMessage()
+	if err != nil {
+		return msg, err
+	}
+	if r.validate != nil && r.validate(msg) != nil {
+		return msg, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done || r.closed {
+		return msg, nil
+	}
+	if err := r.commit(); err != nil {
+		return nil, err
+	}
+	r.done = true
+	return msg, nil
+}
+
+func (r *sessionResponseReader) Close() error {
+	// A worker may already have the bytes when cleanup closes the body. Revoke
+	// admission before closing it, with the same lock held during commitment.
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	return r.reader.Close()
 }
 
 // Protocol negotiation observes framed responses without consuming or changing
@@ -496,6 +555,9 @@ func (r *initializeResponseReader) ReadMessage() ([]byte, error) {
 	msg, err := r.reader.ReadMessage()
 	if err != nil || r.done {
 		return msg, err
+	}
+	if r.client.ResponseKeyValidator != nil && r.client.ResponseKeyValidator(msg) != nil {
+		return msg, nil
 	}
 	var response map[string]json.RawMessage
 	if json.Unmarshal(msg, &response) != nil || jsonscan.RejectDuplicateKeys(msg) != nil ||

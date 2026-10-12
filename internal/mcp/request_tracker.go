@@ -24,7 +24,7 @@ const maxTrackedRequests = 10000
 // A nil tracker passes all IDs through (feature disabled).
 type RequestTracker struct {
 	mu      sync.Mutex
-	pending map[string]TrackedRequestOutcome
+	pending map[string]trackedRequest
 	// order preserves insertion order for FIFO eviction when cap is reached.
 	order []string
 	// seeded is true once at least one request ID has been tracked.
@@ -47,6 +47,11 @@ type TrackedRequestOutcome struct {
 	Method string
 }
 
+type trackedRequest struct {
+	outcome                 TrackedRequestOutcome
+	rejectionOutcomeClaimed bool
+}
+
 // PendingRequestOutcome is a drained pending JSON-RPC request ID plus its
 // outcome receipt metadata.
 type PendingRequestOutcome struct {
@@ -57,7 +62,7 @@ type PendingRequestOutcome struct {
 // NewRequestTracker creates a tracker with an empty pending set.
 func NewRequestTracker() *RequestTracker {
 	return &RequestTracker{
-		pending: make(map[string]TrackedRequestOutcome),
+		pending: make(map[string]trackedRequest),
 	}
 }
 
@@ -125,7 +130,7 @@ func (t *RequestTracker) TrackOutcome(id json.RawMessage, outcome TrackedRequest
 		t.order = t.order[1:]
 	}
 
-	t.pending[key] = outcome
+	t.pending[key] = trackedRequest{outcome: outcome}
 	t.order = append(t.order, key)
 	t.seeded = true
 }
@@ -136,6 +141,28 @@ func (t *RequestTracker) TrackOutcome(id json.RawMessage, outcome TrackedRequest
 func (t *RequestTracker) Validate(id json.RawMessage) bool {
 	_, ok := t.Consume(id)
 	return ok
+}
+
+// claimRejectedOutcome reserves at most one rejection receipt per pending
+// request without consuming its correlation or changing trusted metadata.
+// The reservation is retained even if receipt emission fails.
+func (t *RequestTracker) claimRejectedOutcome(id json.RawMessage) (TrackedRequestOutcome, bool) {
+	if t == nil {
+		return TrackedRequestOutcome{}, false
+	}
+	key := canonicalID(id)
+	if key == "" {
+		return TrackedRequestOutcome{}, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	request, ok := t.pending[key]
+	if !ok || request.rejectionOutcomeClaimed || request.outcome.Receipt.ActionID == "" {
+		return TrackedRequestOutcome{}, false
+	}
+	request.rejectionOutcomeClaimed = true
+	t.pending[key] = request
+	return request.outcome, true
 }
 
 // Consume checks whether id was previously tracked and returns the associated
@@ -153,7 +180,7 @@ func (t *RequestTracker) Consume(id json.RawMessage) (TrackedRequestOutcome, boo
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	outcome, ok := t.pending[key]
+	request, ok := t.pending[key]
 	if !ok {
 		return TrackedRequestOutcome{}, false
 	}
@@ -166,7 +193,7 @@ func (t *RequestTracker) Consume(id json.RawMessage) (TrackedRequestOutcome, boo
 			break
 		}
 	}
-	return outcome, true
+	return request.outcome, true
 }
 
 // Seeded reports whether at least one request ID has been tracked.
@@ -213,10 +240,10 @@ func (t *RequestTracker) DrainPendingOutcomes() []PendingRequestOutcome {
 	for _, key := range t.order {
 		pending = append(pending, PendingRequestOutcome{
 			ID:      json.RawMessage(key),
-			Outcome: t.pending[key],
+			Outcome: t.pending[key].outcome,
 		})
 	}
-	t.pending = make(map[string]TrackedRequestOutcome)
+	t.pending = make(map[string]trackedRequest)
 	t.order = nil
 	return pending
 }

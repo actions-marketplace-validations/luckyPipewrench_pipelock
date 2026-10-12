@@ -14,6 +14,7 @@ import {
   statSync,
 } from "node:fs";
 import * as path from "node:path";
+import { KEY_FOLD_GROUPS } from "./key-fold-data.js";
 
 export class UsageError extends Error {
   readonly code = 64;
@@ -267,10 +268,29 @@ export function parseJSON<T>(text: string, label: string): T {
 const maxDuplicateKeyScanDepth = 128;
 const maxExactJSONInteger = Number.MAX_SAFE_INTEGER;
 
+// Pin key identity to Go's simple-fold cycles, rather than ICU lowercase.
+const keyFold = new Map<string, string>();
+for (const group of KEY_FOLD_GROUPS.split(/\s+/u)) {
+  const chars = [...group];
+  for (const char of chars) keyFold.set(char, chars[0]);
+}
+export function foldKey(value: string): string {
+  return [...value].map((char) => keyFold.get(char) ?? char).join("");
+}
+
 export function rejectDuplicateKeys(text: string): void {
+  rejectKeys(text, false);
+}
+
+// For schema objects only; free-form data uses the exact checker.
+export function rejectFoldedKeys(text: string): void {
+  rejectKeys(text, true);
+}
+
+function rejectKeys(text: string, caseInsensitive: boolean): void {
   interface Frame {
     isObject: boolean;
-    keys: Set<string>;
+    keys: Map<string, string>;
     expectKey: boolean;
   }
   const stack: Frame[] = [];
@@ -326,8 +346,16 @@ export function rejectDuplicateKeys(text: string): void {
       }
       const top = stack[stack.length - 1];
       if (top !== undefined && top.isObject && top.expectKey) {
-        if (top.keys.has(str)) throw new InvalidError(`duplicate object key: ${str}`);
-        top.keys.add(str);
+        const folded = caseInsensitive ? foldKey(str) : str;
+        const prior = top.keys.get(folded);
+        if (prior !== undefined) {
+          throw new InvalidError(
+            caseInsensitive && prior !== str
+              ? `case-insensitive duplicate object keys: ${JSON.stringify(prior)} and ${JSON.stringify(str)}`
+              : `duplicate object key: ${str}`,
+          );
+        }
+        top.keys.set(folded, str);
       }
       continue;
     }
@@ -353,9 +381,9 @@ export function rejectDuplicateKeys(text: string): void {
       }
     }
     if (c === "{") {
-      stack.push({ isObject: true, keys: new Set(), expectKey: true });
+      stack.push({ isObject: true, keys: new Map(), expectKey: true });
     } else if (c === "[") {
-      stack.push({ isObject: false, keys: new Set(), expectKey: false });
+      stack.push({ isObject: false, keys: new Map(), expectKey: false });
     } else if (c === "}" || c === "]") {
       stack.pop();
     } else if (c === ":") {

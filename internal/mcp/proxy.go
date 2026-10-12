@@ -233,6 +233,21 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// Parse the inbound frame once per message; every gate below reads
 		// ID / Method / tool fields from this frame instead of re-parsing.
 		frame := ParseMCPFrame(line)
+		// Key rejection must precede tracker consumption, adaptive recovery,
+		// tool drift promotion, inventory reservations and taint observations.
+		if frame.KeyValidationErr != nil {
+			detected, outbound, err := rejectResponseKeys(frame, lineNum, sc, writer, logW, opts)
+			foundInjection = foundInjection || detected
+			if err != nil {
+				return foundInjection, err
+			}
+			emitRejectedResponseOutcome(frame.Raw, outbound, logW, tracker, opts)
+			continue
+		}
+
+		if opts.OnResponseKeysValidated != nil {
+			opts.OnResponseKeysValidated()
+		}
 
 		// Kill switch: deny all responses when activated mid-stream.
 		// Checked per message so activation after session start takes effect
@@ -466,21 +481,6 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 		}
 		line = mediaResult.Line
-
-		// Reject ambiguous/malformed JSON before any provenance, tool-baseline,
-		// capture, or adaptive side effect. The later response scanner also
-		// rejects duplicates, but tool scanning intentionally runs first; without
-		// this preflight an ultimately-blocked tools/list document could still
-		// seed the session binding baseline before the parser error was observed.
-		if err := jsonscan.RejectDuplicateKeys(line); err != nil {
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: invalid or ambiguous JSON before tool processing: %v\n", lineNum, err)
-			resp := blockResponseReason(recoverTopLevelJSONRPCID(line), "upstream response is not unambiguous JSON")
-			if err := writer.WriteMessage(resp); err != nil {
-				return foundInjection, fmt.Errorf("writing preflight JSON block: %w", err)
-			}
-			emitTrackedOutcome("error", "parse_error", resp)
-			continue
-		}
 
 		// Tool scanning runs first. tools/list responses contain instructional
 		// text ("you must call this tool") that the general injection scanner
@@ -853,20 +853,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// Parse error: always fail-closed regardless of action setting.
 		// Unparseable responses could hide injection in malformed content.
 		if verdict.Error != "" {
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, verdict.Error)
-			// Scan raw text for injection even when not valid JSON-RPC.
-			rawResult := sc.ScanResponse(context.Background(), string(line))
-			if !rawResult.Clean {
-				foundInjection = true
-				names := matchNames(rawResult.Matches)
-				_, _ = fmt.Fprintf(logW, "pipelock: line %d: injection in non-JSON content (%s)\n",
-					lineNum, strings.Join(names, ", "))
+			detected, resp, err := writeUnparseableResponse(frame, verdict.Error, lineNum, sc, writer, logW)
+			foundInjection = foundInjection || detected
+			if err != nil {
+				return foundInjection, err
 			}
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocking unparseable response\n", lineNum)
-			resp := blockResponseReason(nil, "upstream response is not parseable JSON-RPC")
-			if err := writer.WriteMessage(resp); err != nil {
-				return foundInjection, fmt.Errorf("writing block response: %w", err)
-			}
+
 			emitTrackedOutcome("error", "parse_error", resp)
 			continue
 		}
@@ -1107,6 +1099,87 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 	}
 
 	return foundInjection, nil
+}
+
+// writeUnparseableResponse preserves parse diagnostics without admitting any
+// response-derived state. The caller owns request correlation and receipts.
+func writeUnparseableResponse(frame MCPFrame, detail string, lineNum int, sc *scanner.Scanner, writer transport.MessageWriter, logW io.Writer) (bool, []byte, error) {
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, detail)
+	rawResult := sc.ScanResponse(context.Background(), string(frame.Raw))
+	if !rawResult.Clean {
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: injection in non-JSON content (%s)\n", lineNum, strings.Join(matchNames(rawResult.Matches), ", "))
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocking unparseable response\n", lineNum)
+	// Key preflight previously preserved a recoverable request ID even when
+	// the remaining JSON was malformed. Keep that correlation without
+	// consuming the tracker or admitting any response-derived state.
+	var id json.RawMessage
+	if frame.KeyValidationErr != nil {
+		id = frame.ID
+	}
+	resp := blockResponseReason(id, "upstream response is not parseable JSON-RPC")
+	if err := writer.WriteMessage(resp); err != nil {
+		return !rawResult.Clean, resp, fmt.Errorf("writing block response: %w", err)
+	}
+	return !rawResult.Clean, resp, nil
+}
+
+// rejectResponseKeys writes diagnostics without consuming correlation or running
+// any response-derived state updates. Cancellation remains a scan error; valid
+// but ambiguous messages remain security findings, unlike ordinary malformed JSON.
+func rejectResponseKeys(frame MCPFrame, lineNum int, sc *scanner.Scanner, writer transport.MessageWriter, logW io.Writer, opts MCPProxyOpts) (bool, []byte, error) {
+	if err := opts.warnContext().Err(); err != nil {
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: response scan failed: %v\n", lineNum, err)
+		resp := blockResponseReason(frame.ID, "upstream response scan failed")
+		if err := writer.WriteMessage(resp); err != nil {
+			return false, resp, fmt.Errorf("writing scan-error block response: %w", err)
+		}
+		return false, resp, nil
+	}
+	if !json.Valid(frame.Raw) {
+		verdict := responseKeyErrorVerdict(frame.Raw, frame.KeyValidationErr)
+		return writeUnparseableResponse(frame, verdict.Error, lineNum, sc, writer, logW)
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: invalid or ambiguous JSON before tool processing: %v\n", lineNum, frame.KeyValidationErr)
+	id := recoverTopLevelJSONRPCID(frame.Raw)
+	reason := "upstream response is not unambiguous JSON"
+	if shape, _ := toolsListShape(frame.Raw); shape == toolsListUninspectable || (shape == toolsListScannable && jsonscan.RejectDuplicateKeys(frame.Raw) == nil) {
+		reason = "tools/list cannot be safely inspected: tool_definition_uninspectable"
+	}
+	resp := blockResponseReason(id, reason)
+	if err := writer.WriteMessage(resp); err != nil {
+		return true, resp, fmt.Errorf("writing preflight JSON block: %w", err)
+	}
+	return true, resp, nil
+}
+
+// emitRejectedResponseOutcome preserves receipt evidence using only metadata
+// from an admitted request. Ambiguous IDs cannot attribute an outcome, and the
+// rejected response never consumes the outstanding request or admits its state.
+// A tracker reservation bounds rejection receipts to one per pending request.
+func emitRejectedResponseOutcome(raw, outbound []byte, logW io.Writer, tracker *RequestTracker, opts MCPProxyOpts) {
+	if !isResponse(raw) {
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return
+	}
+	if _, duplicate := jsonscan.TopLevelDuplicateKeys(raw)["id"]; duplicate || jsonscan.HasKeyAlias(fields, "id") {
+		return
+	}
+	if _, request := fields["method"]; request || jsonscan.HasKeyAlias(fields, "method") {
+		return
+	}
+	outcome, ok := tracker.claimRejectedOutcome(fields["id"])
+	if !ok {
+		return
+	}
+	reason := "response_key_validation"
+	if opts.warnContext().Err() != nil {
+		reason = "response_scan_error"
+	}
+	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, outcome.Receipt, "error", int64(len(outbound)), reason, opts.requireReceipts())
 }
 
 func toolScanHasDrift(result tools.ToolScanResult) bool {

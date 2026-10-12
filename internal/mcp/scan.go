@@ -111,24 +111,46 @@ func oversizedResponseVerdict(line []byte) jsonrpc.ScanVerdict {
 	}
 }
 
+func responseKeyErrorVerdict(line []byte, err error) jsonrpc.ScanVerdict {
+	reason := "invalid JSON"
+	if redact.IsDuplicateKeyBlock(err) {
+		reason = "duplicate JSON object key"
+	}
+	id := recoverTopLevelJSONRPCID(line)
+	trimmed := bytes.TrimSpace(line)
+	if id == nil && len(trimmed) > 0 && trimmed[0] == '[' {
+		var batch []json.RawMessage
+		if json.Unmarshal(trimmed, &batch) == nil {
+			for _, item := range batch {
+				if id = recoverTopLevelJSONRPCID(item); id != nil {
+					break
+				}
+			}
+		}
+	}
+	return jsonrpc.ScanVerdict{ID: id, Clean: false, Error: fmt.Sprintf("%s: %v", reason, err)}
+}
+
 func scanResponseOpts(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, includeDLP bool) jsonrpc.ScanVerdict {
 	if len(line) > transport.MaxLineSize {
 		return oversizedResponseVerdict(line)
 	}
 	trimmed := bytes.TrimSpace(line)
-	// Detect batch response (JSON-RPC 2.0 batch = JSON array).
+	if err := jsonrpc.ValidateMessageKeys(trimmed); err != nil {
+		return responseKeyErrorVerdict(trimmed, err)
+	}
+	// Preflight the whole batch before a member can emit observations.
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		verdict, _ := scanBatch(trimmed, sc, opts, includeDLP)
 		return verdict
 	}
-	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
-		return jsonrpc.ScanVerdict{
-			ID:    recoverTopLevelJSONRPCID(trimmed),
-			Clean: false,
-			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
-		}
-	}
 
+	return scanResponseObject(trimmed, sc, opts, includeDLP)
+}
+
+// scanResponseObject consumes one member of an already key-validated message.
+// Nested arrays are not JSON-RPC response objects and fail structural decoding.
+func scanResponseObject(trimmed []byte, sc *scanner.Scanner, opts ResponseScanOptions, includeDLP bool) jsonrpc.ScanVerdict {
 	var rpc jsonrpc.RPCResponse
 	if err := json.Unmarshal(trimmed, &rpc); err != nil {
 		return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON: %v", err)}
@@ -597,12 +619,8 @@ func scanToolsListNonToolFieldsContext(ctx context.Context, line []byte, sc *sca
 		return oversizedResponseVerdict(line)
 	}
 	trimmed := bytes.TrimSpace(line)
-	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
-		return jsonrpc.ScanVerdict{
-			ID:    recoverTopLevelJSONRPCID(trimmed),
-			Clean: false,
-			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
-		}
+	if err := jsonrpc.ValidateMessageKeys(trimmed); err != nil {
+		return responseKeyErrorVerdict(trimmed, err)
 	}
 
 	var rpc jsonrpc.RPCResponse
@@ -804,7 +822,7 @@ func scanBatch(line []byte, sc *scanner.Scanner, opts ResponseScanOptions, inclu
 	}
 
 	return scanBatchElements(batch, func(elem []byte) jsonrpc.ScanVerdict {
-		return scanResponseOpts(elem, sc, opts, includeDLP)
+		return scanResponseObject(bytes.TrimSpace(elem), sc, opts, includeDLP)
 	})
 }
 
@@ -1048,6 +1066,11 @@ func emitVerdict(w io.Writer, verdict jsonrpc.ScanVerdict, jsonOutput bool) erro
 // fail-closed parse semantics, while the stream result preserves a sibling
 // finding for its exit-status contract.
 func scanStreamResponse(line []byte, sc *scanner.Scanner, toolCfg *tools.ToolScanConfig) (jsonrpc.ScanVerdict, bool) {
+	if err := jsonrpc.ValidateMessageKeys(line); err != nil {
+		// Preserve the raw finding signal without running stateful tool scanning.
+		raw := sc.ScanResponse(context.Background(), string(line))
+		return responseKeyErrorVerdict(line, err), !raw.Clean
+	}
 	trimmed := bytes.TrimSpace(line)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		var batch []json.RawMessage
@@ -1055,11 +1078,15 @@ func scanStreamResponse(line []byte, sc *scanner.Scanner, toolCfg *tools.ToolSca
 			return jsonrpc.ScanVerdict{Clean: false, Error: fmt.Sprintf("invalid JSON batch: %v", err)}, false
 		}
 		return scanBatchElements(batch, func(elem []byte) jsonrpc.ScanVerdict {
-			verdict, _ := scanStreamResponse(elem, sc, toolCfg)
+			verdict, _ := scanStreamResponseObject(elem, sc, toolCfg)
 			return verdict
 		})
 	}
 
+	return scanStreamResponseObject(line, sc, toolCfg)
+}
+
+func scanStreamResponseObject(line []byte, sc *scanner.Scanner, toolCfg *tools.ToolScanConfig) (jsonrpc.ScanVerdict, bool) {
 	switch shape, id := toolsListShape(line); shape {
 	case toolsListScannable:
 		verdict := scanToolsListCertified(line, sc, toolCfg, ResponseScanOptions{})
@@ -1200,12 +1227,8 @@ func validateA2AResponseEnvelope(line []byte) (jsonrpc.ScanVerdict, bool) {
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		return jsonrpc.ScanVerdict{}, true
 	}
-	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
-		return jsonrpc.ScanVerdict{
-			ID:    recoverTopLevelJSONRPCID(trimmed),
-			Clean: false,
-			Error: fmt.Sprintf("duplicate JSON object key: %v", err),
-		}, false
+	if err := jsonrpc.ValidateMessageKeys(trimmed); err != nil {
+		return responseKeyErrorVerdict(trimmed, err), false
 	}
 	var rpc jsonrpc.RPCResponse
 	if err := json.Unmarshal(trimmed, &rpc); err != nil {

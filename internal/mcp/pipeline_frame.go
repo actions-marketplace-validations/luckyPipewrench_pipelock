@@ -10,7 +10,6 @@ import (
 	"fmt"
 
 	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
-	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
 
 // ErrInvalidMethodType is surfaced via MCPFrame.ParseErr when a
@@ -99,6 +98,9 @@ type MCPFrame struct {
 	// fields are zero-valued in this case; Raw and IsBatch are still
 	// populated because they derive from the bytes directly.
 	ParseErr error
+
+	// KeyValidationErr identifies failures that must precede response state changes.
+	KeyValidationErr error
 }
 
 // IsRequest reports whether the frame carries a JSON-RPC request ID
@@ -132,7 +134,6 @@ func ParseMCPFrame(msg []byte) MCPFrame {
 	trimmed := bytes.TrimSpace(msg)
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		frame.IsBatch = true
-		return frame
 	}
 	frame.ID = recoverTopLevelJSONRPCID(trimmed)
 
@@ -142,10 +143,14 @@ func ParseMCPFrame(msg []byte) MCPFrame {
 	// while upstream first-wins parsers still see the real attack.
 	// ParseMCPFrame is the single entry point for HTTP + stdio input
 	// gates, so blocking here covers the gate-evaluation path. external review C-1.
-	// Only fail-closed on actual duplicate-key matches; let malformed-
-	// JSON errors flow through to the existing structural parse path.
-	if err := redact.NoDuplicateJSONKeys(trimmed); err != nil && redact.IsDuplicateKeyBlock(err) {
+	// Every key-validation error fails closed before structural parsing.
+	if err := jsonrpc.ValidateMessageKeys(trimmed); err != nil {
 		frame.ParseErr = err
+		frame.KeyValidationErr = err
+		return frame
+	}
+
+	if frame.IsBatch {
 		return frame
 	}
 

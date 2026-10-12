@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .canonical import canonicalize
 from .input_file import iter_verifier_jsonl_lines, read_verifier_file
+from .key_fold import field_alias
 from .line_space import trim_go_space
 from .number import (
     StrictParseError,
@@ -354,9 +355,12 @@ class ReceiptError(Exception):
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    seen: set[str] = set()
     for key, value in pairs:
-        if key in out:
+        folded = key
+        if folded in seen:
             raise ReceiptError(f"duplicate object key: {key}")
+        seen.add(folded)
         out[key] = value
     return out
 
@@ -1721,6 +1725,8 @@ def _evidence_preimage(receipt: dict[str, Any]) -> bytes:
 
 def _reject_unknown(value: dict[str, Any], allowed: set[str], label: str) -> None:
     for key in value:
+        if alias := field_alias(key, allowed):
+            raise ReceiptError(f"{label}: {key!r} aliases {alias!r} (case-insensitive)")
         if key not in allowed:
             raise ReceiptError(f"{label}: unknown field {key}")
 
