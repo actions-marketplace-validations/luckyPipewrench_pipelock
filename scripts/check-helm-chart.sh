@@ -118,6 +118,20 @@ helm template pipelock "$chart" \
   --set 'mcp.listen=[::1]:8889' >"$render_dir/mcp-loopback-ipv6.yaml"
 
 grep -q -- "- run" "$render_dir/default.yaml"
+# The proxy pod states its stop budget rather than inheriting Kubernetes' 30 s,
+# which a receipt-group close on a small CPU limit can outlast.
+grep -q -- "terminationGracePeriodSeconds: 600" "$render_dir/default.yaml"
+helm template pipelock "$chart" --set terminationGracePeriodSeconds=1200 | grep -q -- "terminationGracePeriodSeconds: 1200"
+expect_template_error "/terminationGracePeriodSeconds" --set terminationGracePeriodSeconds=-1
+helm template pipelock "$chart" --set terminationGracePeriodSeconds=0 | grep -q -- "terminationGracePeriodSeconds: 0"
+# Null must leave the Kubernetes default, never render a zero-second budget.
+# Render to a file first so a failed render cannot pass as an absent field.
+helm template pipelock "$chart" --set-json terminationGracePeriodSeconds=null >"$render_dir/null-grace.yaml"
+grep -q -- "kind: Deployment" "$render_dir/null-grace.yaml"
+if grep -q -- "terminationGracePeriodSeconds" "$render_dir/null-grace.yaml"; then
+  echo "null terminationGracePeriodSeconds rendered a value instead of leaving the Kubernetes default" >&2
+  exit 1
+fi
 grep -q -- "conductor:" "$render_dir/values-enterprise-follower.yaml"
 grep -q -- "pipelock-follower-bundles" "$render_dir/values-enterprise-follower.yaml"
 grep -q -- "pipelock-follower-audit-queue" "$render_dir/values-enterprise-follower.yaml"
