@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Upgrading to 3.7
 
-Upgrade the binary before loading configurations that use new fields. Keep older fleet members on compatible bundles until their binaries are updated. The [3.7.0 changelog](../../CHANGELOG.md#370---2026-10-13) covers the full release; this guide covers changes that need an operator action.
+Upgrade the binary before loading configurations that use new fields. Keep older fleet members on compatible bundles until their binaries are updated. The [3.7.0 changelog](../../CHANGELOG.md#370---2026-10-14) covers the full release; this guide covers changes that need an operator action.
 
 Installation examples target v3.7.0 after its artifacts are published. Action commit pins identify source, not the eventual tag; the binary `version` input selects the release.
 
@@ -31,7 +31,7 @@ Receipt scanning checks whole values before signing and uses a bounded fragment 
 
 Stopping a recording proxy now has a stated budget. Closing the receipt group at shutdown can outlast systemd's 90 s, Kubernetes' 30 s and Compose's 10 s defaults on a small CPU allocation with a long history, so the managed systemd unit, the Helm chart, generated Kubernetes and Compose output and the examples set 10 minutes. An upgrade run by the 3.7.0 `pipelock contain upgrade` adds the unit setting unless one is already set, but upgrading from an earlier release runs the old binary's upgrade, which doesn't; run `pipelock contain install` with the new binary afterwards, as described below. Helm and generated output pick it up when upgraded or regenerated; hand-written manifests need their own setting. A run killed before its close finishes verifies as `GROUP_INCOMPLETE`. See [stop budget](flight-recorder.md#stop-budget).
 
-The [million-request measurement](../benchmarks.md#million-request-receipt-run) recorded a valid eight-chain group with no missing expected records. It measures that workload and development build; it doesn't certify every deployment or bind a later release artifact by itself.
+The [million-request measurement](../benchmarks.md#million-request-receipt-run) used the published v3.7.0 binary and recorded a valid eight-chain group with no missing expected records. It measures that binary and workload; it doesn't certify every deployment or throughput for another build, host or workload.
 
 ## Containment and sandbox launches
 
@@ -55,7 +55,7 @@ Paid live connections close when their entitlement expires, is revoked or is pro
 
 Forward, intercepted and reverse HTTP paths strip Range and cache-validator headers and refuse origin `206` and `304` responses as `response_incomplete`. Browser Shield exemptions do not relax that refusal. Check clients that require ranged or conditional responses.
 
-JWT Cookie headers follow the configured header DLP action and core floor. Issuer-bound cookies observed through TLS interception retain their scoped allowance. With an unbound `default_agent_identity`, requests with and without a declared agent header share detection state; changing the default identity on reload closes affected intercepted tunnels and WebSocket relays.
+JWT Cookie headers follow the configured header DLP action and core floor. Issuer-bound cookies observed through TLS interception retain their scoped allowance. Their evidence is saved under `$XDG_STATE_HOME`; in a read-only container, point it at a writable directory that only Pipelock mounts, as described in [browser session cookies](false-positive-tuning.md#browser-session-cookies-on-intercepted-https). With an unbound `default_agent_identity`, requests with and without a declared agent header share detection state; changing the default identity on reload closes affected intercepted tunnels and WebSocket relays.
 
 On MCP, malformed JSON, invalid UTF-8, duplicate keys and noncanonical protocol keys refuse despite `mcp_input_scanning.on_parse_error: forward`; rejected MCP responses do not update tracking state. All seven presets also gain credential-file write blocks, so review tools that write, move, copy or patch those paths before updating a preset.
 

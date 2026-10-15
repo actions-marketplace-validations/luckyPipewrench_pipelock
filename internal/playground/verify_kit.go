@@ -78,11 +78,12 @@ var verifyKitRequiredFiles = []string{
 }
 
 // verifyKitOptionalFiles are extracted when present but their absence does not
-// fail the kit build.
+// fail the kit build. The bundle's VERIFY.txt is left out: it describes the raw
+// bundle's directory layout, which the kit rearranges, and the kit carries its
+// own launcher and verifier.txt instead.
 var verifyKitOptionalFiles = []string{
 	hostContainmentWitnessFile,
 	orchestratorDelegationFile,
-	"VERIFY.txt",
 }
 
 // BuildLiveVerifyKit builds a single-download, offline verification kit for one
@@ -300,11 +301,11 @@ func liveKitScript(osName VerifyKitOS, orchKey string, archive bool) (string, st
 	}
 	switch osName {
 	case VerifyKitOSWindows:
-		return "Verify.bat", "@echo off\r\ncd /d \"%~dp0app\"\r\necho Verifying the full Pipelock playground trust chain, offline...\r\necho.\r\npipelock-verifier.exe verify-run run --orchestrator-key " + orchKey + mode + "\r\necho.\r\necho result: VALID means every signature, the receipt chain, witnesses, and run binding held.\r\necho No network was used.\r\necho.\r\npause\r\n", nil
+		return "Verify.bat", "@echo off\r\ncd /d \"%~dp0app\" || exit /b 1\r\necho Verifying the full Pipelock playground trust chain, offline...\r\necho.\r\npipelock-verifier.exe verify-run run --orchestrator-key " + orchKey + mode + "\r\nset \"verify_status=%errorlevel%\"\r\necho.\r\nif \"%verify_status%\"==\"0\" (echo result: VALID means every signature, the receipt chain, witnesses, and run binding held.) else (echo Verification FAILED: the trust chain did not hold. Do not trust this run.)\r\necho No network was used.\r\necho.\r\npause\r\nexit /b %verify_status%\r\n", nil
 	case VerifyKitOSMacOS:
-		return "Verify.command", "#!/bin/bash\ncd \"$(dirname \"$0\")/app\"\necho \"Verifying the full Pipelock playground trust chain, offline...\"\necho\n./pipelock-verifier verify-run run --orchestrator-key " + orchKey + mode + "\necho\necho \"result: VALID means every signature, the receipt chain, witnesses, and run binding held.\"\necho \"No network was used.\"\nread -n 1 -s -r -p \"Press any key to close.\"\n", nil
+		return "Verify.command", "#!/bin/bash\ncd \"$(dirname \"$0\")/app\" || exit 1\necho \"Verifying the full Pipelock playground trust chain, offline...\"\necho\n./pipelock-verifier verify-run run --orchestrator-key " + orchKey + mode + "\nverify_status=$?\necho\nif [ \"$verify_status\" -eq 0 ]; then echo \"result: VALID means every signature, the receipt chain, witnesses, and run binding held.\"; else echo \"Verification FAILED: the trust chain did not hold. Do not trust this run.\"; fi\necho \"No network was used.\"\nread -n 1 -s -r -p \"Press any key to close.\"\nexit \"$verify_status\"\n", nil
 	case VerifyKitOSLinux:
-		return "verify.sh", "#!/bin/bash\ncd \"$(dirname \"$0\")/app\"\necho \"Verifying the full Pipelock playground trust chain, offline...\"\necho\n./pipelock-verifier verify-run run --orchestrator-key " + orchKey + mode + "\necho\necho \"result: VALID means every signature, the receipt chain, witnesses, and run binding held.\"\necho \"No network was used.\"\n", nil
+		return "verify.sh", "#!/bin/bash\ncd \"$(dirname \"$0\")/app\" || exit 1\necho \"Verifying the full Pipelock playground trust chain, offline...\"\necho\n./pipelock-verifier verify-run run --orchestrator-key " + orchKey + mode + "\nverify_status=$?\necho\nif [ \"$verify_status\" -eq 0 ]; then echo \"result: VALID means every signature, the receipt chain, witnesses, and run binding held.\"; else echo \"Verification FAILED: the trust chain did not hold. Do not trust this run.\"; fi\necho \"No network was used.\"\nexit \"$verify_status\"\n", nil
 	default:
 		return "", "", fmt.Errorf("unsupported verify kit OS %q", osName)
 	}
