@@ -31,7 +31,9 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/httpstream"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -1831,14 +1833,30 @@ func updateWSCrossMessageTail(tail []byte, msg []byte) []byte {
 }
 
 func (r *wsRelay) scanClientText(ctx context.Context, log *audit.Logger, scanInput []byte) (blocked bool) {
-	dlpResult := r.scanner.ScanTextForDLP(ctx, string(scanInput))
+	return r.scanClientTextWithCardView(ctx, log, scanInput, scanInput)
+}
+
+func (r *wsRelay) scanClientTextWithCardView(ctx context.Context, log *audit.Logger, scanInput, cardInput []byte) (blocked bool) {
+	dlpResult := r.scanner.ScanTextForDLPWithCardView(ctx, string(scanInput), string(cardInput))
+	return r.handleClientTextResult(log, scanInput, dlpResult, false)
+}
+
+func (r *wsRelay) scanClientNumberText(ctx context.Context, log *audit.Logger, text, cards []byte) bool {
+	result := r.scanner.ScanTextForDLPWithTypedCardView(ctx, string(text), string(cards))
+	return r.handleClientTextResult(log, text, result, true)
+}
+
+func (r *wsRelay) handleClientTextResult(log *audit.Logger, scanInput []byte, dlpResult scanner.TextDLPResult, crossMessage bool) bool {
 	filteredMatches, audienceAllows := r.scanner.FilterTextDLPMatchesForDestination(dlpResult.Matches, r.targetURL, "websocket_frame")
-	dlpResult.Matches = r.filterClientFrameDLPMatches(filteredMatches)
 	for _, allow := range audienceAllows {
 		if err := r.recordCredentialAudienceAllow(allow); err != nil {
 			return r.blockOnCredentialAudienceReceiptFailure(log, err)
 		}
 	}
+	if crossMessage && r.blockCrossMessageRedaction(log, filteredMatches) {
+		return true
+	}
+	dlpResult.Matches = r.filterClientFrameDLPMatches(filteredMatches)
 	var addrFindings []addressprotect.Finding
 	if checker := r.scanner.AddressChecker(); checker != nil {
 		addrFindings = checker.CheckText(string(scanInput), r.agent).Findings
@@ -1848,6 +1866,10 @@ func (r *wsRelay) scanClientText(ctx context.Context, log *audit.Logger, scanInp
 }
 
 func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Logger, tail []byte, msg []byte) (blocked bool) {
+	return r.scanClientCrossMessageTextViews(ctx, log, tail, msg, tail, msg)
+}
+
+func (r *wsRelay) scanClientCrossMessageTextViews(ctx context.Context, log *audit.Logger, tail, msg, cardTail, cardMsg []byte) (blocked bool) {
 	if len(tail) == 0 {
 		return false
 	}
@@ -1856,9 +1878,9 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 	combined = append(combined, tail...)
 	combined = append(combined, msg...)
 
-	combinedDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(combined))
-	prevDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(tail))
-	currDLP := r.scanner.ScanTextForDLPQuiet(ctx, string(msg))
+	combinedDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(combined), string(cardTail)+string(cardMsg))
+	prevDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(tail), string(cardTail))
+	currDLP := r.scanner.ScanTextForDLPQuietWithCardView(ctx, string(msg), string(cardMsg))
 
 	crossDLP, crossWarns := wsCrossMessageDLPMatches(combinedDLP, prevDLP, currDLP)
 	if joined, ok := joinLabeledWSCrossMessageSuffixes(tail, msg); ok {
@@ -1885,7 +1907,16 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 			crossAddr = wsCrossMessageAddressFindings(combinedAddr.Findings, prevAddr.Findings, currAddr.Findings)
 		}
 	}
-	if r.redaction != nil && r.redaction.required && len(crossDLP) > 0 {
+	if r.blockCrossMessageRedaction(log, crossDLP) {
+		return true
+	}
+
+	crossDLP = r.filterClientFrameDLPMatches(crossDLP)
+	return r.handleClientTextFindings(log, crossDLP, crossAddr)
+}
+
+func (r *wsRelay) blockCrossMessageRedaction(log *audit.Logger, matches []scanner.TextDLPMatch) bool {
+	if r.redaction != nil && r.redaction.required && len(matches) > 0 && !scanner.OnlyInformational(matches) {
 		reason := "redaction blocked request: websocket cross-message secret cannot be redacted"
 		r.recordFinding(session.SignalBlock, log, scannerLabelRedaction, reason)
 		log.LogWSBlocked(audit.WSBlockedEvent{
@@ -1912,8 +1943,7 @@ func (r *wsRelay) scanClientCrossMessageText(ctx context.Context, log *audit.Log
 		return true
 	}
 
-	crossDLP = r.filterClientFrameDLPMatches(crossDLP)
-	return r.handleClientTextFindings(log, crossDLP, crossAddr)
+	return false
 }
 
 func (r *wsRelay) filterClientFrameDLPMatches(matches []scanner.TextDLPMatch) []scanner.TextDLPMatch {
@@ -1998,7 +2028,8 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 		}
 		wsBundleRules := dlpBundleRules(dlpMatches)
 		hardBlock := shouldHardBlockCriticalDLP(dlpMatches, r.cfg.EnforceEnabled())
-		if hardBlock || r.cfg.EnforceEnabled() {
+		numberOnly := scanner.OnlyInformational(dlpMatches)
+		if hardBlock || (r.cfg.EnforceEnabled() && !numberOnly) {
 			reason := fmt.Sprintf("DLP match: %s", strings.Join(names, ", "))
 			r.recordFinding(session.SignalBlock, log, scanner.ScannerDLP, reason)
 			log.LogWSBlocked(audit.WSBlockedEvent{
@@ -2025,7 +2056,10 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 		}
 
 		baseAction := config.ActionWarn
-		effectiveAction := decide.UpgradeAction(baseAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
+		effectiveAction := baseAction
+		if !numberOnly {
+			effectiveAction = decide.UpgradeAction(baseAction, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
+		}
 		if effectiveAction == config.ActionBlock {
 			reason := fmt.Sprintf("DLP match: %s (escalated)", strings.Join(names, ", "))
 			r.recordFinding(session.SignalBlock, log, scanner.ScannerDLP, reason)
@@ -2054,7 +2088,9 @@ func (r *wsRelay) handleClientTextFindings(log *audit.Logger, dlpMatches []scann
 			return true
 		}
 
-		r.recordFinding(session.SignalNearMiss, log, scanner.ScannerDLP, fmt.Sprintf("DLP match: %s", strings.Join(names, ", ")))
+		if !numberOnly {
+			r.recordFinding(session.SignalNearMiss, log, scanner.ScannerDLP, fmt.Sprintf("DLP match: %s", strings.Join(names, ", ")))
+		}
 		log.LogWSScan(audit.WSScanEvent{
 			Target:    r.targetURL,
 			Direction: audit.DirectionClientToServer,
@@ -2226,7 +2262,7 @@ func wsFilterUniqueDLPMatches(matches []scanner.TextDLPMatch, excluded map[strin
 }
 
 func wsDLPMatchKey(match scanner.TextDLPMatch) string {
-	return match.PatternName + "\x00" + match.Encoded
+	return match.PatternName + "\x00" + match.Encoded + "\x00" + strconv.FormatBool(match.IsInformational())
 }
 
 func wsAddAddressFindingKeys(seen map[string]struct{}, findings []addressprotect.Finding) {
@@ -2395,7 +2431,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 	}
 
 	originalAction := action
-	if !result.IsEntropyOnly() {
+	if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 		action = decide.UpgradeAction(action, r.escalationLevel(), &r.cfg.AdaptiveEnforcement)
 	}
 	if action != originalAction {
@@ -2424,7 +2460,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 			})
 			return false
 		}
-		if !result.IsEntropyOnly() {
+		if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 			r.recordFinding(session.SignalBlock, log, scannerLabel, reason)
 		}
 		blockReason := reason
@@ -2456,7 +2492,7 @@ func (r *wsRelay) handleClientMessageBodyResult(log *audit.Logger, bodyBytes []b
 		plwsutil.WriteClientCloseFrame(r.upstreamConn, ws.StatusPolicyViolation, closePayload)
 		return true
 	case config.ActionWarn:
-		if !result.IsEntropyOnly() {
+		if !result.IsEntropyOnly() && !result.IsInformationalCardRuns() {
 			r.recordFinding(session.SignalNearMiss, log, scannerLabel, reason)
 		}
 		if len(result.DLPMatches) > 0 {
@@ -2534,7 +2570,10 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 	}()
 	defer r.recoverRelayPanic(cancel, &blocked)
 	frag := &plwsutil.FragmentState{MaxBytes: r.maxMsg}
-	var crossMsgTail []byte   // rolling tail for text-message DLP scanning
+	var crossMsgTail []byte // rolling tail for text-message DLP scanning
+	var crossMsgCardTail []byte
+	var crossMsgNumberTail []byte
+	var crossMsgNumberCardTail []byte
 	var controlMsgTail []byte // separate tail for Ping/Pong payload DLP scanning
 	log := r.proxy.logger.With("agent", r.agent).WithCorrelation(r.correlation)
 	redactionEnabled := r.redaction != nil && r.redaction.required
@@ -2836,17 +2875,38 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 
 		if isTextMessage && r.scanText {
 			prevTail := crossMsgTail
+			prevCardTail := crossMsgCardTail
+			numberText, numberCard := extract.JSONNumberStreamViews(msg)
+			if len(crossMsgNumberTail) > 0 && numberText != "" {
+				if r.scanClientNumberText(ctx, log, append(append([]byte(nil), crossMsgNumberTail...), numberText...), append(append([]byte(nil), crossMsgNumberCardTail...), []byte(jsonnumber.NumberBoundary+numberCard)...)) {
+					blocked = true
+					return
+				}
+			}
+			if numberText == "" {
+				crossMsgNumberTail, crossMsgNumberCardTail = nil, nil
+			} else {
+				crossMsgNumberTail = updateWSCrossMessageTail(crossMsgNumberTail, []byte(numberText))
+				crossMsgNumberCardTail = updateWSCrossMessageTail(crossMsgNumberCardTail, []byte(jsonnumber.NumberBoundary+numberCard))
+			}
+			// Only the complete original message establishes numeric provenance.
+			// Retained suffixes and incomplete text are never parsed as numbers.
+			cardMsg := []byte(jsonnumber.StructuredCardView(string(msg), extract.MaxExtractDepth))
 			var scanInput []byte
+			var cardInput []byte
 			if !redactionEnabled {
 				if len(prevTail) > 0 {
 					scanInput = append(prevTail, msg...)
+					cardInput = append(prevCardTail, cardMsg...)
 				} else {
 					scanInput = msg
+					cardInput = cardMsg
 				}
 			}
 			crossMsgTail = updateWSCrossMessageTail(prevTail, msg)
+			crossMsgCardTail = updateWSCrossMessageTail(prevCardTail, cardMsg)
 			if !redactionEnabled {
-				if len(scanInput) > 0 && r.scanClientText(ctx, log, scanInput) {
+				if len(scanInput) > 0 && r.scanClientTextWithCardView(ctx, log, scanInput, cardInput) {
 					blocked = true
 					return
 				}
@@ -2854,7 +2914,7 @@ func (r *wsRelay) clientToUpstream(ctx context.Context, cancel context.CancelFun
 					blocked = true
 					return
 				}
-			} else if len(prevTail) > 0 && r.scanClientCrossMessageText(ctx, log, prevTail, msg) {
+			} else if len(prevTail) > 0 && r.scanClientCrossMessageTextViews(ctx, log, prevTail, msg, prevCardTail, cardMsg) {
 				blocked = true
 				return
 			}
