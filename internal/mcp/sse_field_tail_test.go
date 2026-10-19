@@ -92,6 +92,9 @@ func streamCases(t *testing.T) []streamCase {
 	key := fakeAWSKey()
 	token := fieldSplitGitHubToken()
 	return []streamCase{
+		{name: "chat repeated credential delta", body: sseStream(t, chatCompletionChunk, "AKIA"+"IOSFOD", "N", "N", "7EXAMPLE"), caught: true},
+		{name: "content repeated credential delta", body: sseStream(t, contentBlockDelta, "AKIA"+"IOSFOD", "N", "N", "7EXAMPLE"), caught: true},
+		{name: "benign repeated text", body: sseStream(t, chatCompletionChunk, "ha", "ha", "ha")},
 		// Positive controls: whole values are caught per event, and split
 		// non-JSON text by the raw tail.
 		{name: "chat chunk unsplit phrase", body: sseStream(t, chatCompletionChunk, fieldSplitPhrase), caught: true},
@@ -142,6 +145,7 @@ func TestA2AStreamJoinsJSONFieldsAcrossEvents(t *testing.T) {
 	a2a.Enabled = true
 	token := fieldSplitGitHubToken()
 	cases := []streamCase{
+		{name: "artifact repeated credential delta", body: a2aStream(t, artifactUpdate, "AKIA"+"IOSFOD", "N", "N", "7EXAMPLE"), caught: true},
 		{name: "artifact unsplit token", body: a2aStream(t, artifactUpdate, "tok "+token+" end"), caught: true},
 		{name: "artifact unsplit phrase", body: a2aStream(t, artifactUpdate, fieldSplitPhrase), caught: true},
 
