@@ -195,7 +195,7 @@ func TestDisplayRuntimeDisableAndRestore(t *testing.T) {
 			if err := st.undo(ctx, env); err != nil {
 				t.Fatal(err)
 			}
-			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err != nil {
+			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err != nil {
 				t.Fatal(err)
 			}
 			if err := removeDisplayRuntimeRule(env); err != nil {
@@ -207,7 +207,7 @@ func TestDisplayRuntimeDisableAndRestore(t *testing.T) {
 
 func TestDisplayRuntimeRuleDiagnostics(t *testing.T) {
 	env, _ := displayRuntimeTestEnv(t)
-	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err == nil || !strings.Contains(err.Error(), "rerun contain install") {
+	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err == nil || !strings.Contains(err.Error(), "rerun `pipelock contain install`") {
 		t.Fatalf("missing diagnostic: %v", err)
 	}
 	if _, err := stepProvisionDisplayRuntime().apply(context.Background(), env); err != nil {
@@ -216,7 +216,7 @@ func TestDisplayRuntimeRuleDiagnostics(t *testing.T) {
 	if err := os.WriteFile(env.displayTmpfilesPath, []byte(displayUnitMarker+"\nd /run/wrong 0755 root root - -\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err == nil {
+	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err == nil {
 		t.Fatal("drift accepted")
 	}
 }
@@ -309,7 +309,7 @@ func TestDisplayRuntimeDoctorVerifyParity(t *testing.T) {
 		change     func(*probeEnv)
 	}{
 		{"valid", "", func(*probeEnv) {}},
-		{"missing rule", "rerun contain install", func(e *probeEnv) {
+		{"missing rule", "rerun `pipelock contain install`", func(e *probeEnv) {
 			old := e.lstat
 			e.lstat = func(p string) (os.FileInfo, error) {
 				if p == e.displayTmpfilesPath {
@@ -345,7 +345,7 @@ func TestDisplayRuntimeDoctorVerifyParity(t *testing.T) {
 				return old(p)
 			}
 		}},
-		{"rule contents", "rerun contain install", func(e *probeEnv) {
+		{"rule contents", "rerun `pipelock contain install`", func(e *probeEnv) {
 			old := e.readFile
 			e.readFile = func(p string) ([]byte, error) {
 				if p == e.displayTmpfilesPath {
@@ -363,7 +363,7 @@ func TestDisplayRuntimeDoctorVerifyParity(t *testing.T) {
 				return old(p)
 			}
 		}},
-		{"missing runtime with missing rule", "rerun contain install", func(e *probeEnv) {
+		{"missing runtime with missing rule", "rerun `pipelock contain install`", func(e *probeEnv) {
 			old := e.lstat
 			e.lstat = func(p string) (os.FileInfo, error) {
 				if p == e.displayTmpfilesPath || p == filepath.Dir(e.rfbSocketPath) || p == e.rfbSocketPath {
@@ -449,12 +449,12 @@ func TestDisplayRuntimeDoctorVerifyParity(t *testing.T) {
 			}
 			if strings.HasPrefix(tc.name, "runtime ") {
 				for _, remedy := range []string{detail, result.remediation} {
-					if !strings.Contains(remedy, displayRuntimeRepair(probe.rfbSocketPath)) || strings.Contains(remedy, "systemd-tmpfiles --create") {
+					if !strings.Contains(remedy, displayRuntimeRepair(probe.rfbSocketPath, probe.port)) || strings.Contains(remedy, "systemd-tmpfiles --create") {
 						t.Fatalf("unsafe runtime remedy would modify an existing directory: %q", remedy)
 					}
 				}
 				install.lstat = probe.lstat
-				if _, err := stepProvisionDisplay().apply(context.Background(), install); err == nil || !strings.Contains(err.Error(), displayRuntimeRepair(probe.rfbSocketPath)) {
+				if _, err := stepProvisionDisplay().apply(context.Background(), install); err == nil || !strings.Contains(err.Error(), displayRuntimeRepair(probe.rfbSocketPath, probe.port)) {
 					t.Fatalf("installer refusal/remedy differs: %v", err)
 				}
 			}
@@ -617,7 +617,7 @@ func TestDisplayRuntimeAdditionalFailureBoundaries(t *testing.T) {
 					}
 					return oldRead(p)
 				}
-				if _, _, err := readDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath); !errors.Is(err, os.ErrPermission) {
+				if _, _, err := readDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.proxyPort); !errors.Is(err, os.ErrPermission) {
 					t.Fatalf("read error lost: %v", err)
 				}
 			case "remove unsafe rule":

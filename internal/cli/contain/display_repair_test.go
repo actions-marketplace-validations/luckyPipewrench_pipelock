@@ -55,9 +55,9 @@ func TestDisplayAbsentSocketRuntimeDiagnostics(t *testing.T) {
 			doctor := &doctorEnv{configPath: probe.configPath, displayTmpfilesPath: probe.displayTmpfilesPath, rfbSocketPath: probe.rfbSocketPath, agentUserName: probe.agentUserName, lookupUser: probe.lookupUser, lstat: stat, readFile: read, stat: func(string) (os.FileInfo, error) { return fakeFileInfo{mode: 0o755}, nil }}
 			got := checkDoctorDisplayRFB(context.Background(), doctor)
 			status, detail := probeAgentDisplayRFB(context.Background(), probe)
-			want := displayRuntimeRepair(install.rfbSocketPath)
+			want := displayRuntimeRepair(install.rfbSocketPath, install.proxyPort)
 			if !strings.HasPrefix(scenario, "runtime ") {
-				want = "restore a regular root:root 0600 managed rule at " + install.displayTmpfilesPath + "; rerun contain install"
+				want = "restore a regular root:root 0600 managed rule at " + install.displayTmpfilesPath + "; " + installRemedyForPort(0)
 			}
 			if got.status != statusFail || status != statusFail || got.remediation != want || !strings.Contains(detail, want) {
 				t.Fatalf("doctor=%+v verify=(%s,%s), want shared remedy %q", got, status, detail, want)
@@ -141,7 +141,7 @@ func TestDisplayFreshRollbackRuntimeCleanupRefusalRemovesUnit(t *testing.T) {
 			if _, err := os.Stat(runtime); err != nil {
 				t.Fatalf("refused runtime cleanup still removed directory: %v", err)
 			}
-			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err != nil {
+			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err != nil {
 				t.Fatalf("refused runtime cleanup lost the managed boot rule: %v", err)
 			}
 		})
@@ -202,7 +202,7 @@ func TestDisplayInactiveRollbackRuntimeCleanupRefusalRestoresUnit(t *testing.T) 
 	if body, readErr := os.ReadFile(env.displayUnitPath); readErr != nil || string(body) != priorUnit {
 		t.Fatalf("replacement unit stranded: %q %v", body, readErr)
 	}
-	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err != nil {
+	if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err != nil {
 		t.Fatalf("refused runtime cleanup lost the managed boot rule: %v", err)
 	}
 }

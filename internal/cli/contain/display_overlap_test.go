@@ -139,7 +139,7 @@ func TestDisplayRuntimeUndoPreservesRuleOnCleanupFailure(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), want) {
 				t.Fatalf("cleanup refusal not reported: %v, want %q", err, want)
 			}
-			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath); err != nil {
+			if err := checkDisplayRuntimeRule(env.lstat, env.readFile, env.displayTmpfilesPath, env.rfbSocketPath, env.proxyPort); err != nil {
 				t.Fatalf("failed cleanup lost the strict managed boot rule: %v", err)
 			}
 			t.Logf("cleanup refused with %v; strict managed rule retained", err)

@@ -619,7 +619,7 @@ func actionRemoveAgentDisplay() step {
 			if env.displayUnitPath == "" {
 				return removeViewerTraverseACL(ctx, env)
 			}
-			_, hadRuntimeRule, ruleErr := readDisplayRuntimeRule(env.lstat, env.readFile, displayRuntimeRulePath(env.displayTmpfilesPath))
+			_, hadRuntimeRule, ruleErr := readDisplayRuntimeRule(env.lstat, env.readFile, displayRuntimeRulePath(env.displayTmpfilesPath), env.proxyPort)
 			env.prevDisplayStateKnown = false
 			restoreErr := restoreAgentDisplay(ctx, env)
 			authorityErr := removeDisplayAuthority(env)
@@ -996,7 +996,7 @@ func probeAgentDisplayRFB(ctx context.Context, env *probeEnv) (string, string) {
 	if lstat == nil {
 		lstat = env.stat
 	}
-	if result := checkDisplayRuntime(lstat, env.readFile, env.lookupUser, env.displayTmpfilesPath, path); result.status != statusPass {
+	if result := checkDisplayRuntime(lstat, env.readFile, env.lookupUser, env.displayTmpfilesPath, path, env.port); result.status != statusPass {
 		return result.status, result.detail + "; " + result.remediation
 	}
 	info, err := lstat(path)
@@ -1004,7 +1004,7 @@ func probeAgentDisplayRFB(ctx context.Context, env *probeEnv) (string, string) {
 		if errors.Is(err, os.ErrPermission) {
 			return statusUnknown, fmt.Sprintf("inspect RFB socket: %v; %s", err, displayInspectionRootRemedy)
 		}
-		return statusFail, fmt.Sprintf("RFB socket missing; rerun contain install: %v", err)
+		return statusFail, fmt.Sprintf("RFB socket missing; %s: %v", installRemedyForPort(env.port), err)
 	}
 	mode := os.FileMode(0o600)
 	if viewerRFBEnabled(cfg.Containment.Display) {

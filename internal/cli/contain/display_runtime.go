@@ -30,7 +30,7 @@ func displayRuntimeRulePath(path string) string {
 	return path
 }
 
-func readDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), path string) ([]byte, bool, error) {
+func readDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), path string, port int) ([]byte, bool, error) {
 	info, err := stat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -39,12 +39,12 @@ func readDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(st
 		return nil, false, fmt.Errorf("stat display tmpfiles rule: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode() != 0o600 {
-		return nil, false, fmt.Errorf("display tmpfiles rule %s must be a regular root:root file with mode 0600; repair or move aside the unsafe rule before rerunning contain install", path)
+		return nil, false, fmt.Errorf("display tmpfiles rule %s must be a regular root:root file with mode 0600; repair or move aside the unsafe rule before you %s", path, installRemedyForPort(port))
 	}
 	uid, uidOK := fileOwnerUID(info)
 	gid, gidOK := fileOwnerGID(info)
 	if !uidOK || !gidOK || uid != 0 || gid != 0 {
-		return nil, false, fmt.Errorf("display tmpfiles rule %s must be owned by root:root; repair or move aside the unsafe rule before rerunning contain install", path)
+		return nil, false, fmt.Errorf("display tmpfiles rule %s must be owned by root:root; repair or move aside the unsafe rule before you %s", path, installRemedyForPort(port))
 	}
 	body, err := read(path)
 	if err != nil {
@@ -56,14 +56,14 @@ func readDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(st
 	return body, true, nil
 }
 
-func checkDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), path, socket string) error {
+func checkDisplayRuntimeRule(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), path, socket string, port int) error {
 	path = displayRuntimeRulePath(path)
-	body, exists, err := readDisplayRuntimeRule(stat, read, path)
+	body, exists, err := readDisplayRuntimeRule(stat, read, path, port)
 	if err != nil {
 		return err
 	}
 	if !exists || !bytes.Equal(body, renderDisplayRuntimeRule(socket)) {
-		return fmt.Errorf("display tmpfiles rule %s is missing or differs from the managed rule; rerun contain install", path)
+		return fmt.Errorf("display tmpfiles rule %s is missing or differs from the managed rule; %s", path, installRemedyForPort(port))
 	}
 	return nil
 }
@@ -94,7 +94,7 @@ func checkDisplayRuntimeParents(env *installEnv, path string) error {
 
 func removeDisplayRuntimeRule(env *installEnv) error {
 	path := displayRuntimeRulePath(env.displayTmpfilesPath)
-	_, exists, err := readDisplayRuntimeRule(env.lstat, env.readFile, path)
+	_, exists, err := readDisplayRuntimeRule(env.lstat, env.readFile, path, env.proxyPort)
 	if err != nil || !exists {
 		return err
 	}
@@ -152,7 +152,7 @@ func stepProvisionDisplay() step {
 
 // Runtime prerequisites remain inspectable while the display is stopped and
 // its socket is absent. Only a verified rule may recreate an absent directory.
-func checkDisplayRuntime(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), lookup lookupUserFunc, rule, socket string) doctorResult {
+func checkDisplayRuntime(stat func(string) (os.FileInfo, error), read func(string) ([]byte, error), lookup lookupUserFunc, rule, socket string, port int) doctorResult {
 	socket = displayRFBPath(socket)
 	rule = displayRuntimeRulePath(rule)
 	_, dirErr := stat(filepath.Dir(socket))
@@ -162,14 +162,14 @@ func checkDisplayRuntime(stat func(string) (os.FileInfo, error), read func(strin
 			if errors.Is(err, os.ErrPermission) {
 				return unknown(err.Error(), displayInspectionRootRemedy)
 			}
-			return fail(classInfra, err.Error(), displayRuntimeRepair(socket))
+			return fail(classInfra, err.Error(), displayRuntimeRepair(socket, port))
 		}
 	}
-	if err := checkDisplayRuntimeRule(stat, read, rule, socket); err != nil {
+	if err := checkDisplayRuntimeRule(stat, read, rule, socket, port); err != nil {
 		if errors.Is(err, os.ErrPermission) {
 			return unknown(err.Error(), displayInspectionRootRemedy)
 		}
-		return fail(classInfra, err.Error(), "restore a regular root:root 0600 managed rule at "+rule+"; rerun contain install")
+		return fail(classInfra, err.Error(), "restore a regular root:root 0600 managed rule at "+rule+"; "+installRemedyForPort(port))
 	}
 	if missing {
 		return fail(classInfra, "RFB runtime directory is missing", "run systemd-tmpfiles --create "+rule+"; then restart the display service")
@@ -177,8 +177,8 @@ func checkDisplayRuntime(stat func(string) (os.FileInfo, error), read func(strin
 	return pass("RFB runtime directory and managed rule are valid")
 }
 
-func displayRuntimeRepair(socket string) string {
-	return "inspect " + filepath.Dir(displayRFBPath(socket)) + ", move it aside if its contents are untrusted, then rerun contain install"
+func displayRuntimeRepair(socket string, port int) string {
+	return "inspect " + filepath.Dir(displayRFBPath(socket)) + ", move it aside if its contents are untrusted, then " + installRemedyForPort(port)
 }
 
 func stepProvisionDisplayRuntime() step {
@@ -196,7 +196,7 @@ func stepProvisionDisplayRuntime() step {
 				return false, err
 			}
 			path := displayRuntimeRulePath(env.displayTmpfilesPath)
-			previous, existed, err = readDisplayRuntimeRule(env.lstat, env.readFile, path)
+			previous, existed, err = readDisplayRuntimeRule(env.lstat, env.readFile, path, env.proxyPort)
 			if err != nil {
 				return false, err
 			}
@@ -228,7 +228,7 @@ func stepProvisionDisplayRuntime() step {
 					return false, err
 				}
 				if err := checkRFBRuntimeDirectory(env.lstat, env.lookupUser, displayRFBPath(env.rfbSocketPath)); err != nil {
-					return false, fmt.Errorf("%w; %s", err, displayRuntimeRepair(env.rfbSocketPath))
+					return false, fmt.Errorf("%w; %s", err, displayRuntimeRepair(env.rfbSocketPath, env.proxyPort))
 				}
 			}
 			body := renderDisplayRuntimeRule(env.rfbSocketPath)
