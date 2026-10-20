@@ -2789,13 +2789,25 @@ them.
 ## Presets
 
 Seven starter configs are selectable with `pipelock generate config --preset <name>`.
+All presets use the bundled files in `configs/`. The `strict`, `balanced`, and `audit` presets apply the configuration loader's security defaults and inherit built-in DLP and response patterns. Supplemental response patterns with different expressions use `Preset` names so both sets remain active. These names appear in findings; a suppression for the original name does not suppress its supplemental pattern. Core patterns remain unsuppressible. The four named presets retain their existing parsing defaults for `init` and sidecar generation.
+
+Generated YAML for `strict`, `balanced`, and `audit` is the bundled file verbatim, including comments and regular expressions. Older generated output serialized an assembled configuration, so text, layout, and explicit fields can differ. Scripts that compare generated files byte for byte need updated expectations.
+
+The mode presets use `Preset Tool Invocation`, `Preset Instruction Boundary`, `Preset Instruction Dismissal`, and `Preset Priority Override` for their supplemental expressions. Audit also uses `Preset Covert Action Directive`. These names identify the supplemental expressions in configuration and any findings they produce. Existing built-in identities remain active alongside them. Immutable core matches take precedence. Audit text covered by `Preset Covert Action Directive` reports the core `Covert Action Directive` identity, which can't be suppressed.
+
+For example, `set system instructions aside` matches `Instruction Dismissal`, while `cast all previous directives aside` matches `Preset Instruction Dismissal`. A suppression for one doesn't cover the other. Use the `Preset` name when updating alerts or suppressions for supplemental findings.
+
+Each preset sets a five-minute tool-chain window. `pipelock init` preserves preset scanning actions, disabled sections, drift settings, and tool-chain windows when it discovers MCP servers. In audit mode, ordinary MCP input and tool-policy findings use `warn` by default. Core and transport safety protections can still block, and individual tool rules can override the tool-policy default, including with `block`. Malformed MCP messages (`mcp_input_scanning.on_parse_error: block`) and binary WebSocket frames (`websocket_proxy.allow_binary_frames: false`) are refused, even during evaluation. Regenerating an older audit configuration replaces its previous parse-error forwarding and binary-frame allowance with these refusals. MCP input scanning blocks findings in the `strict` and `balanced` presets. The response and default tool-policy actions in the table below describe those separate scanning paths; individual tool rules can override that default.
+
 Run `pipelock presets` or `pipelock generate config --list` to list the current built-in names with mode, default action, and reachability posture:
+
+The audit listing label is `warn (ordinary findings; safety rules still block)`, replacing `warn (log-only)`. This human-readable label distinguishes ordinary warnings from safety refusals. Scripts that match the previous label need to accept the updated text.
 
 | Preset | Mode | Response Action | MCP Policy | Best For |
 |--------|------|----------------|------------|----------|
 | `balanced` | balanced | warn | warn | General purpose |
 | `strict` | strict | block | block | High-security |
-| `audit` | audit | warn | warn | Log-only monitoring |
+| `audit` | audit | warn | warn | Evaluate ordinary policy; safety protections can block |
 | `claude-code` | balanced | block | warn | Claude Code (unattended) |
 | `cursor` | balanced | block | warn | Cursor IDE |
 | `generic-agent` | balanced | warn | warn | New agents (tuning) |
