@@ -712,6 +712,8 @@ Examples:
 				return fmt.Errorf("create scanner: %w", err)
 			}
 			defer sc.Close()
+			announcePromptInjectionPolicy(cfg, nil, cmd.ErrOrStderr())
+			wirePromptInjectionStderr(sc, cmd.ErrOrStderr())
 
 			// A nil toolCfg tells ScanStreamResult the operator explicitly
 			// disabled mcp_tool_scanning (RuntimeMCPScan auto-enables it
@@ -1098,6 +1100,8 @@ Key-free evidence capture:
 				return fmt.Errorf("create MCP audit logger: %w", err)
 			}
 			defer auditLogger.Close()
+			wirePromptInjectionAudit(sc, auditLogger)
+			announcePromptInjectionPolicy(cfg, auditLogger, cmd.ErrOrStderr())
 			upstreamDialContext := verifiedDialContext(
 				mcp.NewMetadataSafeDialContext(func() *scanner.Scanner { return sc }),
 				launchIdentity,

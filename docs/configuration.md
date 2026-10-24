@@ -1127,6 +1127,56 @@ Recommended rollout flow:
 4. Remove the `action` line (or set it to empty string) to revert the pattern to normal DLP enforcement semantics — the actual verdict then follows the transport-level DLP action and the session's `mode`/`enforce` state rather than being unconditionally block.
 5. Roll out the change through your normal config-review process.
 
+## Prompt-injection wording detection
+
+Regex wording detection is enabled by default. The global
+`prompt_injection_detection` setting applies to core wording rules, configured
+response patterns, request bodies, MCP responses and inputs, MCP tool
+descriptions, A2A, and browser response wording scans across mediated transports.
+It does not change the existing per-surface actions unless you select warn-only.
+
+To disable the wording family:
+
+```yaml
+prompt_injection_detection:
+  enabled: false
+```
+
+To retain wording observations without blocking, stripping, asking, or producing
+injection-driven taint:
+
+```yaml
+prompt_injection_detection:
+  action: warn
+```
+
+Omitting the section, or using `enabled: true` with `action: block`, preserves the
+existing per-surface policy. A missing, blank, or null `enabled` value means true.
+The action accepts `block` and `warn`; `block` preserves the existing surface
+action rather than forcing every surface to block. `enabled: false` takes
+precedence over the action.
+
+With wording detection disabled on local stdio MCP servers, no injection-driven
+taint is produced, so no prompt-injection protection remains there until source
+trust is tracked separately from wording suspicion. Warn-only also produces no
+injection-driven taint. DLP, including the core credential floor, and destination
+controls still protect traffic leaving the machine through Pipelock. SSRF, tool
+policy, tool drift and structural checks, contracts, action limits, and the kill
+switch retain their existing behavior. Tool-name rules, dangerous-capability
+checks and parameter-name checks keep using `mcp_tool_scanning.action`, including
+when wording detection is off or warn-only. Browser shield structural protections
+also remain active. That includes `browser_shield.strip_hidden_traps`, which
+removes hidden HTML and SVG elements and comments that contain instruction words such
+as "ignore" or "instruction"; this setting does not change it. Set
+`browser_shield.strip_hidden_traps: false` to stop that stripping as well.
+
+Startup logs, `pipelock doctor`, and `pipelock explain` disclose the selected
+coverage reduction. Audit logs record the selected policy and warn-only pattern
+names without matched content. Action receipts include the wording policy in
+existing signed reason fields; their schema is unchanged. Hot reload updates the
+scanner snapshot; strict-mode security downgrade checks still apply, so a
+weakening rejected on reload requires an explicit restart with the new config.
+
 ## Response Scanning
 
 Scans fetched content for prompt injection before returning to the agent. Uses a 6-pass normalization pipeline: zero-width stripping, word boundary reconstruction, leetspeak folding, optional-whitespace matching, vowel folding, and encoding detection.
@@ -3985,7 +4035,7 @@ Classifies each session by how recently it observed untrusted content and escala
 
 MCP history requires an active taint recorder. Standalone `pipelock mcp proxy` creates its session store only with `session_profiling.enabled: true`; taint enabled alone doesn't create one. Subprocess stdio and stdio-to-HTTP/WS upstreams use invocation-scoped, in-memory state. Listener state uses authenticated principals or the legacy session partition described above. These scopes don't promise persistence across process restarts or state expiry/eviction. `pipelock doctor`, `explain mcp-response`, and the dashboard report configuration prerequisites without claiming live coverage.
 
-For subprocess stdio, content origin is **undeclared**. Clean responses default to `internal_generated`; that label doesn't establish that the content was generated locally or is trustworthy. The embedding API's `TaintExternalSource` option can declare external content, but `mcp proxy` has no corresponding CLI flag. HTTP/SSE and WS upstreams declare external content by default. `taint.trusted_mcp_servers` accepts risk for future clean responses from the resolved server; it doesn't clear existing hostile history, and prompt-injection hits can still raise hostile taint. No classification default changes based on these diagnostics.
+For subprocess stdio, content origin is **undeclared**. Clean responses default to `internal_generated`; that label doesn't establish that the content was generated locally or is trustworthy. The embedding API's `TaintExternalSource` option can declare external content, but `mcp proxy` has no corresponding CLI flag. HTTP/SSE and WS upstreams declare external content by default. `taint.trusted_mcp_servers` accepts risk for future clean responses from the resolved server; it doesn't clear existing hostile history, and prompt-injection hits can still raise hostile taint unless `prompt_injection_detection` is off or warn-only. No classification default changes based on these diagnostics.
 
 ```yaml
 taint:
@@ -4031,7 +4081,7 @@ taint:
 | `recent_sources` | int | `10` | How many recent taint sources to keep per session for receipt reporting. |
 | `fail_safe_classification` | bool | `false` | When true, unknown or low-confidence read/tool classifications are treated as protected instead of passing the read-only shortcut. |
 | `allowlisted_domains` | []string | 3 high-trust documentation domains | Responses from these domains do not raise taint. Supports `MatchDomain` wildcards. |
-| `trusted_mcp_servers` | []string | empty | MCP server names whose clean responses do not raise session taint. Entries match the server name, the `pipelock mcp proxy --server-name` operator label or a registered `mcp_identities` name; URLs and slashes are rejected. This does not disable MCP response scanning, and prompt-injection hits can still raise hostile taint. |
+| `trusted_mcp_servers` | []string | empty | MCP server names whose clean responses do not raise session taint. Entries match the server name, the `pipelock mcp proxy --server-name` operator label or a registered `mcp_identities` name; URLs and slashes are rejected. This does not disable MCP response scanning, and prompt-injection hits can still raise hostile taint unless `prompt_injection_detection` is off or warn-only. |
 | `protected_paths` | []string | 7 patterns (see above) | Globs for file paths or tool args that are blocked for tainted sessions. |
 | `elevated_paths` | []string | `*/config/*`, `*/middleware*` | Globs that trigger warn/ask rather than block. |
 | `trust_overrides` | []object | empty | Narrow exemptions (see below). |
