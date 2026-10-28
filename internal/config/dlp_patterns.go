@@ -6,6 +6,8 @@ package config
 import (
 	"fmt"
 	"strings"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 )
 
 //go:generate go run ./gen_dlp_presets.go
@@ -20,6 +22,101 @@ const (
 	OpenAIKeyBodyRegex           = `sk-proj-[a-zA-Z0-9\-_]{20,}`
 	OpenAIServiceKeyBodyRegex    = `sk-svcacct-[a-zA-Z0-9\-_]{20,}`
 )
+
+// Compiled credential-audience carriers. A zero mask means every scanned
+// surface may earn the allow, which is the Slack-shaped rule. A non-zero mask
+// allows only the named headers. Authorization is split by scheme so each
+// provider accepts only the schemes its clients document. Google's Bearer-only
+// rule predates the mask and stays on CredentialAudienceAuthorizationOnly.
+const (
+	CredentialAudienceCarrierAuthorizationBearer uint16 = 1 << iota
+	CredentialAudienceCarrierAuthorizationToken
+	CredentialAudienceCarrierAuthorizationBasic
+	CredentialAudienceCarrierPrivateToken
+	CredentialAudienceCarrierJobToken
+	// CredentialAudienceCarrierGitBasic is the separate git-over-HTTPS rule:
+	// Authorization Basic, https only, at a CredentialAudienceGitHosts host,
+	// and only on a git smart-HTTP or Git LFS path. It never widens the REST
+	// host list, and the REST hosts never accept Basic through it.
+	CredentialAudienceCarrierGitBasic
+	// CredentialAudienceCarrierURLQuery accepts the credential only inside the
+	// URL query of a request to an audience host. It never covers the path,
+	// the host, a header, or a request body, so a grant that a vendor issues
+	// as a signed download link can reach that vendor's storage host and
+	// nothing else.
+	CredentialAudienceCarrierURLQuery
+	// CredentialAudienceCarrierReleaseGrantSAS is the separate GitHub
+	// release-asset SAS rule: an Azure user-delegation SAS is trusted only
+	// inside the URL query of a request to a release-grant audience host,
+	// only when that same query also carries a GitHub release download grant
+	// (a JWT accepted through CredentialAudienceCarrierURLQuery for that
+	// host), and only when the query carries GitHub's whole user-delegation
+	// SAS parameter set. It never widens the JWT's host list, and the JWT
+	// rule never accepts a SAS on its own: the SAS signature is unverifiable
+	// by this proxy, so it is trusted purely because the co-located grant
+	// already proved GitHub issued this exact redirect.
+	CredentialAudienceCarrierReleaseGrantSAS
+	// CredentialAudienceCarrierRegistryBasic is the package-registry rule:
+	// Authorization Basic, https only, at a CredentialAudienceRegistryHosts
+	// host, and only when the decoded password is exactly the GitHub token
+	// and the username is an account-name shape. It does not accept Basic
+	// on the REST host list.
+	CredentialAudienceCarrierRegistryBasic
+	// CredentialAudienceCarrierRegistryBearer accepts the bearer token a
+	// container registry returns after that Basic exchange. It is https
+	// only, at a CredentialAudienceRegistryHosts host, and only when the
+	// bearer value is a registry JWT whose audience is that host.
+	CredentialAudienceCarrierRegistryBearer
+)
+
+// githubTokenAudienceMask is the GitHub carriers: Authorization with the
+// Bearer or token scheme at the REST hosts, the git rule (Basic at
+// github.com only on a git transport path), and the registry rule (Basic
+// at the package-registry hosts, password exactly the token).
+const githubTokenAudienceMask = CredentialAudienceCarrierAuthorizationBearer | CredentialAudienceCarrierAuthorizationToken | CredentialAudienceCarrierGitBasic | CredentialAudienceCarrierRegistryBasic
+
+// githubRegistryHosts are the package registries whose published login is
+// a GitHub username plus the token as the password (HTTP Basic). npm and
+// RubyGems publish different carriers and are not in this list.
+// Sources:
+//   - https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry
+//   - https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-apache-maven-registry
+//   - https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-nuget-registry
+var githubRegistryHosts = []string{"ghcr.io", "maven.pkg.github.com", "nuget.pkg.github.com"}
+
+// githubRegistryBearerHosts are registries that answer the Docker Registry
+// token exchange with a bearer used on later requests to the same host.
+// The anonymous exchange returns an opaque token; an authenticated exchange
+// follows the registry JWT profile, whose aud is the registry service.
+// https://distribution.github.io/distribution/spec/auth/jwt/
+var githubRegistryBearerHosts = []string{"ghcr.io"}
+
+// RegistryBearerHosts returns the registries whose own token exchange issues
+// the bearer the registry-bearer carrier allows. The JWT pattern carries the
+// wider Basic host list, because GitHub's stateless installation token is a
+// ghs_-prefixed JWT that also matches it; the bearer rule narrows to these.
+func RegistryBearerHosts() []string {
+	return append([]string(nil), githubRegistryBearerHosts...)
+}
+
+// githubDownloadGrantAudienceHosts are the hosts GitHub's signed release
+// redirect points at. github.com/<owner>/<repo>/releases/download/... answers
+// 302 to release-assets.githubusercontent.com with a GitHub-issued JWT in the
+// query. Only that exact host is listed: the grant is for that storage host,
+// and the sender cannot read back what lands there.
+var githubDownloadGrantAudienceHosts = []string{"release-assets.githubusercontent.com"}
+
+// GitHubDownloadGrantIssuer is the iss claim of GitHub's release download
+// grant. A JWT in a URL query earns the download audience only when it names
+// this issuer and the destination host as its aud, so an unrelated token sent
+// to the same host still blocks.
+const GitHubDownloadGrantIssuer = "github.com"
+
+// gitlabTokenAudienceMask is the documented GitLab access-token carriers:
+// PRIVATE-TOKEN and Authorization Bearer for the API on any path, and
+// Authorization Basic (oauth2:<token>) through the git rule, which limits it
+// to git transport paths on the same host. Job tokens use JOB-TOKEN only.
+const gitlabTokenAudienceMask = CredentialAudienceCarrierPrivateToken | CredentialAudienceCarrierAuthorizationBearer | CredentialAudienceCarrierGitBasic
 
 // defaultDLPPatternSet is the canonical shipped DLP pattern registry.
 // Defaults, generated presets, and drift tests read from this list instead of
@@ -67,18 +164,38 @@ var defaultDLPPatternSet = []DLPPattern{
 	// also contain dots and hyphens. Keep the broader alphabet scoped to ghs_ so
 	// the other short prefixes do not start matching dotted prose.
 	// Source: https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/
-	{Name: "GitHub Token", Regex: `(?:gh[pour]_[A-Za-z0-9_]{36,}|ghs_[A-Za-z0-9.\-_]{36,})`, Severity: SeverityCritical},
-	{Name: "GitHub Fine-Grained PAT", Regex: `github_pat_[a-zA-Z0-9_]{36,}`, Severity: SeverityCritical},
-	// GitLab personal access tokens: "glpat-" prefix, 20+ chars.
-	{Name: "GitLab PAT", Regex: `glpat-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
-	// Remaining GitLab token families. All documented prefixes share
+	// GitHub REST authentication sends the token in Authorization as Bearer or
+	// token. Release-asset upload uses the same header on uploads.github.com.
+	// github.com itself is git, not the API host, and is not an audience.
+	// Sources: https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api
+	// https://docs.github.com/en/rest/releases/assets
+	// RubyGems publishes Authorization Bearer (":github: Bearer TOKEN").
+	// The install form also puts the token in the URL userinfo; that stays
+	// blocked because a credential in the URL is a different carrier.
+	// https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-rubygems-registry
+	// npm's documented line is "//npm.pkg.github.com/:_authToken=TOKEN".
+	// GitHub does not name the HTTP header that line becomes, so
+	// npm.pkg.github.com is not an audience host.
+	{Name: "GitHub Token", Regex: `(?:gh[pour]_[A-Za-z0-9_]{36,}|ghs_[A-Za-z0-9.\-_]{36,})`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"}, CredentialAudienceGitHosts: []string{"github.com"}, CredentialAudienceRegistryHosts: githubRegistryHosts, CredentialAudienceCarrierMask: githubTokenAudienceMask},
+	{Name: "GitHub Fine-Grained PAT", Regex: `github_pat_[a-zA-Z0-9_]{36,}`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"}, CredentialAudienceGitHosts: []string{"github.com"}, CredentialAudienceRegistryHosts: githubRegistryHosts, CredentialAudienceCarrierMask: githubTokenAudienceMask},
+	// GitLab personal, project, and group access tokens share glpat-.
+	// The API host is the instance host. gitlab.com is the public one.
+	// Source: https://docs.gitlab.com/api/rest/authentication/
+	{Name: "GitLab PAT", Regex: `glpat-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"gitlab.com"}, CredentialAudienceGitHosts: []string{"gitlab.com"}, CredentialAudienceCarrierMask: gitlabTokenAudienceMask},
+	// Remaining GitLab token families. Only the CI job token carries a
+	// compiled audience; the others are not documented as REST credentials on
+	// a header (runner, trigger, and OAuth application secrets travel in
+	// request bodies, deploy tokens also reach registry hosts), so they stay
+	// blocked on every destination. All documented prefixes share
 	// the gl<type>- + base64url shape (GitLab token overview). Optional
 	// suffix chars use the (?:x)? form so the DLP pre-filter extracts
 	// the shorter literal prefix (e.g. "glrt" gates glrt- and glrtr-).
 	// Source: https://docs.gitlab.com/security/tokens/
 	{Name: "GitLab Deploy Token", Regex: `gldt-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
 	{Name: "GitLab Runner Token", Regex: `glrt(?:r)?-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
-	{Name: "GitLab CI Job Token", Regex: `glcbt-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
+	// Job tokens authenticate with the JOB-TOKEN header.
+	// Source: https://docs.gitlab.com/api/rest/authentication/
+	{Name: "GitLab CI Job Token", Regex: `glcbt-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"gitlab.com"}, CredentialAudienceCarrierMask: CredentialAudienceCarrierJobToken},
 	{Name: "GitLab Pipeline Trigger Token", Regex: `glptt-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
 	{Name: "GitLab OAuth Application Secret", Regex: `gloas-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
 	{Name: "GitLab SCIM Token", Regex: `glsoat-[a-zA-Z0-9\-_]{20,}`, Severity: SeverityCritical},
@@ -109,7 +226,7 @@ var defaultDLPPatternSet = []DLPPattern{
 	// Anchored to common config key names to reduce FPs on arbitrary base64.
 	// Separator class handles YAML (: ), env (=), JSON (":"), and quoted formats.
 	{Name: "AWS Secret Key", Regex: `(?:aws_secret_access_key|AWS_SECRET_ACCESS_KEY|secret.?access.?key|SecretAccessKey)\s*["'=:\s]{1,5}\s*[A-Za-z0-9/+=]{40}`, Severity: SeverityCritical},
-	{Name: "Google OAuth Token", Regex: `ya29\.[a-zA-Z0-9_-]{20,}`, Severity: SeverityCritical},
+	{Name: "Google OAuth Token", Regex: `ya29\.[a-zA-Z0-9_-]{20,}`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"*.googleapis.com"}, CredentialAudienceAuthorizationOnly: true},
 	// GCP service-account JSON private_key_id. The "service_account"
 	// type marker is already an always-on CORE pattern (see
 	// scanner/core.go), so it is deliberately NOT duplicated here;
@@ -127,12 +244,37 @@ var defaultDLPPatternSet = []DLPPattern{
 	// Azure SAS signature: the sig= parameter is a base64 HMAC-SHA256
 	// (32 bytes -> 44 base64 chars). Match both the URI form with encoded
 	// padding and the decoded form read after a carrier is unescaped.
+	// GitHub's release-asset redirect (github.com/.../releases/download/...)
+	// answers with a 302 to release-assets.githubusercontent.com carrying an
+	// Azure user-delegation SAS beside the release download grant JWT (see
+	// the "JWT Token" pattern below). That SAS is granted only alongside a
+	// validated grant for that host (releaseGrantSASAllowed). GitHub's
+	// attestations API bundle_url is a different SAS with no JWT, on the
+	// exact storage accounts named in credential_audience.go
+	// (attestationBundleSASAllowed). GitHub Actions job logs and artifacts
+	// redirect to the productionresultssa0-19 accounts GitHub lists in its meta
+	// API (actionsResultsSASAllowed). The pattern host list stays the release
+	// host; the bundle and results accounts are not a second config audience.
 	// Source: https://learn.microsoft.com/en-us/rest/api/storageservices/create-account-sas
-	{Name: "Azure SAS Token", Regex: `\bsig=(?:[A-Za-z0-9%]{43,}%3d\b|[A-Za-z0-9+/]{43}=)`, Severity: SeverityHigh},
+	{Name: "Azure SAS Token", Regex: `\bsig=(?:[A-Za-z0-9%]{43,}%3d\b|[A-Za-z0-9+/]{43}=)`, Severity: SeverityHigh, CredentialAudienceHosts: githubDownloadGrantAudienceHosts, CredentialAudienceCarrierMask: CredentialAudienceCarrierReleaseGrantSAS},
 
 	// Messaging platform tokens
-	{Name: "Slack Token", Regex: `xox[bpras]-[0-9a-zA-Z-]{15,}`, Severity: SeverityCritical},
-	{Name: "Slack App Token", Regex: `xapp-[0-9]+-[A-Za-z0-9_]+-[0-9]+-[a-f0-9]+`, Severity: SeverityCritical},
+	// The Slack Web API serves every method at https://slack.com/api/..., while
+	// Slack's hosted MCP server accepts user tokens at https://mcp.slack.com/mcp.
+	// Those user tokens share the Slack Token pattern with bot and legacy token
+	// forms, so the compiled audience remains pattern-scoped: every xox* token is
+	// allowed only to these two exact Slack-owned authorities. A Socket Mode
+	// client opens its gateway on
+	// the pre-authenticated wss:// URL returned by apps.connections.open, which
+	// carries its own ticket, so no token is re-presented to that subdomain and
+	// it is deliberately not an audience host.
+	// Sources: https://docs.slack.dev/apis/web-api/
+	// https://docs.slack.dev/ai/slack-mcp-server/
+	{Name: "Slack Token", Regex: `xox[bpras]-[0-9a-zA-Z-]{15,}`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"slack.com", "mcp.slack.com"}},
+	// The app-level token authenticates apps.connections.open, also on
+	// https://slack.com/api/..., so it shares the exact-host audience.
+	// Source: https://docs.slack.dev/reference/methods/apps.connections.open/
+	{Name: "Slack App Token", Regex: `xapp-[0-9]+-[A-Za-z0-9_]+-[0-9]+-[a-f0-9]+`, Severity: SeverityCritical, CredentialAudienceHosts: []string{"slack.com"}},
 	// The first segment is base64 of a snowflake user ID, which is
 	// structurally an UPPERCASE M or N; the bot-token form is three
 	// dot-separated base64url parts, the mfa form is "mfa." + 84 chars.
@@ -248,7 +390,7 @@ var defaultDLPPatternSet = []DLPPattern{
 	// "ey..."-ish fragments tripped it. Keep only narrow, case-sensitive
 	// JSON-object prefixes so the precision fix does not drop compact
 	// JWTs serialized with whitespace.
-	{Name: "JWT Token", Regex: `(?:(?-i:ey[JA])[a-zA-Z0-9_\-=]{7,}|(?-i:ew[ok0])[a-zA-Z0-9_\-=]{7,})\.(?:(?-i:ey[JA])[a-zA-Z0-9_\-=]{7,}|(?-i:ew[ok0])[a-zA-Z0-9_\-=]{7,}|(?-i:e30=?))\.[a-zA-Z0-9_\-=]{10,}`, Severity: SeverityHigh},
+	{Name: "JWT Token", Regex: `(?:(?-i:ey[JA])[a-zA-Z0-9_\-=]{7,}|(?-i:ew[ok0])[a-zA-Z0-9_\-=]{7,})\.(?:(?-i:ey[JA])[a-zA-Z0-9_\-=]{7,}|(?-i:ew[ok0])[a-zA-Z0-9_\-=]{7,}|(?-i:e30=?))\.[a-zA-Z0-9_\-=]{10,}`, Severity: SeverityHigh, CredentialAudienceHosts: githubDownloadGrantAudienceHosts, CredentialAudienceRegistryHosts: githubRegistryHosts, CredentialAudienceCarrierMask: CredentialAudienceCarrierURLQuery | CredentialAudienceCarrierRegistryBearer | CredentialAudienceCarrierRegistryBasic},
 
 	// Cryptocurrency private keys
 	// Bitcoin WIF: base58check. Uncompressed (5 + 50 base58 = 51 chars) or
@@ -299,7 +441,7 @@ var defaultDLPPatternSet = []DLPPattern{
 	// The line-start branch is intentionally strict around '=': spaced source
 	// assignments are not URL credentials. Delimiter-led query parameters keep
 	// whitespace tolerance for decoded and hand-written URLs.
-	{Name: "Credential in URL", Regex: `(?m)(?:^\s*(?:password|passwd|secret|token|apikey|api_key|api-key)=[A-Za-z0-9_+/=~%.-][^\s&;]{3,}|[?&;]\s*(?:password|passwd|secret|token|apikey|api_key|api-key)\s*=\s*[A-Za-z0-9_+/=~%.-][^\s&;]{3,})`, Severity: SeverityHigh, CredentialURLWhitespaceGrammar: true},
+	{Name: "Credential in URL", Regex: URLKeywordAssignmentRegex, Severity: SeverityHigh, CredentialURLWhitespaceGrammar: true},
 	// Environment variable credential patterns: catches env var dumps
 	// where the secret-bearing keyword is the terminal segment of an
 	// UPPER_CASE name (e.g., AWS_SECRET_ACCESS_KEY=..., STRIPE_SECRET_KEY=...,
@@ -332,7 +474,7 @@ var defaultDLPPatternSet = []DLPPattern{
 	// Luhn + issuer check drops ~95% of random matches. mod-97 drops ~99%
 	// of random IBAN-format matches. ABA is not in defaults due to high FP
 	// rate; users can add it via config with validator: "aba".
-	{Name: "Credit Card Number", Regex: `\b\d{4}(?:[- ]?\d){11,15}\b`, Severity: SeverityMedium, Validator: ValidatorLuhn},
+	{Name: "Credit Card Number", Regex: jsonnumber.ShippedCardPattern, Severity: SeverityMedium, Validator: ValidatorLuhn},
 	{Name: "IBAN", Regex: `\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b`, Severity: SeverityMedium, Validator: ValidatorMod97},
 }
 
@@ -425,6 +567,13 @@ func IsCredentialAudiencePatternName(name string) bool {
 	return len(credentialAudienceHostsForPattern(name)) > 0
 }
 
+// BuiltInCredentialAudienceHosts returns a copy of the public, compiled audience
+// hosts for diagnostic display. It excludes operator-declared hosts and must not
+// replace the effective audience used to decide whether a credential is allowed.
+func BuiltInCredentialAudienceHosts(name string) []string {
+	return append([]string(nil), credentialAudienceHostsForPattern(name)...)
+}
+
 // credentialAudienceHostsForPattern returns the compiled audience for name.
 // Callers must treat the returned slice as read-only. Unlike
 // DefaultDLPPatterns, this helper does not clone the full default registry, so
@@ -436,6 +585,70 @@ func credentialAudienceHostsForPattern(name string) []string {
 		}
 	}
 	return nil
+}
+
+// builtInAudiencePattern returns the shipped pattern with this exact name when
+// it carries a compiled credential audience. Callers treat the result as
+// read-only.
+func builtInAudiencePattern(name string) (DLPPattern, bool) {
+	for _, pattern := range defaultDLPPatternSet {
+		if len(pattern.CredentialAudienceHosts) > 0 && pattern.Name == name {
+			return pattern, true
+		}
+	}
+	return DLPPattern{}, false
+}
+
+// changedFromBuiltIn names the identity fields in which a same-name pattern
+// differs from the shipped one: the fields whose change costs the pattern its
+// compiled credential audience.
+func changedFromBuiltIn(p, builtIn DLPPattern) []string {
+	var changed []string
+	if p.Regex != builtIn.Regex {
+		changed = append(changed, "regex")
+	}
+	if p.Severity != builtIn.Severity {
+		changed = append(changed, "severity")
+	}
+	if p.Validator != builtIn.Validator {
+		changed = append(changed, "validator")
+	}
+	if p.Action != builtIn.Action {
+		changed = append(changed, "action")
+	}
+	return changed
+}
+
+// AppendDeclaredCredentialAudienceHosts adds operator-named enterprise hosts
+// only onto a pattern that already carries its compiled audience. A redefined
+// pattern whose audience was cleared gets nothing from these lists.
+func AppendDeclaredCredentialAudienceHosts(name string, compiled, githubEnterprise, gitlab []string) []string {
+	if len(compiled) == 0 {
+		return append([]string(nil), compiled...)
+	}
+	var extra []string
+	switch {
+	case strings.EqualFold(name, "GitHub Token") || strings.EqualFold(name, "GitHub Fine-Grained PAT"):
+		extra = githubEnterprise
+	case strings.HasPrefix(strings.ToLower(name), "gitlab "):
+		extra = gitlab
+	}
+	if len(extra) == 0 {
+		return append([]string(nil), compiled...)
+	}
+	out := append([]string(nil), compiled...)
+	seen := make(map[string]struct{}, len(out)+len(extra))
+	for _, host := range out {
+		seen[host] = struct{}{}
+	}
+	for _, host := range extra {
+		if _, ok := seen[host]; ok {
+			continue
+		}
+		seen[host] = struct{}{}
+		out = append(out, host)
+	}
+	return out
 }
 
 // PresetDLPPatterns returns the generated DLP pattern set for a shipped preset

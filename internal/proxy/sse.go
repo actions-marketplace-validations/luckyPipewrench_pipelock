@@ -6,13 +6,17 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/responseencoding"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -42,7 +46,7 @@ func HasSingleSSEContentType(header http.Header) bool {
 // sites in forward.go, intercept.go, and reverse.go all reach the same
 // conclusion about what counts as compressed.
 func IsSSECompressed(h http.Header) bool {
-	return hasNonIdentityEncoding(h.Get("Content-Encoding"))
+	return responseencoding.HasNonIdentityContentEncoding(h)
 }
 
 // SSEDispatchOptions selects which streaming scanner runs for an SSE
@@ -55,6 +59,25 @@ type SSEDispatchOptions struct {
 	A2A        *config.A2AScanning
 	GenericSSE *config.GenericSSEScanning
 	Generic    mcp.GenericSSEScanOptions
+}
+
+// sseFindingReceiptConfirmer admits warned events before their wire write.
+// Errors are receipt failures, not content findings: a warn-mode caller must
+// terminate on them rather than treating a failed confirmation as visibility.
+func sseFindingReceiptConfirmer(cfg *config.Config, opts receipt.EmitOpts, emit func(*config.Config, receipt.EmitOpts) error) func(error) error {
+	if cfg == nil || !cfg.FlightRecorder.RequireReceipts {
+		return nil
+	}
+	return func(finding error) error {
+		opts.ActionID = receipt.NewActionID()
+		opts.Verdict = config.ActionWarn
+		opts.Layer = LayerSSEStream
+		opts.Pattern = finding.Error()
+		if err := emit(cfg, opts); err != nil {
+			return fmt.Errorf("%w: confirm SSE response receipt: %w", mcp.ErrReceiptRequired, err)
+		}
+		return nil
+	}
 }
 
 // DispatchSSEScan picks the appropriate streaming scanner and runs it.
@@ -77,7 +100,7 @@ func DispatchSSEScan(
 	opts SSEDispatchOptions,
 ) error {
 	if opts.IsA2A {
-		return mcp.ScanA2AStream(ctx, body, w, flusher, sc, opts.A2A)
+		return mcp.ScanA2AStreamWithOptions(ctx, body, w, flusher, sc, mcp.A2AStreamOptions{Config: opts.A2A, Warning: opts.Generic})
 	}
 	return mcp.ScanGenericSSEStreamWithOptions(ctx, body, w, flusher, sc, opts.GenericSSE, opts.Generic)
 }
@@ -175,7 +198,7 @@ func HijackResponseForSSE(
 		// nil flusher: httputil.ReverseProxy detects text/event-stream and
 		// flushes per write to the client, so the per-event flush behavior
 		// happens downstream of this pipe write.
-		scanErr := DispatchSSEScan(ctx, upstream, pw, nil, sc, opts)
+		scanErr := DispatchSSEScan(ctx, upstream, httpstream.Writer{Writer: pw}, nil, sc, opts)
 		_ = upstream.Close()
 		// Reverse-proxy outcomes are emitted after the body copier observes
 		// the pipe close. Publish the final scan state first so an incomplete

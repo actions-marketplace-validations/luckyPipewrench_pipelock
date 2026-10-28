@@ -8,8 +8,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"strings"
 
-	"github.com/luckyPipewrench/pipelock/internal/contract"
 	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
@@ -129,11 +129,7 @@ func decodeEvidenceReceipt(data []byte) (contractreceipt.EvidenceReceipt, error)
 	if err := jsonscan.RejectUnsafeNumbers(data); err != nil {
 		return contractreceipt.EvidenceReceipt{}, err
 	}
-	var r contractreceipt.EvidenceReceipt
-	if err := contract.DecodeStrictJSON(data, &r); err != nil {
-		return contractreceipt.EvidenceReceipt{}, err
-	}
-	return r, nil
+	return contractreceipt.ParseEvidenceReceipt(data)
 }
 
 func verifyEvidenceReceipt(r contractreceipt.EvidenceReceipt, keyHex string, opts evidenceBindingOptions) (bool, error) {
@@ -157,4 +153,19 @@ func verifyEvidenceReceipt(r contractreceipt.EvidenceReceipt, keyHex string, opt
 		return false, err
 	}
 	return true, nil
+}
+
+// verifyDeclaredSigner verifies r's signature against the signer key it
+// declares. It establishes that r is unchanged since it was signed, not who
+// signed it.
+func verifyDeclaredSigner(r contractreceipt.EvidenceReceipt) error {
+	declared := strings.ToLower(strings.TrimSpace(r.Signature.SignerKeyID))
+	raw, err := hex.DecodeString(declared)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		return fmt.Errorf("declared signer_key_id %q is not an Ed25519 public key", r.Signature.SignerKeyID)
+	}
+	if err := contractreceipt.VerifyWithKey(r, ed25519.PublicKey(raw), declared); err != nil {
+		return fmt.Errorf("signature against declared signer: %w", err)
+	}
+	return nil
 }

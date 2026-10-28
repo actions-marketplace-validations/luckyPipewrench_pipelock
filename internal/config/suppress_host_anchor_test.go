@@ -71,6 +71,7 @@ func TestBuiltInCredentialAudienceHosts_ReplaceDerivedProviderDefaults(t *testin
 		"Answer Engine API Key": {"*.perplexity.ai"},
 		"Web Research API Key":  {"*.tavily.com"},
 		"Google API Key":        {"*.googleapis.com"},
+		"Google OAuth Token":    {"*.googleapis.com"},
 		"Hugging Face Token":    {"*.huggingface.co"},
 		"Databricks Token":      {"*.databricks.com"},
 		"Replicate API Token":   {"*.replicate.com"},
@@ -79,6 +80,25 @@ func TestBuiltInCredentialAudienceHosts_ReplaceDerivedProviderDefaults(t *testin
 		"Groq API Key":          {"*.groq.com"},
 		"xAI API Key":           {"*.x.ai"},
 		"Discord Bot Token":     {"discord.com", "gateway.discord.gg"},
+		// Slack bot/user tokens are presented to the Web API and hosted MCP server;
+		// app-level tokens are presented only to the Web API. Slack Token is also a
+		// core-floor pattern, so these prove a compiled audience attaches to a core
+		// pattern (its issuing authorities) while YAML still cannot reach the floor.
+		"Slack Token":             {"slack.com", "mcp.slack.com"},
+		"Slack App Token":         {"slack.com"},
+		"GitHub Token":            {"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"},
+		"GitHub Fine-Grained PAT": {"api.github.com", "uploads.github.com", "rubygems.pkg.github.com"},
+		"GitLab PAT":              {"gitlab.com"},
+		"GitLab CI Job Token":     {"gitlab.com"},
+		// GitHub release downloads redirect to this storage host with a signed
+		// grant in the URL query; the exact host is the whole audience.
+		"JWT Token": {"release-assets.githubusercontent.com"},
+		// The release redirect's Azure SAS shares that exact host list and is
+		// granted only beside a validated JWT for that host. Attestation
+		// bundle SAS uses the same carrier with a scanner-side account list
+		// (attestationBundleSASAllowed); it is not a second pattern host, so
+		// this set does not grow.
+		"Azure SAS Token": {"release-assets.githubusercontent.com"},
 	}
 	for name, hosts := range expected {
 		t.Run(name, func(t *testing.T) {
@@ -102,6 +122,17 @@ func TestBuiltInCredentialAudienceHosts_ReplaceDerivedProviderDefaults(t *testin
 		})
 	}
 
+	// The table above is only half the contract. Without this reverse check an
+	// audience added to a built-in pattern, which allows that credential to
+	// leave for a new set of hosts, lands without anyone updating the table.
+	for _, p := range cfg.DLP.Patterns {
+		if len(p.CredentialAudienceHosts) == 0 {
+			continue
+		}
+		if _, ok := expected[p.Name]; !ok {
+			t.Errorf("%q carries compiled credential audience %#v but is not listed in this test", p.Name, p.CredentialAudienceHosts)
+		}
+	}
 	for _, suppression := range cfg.Suppress {
 		if suppression.Reason == "provider-bound credential" {
 			t.Fatalf("legacy derived suppression remained: %#v", suppression)

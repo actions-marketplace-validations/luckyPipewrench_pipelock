@@ -28,16 +28,20 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+
+	"github.com/luckyPipewrench/pipelock/internal/receiptcontent"
 )
 
 // HTTP response headers emitted on every block.
 const (
-	HeaderReason   = "X-Pipelock-Block-Reason"
-	HeaderVersion  = "X-Pipelock-Block-Reason-Version"
-	HeaderSeverity = "X-Pipelock-Block-Reason-Severity"
-	HeaderRetry    = "X-Pipelock-Block-Reason-Retry"
-	HeaderLayer    = "X-Pipelock-Block-Reason-Layer"
-	HeaderReceipt  = "X-Pipelock-Block-Reason-Receipt"
+	HeaderReason    = "X-Pipelock-Block-Reason"
+	HeaderVersion   = "X-Pipelock-Block-Reason-Version"
+	HeaderSeverity  = "X-Pipelock-Block-Reason-Severity"
+	HeaderRetry     = "X-Pipelock-Block-Reason-Retry"
+	HeaderLayer     = "X-Pipelock-Block-Reason-Layer"
+	HeaderReceipt   = "X-Pipelock-Block-Reason-Receipt"
+	HeaderRequestID = "X-Pipelock-Request-ID"
+	HeaderOperator  = "X-Pipelock-Operator"
 	// HeaderRecordedReceipt carries the action_id of a receipt that was
 	// successfully recorded before this response was written. It is additive
 	// metadata and must never be treated as proof without verifying the signed
@@ -66,18 +70,20 @@ type Reason string
 
 const (
 	// Egress / network layer.
-	SchemeBlocked    Reason = "scheme_blocked"
-	DomainBlocklist  Reason = "domain_blocklist"
-	SSRFPrivateIP    Reason = "ssrf_private_ip"
-	SSRFMetadata     Reason = "ssrf_metadata"
-	SSRFDNSRebind    Reason = "ssrf_dns_rebind"
-	PathEntropy      Reason = "path_entropy"
-	BodyEntropy      Reason = "body_entropy"
-	SubdomainEntropy Reason = "subdomain_entropy"
-	URLLength        Reason = "url_length"
-	RateLimit        Reason = "rate_limit"
-	DataBudget       Reason = "data_budget"
-	ResponseSize     Reason = "response_size"
+	SchemeBlocked      Reason = "scheme_blocked"
+	DomainBlocklist    Reason = "domain_blocklist"
+	SSRFPrivateIP      Reason = "ssrf_private_ip"
+	SSRFMetadata       Reason = "ssrf_metadata"
+	SSRFDNSRebind      Reason = "ssrf_dns_rebind"
+	PathEntropy        Reason = "path_entropy"
+	QueryEntropy       Reason = "query_entropy"
+	BodyEntropy        Reason = "body_entropy"
+	SubdomainEntropy   Reason = "subdomain_entropy"
+	URLLength          Reason = "url_length"
+	RateLimit          Reason = "rate_limit"
+	DataBudget         Reason = "data_budget"
+	ResponseSize       Reason = "response_size"
+	ResponseIncomplete Reason = "response_incomplete"
 
 	// Content / payload layer.
 	DLPMatch         Reason = "dlp_match"
@@ -92,18 +98,19 @@ const (
 	SessionBinding   Reason = "session_binding"
 
 	// Posture / runtime layer.
-	AirlockActive          Reason = "airlock_active"
-	KillSwitchActive       Reason = "kill_switch_active"
-	EnvelopeVerifyFailed   Reason = "envelope_verify_failed"
-	OutboundEnvelopeFailed Reason = "outbound_envelope_failed"
-	ReceiptEmissionFailed  Reason = "receipt_emission_failed"
-	RedirectScanDenied     Reason = "redirect_scan_denied"
-	AuthorityMismatch      Reason = "authority_mismatch"
-	EscalationLevel        Reason = "escalation_level"
-	SessionAnomaly         Reason = "session_anomaly"
-	CrossRequestDeny       Reason = "cross_request_deny"
-	CompressedResponse     Reason = "compressed_response"
-	BrowserShieldOversize  Reason = "browser_shield_oversize"
+	AirlockActive              Reason = "airlock_active"
+	KillSwitchActive           Reason = "kill_switch_active"
+	EnvelopeVerifyFailed       Reason = "envelope_verify_failed"
+	OutboundEnvelopeFailed     Reason = "outbound_envelope_failed"
+	ReceiptEmissionFailed      Reason = "receipt_emission_failed"
+	RedirectScanDenied         Reason = "redirect_scan_denied"
+	AuthorityMismatch          Reason = "authority_mismatch"
+	EscalationLevel            Reason = "escalation_level"
+	SessionAnomaly             Reason = "session_anomaly"
+	CrossRequestDeny           Reason = "cross_request_deny"
+	CompressedResponse         Reason = "compressed_response"
+	BrowserShieldOversize      Reason = "browser_shield_oversize"
+	BrowserShieldUninspectable Reason = "browser_shield_uninspectable"
 
 	// Generic.
 	ParseError         Reason = "parse_error"
@@ -144,50 +151,53 @@ const (
 
 // validReasons is the fixed v1 allowlist enforced at construction.
 var validReasons = map[Reason]struct{}{
-	SchemeBlocked:          {},
-	DomainBlocklist:        {},
-	SSRFPrivateIP:          {},
-	SSRFMetadata:           {},
-	SSRFDNSRebind:          {},
-	PathEntropy:            {},
-	BodyEntropy:            {},
-	SubdomainEntropy:       {},
-	URLLength:              {},
-	RateLimit:              {},
-	DataBudget:             {},
-	ResponseSize:           {},
-	DLPMatch:               {},
-	PromptInjection:        {},
-	RedactionFailure:       {},
-	MediaPolicy:            {},
-	ToolPolicyDeny:         {},
-	ToolChainBlocked:       {},
-	ToolPoisoning:          {},
-	SessionBinding:         {},
-	AirlockActive:          {},
-	KillSwitchActive:       {},
-	EnvelopeVerifyFailed:   {},
-	OutboundEnvelopeFailed: {},
-	ReceiptEmissionFailed:  {},
-	RedirectScanDenied:     {},
-	AuthorityMismatch:      {},
-	EscalationLevel:        {},
-	SessionAnomaly:         {},
-	CrossRequestDeny:       {},
-	CompressedResponse:     {},
-	BrowserShieldOversize:  {},
-	ParseError:             {},
-	Timeout:                {},
-	PatternUnavailable:     {},
-	NotEnabled:             {},
-	BadRequest:             {},
-	BlockReasonOverflow:    {},
-	ContractDefaultDeny:    {},
-	ContractEnforceDefault: {},
-	ContractNonDefaultPort: {},
-	ContractInvalidPath:    {},
-	ContractObservedOnly:   {},
-	RequestPolicyDeny:      {},
+	SchemeBlocked:              {},
+	DomainBlocklist:            {},
+	SSRFPrivateIP:              {},
+	SSRFMetadata:               {},
+	SSRFDNSRebind:              {},
+	PathEntropy:                {},
+	QueryEntropy:               {},
+	BodyEntropy:                {},
+	SubdomainEntropy:           {},
+	URLLength:                  {},
+	RateLimit:                  {},
+	DataBudget:                 {},
+	ResponseSize:               {},
+	ResponseIncomplete:         {},
+	DLPMatch:                   {},
+	PromptInjection:            {},
+	RedactionFailure:           {},
+	MediaPolicy:                {},
+	ToolPolicyDeny:             {},
+	ToolChainBlocked:           {},
+	ToolPoisoning:              {},
+	SessionBinding:             {},
+	AirlockActive:              {},
+	KillSwitchActive:           {},
+	EnvelopeVerifyFailed:       {},
+	OutboundEnvelopeFailed:     {},
+	ReceiptEmissionFailed:      {},
+	RedirectScanDenied:         {},
+	AuthorityMismatch:          {},
+	EscalationLevel:            {},
+	SessionAnomaly:             {},
+	CrossRequestDeny:           {},
+	CompressedResponse:         {},
+	BrowserShieldOversize:      {},
+	BrowserShieldUninspectable: {},
+	ParseError:                 {},
+	Timeout:                    {},
+	PatternUnavailable:         {},
+	NotEnabled:                 {},
+	BadRequest:                 {},
+	BlockReasonOverflow:        {},
+	ContractDefaultDeny:        {},
+	ContractEnforceDefault:     {},
+	ContractNonDefaultPort:     {},
+	ContractInvalidPath:        {},
+	ContractObservedOnly:       {},
+	RequestPolicyDeny:          {},
 }
 
 // AllReasons returns every Reason in the canonical allowlist. The returned
@@ -260,11 +270,22 @@ var (
 // fields for tests; do not rely on direct struct construction outside this
 // package's tests.
 type Info struct {
-	Reason   Reason
-	Severity Severity
-	Retry    Retry
-	Layer    string
-	Receipt  string
+	Reason    Reason
+	Severity  Severity
+	Retry     Retry
+	Layer     string
+	Receipt   string
+	RequestID string
+}
+
+// WithRequestID attaches the ID recorded for this block. Invalid IDs clear
+// the field so arbitrary text cannot reach headers or close-frame metadata.
+func (i Info) WithRequestID(requestID string) Info {
+	i.RequestID = ""
+	if receiptcontent.ValidRequestID(requestID) {
+		i.RequestID = requestID
+	}
+	return i
 }
 
 // New constructs an Info, validating reason / severity / retry against the
@@ -432,6 +453,12 @@ func isRFC4122VariantByte(c byte) bool {
 // violation; the headers still emit but downstream consumers may treat
 // the block as malformed.
 func (i Info) SetHeaders(h http.Header) {
+	h.Del(HeaderRequestID)
+	h.Del(HeaderOperator)
+	if receiptcontent.ValidRequestID(i.RequestID) {
+		h.Set(HeaderRequestID, i.RequestID)
+		h.Set(HeaderOperator, "pipelock explain event "+i.RequestID)
+	}
 	h.Set(HeaderReason, string(i.Reason))
 	h.Set(HeaderVersion, SchemaVersion)
 	h.Set(HeaderSeverity, string(i.Severity))
@@ -495,7 +522,7 @@ func FromHeader(h http.Header) (Info, bool) {
 	if receipted, receiptErr := info.WithReceipt(h.Get(HeaderReceipt)); receiptErr == nil {
 		info = receipted
 	}
-	return info, true
+	return info.WithRequestID(h.Get(HeaderRequestID)), true
 }
 
 // SetRecordedReceipt sets the caller-correlation header only for a valid
@@ -525,6 +552,7 @@ type closeFramePayload struct {
 	Retry       string `json:"retry,omitempty"`
 	Layer       string `json:"layer,omitempty"`
 	Receipt     string `json:"receipt,omitempty"`
+	RequestID   string `json:"request_id,omitempty"`
 }
 
 // closeFrameMaxBytes is RFC 6455's close-frame reason payload limit (125 bytes
@@ -540,7 +568,7 @@ const closeFrameOverflowFallback = `{"block_reason":"block_reason_overflow","ver
 // CloseFramePayload returns a JSON document for the WebSocket close-frame
 // Reason field. The result is GUARANTEED to be at most closeFrameMaxBytes
 // bytes (RFC 6455's 123-byte ceiling). To honor the ceiling, optional
-// fields drop in this order: receipt, layer, retry, severity, version.
+// fields drop in this order: receipt, layer, retry, severity, version, request_id.
 // If even the bare {"block_reason":"<code>"} would overflow because the
 // Reason value is unusually long, CloseFramePayload returns
 // closeFrameOverflowFallback (block_reason_overflow). The fallback
@@ -561,6 +589,9 @@ func (i Info) CloseFramePayload() string {
 		Layer:       i.Layer,
 		Receipt:     i.Receipt,
 	}
+	if receiptcontent.ValidRequestID(i.RequestID) {
+		p.RequestID = i.RequestID
+	}
 	out := mustMarshal(p)
 	if len(out) <= closeFrameMaxBytes {
 		return out
@@ -571,6 +602,7 @@ func (i Info) CloseFramePayload() string {
 		func(p *closeFramePayload) { p.Retry = "" },
 		func(p *closeFramePayload) { p.Severity = "" },
 		func(p *closeFramePayload) { p.Version = "" },
+		func(p *closeFramePayload) { p.RequestID = "" },
 	}
 	for _, drop := range dropFields {
 		drop(&p)
@@ -583,7 +615,7 @@ func (i Info) CloseFramePayload() string {
 }
 
 // mustMarshal is json.Marshal with a known-good fixed-shape struct. The
-// struct has only string fields (no interface{}, no time.Time) so
+// struct has only strings, so
 // json.Marshal cannot fail on real input. The error fallback is defensive
 // code; it would surface the BlockReasonOverflow sentinel rather than a
 // silent zero value.
@@ -607,18 +639,21 @@ func SeverityFor(reason Reason) Severity {
 		return SeverityInfo
 	case SchemeBlocked,
 		PathEntropy,
+		QueryEntropy,
 		BodyEntropy,
 		SubdomainEntropy,
 		URLLength,
 		RateLimit,
 		DataBudget,
 		ResponseSize,
+		ResponseIncomplete,
 		MediaPolicy,
 		ParseError,
 		Timeout,
 		PatternUnavailable,
 		CompressedResponse,
 		BrowserShieldOversize,
+		BrowserShieldUninspectable,
 		BlockReasonOverflow,
 		ContractNonDefaultPort,
 		ContractInvalidPath:
@@ -649,6 +684,7 @@ func RetryFor(reason Reason) Retry {
 		return RetryTransient
 	case DomainBlocklist,
 		PathEntropy,
+		QueryEntropy,
 		BodyEntropy,
 		SubdomainEntropy,
 		URLLength,
@@ -661,6 +697,7 @@ func RetryFor(reason Reason) Retry {
 		NotEnabled,
 		CompressedResponse,
 		BrowserShieldOversize,
+		BrowserShieldUninspectable,
 		RequestPolicyDeny:
 		return RetryPolicy
 	case ContractInvalidPath:

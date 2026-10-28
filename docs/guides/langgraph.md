@@ -9,7 +9,7 @@ deployment.
 
 ```bash
 # 1. Install pipelock
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 
 # 2. Generate a config (or copy a preset)
@@ -204,7 +204,19 @@ asyncio.run(main())
 
 ### LangGraph Docker image with Pipelock
 
-Use `dockerfile_lines` in `langgraph.json` to install Pipelock into the image:
+Download and verify the v3.7.0 [Linux amd64 archive](https://github.com/luckyPipewrench/pipelock/releases/download/v3.7.0/pipelock_3.7.0_linux_amd64.tar.gz) in the build directory.
+
+Use GitHub CLI v2.102.0 or later for attestation verification; this release fixes a [workflow signer-matching vulnerability](https://github.com/cli/cli/security/advisories/GHSA-wjmr-j3rp-mh2g).
+
+Run these commands in a fresh directory. If verification fails or provenance cannot be retrieved, stop without extracting the archive or building the image. Use another fresh directory before retrying so an existing download does not prevent the commands from running.
+
+```bash
+gh release download v3.7.0 --repo luckyPipewrench/pipelock --pattern pipelock_3.7.0_linux_amd64.tar.gz &&
+  gh attestation verify pipelock_3.7.0_linux_amd64.tar.gz --repo luckyPipewrench/pipelock --signer-workflow luckyPipewrench/pipelock/.github/workflows/release.yaml &&
+  tar xzf pipelock_3.7.0_linux_amd64.tar.gz pipelock
+```
+
+Then use `dockerfile_lines` in `langgraph.json` to copy the verified binary into the image:
 
 ```json
 {
@@ -214,8 +226,7 @@ Use `dockerfile_lines` in `langgraph.json` to install Pipelock into the image:
     },
     "env": ".env",
     "dockerfile_lines": [
-        "RUN apt-get update && apt-get install -y curl",
-        "RUN curl -fsSL -o /tmp/pipelock.tar.gz https://github.com/luckyPipewrench/pipelock/releases/download/v3.5.0/pipelock_3.5.0_linux_amd64.tar.gz && echo '0e9fe1461107e8fc6a7f7969c87e7810824b019eaabd6fa7318f642ca9e4b858  /tmp/pipelock.tar.gz' | sha256sum -c - && tar xzf /tmp/pipelock.tar.gz -C /usr/local/bin/ && rm /tmp/pipelock.tar.gz",
+        "COPY pipelock /usr/local/bin/pipelock",
         "COPY pipelock-config.yaml /etc/pipelock/config.yaml"
     ]
 }
@@ -267,11 +278,12 @@ networks:
 
 services:
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock:3.5.0
+    image: ghcr.io/luckypipewrench/pipelock:3.7.0
     networks:
       - pipelock-internal
       - pipelock-external
     command: ["run", "--listen", "0.0.0.0:8888", "--config", "/config/pipelock.yaml"]
+    stop_grace_period: 10m   # Receipt-group close at shutdown; Compose default is 10 s
     volumes:
       - ./pipelock.yaml:/config/pipelock.yaml:ro
     healthcheck:

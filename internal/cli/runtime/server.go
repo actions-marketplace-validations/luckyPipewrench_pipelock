@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,6 +41,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	plsentry "github.com/luckyPipewrench/pipelock/internal/sentry"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
+	"github.com/luckyPipewrench/pipelock/internal/verification"
 	"golang.org/x/time/rate"
 )
 
@@ -48,6 +50,9 @@ import (
 // config default", matching the cobra.Flag.Changed semantics RunCmd relied on
 // before the extraction.
 type ServerOpts struct {
+	// StartupVerification supplies cancellation and observed verification work
+	// during construction, before Start owns the listener lifecycle.
+	StartupVerification     verification.Options
 	ConfigFile              string
 	Mode                    string
 	Listen                  string
@@ -96,8 +101,26 @@ type ServerOpts struct {
 // loop and blocks until ctx is cancelled. Reload drives a single
 // hot-reload cycle against newCfg. Shutdown cancels the internal context
 // so Start unblocks.
+// liveCredentialAckSet pairs an acknowledgment set with the configuration it
+// was built from.
+type liveCredentialAckSet struct {
+	cfg *config.Config
+	set *tools.CredentialAckSet
+}
+
 type Server struct {
 	opts ServerOpts
+
+	// ackKeyRevokedFor is the running configuration whose acknowledgment key
+	// was found unavailable or changed after a failed reload. Its
+	// acknowledgments refuse; a successfully reloaded configuration is a
+	// different value and is unaffected.
+	ackKeyRevokedFor atomic.Pointer[config.Config]
+	// liveAckSet is the acknowledgment set the MCP listener built for its
+	// current configuration. Every tool configuration copy shares it, including
+	// one an in-flight response already holds, so revoking it reaches them all
+	// at once.
+	liveAckSet atomic.Pointer[liveCredentialAckSet]
 
 	runtimeMode        config.RuntimeMode
 	hasMCPListen       bool
@@ -136,6 +159,8 @@ type Server struct {
 	ksAPI                  *killswitch.APIHandler
 	proxy                  *proxy.Proxy
 	receiptEmitter         *receipt.Emitter
+	receiptShardSet        *receipt.ReceiptShardSet
+	receiptGroupFailure    atomic.Pointer[error]
 	envelopeEmitter        *envelope.Emitter
 	captureWriter          *capture.Writer
 	mcpListenerBearerToken string
@@ -209,6 +234,9 @@ type Server struct {
 	// cancel itself does not synchronously deadlock on Start's defers.
 	cancelMu       sync.Mutex
 	internalCancel context.CancelFunc
+	// Set before cancellation for multi-chain key-file rotation. Start returns
+	// a distinct error after its normal listener drain and group close.
+	receiptRotationRequested atomic.Bool
 
 	// conductorApplyMu serializes ApplyConductorPolicyBundle so the
 	// stage -> reload -> activate sequence is atomic. Concurrent applies
@@ -222,7 +250,9 @@ type Server struct {
 	// refresh. proxy.Reload has its own lock, but that only covers lower-level
 	// pointer publication; the server-level gates also depend on s.stateMu-backed
 	// mirrors such as mcpToolExtraPoison.
-	reloadMu sync.Mutex
+	reloadMu             sync.Mutex
+	reloadOutcome        proxy.ReloadOutcome // guarded by reloadMu
+	reloadDurablePending bool                // Conductor owns final success until durable activation
 
 	stateMu            sync.RWMutex
 	toolPolicyCfg      *policy.Config
@@ -263,6 +293,8 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		opts.Stderr = io.Discard
 	}
 	opts.Stderr = &stderrSyncWriter{w: opts.Stderr}
+	startupVerification, stopStartupProgress := startupVerificationOptions(opts)
+	defer stopStartupProgress()
 	if opts.Stdout == nil {
 		opts.Stdout = io.Discard
 	}
@@ -314,7 +346,7 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	var cfg *config.Config
 	var err error
 	if opts.ConfigFile != "" {
-		cfg, err = config.Load(opts.ConfigFile)
+		cfg, err = config.LoadForRuntime(opts.ConfigFile)
 		if err != nil {
 			return nil, fmt.Errorf("loading config: %w", err)
 		}
@@ -343,6 +375,15 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		_, _ = fmt.Fprintf(opts.Stderr, "WARNING: %s: %s\n", wn.Field, wn.Message)
 	}
 	if err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	// An expired containment grant is dropped from the effective set rather
+	// than refusing to start, so a lapsed entry can never take the proxy, and
+	// every contained agent's egress, down with it.
+	if _, err := cfg.LapseExpiredScannerExceptions(time.Now()); err != nil {
+		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+	if _, err := cfg.LapseExpiredContainmentGrants(time.Now()); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
 	}
 
@@ -383,28 +424,11 @@ func NewServer(opts ServerOpts) (*Server, error) {
 
 	m := metrics.New()
 	s.metrics = m
-	emitSinks, emitErr := BuildEmitSinks(cfg, m)
+	emitter, emitSinks, emitErr := startAuditEmitter(cfg, logger, m, opts.ConfigFile, opts.Stderr)
 	if emitErr != nil {
 		s.cleanup()
-		return nil, fmt.Errorf("creating emit sinks: %w", emitErr)
+		return nil, emitErr
 	}
-	instanceID := cfg.Emit.InstanceID
-	if instanceID == "" {
-		instanceID = emit.DefaultInstanceID()
-	}
-	if activationErr := activateEmitSinks(emitSinks); activationErr != nil {
-		activationErr = fmt.Errorf("activating configured emit sinks: %w", activationErr)
-		logger.LogError(audit.NewResourceLogContext("EMIT_ACTIVATION", opts.ConfigFile), activationErr)
-		_, _ = fmt.Fprintf(opts.Stderr, "WARNING: audit sink activation failed; startup aborted so configured audit delivery cannot be bypassed: %v\n", activationErr)
-		for _, sink := range emitSinks {
-			_ = sink.Close()
-		}
-		s.cleanup()
-		return nil, activationErr
-	}
-	emitter := emit.NewEmitter(instanceID, emitSinks...)
-	m.SetAuditSinkHealthSnapshot(emitter.SinkHealth)
-	logger.SetEmitter(emitter)
 	s.emitter = emitter
 	s.emitSinks = append([]emit.Sink(nil), emitSinks...)
 	if s.containmentManaged {
@@ -413,6 +437,7 @@ func NewServer(opts ServerOpts) (*Server, error) {
 			s.reportContainmentMetricsDrift(cfg, "startup", containmentErr)
 		}
 	}
+	s.reportLapsedContainmentGrants(cfg, "startup")
 	runtimeMode := config.RuntimeForward
 	if hasMCPListen {
 		runtimeMode = config.RuntimeForwardWithMCPListener
@@ -420,13 +445,14 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	s.runtimeMode = runtimeMode
 
 	var bundleResult *rules.LoadResult
-	cfg, _ = runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+	cfg, resolveInfo := runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
 		Mode: runtimeMode,
 		MergeBundles: func(c *config.Config) {
 			bundleResult = rules.MergeIntoConfig(c, cliutil.Version)
 		},
 		DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
-	}, opts.Stderr, "listener")
+	}, nil, "listener")
+	runtimeconfig.EmitResolveInfoLogs(opts.Stderr, resolveInfo, "listener")
 	if err := s.reportStartupRuleBundleResult(cfg, bundleResult); err != nil {
 		s.cleanup()
 		return nil, err
@@ -476,6 +502,8 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	sc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
 		emitDLPWarn(s.logger, s.metrics, s.liveReceiptEmitter(), ctx, patternName, severity)
 	})
+	wirePromptInjectionAudit(sc, logger)
+	logPromptInjectionPolicy(cfg, logger)
 
 	ks := killswitch.New(cfg)
 	m.RegisterKillSwitchState(ks.Sources)
@@ -557,11 +585,6 @@ func NewServer(opts ServerOpts) (*Server, error) {
 			Metrics:            m,
 		}
 
-		var redactFn recorder.RedactFunc
-		if cfg.FlightRecorder.Redact {
-			redactFn = sc.ScanTextForDLP
-		}
-
 		if cfg.FlightRecorder.SigningKeyPath != "" {
 			k, kErr := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath)
 			if kErr != nil {
@@ -571,13 +594,22 @@ func NewServer(opts ServerOpts) (*Server, error) {
 			recPrivKey = k
 		}
 
-		rec, recErr := recorder.New(recCfg, redactFn, recPrivKey)
+		rec, recErr := recorder.NewWithScanner(recCfg, sc, recPrivKey)
 		if recErr != nil {
 			s.cleanup()
 			return nil, fmt.Errorf("creating flight recorder: %w", recErr)
 		}
 		runFlightRecorderExpiryOnce(rec, opts.Stderr, opts.expiry())
 		s.recorder = rec
+		var runSession string
+		if cfg.FlightRecorder.ReceiptChainCount() == 1 {
+			var sessErr error
+			runSession, sessErr = acquireRunSession(rec)
+			if sessErr != nil {
+				s.cleanup()
+				return nil, sessErr
+			}
+		}
 		proxyOpts = append(proxyOpts, proxy.WithRecorder(rec))
 		postureResult, bindErr := posturebinding.LoadRuntimeForReceipts(posturebinding.RuntimeReceiptOptions{
 			ReceiptSigningEnabled:      cfg.FlightRecorder.SigningKeyPath != "",
@@ -590,71 +622,98 @@ func NewServer(opts ServerOpts) (*Server, error) {
 			return nil, fmt.Errorf("loading posture binding: %w", bindErr)
 		}
 
-		// Action receipt emitter: ConfigHash uses cfg.Hash() (raw YAML
-		// bytes) because the receipt is a point-in-time audit
-		// fingerprint of the loaded configuration file. Two deployments
-		// that happened to produce the same effective policy through
-		// different YAML should still be distinguishable in a forensic
-		// trail. Envelope attestation (below) uses the policy-semantic
-		// hash because its contract is the opposite - identical
-		// effective policy should produce identical envelope ph
-		// regardless of YAML formatting.
-		s.receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
-			Recorder:            rec,
-			PrivKey:             recPrivKey,
-			ConfigHash:          cfg.Hash(),
-			Principal:           "local",
-			Actor:               "pipelock",
-			Metrics:             m,
-			PostureBinding:      postureResult.Binding,
-			PostureAvailability: string(postureResult.Availability),
-			HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
-		})
-		if s.receiptEmitter != nil {
-			// Loud, one-time startup signal when the chain could not be
-			// resumed. Without this an init failure was only an error log on
-			// each Emit (to a formerly root-only file), silent to operators.
-			// A non-nil InitError means every Emit will fail until resolved,
-			// so name the cause and the remediation here.
-			if initErr := s.receiptEmitter.InitError(); initErr != nil {
-				_, _ = fmt.Fprintf(opts.Stderr,
-					"  Receipts: ERROR - chain could not be resumed: %v\n"+
-						"            Receipt emission is DISABLED until resolved. If the flight-recorder\n"+
-						"            signing key was rotated, the prior chain is sealed under the old key;\n"+
-						"            a corrupt or tampered evidence tail fails closed. Inspect the evidence\n"+
-						"            directory and the configured signing_key_path.\n",
-					initErr)
-			} else {
-				if openErr := emitStartupSessionOpen(s.receiptEmitter); openErr != nil {
-					if cfg.FlightRecorder.RequireReceipts {
-						s.cleanup()
-						return nil, fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
-					}
-					_, _ = fmt.Fprintf(opts.Stderr,
-						"  Receipts: ERROR - session_open could not be emitted: %v\n"+
-							"            Receipt emission for this run is UNVERIFIED until resolved.\n",
-						openErr)
-				}
-				proxyOpts = append(proxyOpts, proxy.WithReceiptEmitter(s.receiptEmitter))
-				if cfg.FlightRecorder.SigningKeyPath != "" {
-					proxyOpts = append(proxyOpts, proxy.WithReceiptKeyPath(cfg.FlightRecorder.SigningKeyPath))
-				}
-				_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: enabled (action receipts signed)\n")
+		if cfg.FlightRecorder.ReceiptChainCount() > 1 {
+			if len(recPrivKey) == 0 {
+				s.cleanup()
+				return nil, errors.New("multiple receipt chains require a signing key")
 			}
+			shards, groupOpts, groupErr := buildServerReceiptShardGroup(receipt.EmitterConfig{
+				StartupVerification: startupVerification,
+				Recorder:            rec, PrivKey: recPrivKey, ConfigHash: cfg.Hash(),
+				Principal: "local", Actor: "pipelock", Metrics: m,
+				PriorSignerKeys:     cfg.FlightRecorder.ReceiptGroupPriorSignerKeys,
+				PostureBinding:      postureResult.Binding,
+				PostureAvailability: string(postureResult.Availability),
+				HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+			}, cfg.FlightRecorder.ReceiptChainCount(), cfg.FlightRecorder.SigningKeyPath, false, s.failRequiredReceiptGroup)
+			if groupErr != nil {
+				s.cleanup()
+				return nil, fmt.Errorf("opening receipt shard group: %w", groupErr)
+			}
+			s.receiptShardSet = shards
+			s.receiptEmitter = shards.ProcessEmitter()
+			opening, _ := shards.Opening()
+			proxyOpts = append(proxyOpts, groupOpts...)
+			_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: %d signed chains opened\n", opening.ShardCount)
+		} else {
+			proxyOpts = append(proxyOpts, proxy.WithSession(runSession))
+			// Action receipt emitter: ConfigHash uses cfg.Hash() (raw YAML
+			// bytes) because the receipt is a point-in-time audit
+			// fingerprint of the loaded configuration file. Two deployments
+			// that happened to produce the same effective policy through
+			// different YAML should still be distinguishable in a forensic
+			// trail. Envelope attestation (below) uses the policy-semantic
+			// hash because its contract is the opposite - identical
+			// effective policy should produce identical envelope ph
+			// regardless of YAML formatting.
+			s.receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
+				Recorder:            rec,
+				PrivKey:             recPrivKey,
+				ConfigHash:          cfg.Hash(),
+				Principal:           "local",
+				Actor:               "pipelock",
+				Metrics:             m,
+				PostureBinding:      postureResult.Binding,
+				PostureAvailability: string(postureResult.Availability),
+				HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+				Session:             runSession,
+			})
+			if s.receiptEmitter != nil {
+				// Loud, one-time startup signal when the chain could not be
+				// resumed. Without this an init failure was only an error log on
+				// each Emit (to a formerly root-only file), silent to operators.
+				// A non-nil InitError means every Emit will fail until resolved,
+				// so name the cause and the remediation here.
+				if initErr := s.receiptEmitter.InitError(); errors.Is(initErr, receipt.ErrRetainedContent) {
+					// A configuration refusal, not a chain-resume fault: name
+					// the field and pattern and refuse to start.
+					s.cleanup()
+					return nil, fmt.Errorf("flight_recorder: %w", initErr)
+				} else if initErr != nil {
+					_, _ = io.WriteString(opts.Stderr, receiptResumeFailureNotice(initErr))
+				} else {
+					if openErr := emitStartupSessionOpen(s.receiptEmitter); openErr != nil {
+						if cfg.FlightRecorder.RequireReceipts {
+							s.cleanup()
+							return nil, fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
+						}
+						_, _ = fmt.Fprintf(opts.Stderr,
+							"  Receipts: ERROR - session_open could not be emitted: %v\n"+
+								"            Receipt emission for this run is UNVERIFIED until resolved.\n",
+							openErr)
+					}
+					proxyOpts = append(proxyOpts, proxy.WithReceiptEmitter(s.receiptEmitter))
+					if cfg.FlightRecorder.SigningKeyPath != "" {
+						proxyOpts = append(proxyOpts, proxy.WithReceiptKeyPath(cfg.FlightRecorder.SigningKeyPath))
+					}
+					_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: enabled (action receipts signed)\n")
+				}
 
-			// v2 proxy_decision emitter: dual-emitted alongside the v1 action
-			// receipt on every proxy decision, signed with the same key and
-			// gated on the same receipt intent (no separate flag). Sanitizes
-			// targets with the recorder's redactor (#676) before signing.
-			if v2Emitter := proxydecision.NewEmitter(proxydecision.EmitterConfig{
-				Recorder:  rec,
-				Signer:    proxydecision.NewKeyedSigner(recPrivKey),
-				Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
-				Principal: "local",
-				Actor:     "pipelock",
-			}); v2Emitter != nil {
-				proxyOpts = append(proxyOpts, proxy.WithV2ReceiptEmitter(v2Emitter))
-				_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: v2 proxy_decision dual-emit enabled\n")
+				// v2 proxy_decision emitter: dual-emitted alongside the v1 action
+				// receipt on every proxy decision, signed with the same key and
+				// gated on the same receipt intent (no separate flag). Sanitizes
+				// targets with the recorder's redactor (#676) before signing.
+				if v2Emitter := proxydecision.NewEmitter(proxydecision.EmitterConfig{
+					Recorder:  rec,
+					Signer:    proxydecision.NewKeyedSigner(recPrivKey),
+					Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
+					Principal: "local",
+					Actor:     "pipelock",
+					Session:   runSession,
+				}); v2Emitter != nil {
+					proxyOpts = append(proxyOpts, proxy.WithV2ReceiptEmitter(v2Emitter))
+					_, _ = fmt.Fprintf(opts.Stderr, "  Receipts: v2 proxy_decision dual-emit enabled\n")
+				}
 			}
 		}
 
@@ -715,6 +774,10 @@ func NewServer(opts ServerOpts) (*Server, error) {
 		return nil, fmt.Errorf("creating proxy: %w", pErr)
 	}
 	s.proxy = p
+	s.initReloadIdentity()
+	if api := p.SessionAPI(); api != nil {
+		api.SetConfigControl(s.ReloadStatus, s.ReloadFile)
+	}
 
 	if err := p.LoadCertCache(cfg); err != nil {
 		if sentryClient != nil {
@@ -725,6 +788,28 @@ func NewServer(opts ServerOpts) (*Server, error) {
 	}
 
 	s.refreshRuntimeState(nil, cfg, bundleResult, sc)
+	if err := s.recoverActiveConductorPolicy(); err != nil {
+		s.cleanup()
+		return nil, fmt.Errorf("recovering active conductor policy bundle: %w", err)
+	}
+	// Bundle resolution and cached-policy recovery can add DLP inputs after
+	// Sentry's first initialization. Bind the startup client to the final
+	// policy before serving, so restarting actually reconciles scrubber drift.
+	if s.sentry.ScrubberNeedsRestart(s.liveConfig()) {
+		s.sentry.Close()
+		s.sentry, sentryErr = plsentry.Init(s.liveConfig(), cliutil.Version)
+		if sentryErr != nil {
+			_, _ = fmt.Fprintf(opts.Stderr, "warning: sentry init failed: %v\n", sentryErr)
+		}
+		s.reloadOutcome.RestartRequiredFields = slices.DeleteFunc(s.reloadOutcome.RestartRequiredFields, func(field string) bool {
+			return field == reloadSentryScrubberField
+		})
+		s.reloadOutcome.PendingRestart = len(s.reloadOutcome.RestartRequiredFields) != 0
+		if s.reloadOutcome.Verdict == proxy.ReloadRestartRequired && !s.reloadOutcome.PendingRestart {
+			s.reloadOutcome.Verdict = proxy.ReloadAccepted
+			s.reloadOutcome.Reason = ""
+		}
+	}
 
 	return s, nil
 }
@@ -742,6 +827,29 @@ func (s *Server) Shutdown(_ context.Context) error {
 	return nil
 }
 
+func (s *Server) failRequiredReceiptGroup(err error) {
+	if err == nil {
+		return
+	}
+	live := s.currentConfig()
+	if live == nil || !live.FlightRecorder.RequireReceipts {
+		return
+	}
+	if s.receiptGroupFailure.CompareAndSwap(nil, &err) {
+		if s.logger != nil {
+			s.logger.LogError(audit.NewMethodLogContext("RECEIPT"), fmt.Errorf("required receipt group failed: %w", err))
+		}
+	}
+	_ = s.Shutdown(context.Background())
+}
+
+func (s *Server) requiredReceiptGroupError() error {
+	if failure := s.receiptGroupFailure.Load(); failure != nil {
+		return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt group emission failed: %w", *failure)
+	}
+	return nil
+}
+
 // expiry returns the retention pass to run: the test override when set,
 // otherwise the real one.
 func (o ServerOpts) expiry() expireFunc {
@@ -749,4 +857,15 @@ func (o ServerOpts) expiry() expireFunc {
 		return o.expireForTesting
 	}
 	return defaultExpire
+}
+
+// receiptResumeFailureNotice is the startup message for a receipt chain that
+// could not be resumed. Each run begins a new recorder session, so the cause is
+// a corrupt, tampered, or foreign-key evidence tail or an evidence read error,
+// never a routine key change, and restarting is what begins a clean session.
+func receiptResumeFailureNotice(err error) string {
+	return fmt.Sprintf("  Receipts: ERROR - chain could not be resumed: %v\n"+
+		"            Receipt emission is DISABLED until resolved. A corrupt, tampered, or\n"+
+		"            foreign-key evidence tail fails closed. Inspect the evidence directory\n"+
+		"            and the configured signing_key_path, then restart to begin a new session.\n", err)
 }

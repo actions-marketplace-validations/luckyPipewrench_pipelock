@@ -10,14 +10,38 @@ The registry contains these immutable profiles:
 
 - v1: `sdk/conformance/testdata/transform-profile/evidence-provenance-transform-v1.json`, digest `sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94`.
 - v2: `sdk/conformance/testdata/transform-profile/evidence-provenance-transform-v2.json`, digest `sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7`.
+- v3: `sdk/conformance/testdata/transform-profile/evidence-provenance-transform-v3.json`, digest `sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e`.
+
+- v4: `sdk/conformance/testdata/transform-profile/evidence-provenance-transform-v4.json`, digest `sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37`.
+- v5: `sdk/conformance/testdata/transform-profile/evidence-provenance-transform-v5.json`, digest `sha256:1ba7ea1a9a18622e259531bab86e4e2671fbfabe8259fde38223b0d80ca6d441`.
 
 Every normative profile document and its digest are frozen at publication, including experimental profiles. A semantic correction MUST create a new document and digest. It MUST NOT rewrite a prior profile in place. Verifiers retain every registered profile for the receipt-retention period.
 
 Before executing any operation, a verifier MUST resolve `transform_profile_digest` by exact allowlisted match. An unknown, malformed, or unsupported digest is a rejection. It MUST NOT fall back to v1, select the newest profile, or try another profile after a failure. Ordered fallback would let an attacker choose a weaker interpretation of the same bytes.
 
-V2 adds `ascii_alphanumeric_strip`; v1 recipes MUST reject it. The digest remains the semantic selector, so no verifier may reinterpret a v1 recipe under v2 semantics.
+V2 adds `ascii_alphanumeric_strip`; v1 recipes MUST reject it. V3 adds `ascii_upper` and `json_unicode_escape`, allows a `base32hex` alphabet on `base32_decode` and `base32_decode_liberal`, and recomposes `matching_normalize` with NFC after combining-mark removal. v1 and v2 recipes MUST reject the new operations and a present base32 alphabet, and their `matching_normalize` stays the NFD form. The digest remains the semantic selector, so no verifier may reinterpret an older recipe under a newer profile.
 
 `encoded_token_normalize` and `url_noise_strip` differ between the profiles. v1 retains its original allow-list behavior: token normalization removes only its listed delimiters and rejects other separators, while URL noise stripping removes dot, slash, ASCII space/TAB/LF/CR, plus, comma, semicolon, and vertical bar. For hex, v2 consumes `0x`, `0X`, `\\x`, or `\\X` only when the prefix is immediately followed by two ASCII hex bytes, rejects the token when a remaining ASCII letter falls outside `[A-Fa-f]` and is not `x` or `X`, rejects a retained result longer than 4096 bytes, then keeps token data bytes by alphabet: hex `[0-9A-Fa-f]`; Base32 `[A-Z2-7=]`; standard Base64 `[A-Za-z0-9+/=]`; and URL-safe Base64 `[A-Za-z0-9_-=]`. v2 `url_noise_strip` keeps ASCII `[A-Za-z0-9_-=]`. The profile documents remain normative for the complete operation behavior.
+
+### Replay errata (documents and digests unchanged)
+
+**V3:** The normative document requires valid UTF-8 before the first operation
+and after each operation, not after each internal decoding pass. Go matches
+that rule. TypeScript, Python, and Rust v3 replays of inputs that are invalid
+UTF-8 between passes are non-portable: `percent_decode`, `query_unescape`, and
+the query-decoding steps in `ordered_query_concat` and `query_subsequence` can
+reject or retain different bytes. Verifiers MUST NOT fall back between profiles
+after a failure. Existing v3 documents, digests, and published vectors are unchanged.
+
+**V4:** Byte-oriented `query_unescape` fixes the internal-pass boundary, but
+`percent_decode` still validates UTF-8 between passes in TypeScript, Python, and
+Rust. Their `ordered_query_concat` and `query_subsequence` implementations also
+validate each decoded value before concatenation, rather than the complete
+operation output. Query selection in `url_component` validates unselected decoded
+components early. Go keeps bytes until the operation boundary. Use the immutable
+[v5 profile](evidence-provenance-transform-v5.md) for portable replay. V5 also
+preserves decoded byte-order marks and applies HTML5 numeric-reference replacement
+in Rust. No older profile is reinterpreted or upgraded automatically.
 
 ## Scope and terms
 
@@ -27,7 +51,7 @@ Implementations MUST reject invalid UTF-8 source or view bytes; starts or ends i
 
 ## Typed recipe language
 
-`transform_profile_digest` is a `sha256:<lowercase hex>` digest of the profile document. A verifier MUST possess the exact digest-matched registry profile before reconstructing a view. The v1 and v2 documents and digests are listed above.
+`transform_profile_digest` is a `sha256:<lowercase hex>` digest of the profile document. A verifier MUST possess the exact digest-matched registry profile before reconstructing a view. The v1–v5 documents and digests are listed above.
 
 That profile document, rather than a Pipelock implementation, is the normative source of truth for the ordered vocabulary, operation parameter shapes, Unicode/control-character and malformed-input policy, decoding and padding selection, canonical encodings, UTF-8 checks, and execution limits. It declares a 32-operation maximum, a 16 MiB cumulative processing budget charged before every operation and repeated internal decode pass, a 2 MiB input limit, a 1 MiB post-operation output limit, and at most four percent-decode passes. Implementations MUST reject an oversized recipe before execution or commitment reconstruction. The Go implementation deliberately does not load a conformance document at runtime; its digest test parses the document and fails if those implementation constants or the operation order diverge. This keeps receipt validation hermetic while preventing a second source of truth. It is a distinct document from `pipelock-transform-v1.json`, which remains the source-span transform profile.
 
@@ -44,9 +68,12 @@ Recipes are ordered arrays of typed operations. Operations are never labels or c
 - `encoded_token_normalize { alphabet }`, `text_segment { occurrence }`, `html_entity_decode`, and `whitespace_compact`.
 - `url_noise_strip`, `ordered_query_concat`, `query_subsequence { indices }`, and `hostname_dot_remove`.
 - `encoded_run { occurrence, minimum_length }` and `canary_canonicalize`.
-- V2 only: `ascii_alphanumeric_strip`, which keeps ASCII `[A-Za-z0-9]` and removes every other rune.
+- V2 only: `ascii_alphanumeric_strip`, which keeps ASCII `[A-Za-z0-9]` and removes every other rune. V3 keeps this operation.
+- V3 only: `ascii_upper`, which folds ASCII `a-z` to `A-Z` and leaves every other code point unchanged, and `json_unicode_escape`, which replaces JSON-style `\uXXXX` escapes. A high surrogate escape followed by a low surrogate escape is one scalar. An unpaired surrogate escape becomes U+FFFD, as a JSON parser decodes it. Anything else beginning with `\u`, including a truncated escape or non-hex digits, is copied unchanged, and the operation never rejects.
+- V3 `base32_decode` and `base32_decode_liberal` accept an optional `alphabet` of `standard` or `base32hex`. Absent means standard RFC 4648 base32. `base32hex` is RFC 4648 section 7.
+- V3 `matching_normalize` applies Unicode NFC after combining-mark removal and before the exotic-space replacement. v1 and v2 stop after mark removal.
 
-Each operation consumes the preceding output; no operation may silently retain undecodable input. Unsupported parameters, malformed encodings, absent URL components, and limit failures are errors. `selector` and `profile` values MUST NOT contain Unicode control characters; implementations MUST reject them. `hex_decode` inputs MUST be canonical lowercase hex: re-encoding decoded bytes using lowercase hexadecimal MUST produce exactly the input. `base32_decode` and `base64_decode` inputs MUST be canonical for their selected padding mode: re-encoding decoded bytes using the selected RFC 4648 encoding MUST produce exactly the input. The `*_liberal` operations deliberately omit canonical re-encoding checks so they reproduce scanner-accepted decodings; they still reject malformed input and require valid UTF-8 output. Valid UTF-8 is required before the first operation and after every operation. The profile, not the producer or implementation, determines vocabulary, decoding ambiguity, limits, and policy.
+Each operation consumes the preceding output; no decoding operation may silently retain undecodable input. Unsupported parameters, malformed encodings, absent URL components, and limit failures are errors. `json_unicode_escape` is the one exception: it copies a malformed or truncated `\u` sequence unchanged and replaces an unpaired surrogate with U+FFFD, as the scanner does, and never rejects. `selector` and `profile` values MUST NOT contain Unicode control characters; implementations MUST reject them. `hex_decode` inputs MUST be canonical lowercase hex: re-encoding decoded bytes using lowercase hexadecimal MUST produce exactly the input. `base32_decode` and `base64_decode` inputs MUST be canonical for their selected padding mode: re-encoding decoded bytes using the selected RFC 4648 encoding MUST produce exactly the input. The `*_liberal` operations deliberately omit canonical re-encoding checks so they reproduce scanner-accepted decodings; they still reject malformed input and require valid UTF-8 output. `base32_decode_liberal` and `base64_decode_liberal` ignore carriage returns and line feeds anywhere in their input, as the scanner's RFC 4648 decoders do; `hex_decode_liberal` does not. Valid UTF-8 is required before the first operation and after every operation. The profile, not the producer or implementation, determines vocabulary, decoding ambiguity, limits, and policy.
 
 ## Commitments
 

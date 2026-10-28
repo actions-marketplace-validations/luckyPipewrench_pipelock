@@ -11,7 +11,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"time"
+	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/edition"
@@ -28,12 +28,46 @@ type cidrMapping struct {
 // AgentRegistry maps agent profile names to resolved agents. Built at
 // startup and on hot-reload, then swapped atomically via Edition.
 type AgentRegistry struct {
+	licenseRevoked   *licenseRevocationState
 	agents           map[string]*edition.ResolvedAgent
 	ports            map[string]string // listen addr -> profile name
 	cidrs            []cidrMapping     // source CIDR -> profile name
 	fallback         *edition.ResolvedAgent
 	ownsFallback     bool  // true when the registry created the fallback scanner
 	licenseExpiresAt int64 // Unix timestamp; 0 = perpetual. Checked on Lookup().
+}
+
+// licenseRevocationState is shared across same-token reloads. Each recovery
+// starts a new generation; snapshots from a revoked generation stay revoked.
+type licenseRevocationState struct {
+	mu      sync.Mutex
+	revoked bool
+	done    chan struct{}
+}
+
+func (s *licenseRevocationState) Store(revoked bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if revoked == s.revoked {
+		return
+	}
+	s.revoked = revoked
+	if revoked {
+		close(s.done)
+	} else {
+		s.done = make(chan struct{})
+	}
+}
+
+func (s *licenseRevocationState) snapshot() (bool, <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.revoked, s.done
+}
+
+func (s *licenseRevocationState) Load() bool {
+	revoked, _ := s.snapshot()
+	return revoked
 }
 
 // NewAgentRegistry builds a registry from the base config. Each agent profile
@@ -43,6 +77,7 @@ type AgentRegistry struct {
 // instance and lifecycle.
 func NewAgentRegistry(base *config.Config, fallbackScanners ...*scanner.Scanner) (_ *AgentRegistry, err error) {
 	reg := &AgentRegistry{
+		licenseRevoked:   &licenseRevocationState{done: make(chan struct{})},
 		agents:           make(map[string]*edition.ResolvedAgent, len(base.Agents)),
 		ports:            make(map[string]string),
 		licenseExpiresAt: base.LicenseExpiresAt,
@@ -64,6 +99,9 @@ func NewAgentRegistry(base *config.Config, fallbackScanners ...*scanner.Scanner)
 		sc, err := scanner.New(merged)
 		if err != nil {
 			return nil, fmt.Errorf("agent %q scanner: %w", name, err)
+		}
+		if len(fallbackScanners) > 0 {
+			sc.ForwardInjectionWarnings(fallbackScanners[0])
 		}
 		bt := NewBudgetTracker(&profile.Budget)
 
@@ -134,15 +172,8 @@ func (r *AgentRegistry) Fallback() *edition.ResolvedAgent { return r.fallback }
 // If the license has expired since startup, non-default profiles are
 // rejected and the fallback is returned instead.
 func (r *AgentRegistry) Lookup(profile string) *edition.ResolvedAgent {
-	if agent, ok := r.agents[profile]; ok {
-		// Runtime license expiry: if the license has a non-zero expiry
-		// and it's past, fall back for non-default profiles.
-		if profile != edition.ProfileDefault && r.licenseExpiresAt > 0 && time.Now().Unix() > r.licenseExpiresAt {
-			return r.fallback
-		}
-		return agent
-	}
-	return r.fallback
+	agent, _ := r.LookupByName(profile)
+	return agent
 }
 
 // LookupByName resolves a named profile for Edition.LookupProfile.
@@ -151,11 +182,17 @@ func (r *AgentRegistry) Lookup(profile string) *edition.ResolvedAgent {
 // Enforces runtime license expiry: expired non-default profiles return fallback.
 func (r *AgentRegistry) LookupByName(name string) (*edition.ResolvedAgent, bool) {
 	if agent, ok := r.agents[name]; ok {
-		// Runtime license expiry: same check as Lookup().
-		if name != edition.ProfileDefault && r.licenseExpiresAt > 0 && time.Now().Unix() > r.licenseExpiresAt {
+		if name == edition.ProfileDefault {
+			return agent, true
+		}
+		revoked, done := r.licenseRevoked.snapshot()
+		if revoked || (r.licenseExpiresAt > 0 && edition.CurrentLicenseClock().Now().Unix() > r.licenseExpiresAt) {
 			return r.fallback, false
 		}
-		return agent, true
+		resolved := *agent
+		resolved.LicenseRevoked = done
+		resolved.LicenseExpiresAt = r.licenseExpiresAt
+		return &resolved, true
 	}
 	return r.fallback, false
 }
@@ -184,9 +221,11 @@ func (r *AgentRegistry) ResolveFromRequest(ctx context.Context, req *http.Reques
 	}
 
 	// Header/query/fallback via ResolveAgentIdentity.
-	profiles := r.Profiles()
-	known := make(map[string]bool, len(profiles))
-	for _, name := range profiles {
+	// Identity resolution still needs configured names to recognize a revoked
+	// operator binding and downgrade its provenance when Lookup falls back.
+	// Public enumeration omits revoked profiles, but is not this trust input.
+	known := make(map[string]bool, len(r.agents))
+	for name := range r.agents {
 		known[name] = true
 	}
 	id := edition.ResolveAgentIdentity(req, known, defaultCfg.DefaultAgentIdentity, defaultCfg.BindDefaultAgentIdentity)
@@ -199,7 +238,12 @@ func (r *AgentRegistry) ResolveFromRequest(ctx context.Context, req *http.Reques
 		id.Profile = resolved.Name
 		return resolved, id
 	}
-	return r.Lookup(id.Profile), id
+	resolved := r.Lookup(id.Profile)
+	if resolved.Name != id.Profile {
+		id.Profile = resolved.Name
+		id.Auth = envelope.ActorAuthUnknown
+	}
+	return resolved, id
 }
 
 // resolveInfrastructureIdentity grades an identity that infrastructure
@@ -245,7 +289,11 @@ func (r *AgentRegistry) Close() {
 // Ports returns a copy of the listen-address-to-profile mapping.
 func (r *AgentRegistry) Ports() map[string]string {
 	out := make(map[string]string, len(r.ports))
+	revoked := r.licenseRevoked.Load()
 	for addr, name := range r.ports {
+		if revoked && name != edition.ProfileDefault {
+			continue
+		}
 		out[addr] = name
 	}
 	return out
@@ -263,11 +311,16 @@ func (r *AgentRegistry) MatchCIDR(ip net.IP) (string, bool) {
 	return "", false
 }
 
-// Profiles returns all configured agent profile names (excluding fallback
-// if it was synthesized from the base config).
+// Profiles returns configured, non-revoked profile names (excluding fallback
+// if it was synthesized from the base config). Expired names remain known so
+// callers can distinguish expiration from an unknown profile.
 func (r *AgentRegistry) Profiles() []string {
 	names := make([]string, 0, len(r.agents))
+	revoked := r.licenseRevoked.Load()
 	for name := range r.agents {
+		if revoked && name != edition.ProfileDefault {
+			continue
+		}
 		names = append(names, name)
 	}
 	return names

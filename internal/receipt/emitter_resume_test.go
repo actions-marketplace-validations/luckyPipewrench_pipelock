@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -105,51 +106,9 @@ func TestInitError_CleanResumeIsNil(t *testing.T) {
 	}
 }
 
-// TestResume_SameKeyValidTail_ResumesUnchanged is case 1: a tail signed by the
-// current key with a valid signature resumes the same chain segment.
-func TestResume_SameKeyValidTail_ResumesUnchanged(t *testing.T) {
-	dir := t.TempDir()
-	_, priv := generateTestKey(t)
-
-	rec1 := newTestRecorder(t, dir, priv)
-	e1 := NewEmitter(EmitterConfig{Recorder: rec1, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
-	emitOne(t, e1)
-	emitOne(t, e1)
-	if err := rec1.Close(); err != nil {
-		t.Fatalf("close rec1: %v", err)
-	}
-
-	// Reopen with the SAME key. Resume should continue the chain.
-	rec2 := newTestRecorder(t, dir, priv)
-	e2 := NewEmitter(EmitterConfig{Recorder: rec2, PrivKey: priv, Principal: testPrincipal, Actor: testActor})
-	if err := e2.InitError(); err != nil {
-		t.Fatalf("InitError after same-key reopen: %v", err)
-	}
-	if e2.chainSeq != 2 {
-		t.Fatalf("chainSeq = %d, want 2 (resumed)", e2.chainSeq)
-	}
-	if e2.pendingTransition != nil {
-		t.Fatalf("same-key resume must not set a transition marker: %+v", e2.pendingTransition)
-	}
-	emitOne(t, e2)
-	if err := rec2.Close(); err != nil {
-		t.Fatalf("close rec2: %v", err)
-	}
-
-	receipts := allReceiptsRaw(t, dir)
-	if len(receipts) != 3 {
-		t.Fatalf("receipt count = %d, want 3", len(receipts))
-	}
-	// Seq monotonic 0,1,2 and no transition markers anywhere.
-	for i, r := range receipts {
-		if r.ActionRecord.ChainSeq != uint64(i) {
-			t.Errorf("receipt %d chain_seq = %d, want %d", i, r.ActionRecord.ChainSeq, i)
-		}
-		if r.ActionRecord.KeyTransition != nil {
-			t.Errorf("receipt %d unexpectedly carries a key transition marker", i)
-		}
-	}
-}
+// TestResume_SameKeyValidTail_ResumesUnchanged now lives in
+// chain_link_test.go, rewritten to assert the explicit signed link file that
+// replaced implicit same-session resume across process restarts.
 
 // TestResume_EvidenceReadFailuresFailClosed verifies that a complete, valid
 // tail never permits resume to silently reset when earlier evidence cannot be
@@ -486,7 +445,7 @@ func TestResume_RotatedKeySelfValidTail_OpensNewSegment(t *testing.T) {
 	_ = pubA
 	recB := newTestRecorder(t, dir, privB)
 	metrics := &stubMetrics{}
-	eB := NewEmitter(EmitterConfig{Recorder: recB, PrivKey: privB, Principal: testPrincipal, Actor: testActor, Metrics: metrics})
+	eB := NewEmitter(EmitterConfig{Recorder: recB, PrivKey: privB, Principal: testPrincipal, Actor: testActor, Metrics: metrics, PriorSignerKeys: []string{fmt.Sprintf("%x", pubA)}})
 	if err := eB.InitError(); err != nil {
 		t.Fatalf("rotation must NOT brick the chain, got InitError: %v", err)
 	}
@@ -768,3 +727,70 @@ func mutateTailReceipt(t *testing.T, dir string, mutate func(*Receipt)) {
 
 // ed25519 import kept meaningful.
 var _ = ed25519.PublicKeySize
+
+// A tail self-signed by a key this process never held is refused, not
+// treated as a rotation: anyone can sign a receipt with their own key, and a
+// rotation would have the live key vouch for it. A prior key that is not the
+// named in EmitterConfig.PriorSignerKeys is refused the same way.
+func TestResume_ForeignKeyTailIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		prior func(pubA, pubOther ed25519.PublicKey) string
+	}{
+		{"fresh start names no prior key", func(_, _ ed25519.PublicKey) string { return "" }},
+		{"reload names a different prior key", func(_, other ed25519.PublicKey) string { return fmt.Sprintf("%x", other) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			pubA, privA := generateTestKey(t)
+			recA := newTestRecorder(t, dir, privA)
+			eA := NewEmitter(EmitterConfig{Recorder: recA, PrivKey: privA, Principal: testPrincipal, Actor: testActor})
+			emitOne(t, eA)
+			if err := recA.Close(); err != nil {
+				t.Fatalf("close recA: %v", err)
+			}
+			pubOther, _ := generateTestKey(t)
+			_, privB := generateTestKey(t)
+			recB := newTestRecorder(t, dir, privB)
+			eB := NewEmitter(EmitterConfig{Recorder: recB, PrivKey: privB, Principal: testPrincipal, Actor: testActor, PriorSignerKeys: []string{tc.prior(pubA, pubOther)}})
+			err := eB.InitError()
+			if err == nil || !strings.Contains(err.Error(), "refusing to resume") || !strings.Contains(err.Error(), fmt.Sprintf("%x", pubA)) {
+				t.Fatalf("InitError = %v, want a refusal naming the tail key", err)
+			}
+			if emitErr := eB.Emit(EmitOpts{ActionID: "after", Verdict: "allow", Transport: "fetch", Method: http.MethodGet, Target: "https://api.vendor.example/x"}); emitErr == nil {
+				t.Fatal("Emit succeeded after a refused resume; the emitter must fail closed")
+			}
+		})
+	}
+}
+
+// Any key this process held may sign the tail, not only the one published
+// last: a reload whose session_open was written but not confirmed leaves its
+// key on the tail while the older emitter stays published, and a later reload
+// to a third key must still resume.
+func TestResume_AnyHeldPriorKeyIsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	pubA, privA := generateTestKey(t)
+	recA := newTestRecorder(t, dir, privA)
+	eA := NewEmitter(EmitterConfig{Recorder: recA, PrivKey: privA, Principal: testPrincipal, Actor: testActor})
+	emitOne(t, eA)
+	if err := recA.Close(); err != nil {
+		t.Fatalf("close recA: %v", err)
+	}
+	pubPublished, _ := generateTestKey(t)
+	_, privC := generateTestKey(t)
+	recC := newTestRecorder(t, dir, privC)
+	held := []string{fmt.Sprintf("%x", pubPublished), fmt.Sprintf("%x", pubA)}
+	eC := NewEmitter(EmitterConfig{Recorder: recC, PrivKey: privC, Principal: testPrincipal, Actor: testActor, PriorSignerKeys: held})
+	if err := eC.InitError(); err != nil {
+		t.Fatalf("InitError = %v, want a resume across a key this process held", err)
+	}
+	if eC.pendingTransition == nil || eC.pendingTransition.PriorSignerKey != fmt.Sprintf("%x", pubA) {
+		t.Fatalf("pending transition = %+v, want prior key %x", eC.pendingTransition, pubA)
+	}
+	// Caller mutation of the slice after construction cannot widen the set.
+	held[0] = "tampered"
+	if eC.priorSignerKeys[0] == "tampered" {
+		t.Fatal("emitter shares the caller's PriorSignerKeys backing array")
+	}
+}

@@ -69,32 +69,16 @@ func normalizeConductor(c *Conductor) {
 // distinguish "field omitted" (should default to true, fail-closed) from "field
 // explicitly set to false" (user intent). We unmarshal into a raw map to detect
 // which fields are actually present with a non-nil value, then default the rest.
+// It also records ambiguous legacy MCP settings without changing their defaults.
 func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 	var raw map[string]interface{}
 	if err := yaml.Unmarshal(rawYAML, &raw); err != nil {
-		// Primary unmarshal already succeeded; treat parse errors as "all omitted"
-		// so we fail closed with all security defaults enabled.
-		cfg.DLP.ScanEnv = true
-		cfg.ResponseScanning.Enabled = true
-		cfg.RequestBodyScanning.Enabled = true
-		cfg.RequestBodyScanning.ScanHeaders = true
-		cfg.RequestBodyScanning.ContentEntropyEnabled = true
-		cfg.GitProtection.PrePushScan = true
-		cfg.Logging.IncludeAllowed = true
-		cfg.Logging.IncludeBlocked = true
-		cfg.ScanAPI.Kinds.URL = true
-		cfg.ScanAPI.Kinds.DLP = true
-		cfg.ScanAPI.Kinds.PromptInjection = true
-		cfg.ScanAPI.Kinds.ToolCall = true
-		cfg.Taint.Enabled = true
-		cfg.Learn.Privacy.PublicAllowlistDefault = true
-		cfg.HealthWatchdog.Enabled = true
-		cfg.Conductor.HonorRemoteKillSwitch = true
-		cfg.FlightRecorder.Enabled = true
-		cfg.Defer.Enabled = true
-		cfg.Rules.TrustEmbeddedKeys = true
-		cfg.Rules.AllowUnversionedBundleLoad = true
-		return
+		// Primary unmarshal already succeeded; treat parse errors as "all
+		// omitted" so we fail closed with every security default enabled. A nil
+		// map makes every section lookup below nil, and setBoolDefault turns a
+		// nil section into true, so this path and the normal path share one list
+		// and cannot drift apart.
+		raw = nil
 	}
 
 	setBoolDefault := func(section map[string]interface{}, key string, target *bool) {
@@ -108,6 +92,22 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 		}
 	}
 
+	// False plus an empty action is the historical unset representation,
+	// including in generated YAML. Preserve its runtime defaults and warn
+	// rather than silently interpreting existing files as disables.
+	warnAmbiguousMCPDisable := func(name string, enabled bool, action string, configured bool) {
+		section, _ := raw[name].(map[string]interface{})
+		if value, present := section["enabled"]; present && value != nil && !enabled && action == "" && !configured {
+			cfg.mcpCompatibilityWarnings = append(cfg.mcpCompatibilityWarnings, Warning{
+				Field:   name,
+				Message: fmt.Sprintf("%s: enabled: false with an empty action is ambiguous; retaining runtime defaults in MCP modes. To disable this section intentionally, set \"action: warn\" under %s, replacing any existing action line (a second action key is a duplicate-key error), aligned with enabled (or inside the same inline mapping), and restart. Remove enabled: false to keep defaults without this warning.", name, name),
+			})
+		}
+	}
+	warnAmbiguousMCPDisable("mcp_input_scanning", cfg.MCPInputScanning.Enabled, cfg.MCPInputScanning.Action, false)
+	warnAmbiguousMCPDisable("mcp_tool_scanning", cfg.MCPToolScanning.Enabled, cfg.MCPToolScanning.Action, false)
+	warnAmbiguousMCPDisable("mcp_tool_policy", cfg.MCPToolPolicy.Enabled, cfg.MCPToolPolicy.Action, len(cfg.MCPToolPolicy.Rules) != 0)
+
 	dlp, _ := raw["dlp"].(map[string]interface{})
 	setBoolDefault(dlp, "scan_env", &cfg.DLP.ScanEnv)
 
@@ -118,6 +118,10 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 	setBoolDefault(reqBody, "enabled", &cfg.RequestBodyScanning.Enabled)
 	setBoolDefault(reqBody, "scan_headers", &cfg.RequestBodyScanning.ScanHeaders)
 	setBoolDefault(reqBody, "content_entropy_enabled", &cfg.RequestBodyScanning.ContentEntropyEnabled)
+	// Issuer-bound session cookies default on (Defaults() and the configuration
+	// guide both say true). Without this line any config file loaded false, so
+	// the feature only existed on the no-config path.
+	setBoolDefault(reqBody, "issuer_bound_session_cookies", &cfg.RequestBodyScanning.IssuerBoundSessionCookies)
 
 	git, _ := raw["git_protection"].(map[string]interface{})
 	setBoolDefault(git, "pre_push_scan", &cfg.GitProtection.PrePushScan)
@@ -182,6 +186,14 @@ func applySecurityDefaults(rawYAML []byte, cfg *Config) {
 	// Behavioral baseline: poison_resistance defaults to true (trimmed-mean scoring).
 	bb, _ := raw["behavioral_baseline"].(map[string]interface{})
 	setBoolDefault(bb, "poison_resistance", &cfg.BehavioralBaseline.PoisonResistance)
+
+	// Browser Shield rewrite passes default on. An operator who enables the
+	// shield in a config file without naming these got a shield that stripped
+	// no hidden prompt traps, extension probes or tracking pixels.
+	shield, _ := raw["browser_shield"].(map[string]interface{})
+	setBoolDefault(shield, "strip_extension_probing", &cfg.BrowserShield.StripExtensionProbing)
+	setBoolDefault(shield, "strip_hidden_traps", &cfg.BrowserShield.StripHiddenTraps)
+	setBoolDefault(shield, "strip_tracking_pixels", &cfg.BrowserShield.StripTrackingPixels)
 
 	// Taint defaults to enabled when omitted, matching Defaults().
 	taint, _ := raw["taint"].(map[string]interface{})
@@ -317,6 +329,13 @@ func (c *Config) ApplyDefaults() {
 	// opt-out and is preserved, matching the sibling above.
 	if c.FetchProxy.Monitoring.PathEntropyExclusions == nil {
 		c.FetchProxy.Monitoring.PathEntropyExclusions = append([]PathEntropyExclusion(nil), Defaults().FetchProxy.Monitoring.PathEntropyExclusions...)
+	}
+	// Same rule for the exfiltration blocklist, where losing it is worse: it is
+	// a deny list, so a config file that omitted the key ran with no blocklist
+	// at all while validation reported OK. nil gets the shipped set; an
+	// explicit [] stays an opt-out.
+	if c.FetchProxy.Monitoring.Blocklist == nil {
+		c.FetchProxy.Monitoring.Blocklist = append([]string(nil), Defaults().FetchProxy.Monitoring.Blocklist...)
 	}
 	if c.FetchProxy.Monitoring.MaxReqPerMinute <= 0 {
 		c.FetchProxy.Monitoring.MaxReqPerMinute = 60
@@ -556,6 +575,7 @@ func (c *Config) ApplyDefaults() {
 	}
 
 	// Emit defaults
+	c.normalizeEmitCorrelationHeader()
 	if c.Emit.Webhook.TimeoutSecs <= 0 {
 		c.Emit.Webhook.TimeoutSecs = 5
 	}
@@ -700,6 +720,8 @@ func (c *Config) ApplyDefaults() {
 				"X-Token",
 				"Proxy-Authorization",
 				"X-Goog-Api-Key",
+				"Private-Token",
+				"Job-Token",
 			}
 		}
 		if len(c.RequestBodyScanning.IgnoreHeaders) == 0 {
@@ -967,24 +989,37 @@ func markBuiltInCredentialURLWhitespaceGrammar(patterns []DLPPattern) {
 }
 
 // markBuiltInCredentialAudienceHosts restores the immutable audience property
-// for generated preset YAML. The field is excluded from YAML, so only an exact
-// copy of a shipped pattern receives it after default merging. A changed regex,
-// severity, validator, or widening operator exemption stays a normal blocking
-// pattern. A legacy exemption that is already a subset of the compiled
-// audience remains an audience-bound pattern; validation warns that the stale
-// stanza is ignored instead of making a shipped config fail on upgrade.
+// for generated preset YAML. The field is excluded from YAML, so only a copy
+// of a shipped pattern receives it after default merging. A changed regex,
+// severity, validator or action stays a normal blocking pattern, and validation
+// warns that the compiled audience no longer applies. An operator
+// exempt_domains list is not part of the identity: it never changes what the
+// pattern matches, so it cannot cost the pattern its audience. Validation
+// warns about an entry the audience already covers (ignored) and about one
+// outside it (honored by the scanner, and a widening the operator chose).
 func markBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
 	// Clear every candidate ONCE, before matching. A clone carries the audience
-	// field, so a pattern whose regex, severity or validator was customized
-	// would otherwise keep the built-in audience and earn an allow it no longer
-	// qualifies for. Fail closed: only a candidate that passes the identity
-	// checks below gets an audience back.
+	// field, so a pattern whose regex, severity, validator or action was
+	// customized would otherwise keep the built-in audience and earn an allow it
+	// no longer qualifies for. Fail closed: only a candidate that passes the
+	// identity checks below gets an audience back.
+	//
+	// The ACTION belongs in that list even though it softens rather than widens
+	// enforcement. The scanner sets its warn flag as "action is warn AND no
+	// audience", so handing an audience back to a pattern the operator marked
+	// warn does not just add metadata: it clears the warn flag and sends every
+	// non-audience match to the blocking branch, which is the operator's stated
+	// intent reversed.
 	//
 	// This cannot move inside the loop over built-ins: that runs once per
 	// built-in pattern, so a later iteration would wipe the audience an earlier
 	// one had just assigned and every pattern but the last would lose it.
 	for i := range patterns {
 		patterns[i].CredentialAudienceHosts = nil
+		patterns[i].CredentialAudienceAuthorizationOnly = false
+		patterns[i].CredentialAudienceCarrierMask = 0
+		patterns[i].CredentialAudienceGitHosts = nil
+		patterns[i].CredentialAudienceRegistryHosts = nil
 	}
 	for _, builtIn := range defaultDLPPatternSet {
 		if len(builtIn.CredentialAudienceHosts) == 0 {
@@ -994,24 +1029,25 @@ func markBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
 			candidate := &patterns[i]
 			if candidate.Bundle != "" || candidate.Name != builtIn.Name ||
 				candidate.Regex != builtIn.Regex || candidate.Severity != builtIn.Severity ||
-				candidate.Validator != builtIn.Validator ||
-				!credentialAudienceExemptDomainsSubset(candidate.ExemptDomains, builtIn.CredentialAudienceHosts) {
+				candidate.Validator != builtIn.Validator || candidate.Action != builtIn.Action {
 				continue
 			}
 			candidate.CredentialAudienceHosts = append([]string(nil), builtIn.CredentialAudienceHosts...)
+			candidate.CredentialAudienceAuthorizationOnly = builtIn.CredentialAudienceAuthorizationOnly
+			candidate.CredentialAudienceCarrierMask = builtIn.CredentialAudienceCarrierMask
+			candidate.CredentialAudienceGitHosts = append([]string(nil), builtIn.CredentialAudienceGitHosts...)
+			candidate.CredentialAudienceRegistryHosts = append([]string(nil), builtIn.CredentialAudienceRegistryHosts...)
 		}
 	}
 }
 
-func credentialAudienceExemptDomainsSubset(domains, audience []string) bool {
-	if len(domains) == 0 {
-		return true
-	}
-	normalized := append([]string(nil), domains...)
-	if err := ValidateTrustedDomains(normalized, "credential audience exempt_domains"); err != nil {
-		return false
-	}
-	return credentialAudienceDomainSubset(normalized, audience)
+// RestoreBuiltInCredentialAudienceHosts re-derives immutable runtime audience
+// metadata after a trusted config transformation, such as an Enterprise agent
+// profile merge. Serialized profile patterns cannot carry this yaml-excluded
+// field, so callers must restore it from exact shipped pattern identity before
+// constructing a scanner.
+func RestoreBuiltInCredentialAudienceHosts(patterns []DLPPattern) {
+	markBuiltInCredentialAudienceHosts(patterns)
 }
 
 // mergeResponsePatterns merges default response scanning patterns with user-defined patterns.

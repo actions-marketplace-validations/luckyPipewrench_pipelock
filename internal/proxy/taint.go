@@ -33,8 +33,8 @@ type taintDecision struct {
 	TaskOverrideApplied bool
 }
 
-func responseTaintSessionKey(agent, clientIP string, auth envelope.ActorAuth) string {
-	return ceeSessionKey(agent, clientIP, auth)
+func responseTaintSessionKey(cfg *config.Config, agent, clientIP string, auth envelope.ActorAuth) string {
+	return ceeSessionKey(cfg, agent, clientIP, auth)
 }
 
 func (p *Proxy) resolveTaintAsk(agent, target, method, reason string) (bool, string) {
@@ -54,11 +54,19 @@ func (p *Proxy) resolveTaintAsk(agent, target, method, reason string) (bool, str
 }
 
 func observeHTTPResponseTaint(rec session.Recorder, cfg *config.Config, rawURL, contentType, kind string, promptHit bool) {
+	var kinds []session.HostileFindingKind
+	if promptHit {
+		kinds = []session.HostileFindingKind{session.FindingUnattributed}
+	}
+	observeHTTPResponseFindings(rec, cfg, rawURL, contentType, kind, kinds)
+}
+
+func observeHTTPResponseFindings(rec session.Recorder, cfg *config.Config, rawURL, contentType, kind string, kinds []session.HostileFindingKind) {
 	rs, ok := rec.(session.RiskState)
 	if !ok || cfg == nil || !cfg.Taint.Enabled {
 		return
 	}
-	observation := session.ClassifyHTTPResponseObservation(rawURL, contentType, cfg.Taint.AllowlistedDomains, promptHit)
+	observation := session.ClassifyHTTPResponseFindings(rawURL, contentType, cfg.Taint.AllowlistedDomains, kinds)
 	observation.Source.Kind = kind
 	observation.MaxSources = cfg.Taint.RecentSources
 	rs.ObserveRisk(observation)

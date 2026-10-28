@@ -33,6 +33,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
+	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
 	"github.com/luckyPipewrench/pipelock/internal/deferred"
 	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
@@ -41,6 +42,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/identity"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -123,27 +125,27 @@ func parseHeaderFlags(raw []string) (http.Header, error) {
 	for _, entry := range raw {
 		key, value, ok := strings.Cut(entry, ":")
 		if !ok {
-			return nil, fmt.Errorf("--header %q: expected 'Key: Value' format", entry)
+			return nil, errors.New("--header: expected 'Key: Value' format")
 		}
 		key = strings.TrimSpace(key)
 		if key == "" {
-			return nil, fmt.Errorf("--header %q: key is empty", entry)
+			return nil, errors.New("--header: key is empty")
 		}
 		if !validHeaderName(key) {
-			return nil, fmt.Errorf("--header %q: key contains invalid characters", entry)
+			return nil, errors.New("--header: key contains invalid characters")
 		}
 		// Validate the raw value before trimming so leading/trailing CRLF,
 		// control chars, or unicode whitespace are rejected rather than
 		// silently stripped by TrimSpace and then accepted.
 		if !validHeaderValue(value) {
-			return nil, fmt.Errorf("--header %q: value contains invalid characters", entry)
+			return nil, errors.New("--header: value contains invalid characters")
 		}
 		// Trim ASCII space/tab only after validation; full TrimSpace would
 		// strip unicode whitespace that the validator just rejected, leaving
 		// the bypass available through the header value's edges.
 		value = strings.Trim(value, " \t")
 		if _, reserved := reservedTransportHeaders[http.CanonicalHeaderKey(key)]; reserved {
-			return nil, fmt.Errorf("--header %q: %q is managed by the MCP HTTP transport and cannot be overridden via --header", entry, key)
+			return nil, fmt.Errorf("--header: %q is managed by the MCP HTTP transport and cannot be overridden via --header", key)
 		}
 		canonicalKey := http.CanonicalHeaderKey(key)
 		if _, exists := h[canonicalKey]; exists {
@@ -151,7 +153,7 @@ func parseHeaderFlags(raw []string) (http.Header, error) {
 				h.Add(canonicalKey, value)
 				continue
 			}
-			return nil, fmt.Errorf("--header %q: duplicate header %q is ambiguous", entry, canonicalKey)
+			return nil, fmt.Errorf("--header: duplicate header %q is ambiguous", canonicalKey)
 		}
 		h.Add(canonicalKey, value)
 	}
@@ -270,19 +272,27 @@ func applyMCPA2AOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, baseline *mcp.C
 	}
 }
 
-func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, serverName string) {
-	opts.ServerName = serverName
+// applyMCPResponseSuppressOpts applies a resolved identity to the proxy
+// options. Audit, receipts, adaptive state and acknowledgment lookup use the
+// resolution's Name; the suppress target, core-observe target and the trust,
+// taint and action lookups use only its ArmingName, so a name that was never
+// proven arms nothing.
+func applyMCPResponseSuppressOpts(opts *mcp.MCPProxyOpts, cfg *config.Config, res identity.Resolution) {
+	opts.ServerName = res.Name
+	opts.PolicyServerName = res.ArmingName
+	opts.ServerBindingMode = res.BindingMode
+	opts.ServerRevision = res.Revision
 	trust := config.ResponseTrustUntrusted
 	taintTrusted := false
 	if cfg != nil {
 		opts.Suppress = cfg.Suppress
-		if configuredTrust, ok := cfg.MCPResponseTrustForServer(serverName); ok {
+		if configuredTrust, ok := cfg.MCPResponseTrustForServer(res.ArmingName); ok {
 			trust = configuredTrust
 		}
-		taintTrusted = cfg.TaintTrustsMCPServer(serverName)
+		taintTrusted = cfg.TaintTrustsMCPServer(res.ArmingName)
 	}
 	opts.ResponseTrustClass = trust
-	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(serverName)
+	opts.ResponseActionOverride = cfg.MCPResponseActionForServer(res.ArmingName)
 	opts.TaintTrustedSource = taintTrusted
 }
 
@@ -376,7 +386,7 @@ func startDeferredOperatorAPI(
 	}
 	apiToken := cfg.EffectiveKillSwitchAPIToken()
 	if apiToken == "" {
-		return func() {}, fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token or %s to be set", killswitch.EnvAPIToken)
+		return func() {}, fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token, api_token_file or %s to be set", killswitch.EnvAPIToken)
 	}
 	sessionAPI := proxy.NewSessionAPIHandler(proxy.SessionAPIOptions{
 		Logger:   logger,
@@ -464,9 +474,7 @@ func resolvedMCPDoWAgentName(requested, resolved string, found bool) string {
 func recoverDeferredActions(
 	manager *deferred.Manager,
 	journalPath string,
-	receiptEmitter *receipt.Emitter,
-	v2ReceiptEmitter *proxydecision.Emitter,
-	policyHash string,
+	opts mcp.MCPProxyOpts,
 	logW io.Writer,
 ) error {
 	if journalPath == "" && manager != nil {
@@ -479,6 +487,21 @@ func recoverDeferredActions(
 	if err != nil {
 		return fmt.Errorf("reading deferred action journal: %w", err)
 	}
+	// Validate every saved selection before closing any hold. A restart must
+	// not assign an unresolved action to a different receipt shard.
+	if opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+		for _, held := range pending {
+			if !held.ShardSelected {
+				return fmt.Errorf("deferred restart recovery %q has no recorded receipt shard; start once with flight_recorder.receipt_chains set to 1 to close it, and preserve journal %q and its receipt evidence: %w", held.DeferID, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex < 0 {
+				return fmt.Errorf("deferred restart recovery %q has invalid saved receipt shard %d; preserve journal %q and its receipt evidence for recovery: %w", held.DeferID, held.ShardIndex, journalPath, mcp.ErrReceiptRequired)
+			}
+			if held.ShardIndex >= opts.ReceiptGroup.Shards.ShardCount() {
+				return fmt.Errorf("deferred restart recovery %q needs saved receipt shard %d, unavailable in the configured group of %d; set flight_recorder.receipt_chains to at least %d and preserve journal %q: %w", held.DeferID, held.ShardIndex, opts.ReceiptGroup.Shards.ShardCount(), held.ShardIndex+1, journalPath, mcp.ErrReceiptRequired)
+			}
+		}
+	}
 	sort.Slice(pending, func(i, j int) bool {
 		if pending[i].CascadeDepth != pending[j].CascadeDepth {
 			return pending[i].CascadeDepth < pending[j].CascadeDepth
@@ -486,16 +509,13 @@ func recoverDeferredActions(
 		return pending[i].DeferID < pending[j].DeferID
 	})
 	for _, held := range pending {
-		opts := mcp.MCPProxyOpts{
-			ReceiptEmitter:   receiptEmitter,
-			V2ReceiptEmitter: v2ReceiptEmitter,
-			PolicyHash:       policyHash,
-			RequireReceipts:  true,
-			Transport:        held.Surface,
-		}
+		opts.RequireReceipts = true
+		opts.Transport = held.Surface
 		if err := mcp.EmitDeferredResolutionReceipt(opts, logW, deferred.Resolution{
 			DeferID:          held.DeferID,
 			ParentActionID:   held.ActionID,
+			ShardIndex:       held.ShardIndex,
+			ShardSelected:    held.ShardSelected,
 			FinalDecision:    config.ActionBlock,
 			ResolutionSource: deferred.SourceRestartRecovery,
 			Authority:        held.Authority,
@@ -620,6 +640,7 @@ Examples:
 	cmd.AddCommand(mcpScanCmd())
 	cmd.AddCommand(mcpProxyCmdWithAuditLoggerFactory(newAuditLogger))
 	cmd.AddCommand(mcpIntegrityCmd())
+	cmd.AddCommand(mcpIdentityCmd())
 	return cmd
 }
 
@@ -646,7 +667,9 @@ tool-definition poisoning/drift) is detected, and 2 if any line could not be
 fully inspected and was therefore not verified clean - including a tools/list
 response scanned while mcp_tool_scanning is explicitly disabled by config; a
 verdict never reports clean:true over content it did not inspect. A finding
-outranks an inspection failure. Scanning covers response injection, inbound
+outranks an inspection failure. A strict-mode rule-bundle integrity refusal
+also exits with code 1 before stdin is read and produces no response verdict.
+Scanning covers response injection, inbound
 DLP, and (auto-enabled by default, like the proxy) tool-definition scanning
 for tools/list responses. It does not include tool call policy or request-side
 input scanning, because scan only ever sees one side of the conversation: the
@@ -686,6 +709,9 @@ Examples:
 			for _, w := range bundleResult.Warnings {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
 			}
+			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
+				return err
+			}
 			if bundleResult.Degraded {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
 			}
@@ -694,6 +720,8 @@ Examples:
 				return fmt.Errorf("create scanner: %w", err)
 			}
 			defer sc.Close()
+			announcePromptInjectionPolicy(cfg, nil, cmd.ErrOrStderr())
+			wirePromptInjectionStderr(sc, cmd.ErrOrStderr())
 
 			// A nil toolCfg tells ScanStreamResult the operator explicitly
 			// disabled mcp_tool_scanning (RuntimeMCPScan auto-enables it
@@ -704,6 +732,8 @@ Examples:
 			// detection is scoped to definitions repeated within this run.
 			var toolCfg *tools.ToolScanConfig
 			if cfg.MCPToolScanning.Enabled {
+				// ack-exempt: the offline scan has no configured server or
+				// transport binding, so no acknowledgment can apply to it.
 				toolCfg = &tools.ToolScanConfig{
 					Baseline:         tools.NewToolBaseline(),
 					Action:           cfg.MCPToolScanning.Action,
@@ -837,12 +867,17 @@ Key-free evidence capture:
   evidence-*.jsonl without requiring a signing key, mirroring
   'pipelock run --capture-output'. Captured tool arguments are DLP-redacted
   unless flight_recorder.redact is set to false.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (runErr error) {
 			dashIdx := cmd.ArgsLenAtDash()
 			hasSubprocess := dashIdx >= 0 && dashIdx < len(args)
 			hasUpstream := upstreamURL != ""
 			hasListen := listenAddr != ""
-			resolvedHeaders, err := resolveHeaderCarriers(headerCarriers)
+			if serverName != "" {
+				if err := config.ValidateMCPServerName(serverName, "--server-name"); err != nil {
+					return err
+				}
+			}
+			carrierEntries, err := resolveHeaderCarrierEntries(headerCarriers)
 			if err != nil {
 				return err
 			}
@@ -863,6 +898,37 @@ Key-free evidence capture:
 			}
 			if !hasUpstream && !hasSubprocess {
 				return errors.New("specify --upstream URL or -- COMMAND [ARGS...]")
+			}
+			// Headers and child-environment overrides are resolved once here and
+			// reused by the transport, so the server binding covers exactly
+			// what is sent.
+			var upstreamHeaders http.Header
+			var launchHeaders []identity.Header
+			var extraEnv []string
+			bindingInputs := mcpBindingInputs{}
+			if hasUpstream {
+				fileHeaders, fileErr := readHeaderFile(headerFile)
+				if fileErr != nil {
+					return fileErr
+				}
+				var headerErr error
+				upstreamHeaders, headerErr = parseHeaderFlags(mergeHeaderLines(fileHeaders, rawHeaders, carrierEntries))
+				if headerErr != nil {
+					return headerErr
+				}
+				launchHeaders, headerErr = identityHeaders(fileHeaders, rawHeaders, carrierEntries)
+				if headerErr != nil {
+					return headerErr
+				}
+				bindingInputs = mcpUpstreamBindingInputs(upstreamURL, upstreamHeaders)
+			} else {
+				var envErr error
+				extraEnv, envErr = buildChildExtraEnv(resolvedEnv, envVars, os.LookupEnv)
+				if envErr != nil {
+					return envErr
+				}
+				bindingInputs.Command = args[dashIdx:]
+				bindingInputs.ChildEnv = extraEnv
 			}
 			if adaptiveResetFile != "" && (hasUpstream || hasListen) {
 				return errors.New("--adaptive-reset-file is only supported with local subprocess MCP servers")
@@ -909,7 +975,7 @@ Key-free evidence capture:
 			if hasUpstream {
 				u, err := url.Parse(upstreamURL)
 				if err != nil || u.Host == "" {
-					return fmt.Errorf("invalid upstream URL %q: must include a scheme and host", upstreamURL)
+					return fmt.Errorf("invalid upstream URL %q: must include a scheme and host", RedactEndpoint(upstreamURL))
 				}
 				switch u.Scheme {
 				case schemeHTTP, schemeHTTPS:
@@ -917,12 +983,15 @@ Key-free evidence capture:
 				case "ws", "wss":
 					isWSUpstream = true
 				default:
-					return fmt.Errorf("invalid upstream URL %q: scheme must be http, https, ws, or wss", upstreamURL)
+					return fmt.Errorf("invalid upstream URL %q: scheme must be http, https, ws, or wss", RedactEndpoint(upstreamURL))
 				}
 			}
 
 			cfg, err := cliutil.LoadConfigOrDefault(configFile)
 			if err != nil {
+				return err
+			}
+			if err := cfg.ResolveRuntimeCredentials(); err != nil {
 				return err
 			}
 
@@ -954,6 +1023,9 @@ Key-free evidence capture:
 			dowAgentName := resolvedMCPDoWAgentName(agentName, resolved.Name, found)
 			cfg = resolved.Config
 			bootSC.Close() // done with bootstrap scanner
+			if err := ackKeyWithheldFromChild(cfg.MCPToolScanning.AcknowledgmentKey, extraEnv); err != nil {
+				return err
+			}
 
 			// Set up Sentry error reporting
 			sentryClient, sentryErr := plsentry.Init(cfg, cliutil.Version)
@@ -984,9 +1056,6 @@ Key-free evidence capture:
 			for _, w := range bundleResult.Warnings {
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: %s\n", w)
 			}
-			if bundleResult.Degraded {
-				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
-			}
 			// Fail closed in strict mode on installed-bundle integrity loss,
 			// matching the main proxy server's startup path. Without this a
 			// strict `mcp proxy` would silently boot on core patterns only when
@@ -994,7 +1063,35 @@ Key-free evidence capture:
 			if err := strictRuleBundleIntegrityError(cfg, bundleResult); err != nil {
 				return err
 			}
+			if bundleResult.Degraded {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: DEGRADED — standard pack failed, running core patterns only\n")
+			}
 			extraPoison := rules.ConvertToolPoison(bundleResult.ToolPoison)
+
+			// Resolve the launch identity once, from the final config and before
+			// the acknowledgment binding is computed: a registered verified local
+			// service is bound by the session digest, everything else by the
+			// transport digest.
+			launchTransport := identity.Transport{
+				Kind:     identity.KindSubprocess,
+				Command:  bindingInputs.Command,
+				ChildEnv: bindingInputs.ChildEnv,
+			}
+			if hasUpstream {
+				launchTransport = identity.Transport{
+					Kind:        upstreamTransportKind(isWSUpstream),
+					UpstreamURL: upstreamURL,
+					Headers:     launchHeaders,
+				}
+			}
+			launchIdentity, err := resolveLaunchIdentity(cfg, serverName, launchTransport, cmd.ErrOrStderr())
+			if err != nil {
+				return err
+			}
+			serverBinding, err := launchBinding(launchIdentity, launchTransport, bindingInputs)
+			if err != nil {
+				return err
+			}
 
 			// Rebuild scanner with the (possibly modified) resolved config.
 			sc, err := scanner.New(cfg)
@@ -1014,7 +1111,13 @@ Key-free evidence capture:
 				return fmt.Errorf("create MCP audit logger: %w", err)
 			}
 			defer auditLogger.Close()
-			upstreamDialContext := mcp.NewMetadataSafeDialContext(func() *scanner.Scanner { return sc })
+			wirePromptInjectionAudit(sc, auditLogger)
+			announcePromptInjectionPolicy(cfg, auditLogger, cmd.ErrOrStderr())
+			upstreamDialContext := verifiedDialContext(
+				mcp.NewMetadataSafeDialContext(func() *scanner.Scanner { return sc }),
+				launchIdentity,
+				cmd.ErrOrStderr(),
+			)
 
 			ks := killswitch.New(cfg)
 
@@ -1048,6 +1151,7 @@ Key-free evidence capture:
 					NewToolAdmission:       cfg.MCPToolScanning.NewToolAdmission,
 					ListenerDriftResetFile: cfg.MCPToolScanning.ListenerDriftResetFile,
 					ExtraPoison:            extraPoison,
+					CredentialAcks:         tools.NewCredentialAckSet(cfg.MCPToolScanning.AcknowledgedFindings, cfg.MCPToolScanning.AcknowledgmentKeyBytes),
 				}
 				resetTarget := cfg.MCPToolScanning.ListenerDriftResetTarget
 				if cfg.MCPToolScanning.ListenerDriftResetAuthorityPublicKeyFile != "" &&
@@ -1082,6 +1186,15 @@ Key-free evidence capture:
 			var policyCfg *policy.Config
 			if cfg.MCPToolPolicy.Enabled {
 				policyCfg = policy.New(cfg.MCPToolPolicy)
+				// A subprocess server shares this host's filesystem, so a submitted
+				// path is also matched by the file it resolves to here. A remote
+				// upstream resolves paths on its own host, which Pipelock cannot see.
+				// A server commonly resolves relative names against the directories
+				// it was given, so those join the working directory as bases.
+				if hasSubprocess && !hasUpstream {
+					cwd, _ := os.Getwd()
+					policyCfg.EnableLocalPathIdentity(localPathBasesFromArgs(cwd, args[dashIdx+1:])...)
+				}
 			}
 
 			// Initialize chain matcher if tool chain detection is configured.
@@ -1093,6 +1206,17 @@ Key-free evidence capture:
 			// Create the MCP metrics registry independently of session profiling so
 			// transport, CEE, and denial-of-wallet counters share the served registry.
 			mcpMetrics := metrics.New()
+
+			// Deliver audit events to the sinks configured under emit, exactly
+			// as pipelock run does. Without this, a wrapper's emit section was
+			// parsed and then ignored. Activation failure aborts startup so a
+			// configured audit destination cannot be bypassed. The deferred
+			// Close runs before auditLogger.Close (LIFO), draining queued events.
+			mcpEmitter, _, emitErr := startAuditEmitter(cfg, auditLogger, mcpMetrics, configFile, cmd.ErrOrStderr())
+			if emitErr != nil {
+				return emitErr
+			}
+			defer func() { _ = mcpEmitter.Close() }()
 
 			// Build CEE deps when cross-request detection is enabled.
 			var cee *mcp.CEEDeps
@@ -1133,6 +1257,7 @@ Key-free evidence capture:
 
 			var receiptEmitter *receipt.Emitter
 			var v2ReceiptEmitter *proxydecision.Emitter
+			var receiptGroup *mcp.MCPReceiptGroup
 			if cfg.FlightRecorder.Enabled {
 				recCfg := recorder.Config{
 					Enabled:            cfg.FlightRecorder.Enabled,
@@ -1147,11 +1272,6 @@ Key-free evidence capture:
 					EscrowPublicKey:    cfg.FlightRecorder.EscrowPublicKey,
 				}
 
-				var redactFn recorder.RedactFunc
-				if cfg.FlightRecorder.Redact {
-					redactFn = sc.ScanTextForDLP
-				}
-
 				var recPrivKey ed25519.PrivateKey
 				if cfg.FlightRecorder.SigningKeyPath != "" {
 					k, kErr := signing.LoadPrivateKeyFile(cfg.FlightRecorder.SigningKeyPath)
@@ -1161,12 +1281,22 @@ Key-free evidence capture:
 					recPrivKey = k
 				}
 
-				rec, recErr := recorder.New(recCfg, redactFn, recPrivKey)
+				// The recorder owns this scanner generation as its receipt
+				// detector for its whole lifetime (see recorder.NewWithScanner).
+				rec, recErr := recorder.NewWithScanner(recCfg, sc, recPrivKey)
 				if recErr != nil {
 					return fmt.Errorf("creating flight recorder: %w", recErr)
 				}
 				runFlightRecorderExpiryOnce(rec, cmd.ErrOrStderr(), defaultExpire)
 				defer func() { _ = rec.Close() }()
+				var runSession string
+				if cfg.FlightRecorder.ReceiptChainCount() == 1 {
+					var sessErr error
+					runSession, sessErr = acquireRunSession(rec)
+					if sessErr != nil {
+						return sessErr
+					}
+				}
 				retentionCtx, retentionCancel := context.WithCancel(cmd.Context())
 				var retentionWG sync.WaitGroup
 				startFlightRecorderRetention(retentionCtx, &retentionWG, rec, cmd.ErrOrStderr(), defaultFlightRecorderRetentionInterval, defaultExpire)
@@ -1194,53 +1324,72 @@ Key-free evidence capture:
 				// so Hash() still reflects the on-disk YAML even after
 				// bundle merge and auto-enable.
 				// The shared MCP registry also captures receipt emission failures.
-				receiptEmitter = receipt.NewEmitter(receipt.EmitterConfig{
+				template := receipt.EmitterConfig{
 					Recorder:            rec,
 					PrivKey:             recPrivKey,
 					ConfigHash:          cfg.Hash(),
 					Principal:           "local",
 					Actor:               "pipelock",
 					Metrics:             mcpMetrics,
+					PriorSignerKeys:     cfg.FlightRecorder.ReceiptGroupPriorSignerKeys,
 					PostureBinding:      postureResult.Binding,
 					PostureAvailability: string(postureResult.Availability),
 					HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
-				})
-
+					Session:             runSession,
+				}
 				cmd.PrintErrf("  Recorder: %s (flight recorder enabled)\n", cfg.FlightRecorder.Dir)
 				printFlightRecorderEvidenceWarning(cmd.ErrOrStderr(), cfg.FlightRecorder.Dir, cfg.FlightRecorder.RetentionDays)
-				// Loud, one-time startup signal when the chain could not be
-				// resumed (corrupt/tampered tail or an evidence read error).
-				// A legitimate key rotation no longer lands here - it opens a
-				// new chain segment instead of failing.
-				if initErr := receiptEmitter.InitError(); initErr != nil {
-					cmd.PrintErrf("  Receipts: ERROR - chain could not be resumed: %v\n"+
-						"            Receipt emission is DISABLED until resolved. Inspect the evidence\n"+
-						"            directory and flight_recorder.signing_key_path.\n", initErr)
-				} else if len(recPrivKey) > 0 {
-					if openErr := emitStartupSessionOpen(receiptEmitter); openErr != nil {
-						if cfg.FlightRecorder.RequireReceipts {
-							return fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
-						}
-						cmd.PrintErrf("  Receipts: ERROR - session_open could not be emitted: %v\n"+
-							"            Receipt emission for this run is UNVERIFIED until resolved.\n", openErr)
+				if cfg.FlightRecorder.ReceiptChainCount() > 1 {
+					var groupErr error
+					receiptGroup, groupErr = buildMCPReceiptGroup(template, cfg.FlightRecorder.ReceiptChainCount())
+					if groupErr != nil {
+						return groupErr
 					}
-					cmd.PrintErrf("  Receipts: enabled (action receipts signed)\n")
-					v2ReceiptEmitter = proxydecision.NewEmitter(proxydecision.EmitterConfig{
-						Recorder:  rec,
-						Signer:    proxydecision.NewKeyedSigner(recPrivKey),
-						Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
-						Principal: "local",
-						Actor:     "pipelock",
-					})
-					if v2ReceiptEmitter != nil {
-						cmd.PrintErrf("  Receipts: v2 proxy_decision dual-emit enabled\n")
-					}
+					opening, _ := receiptGroup.Shards.Opening()
+					receiptEmitter = receiptGroup.Shards.ProcessEmitter()
+					v2ReceiptEmitter = receiptGroup.V2[opening.ProcessShardIndex]
+					cmd.PrintErrf("  Receipts: %d signed chains enabled\n", opening.ShardCount)
 				} else {
-					// receipt.NewEmitter returns nil when no signing key is
-					// configured. Receipts must be signed - there is no
-					// "unsigned receipt" mode - so report the operator-facing
-					// status by signing-key presence, not by emitter identity.
-					cmd.PrintErrf("  Receipts: disabled — set flight_recorder.signing_key_path to enable signed action receipts\n")
+					receiptEmitter = receipt.NewEmitter(template)
+
+					// Loud, one-time startup signal when the chain could not be
+					// resumed (a corrupt, tampered, or foreign-key tail, or an
+					// evidence read error). Each run mints a new session, so a key
+					// changed between runs starts a fresh chain and never lands here.
+					if initErr := receiptEmitter.InitError(); errors.Is(initErr, receipt.ErrRetainedContent) {
+						// A configuration refusal, not a chain-resume fault.
+						return fmt.Errorf("flight_recorder: %w", initErr)
+					} else if initErr != nil {
+						cmd.PrintErrf("  Receipts: ERROR - chain could not be resumed: %v\n"+
+							"            Receipt emission is DISABLED until resolved. Inspect the evidence\n"+
+							"            directory and flight_recorder.signing_key_path.\n", initErr)
+					} else if len(recPrivKey) > 0 {
+						if openErr := emitStartupSessionOpen(receiptEmitter); openErr != nil {
+							if cfg.FlightRecorder.RequireReceipts {
+								return fmt.Errorf("flight_recorder.require_receipts is enabled but session_open receipt could not be emitted: %w", openErr)
+							}
+							cmd.PrintErrf("  Receipts: ERROR - session_open could not be emitted: %v\n"+
+								"            Receipt emission for this run is UNVERIFIED until resolved.\n", openErr)
+						}
+						cmd.PrintErrf("  Receipts: enabled (action receipts signed)\n")
+						v2ReceiptEmitter = proxydecision.NewEmitter(proxydecision.EmitterConfig{
+							Recorder:  rec,
+							Signer:    proxydecision.NewKeyedSigner(recPrivKey),
+							Sanitize:  proxydecision.SanitizeFromRedactor(rec.ReceiptRedactor()),
+							Principal: "local",
+							Actor:     "pipelock",
+							Session:   runSession,
+						})
+						if v2ReceiptEmitter != nil {
+							cmd.PrintErrf("  Receipts: v2 proxy_decision dual-emit enabled\n")
+						}
+					} else {
+						// receipt.NewEmitter returns nil when no signing key is
+						// configured. Receipts must be signed - there is no
+						// "unsigned receipt" mode - so report the operator-facing
+						// status by signing-key presence, not by emitter identity.
+						cmd.PrintErrf("  Receipts: disabled — set flight_recorder.signing_key_path to enable signed action receipts\n")
+					}
 				}
 			}
 			// require_receipts escalates a missing receipt to a block. With no
@@ -1276,6 +1425,7 @@ Key-free evidence capture:
 			defer stopMetrics()
 			var heartbeatErrMu sync.Mutex
 			var heartbeatErr error
+			var groupFailureErr error
 			setRequiredHeartbeatErr := func(err error) {
 				if err == nil {
 					return
@@ -1290,25 +1440,49 @@ Key-free evidence capture:
 			requiredHeartbeatErr := func() error {
 				heartbeatErrMu.Lock()
 				defer heartbeatErrMu.Unlock()
+				if groupFailureErr != nil {
+					return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt group emission failed: %w", groupFailureErr)
+				}
 				if heartbeatErr == nil {
 					return nil
 				}
 				return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt heartbeat emission failed: %w", heartbeatErr)
+			}
+			if receiptGroup != nil {
+				receiptGroup.OnRequiredFailure = func(err error) {
+					heartbeatErrMu.Lock()
+					if groupFailureErr == nil {
+						groupFailureErr = err
+					}
+					heartbeatErrMu.Unlock()
+					heartbeatCancel()
+				}
 			}
 			// Standalone MCP does not have the proxy server's drain-then-seal
 			// WaitGroup. Tie heartbeat to the command lifetime instead: the
 			// deferred stop cancels and joins heartbeats before writing
 			// session_close + transcript_root, so no heartbeat appends after
 			// the close even though each transport has its own run loop.
-			stopReceiptLifecycle := startStandaloneReceiptLifecycle(
-				heartbeatCtx,
-				cfg.FlightRecorder.HeartbeatIntervalDuration(),
-				receiptEmitter,
-				cmd.ErrOrStderr(),
-				cfg.FlightRecorder.RequireReceipts,
-				setRequiredHeartbeatErr,
-			)
-			defer stopReceiptLifecycle()
+			var stopReceiptLifecycle func()
+			if receiptGroup != nil {
+				stopReceiptLifecycle = startStandaloneReceiptGroupLifecycle(
+					heartbeatCtx, cfg.FlightRecorder.HeartbeatIntervalDuration(),
+					receiptGroup.Shards, cmd.ErrOrStderr(), cfg.FlightRecorder.RequireReceipts,
+					setRequiredHeartbeatErr,
+				)
+			} else {
+				stopReceiptLifecycle = startStandaloneReceiptLifecycle(
+					heartbeatCtx, cfg.FlightRecorder.HeartbeatIntervalDuration(),
+					receiptEmitter, cmd.ErrOrStderr(), cfg.FlightRecorder.RequireReceipts,
+					setRequiredHeartbeatErr,
+				)
+			}
+			defer func() {
+				stopReceiptLifecycle()
+				if failure := requiredHeartbeatErr(); failure != nil {
+					runErr = errors.Join(runErr, failure)
+				}
+			}()
 			sc.SetDLPWarnHook(func(ctx context.Context, patternName, severity string) {
 				emitDLPWarn(auditLogger, nil, receiptEmitter, ctx, patternName, severity)
 			})
@@ -1331,6 +1505,7 @@ Key-free evidence capture:
 			if contractLoaderErr != nil {
 				return fmt.Errorf("building MCP contract loader: %w", contractLoaderErr)
 			}
+			defer startMCPContractWatch(heartbeatCtx, contractLoader, auditLogger)()
 			contractAgent := agentName
 			if contractAgent == "" {
 				contractAgent = captureProfile
@@ -1367,6 +1542,10 @@ Key-free evidence capture:
 				cmd.PrintErrf("  Capture: %s (key-free evidence)\n", captureOutput)
 			}
 
+			inputAction := "disabled"
+			if inputCfg.Enabled {
+				inputAction = inputCfg.Action
+			}
 			toolAction := "disabled"
 			if toolCfg != nil {
 				toolAction = toolCfg.Action
@@ -1377,7 +1556,10 @@ Key-free evidence capture:
 			}
 			a2aCardBaseline := mcp.NewCardBaseline(1000)
 			deferManager := buildDeferManager(cfg, cmd.ErrOrStderr())
-			if err := recoverDeferredActions(deferManager, deferJournalPath(cfg), receiptEmitter, v2ReceiptEmitter, captureConfigHash, cmd.ErrOrStderr()); err != nil {
+			if err := recoverDeferredActions(deferManager, deferJournalPath(cfg), mcp.MCPProxyOpts{
+				Scanner: sc, ReceiptEmitter: receiptEmitter, V2ReceiptEmitter: v2ReceiptEmitter,
+				ReceiptGroup: receiptGroup, PolicyHash: captureConfigHash,
+			}, cmd.ErrOrStderr()); err != nil {
 				return err
 			}
 			if hasUpstream {
@@ -1385,17 +1567,7 @@ Key-free evidence capture:
 					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --env is ignored in HTTP transport mode (no child process)")
 				}
 
-				fileHeaders, fileErr := readHeaderFile(headerFile)
-				if fileErr != nil {
-					return fileErr
-				}
-				mergedHeaders := append([]string{}, fileHeaders...)
-				mergedHeaders = append(mergedHeaders, rawHeaders...)
-				mergedHeaders = append(mergedHeaders, resolvedHeaders...)
-				extraHeaders, headerErr := parseHeaderFlags(mergedHeaders)
-				if headerErr != nil {
-					return headerErr
-				}
+				extraHeaders := upstreamHeaders
 				if len(extraHeaders) > 0 && isWSUpstream {
 					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "warning: --header is only honored for HTTP upstreams; ignored for ws/wss upstreams")
 				}
@@ -1405,7 +1577,7 @@ Key-free evidence capture:
 
 				// HTTP reverse proxy mode: --listen + --upstream.
 				if hasListen && isWSUpstream {
-					err := fmt.Errorf("--listen with WebSocket upstream (ws/wss) is not yet supported; use stdio mode: pipelock mcp proxy --upstream %s", upstreamURL)
+					err := fmt.Errorf("--listen with WebSocket upstream (ws/wss) is not yet supported; use stdio mode: pipelock mcp proxy --upstream %s", RedactEndpoint(upstreamURL))
 					if sentryClient != nil {
 						sentryClient.CaptureError(err)
 					}
@@ -1429,8 +1601,8 @@ Key-free evidence capture:
 						},
 						UpstreamHeaders: extraHeaders,
 						Scanner:         sc, Approver: approver,
-						AuditLogger: auditLogger,
-						InputCfg:    inputCfg, RequestBodyCfg: &cfg.RequestBodyScanning,
+						AuditLogger: auditLogger, CorrelationHeader: cfg.Emit.CorrelationHeader,
+						InputCfg: inputCfg, RequestBodyCfg: &cfg.RequestBodyScanning,
 						ToolCfg: toolCfg, PolicyCfg: policyCfg,
 						KillSwitch: ks, ChainMatcher: chainMatcher,
 						CEE: cee, Store: store, Baseline: baselineChecker, AdaptiveCfgFn: adaptiveFn, AirlockCfg: &cfg.Airlock, Metrics: mcpMetrics,
@@ -1456,11 +1628,16 @@ Key-free evidence capture:
 						}
 					}
 					applyMCPA2AOpts(&listenerOpts, cfg, a2aCardBaseline, upstreamURL)
-					applyMCPResponseSuppressOpts(&listenerOpts, cfg, serverName)
+					applyMCPResponseSuppressOpts(&listenerOpts, cfg, launchIdentity)
+					listenerOpts.ServerBinding = serverBinding
+					listenerOpts.ServerIdentityHeadersFn = listenerIdentityHeadersFn(launchIdentity, launchTransport, func() mcp.ServerIdentity {
+						return mcp.ServerIdentity{Name: launchIdentity.Name, PolicyName: launchIdentity.ArmingName, Binding: serverBinding, BindingMode: launchIdentity.BindingMode, Revision: launchIdentity.Revision}
+					})
 					listenerOpts = mcpReceiptParityOpts(listenerOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+					listenerOpts.ReceiptGroup = receiptGroup
 					respAction, respTrust, respServer := mcpResponseLogFields(listenerOpts)
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: MCP reverse proxy %s -> %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
-						listenAddr, upstreamURL, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
+						listenAddr, RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
 					if err := mcp.RunHTTPListenerProxy(ctx, mcpLn, upstreamURL, cmd.ErrOrStderr(), listenerOpts); err != nil {
 						if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 							return heartbeatErr
@@ -1507,11 +1684,13 @@ Key-free evidence capture:
 					}
 					applyMCPDoWOpts(&wsOpts, dowWiring, false)
 					applyMCPA2AOpts(&wsOpts, cfg, a2aCardBaseline, upstreamURL)
-					applyMCPResponseSuppressOpts(&wsOpts, cfg, serverName)
+					applyMCPResponseSuppressOpts(&wsOpts, cfg, launchIdentity)
+					wsOpts.ServerBinding = serverBinding
 					wsOpts = mcpReceiptParityOpts(wsOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+					wsOpts.ReceiptGroup = receiptGroup
 					respAction, respTrust, respServer := mcpResponseLogFields(wsOpts)
 					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying WS upstream %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
-						upstreamURL, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
+						RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
 					if err := mcp.RunWSProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, wsOpts); err != nil {
 						if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 							return heartbeatErr
@@ -1562,11 +1741,13 @@ Key-free evidence capture:
 				}
 				applyMCPDoWOpts(&httpOpts, dowWiring, false)
 				applyMCPA2AOpts(&httpOpts, cfg, a2aCardBaseline, upstreamURL)
-				applyMCPResponseSuppressOpts(&httpOpts, cfg, serverName)
+				applyMCPResponseSuppressOpts(&httpOpts, cfg, launchIdentity)
+				httpOpts.ServerBinding = serverBinding
 				httpOpts = mcpReceiptParityOpts(httpOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+				httpOpts.ReceiptGroup = receiptGroup
 				respAction, respTrust, respServer := mcpResponseLogFields(httpOpts)
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying upstream %s (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
-					upstreamURL, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
+					RedactEndpoint(upstreamURL), respAction, respTrust, respServer, inputAction, toolAction, policyAction)
 				if err := mcp.RunHTTPProxy(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), cmd.ErrOrStderr(), upstreamURL, extraHeaders, httpOpts); err != nil {
 					if heartbeatErr := requiredHeartbeatErr(); heartbeatErr != nil {
 						return heartbeatErr
@@ -1582,28 +1763,7 @@ Key-free evidence capture:
 				return nil
 			}
 
-			// Parse --env flags into KEY=VALUE pairs for the child process.
-			// KEY without value: pass through from current environment.
-			// KEY=VALUE: set explicitly.
-			// Empty keys, safe-list keys, and dangerous keys are rejected.
-			extraEnv := append([]string(nil), resolvedEnv...)
-			for _, e := range envVars {
-				key, _, hasValue := strings.Cut(e, "=")
-				if key == "" {
-					return errors.New("--env requires a non-empty variable name")
-				}
-				if mcp.IsSafeEnvKey(key) {
-					return fmt.Errorf("--env %s is already set by pipelock and cannot be overridden", key)
-				}
-				if mcp.IsDangerousEnvKey(key) {
-					return fmt.Errorf("--env %s is blocked: this variable can inject code or redirect traffic in the child process", key)
-				}
-				if hasValue {
-					extraEnv = append(extraEnv, e)
-				} else if val, found := os.LookupEnv(e); found {
-					extraEnv = append(extraEnv, e+"="+val)
-				}
-			}
+			// extraEnv was resolved once above, with the server binding.
 			if len(extraEnv) > 0 {
 				keys := make([]string, 0, len(extraEnv))
 				for _, e := range extraEnv {
@@ -1646,6 +1806,9 @@ Key-free evidence capture:
 					workspace, _ = os.Getwd()
 				}
 				workspace, _ = filepath.Abs(workspace)
+				// The sandboxed child runs in the workspace, so relative names it
+				// receives, including its own directory arguments, resolve there.
+				policyCfg.AddLocalPathBases(append([]string{workspace}, localPathBasesFromArgs(workspace, serverCmd[1:])...)...)
 
 				ctx, cancel := signal.NotifyContext(heartbeatCtx, syscall.SIGINT, syscall.SIGTERM)
 				defer cancel()
@@ -1690,6 +1853,8 @@ Key-free evidence capture:
 					BestEffortExpiry: mcpBestEffortExpiry,
 					ExtraEnv:         extraEnv,
 					GateTargetStart:  true,
+
+					BridgeIdleTimeout: sandboxBridgeIdleTimeout(cfg),
 				}
 				if cfg.Sandbox.FS != nil {
 					p := sandbox.DefaultPolicy(workspace)
@@ -1716,6 +1881,7 @@ Key-free evidence capture:
 
 				closeBridge, bridgeErr := setupMCPSandboxBridge(mcpSandboxBridgeSetupOptions{
 					Context:          ctx,
+					Cancel:           cancel,
 					GOOS:             runtime.GOOS,
 					Config:           cfg,
 					KillSwitch:       ks,
@@ -1723,6 +1889,7 @@ Key-free evidence capture:
 					Metrics:          mcpMetrics,
 					ReceiptEmitter:   receiptEmitter,
 					V2ReceiptEmitter: v2ReceiptEmitter,
+					ReceiptGroup:     receiptGroup,
 					EnvelopeEmitter:  envEmitter,
 					Stderr:           cmd.ErrOrStderr(),
 					LaunchConfig:     &launchCfg,
@@ -1767,12 +1934,14 @@ Key-free evidence capture:
 				}
 				applyMCPDoWOpts(&proxyOpts, dowWiring, false)
 				applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
-				applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
+				applyMCPResponseSuppressOpts(&proxyOpts, cfg, launchIdentity)
+				proxyOpts.ServerBinding = serverBinding
 				proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+				proxyOpts.ReceiptGroup = receiptGroup
 				respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
 				_, _ = fmt.Fprintf(cmd.ErrOrStderr(),
 					"pipelock: proxying MCP server %v [SANDBOXED] (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s, workspace=%s)\n",
-					serverCmd, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction, workspace)
+					serverCmd, respAction, respTrust, respServer, inputAction, toolAction, policyAction, workspace)
 				// Report orphan-cleanup availability once, before the server
 				// launches, so the operator learns it up front. The proxy path
 				// still runs the authoritative strict refusal against the same
@@ -1923,8 +2092,10 @@ Key-free evidence capture:
 			}
 			applyMCPDoWOpts(&proxyOpts, dowWiring, false)
 			applyMCPA2AOpts(&proxyOpts, cfg, a2aCardBaseline, "")
-			applyMCPResponseSuppressOpts(&proxyOpts, cfg, serverName)
+			applyMCPResponseSuppressOpts(&proxyOpts, cfg, launchIdentity)
+			proxyOpts.ServerBinding = serverBinding
 			proxyOpts = mcpReceiptParityOpts(proxyOpts, receiptEmitter, v2ReceiptEmitter, captureConfigHash, cfg.FlightRecorder.RequireReceipts)
+			proxyOpts.ReceiptGroup = receiptGroup
 			// The unsandboxed path has no UID/GID map setup. Harden before
 			// RunProxy can start its wrapped command.
 			if err := mcp.HardenProxyProcess(); err != nil {
@@ -1932,7 +2103,7 @@ Key-free evidence capture:
 			}
 			respAction, respTrust, respServer := mcpResponseLogFields(proxyOpts)
 			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "pipelock: proxying MCP server %v (response=%s, trust=%s, server=%s, input=%s, tools=%s, policy=%s)\n",
-				serverCmd, respAction, respTrust, respServer, inputCfg.Action, toolAction, policyAction)
+				serverCmd, respAction, respTrust, respServer, inputAction, toolAction, policyAction)
 			// Report orphan-cleanup availability once, before the server
 			// launches. The plain stdio path has no strict mode, so this is
 			// informational, with no strict-mode remedy hint.
@@ -1978,7 +2149,7 @@ Key-free evidence capture:
 	cmd.Flags().StringArrayVar(&headerCarriers, "header-carrier", nil, "map a host-resolved carrier into an upstream header (HEADER=CARRIER, repeatable)")
 	cmd.Flags().StringVar(&headerFile, "header-file", "", "path to a headers file (one 'Key: Value' per line, '#' comments) merged with --header; on Unix it must be mode 0o600 or 0o640, on Windows restrict access with file ACLs")
 	cmd.Flags().StringVar(&agentName, "agent", "", "agent profile name (resolves to config profile for policy/scanner)")
-	cmd.Flags().StringVar(&serverName, "server-name", "", "stable identity for this MCP server; enables per-server response suppression via target 'mcp://<name>/response'")
+	cmd.Flags().StringVar(&serverName, "server-name", "", "operator label for an unregistered MCP server; enables per-server response suppression via target 'mcp://<name>/response' (tools/list tool-definition findings are not suppressed by it; control them with mcp_tool_scanning). A server registered in mcp_identities supplies its own verified name; an explicit name equal to a registered identity must match the registration this launch's upstream resolves to")
 	cmd.Flags().StringVar(&adaptiveResetFile, "adaptive-reset-file", "", "signed adaptive reset delegation control file")
 	cmd.Flags().StringVar(&adaptiveResetAuthorityPublicKeyFile, "adaptive-reset-authority-public-key-file", "", "exported mcp-reset-authority public key for --adaptive-reset-file")
 	cmd.Flags().StringVar(&adaptiveResetTarget, "adaptive-reset-target", "", "stable target identity for --adaptive-reset-file delegations")
@@ -2002,4 +2173,26 @@ func mcpSessionManagerOptions(cfg *config.Config, auditLogger *audit.Logger) pro
 		opts.AirlockCfg = &cfg.Airlock
 	}
 	return opts
+}
+
+// startMCPContractWatch keeps a promoted Learn and Lock manifest live for the
+// MCP proxy: the watcher swaps the loader's active set in place, and every
+// transport reads it through the one loader. A rejected or unreadable promote
+// keeps the last accepted set and is logged. The returned stop function
+// cancels the watcher and waits for it to exit; it is never nil.
+func startMCPContractWatch(ctx context.Context, loader *contractruntime.Loader, logger *audit.Logger) func() {
+	if loader == nil {
+		return func() {}
+	}
+	logWatchErr := func(err error) {
+		if logger != nil {
+			logger.LogError(audit.NewMethodLogContext("CONTRACT_WATCH"), err)
+		}
+	}
+	stop, err := loader.StartWatch(ctx, logWatchErr)
+	if err != nil {
+		logWatchErr(fmt.Errorf("active manifest watcher not running, keeping last accepted contract: %w", err))
+		return func() {}
+	}
+	return stop
 }

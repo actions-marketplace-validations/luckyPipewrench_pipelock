@@ -331,20 +331,23 @@ func Whitespace(s string) string {
 // exactly so the two functions share one mental model for stego whitespace.
 func StripExoticWhitespace(s string) string {
 	return strings.Map(func(r rune) rune {
-		switch r {
-		case '\u00A0',
-			'\u1680',
-			'\u180E',
-			'\u2000', '\u2001', '\u2002', '\u2003', '\u2004',
-			'\u2005', '\u2006', '\u2007', '\u2008', '\u2009', '\u200A',
-			'\u2028', '\u2029',
-			'\u202F',
-			'\u205F',
-			'\u3000':
+		if isExoticWhitespace(r) {
 			return -1
 		}
 		return r
 	}, s)
+}
+
+func isExoticWhitespace(r rune) bool {
+	switch r {
+	case '\u00A0', '\u1680', '\u180E',
+		'\u2000', '\u2001', '\u2002', '\u2003', '\u2004',
+		'\u2005', '\u2006', '\u2007', '\u2008', '\u2009', '\u200A',
+		'\u2028', '\u2029', '\u202F', '\u205F', '\u3000':
+		return true
+	default:
+		return false
+	}
 }
 
 // ZalgoSuspiciousThreshold is the minimum consecutive-combining-mark count that
@@ -472,6 +475,9 @@ func ReplaceInvisibleWithSpace(s string) string {
 // attacks that NFKC does not handle (Cyrillic, Greek lookalikes).
 func ConfusableToASCII(s string) string {
 	return strings.Map(func(r rune) rune {
+		if r < 0x80 {
+			return r
+		}
 		if mapped, ok := confusableMap[r]; ok {
 			return mapped
 		}
@@ -499,14 +505,15 @@ func StripCombiningMarks(s string) string {
 // Used in DLP scanning paths.
 func StripControlChars(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r <= 0x1F || r == 0x7F || (r >= 0x80 && r <= 0x9F) {
-			return -1
-		}
-		if unicode.Is(InvisibleRanges, r) {
+		if isDLPControl(r) {
 			return -1
 		}
 		return r
 	}, s)
+}
+
+func isDLPControl(r rune) bool {
+	return r <= 0x1F || r == 0x7F || (r >= 0x80 && r <= 0x9F) || unicode.Is(InvisibleRanges, r)
 }
 
 // ForDLP applies the standard DLP normalization pipeline: strip all control/
@@ -521,12 +528,38 @@ func StripControlChars(s string) string {
 //
 //pipelock:provenance-transform dlp_normalize
 func ForDLP(s string) string {
-	s = StripControlChars(s)
-	s = StripExoticWhitespace(s)
+	// Printable ASCII is unchanged by every step below. Other input runs the
+	// full pipeline between stable code points (see segmentTable).
+	if isPrintableASCII(s) {
+		return s
+	}
+	return normalizeSegmented(s, &segmentTablesOnce().dlp, forDLPFull)
+}
+
+// forDLPFull is the complete ForDLP pipeline without fast paths. It is the
+// reference the segmented fast path is derived from and tested against.
+func forDLPFull(s string) string {
+	// These two stages only delete runes. Their union preserves the original
+	// order and strings.Map's malformed UTF-8 repair while walking once.
+	s = strings.Map(func(r rune) rune {
+		if isDLPControl(r) || isExoticWhitespace(r) {
+			return -1
+		}
+		return r
+	}, s)
 	s = norm.NFKC.String(s)
 	s = ConfusableToASCII(s)
 	s = StripCombiningMarks(s)
 	return s
+}
+
+func isPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] > '~' {
+			return false
+		}
+	}
+	return true
 }
 
 // ForMatching applies the standard normalization pipeline for response/injection
@@ -535,12 +568,131 @@ func ForDLP(s string) string {
 //
 //pipelock:provenance-transform matching_normalize
 func ForMatching(s string) string {
+	return matchingNormalize(s, true)
+}
+
+// matchingNormalize is the response and injection pipeline. recompose adds
+// NFC after mark stripping. v1 and v2 recipes pass false so their output
+// stays the NFD fixed point those profiles published. ForDLP does not use
+// this function; the fragment buffer's concatenation invariant depends on
+// ForDLP staying in NFD.
+func matchingNormalize(s string, recompose bool) string {
+	// Printable ASCII survives every matching transform unchanged. Whitespace
+	// only maps Unicode characters, so both versioned profiles can use it.
+	if isPrintableASCII(s) {
+		return s
+	}
+	if recompose {
+		return normalizeSegmented(s, &segmentTablesOnce().matching[1], recomposedMatchingFull)
+	}
+	return normalizeSegmented(s, &segmentTablesOnce().matching[0], decomposedMatchingFull)
+}
+
+func recomposedMatchingFull(s string) string { return matchingNormalizeFull(s, true) }
+
+func decomposedMatchingFull(s string) string { return matchingNormalizeFull(s, false) }
+
+// matchingNormalizeFull is the complete matching pipeline without fast paths.
+func matchingNormalizeFull(s string, recompose bool) string {
 	s = StripZeroWidth(s)
 	s = norm.NFKC.String(s)
 	s = ConfusableToASCII(s)
 	s = StripCombiningMarks(s)
+	if recompose {
+		s = norm.NFC.String(s)
+	}
 	s = Whitespace(s)
 	return s
+}
+
+// ASCIIUpper folds ASCII a-z to A-Z and retains other Unicode scalars.
+// Malformed UTF-8 becomes U+FFFD, matching strings.Map.
+// DNS 0x20 and RFC 4648 base32 case differences use this fold. It is not
+// Unicode case mapping.
+//
+//pipelock:provenance-transform ascii_upper
+func ASCIIUpper(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' {
+			return r - ('a' - 'A')
+		}
+		return r
+	}, s)
+}
+
+// DecodeJSONUnicodeEscapes replaces JSON-style \uXXXX escapes with their
+// Unicode scalars. A high surrogate immediately followed by a low surrogate
+// becomes one scalar, and an unpaired surrogate escape becomes U+FFFD, as
+// encoding/json decodes it. A truncated escape or non-hex digits are left
+// exactly as written. It never fails: a scanner view that one malformed escape could discard would
+// let a sender append one to hide every valid escape before it.
+//
+//pipelock:provenance-transform json_unicode_escape
+func DecodeJSONUnicodeEscapes(s string) string {
+	if !strings.Contains(s, `\u`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if r, size, ok := jsonUnicodeScalar(s[i:]); ok {
+			b.WriteRune(r)
+			i += size
+			continue
+		}
+		b.WriteByte(s[i])
+		i++
+	}
+	return b.String()
+}
+
+// jsonUnicodeScalar decodes one escape at the start of s. ok is false when s
+// does not start with a decodable escape, and the caller copies the byte.
+func jsonUnicodeScalar(s string) (rune, int, bool) {
+	if len(s) < 6 || s[0] != '\\' || s[1] != 'u' {
+		return 0, 0, false
+	}
+	value, ok := parseHex4(s[2:6])
+	if !ok {
+		return 0, 0, false
+	}
+	if value >= 0xDC00 && value <= 0xDFFF {
+		return unicode.ReplacementChar, 6, true
+	}
+	if value < 0xD800 || value > 0xDBFF {
+		return value, 6, true
+	}
+	if len(s) < 12 || s[6] != '\\' || s[7] != 'u' {
+		return unicode.ReplacementChar, 6, true
+	}
+	low, ok := parseHex4(s[8:12])
+	if !ok || low < 0xDC00 || low > 0xDFFF {
+		return unicode.ReplacementChar, 6, true
+	}
+	return 0x10000 + ((value-0xD800)<<10 | (low - 0xDC00)), 12, true
+}
+
+func parseHex4(s string) (rune, bool) {
+	if len(s) != 4 {
+		return 0, false
+	}
+	var value rune
+	for i := 0; i < 4; i++ {
+		c := rune(s[i])
+		var digit rune
+		switch {
+		case c >= '0' && c <= '9':
+			digit = c - '0'
+		case c >= 'a' && c <= 'f':
+			digit = c - 'a' + 10
+		case c >= 'A' && c <= 'F':
+			digit = c - 'A' + 10
+		default:
+			return 0, false
+		}
+		value = value<<4 | digit
+	}
+	return value, true
 }
 
 // ForPolicy applies the same pipeline as ForMatching, but replaces invisible
@@ -581,7 +733,25 @@ func FoldVowels(s string) string {
 // whitespace. More aggressive than ForMatching because tool descriptions have no
 // legitimate control chars - any present are evasion attempts.
 func ForToolText(s string) string {
-	s = StripControlChars(s)
+	return toolTextNormalize(StripControlChars(s))
+}
+
+// ForToolTextSpaced is ForToolText with each control and invisible character
+// replaced by a space instead of removed. Removal joins the words on either
+// side of a line break or zero-width separator ("yolo\nmode" becomes
+// "yolomode"), which hides a phrase from patterns that need a word boundary.
+// Removal is still right for a separator inside a word ("IMPOR\tTANT"), so
+// tool scanning matches both views, as response scanning does.
+func ForToolTextSpaced(s string) string {
+	return toolTextNormalize(strings.Map(func(r rune) rune {
+		if isDLPControl(r) {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
+func toolTextNormalize(s string) string {
 	s = norm.NFKC.String(s)
 	s = ConfusableToASCII(s)
 	s = StripCombiningMarks(s)

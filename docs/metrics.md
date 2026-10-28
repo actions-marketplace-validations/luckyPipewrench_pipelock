@@ -99,8 +99,12 @@ form data, multipart uploads, and HTTP headers on forward-proxy traffic.
 | `pipelock_body_prompt_injection_hits_total` | counter | `action`, `agent` | Request body prompt-injection detections. `action` is `warn` or `block`. |
 | `pipelock_body_redactions_total` | counter | `transport`, `agent`, `provider`, `parser`, `class` | Request body redactions by transport surface, agent profile, provider format, parser, and redaction class. Incremented once per redacted field (not per request), so a single request body can produce several counts. |
 | `pipelock_dlp_warn_matches_total` | counter | `pattern`, `transport` | Warn-mode DLP matches by pattern name and transport. Only incremented when the configured DLP action is `warn`; blocked matches are reflected in `pipelock_body_dlp_hits_total` instead. |
+| `pipelock_dlp_dropped_matches_total` | counter | `pattern`, `surface`, `reason` | DLP matches deliberately not enforced. `surface` is `body`, `header`, `mcp_sse`, or `mcp_stdio`; `reason` is `suppressed`, `disabled`, or `low_confidence`. WebSocket upgrade headers count as `header`; matches dropped inside WebSocket frames are not counted. |
+| `pipelock_dlp_credential_audience_allows_total` | counter | `pattern`, `surface` | Compiled credential DLP matches allowed at their declared audience (see [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md)). |
+| `pipelock_issuer_id_blocks_total` | counter | `scope` | Newly tainted caller ID-history buckets (`session`) and the transition to refusing new buckets at capacity (`capacity`). No identity, address, host or ID labels. Existing peers retain their IDs at capacity. Restarting or disabling and re-enabling issuer evidence clears history; enabled reloads preserve it. |
 | `pipelock_header_dlp_hits_total` | counter | `action`, `agent` | Request header DLP detections. `action` is `warn` or `block`. |
-| `pipelock_response_scan_exempt_total` | counter | `reason`, `transport` | Response scanning exemptions. `reason` is `exempt_domain` or `suppress`; current emitters use transports such as `fetch`, `forward`, `connect`, `reverse`, and `websocket`. Every skipped response scan is counted so operators can quantify how much traffic bypasses injection scanning. |
+| `pipelock_response_scan_exempt_total` | counter | `reason`, `transport` | Response scanning exemptions. `reason` is `exempt_domain` (a skipped scan, counted once per response), `suppress` (a suppressed finding, counted once per finding), or `core_observed` (a core finding withheld from blocking by a declared observe exception, counted once per finding; the scan still ran); current emitters use transports such as `fetch`, `forward`, `connect`, `reverse`, and `websocket`. Together they show how much traffic skipped injection scanning and how many findings were not enforced. |
+| `pipelock_response_suppressed_matches_total` | counter | `pattern`, `surface`, `reason` | Individual response-scan findings withheld from enforcement. `reason` is `suppressed` (dropped by a non-core `suppress` entry) or `core_observed` (immutable-floor finding withheld by a declared `core_observe_exceptions` entry). |
 
 ## WebSocket Proxy Metrics
 
@@ -123,7 +127,7 @@ inspect WebSocket frames for DLP and prompt injection.
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `pipelock_info` | gauge | `version` | Build information. Always 1. The `version` label identifies the running release (e.g. `2.2.0`). |
-| `pipelock_kill_switch_active` | gauge | `source` | Whether each kill switch source is active (1) or inactive (0). `source` is `config`, `api`, `signal`, or `sentinel`. Reported fresh on every scrape via a custom collector; the value is never stale. |
+| `pipelock_kill_switch_active` | gauge | `source` | Whether each kill switch source is active (1) or inactive (0). `source` is `config`, `api`, `conductor_remote`, `conductor_stale`, `conductor_apply_failure`, `signal`, or `sentinel`. Reported fresh on every scrape via a custom collector; the value is never stale. |
 
 ## Security Event Metrics
 
@@ -144,20 +148,20 @@ health sampler is not measuring that fact in the current runtime.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `pipelock_evidence_local_recorder_operational` | gauge | (none) | One when this process's recorder and emitter are running with no locally observed sequence gap, self-audit failure, or ungated fsync failure. This does not check for a competing writer, prove corpus-wide integrity, or award an AEL grade. |
+| `pipelock_evidence_local_recorder_operational` | gauge | (none) | One when this process's recorder and every receipt chain's emitter are running, every chain's disk tail has been verified against its in-memory head, and no sequence gap, self-audit failure, or ungated fsync failure was observed locally. This does not check for a competing writer, prove corpus-wide integrity, or award an AEL grade. |
 | `pipelock_evidence_corpus_integrity_ok` | textfile gauge | (none) | One when the most recent complete deployment-managed whole-corpus audit found no structural damage. `pipelock init` installs the producer as a user-systemd timer; Prometheus must scrape its configured textfile directory. This metric never gates proxy traffic. |
 | `pipelock_evidence_corpus_last_audit_timestamp_seconds` | textfile gauge | (none) | Unix timestamp of the most recent whole-corpus audit. The generated corpus-integrity alert treats an audit older than 30 minutes as unhealthy. |
 | `pipelock_evidence_current_ael` | gauge | (none) | **Deprecated.** Always `NaN` (not a number). A live process cannot independently grade its own in-memory state. The series remains for one compatibility window so dashboards fail visibly instead of silently changing meaning. |
 | `pipelock_evidence_ael_requirement_ok` | gauge | `requirement` | **Deprecated.** Diagnostic inputs from the former live AEL estimate. Requirement labels are `recorder_enabled`, `emitter_healthy`, `durability_gate`, `heartbeats`, `anchoring_fresh`, `cpc_active`, and `selfaudit_ok`. These values do not award an AEL grade. |
-| `pipelock_evidence_chain_head_seq` | gauge | (none) | Last emitted in-memory receipt sequence, omitted when evidence health is not measured. |
-| `pipelock_evidence_chain_head_age_seconds` | gauge | (none) | Seconds since the last durable chain entry, omitted when evidence health is not measured. |
+| `pipelock_evidence_chain_head_seq` | gauge | (none) | Last emitted in-memory receipt sequence of the process chain, omitted when evidence health is not measured. With `receipt_chains` above 1, per-chain heads are in `/stats` under `evidence_health.self_audit.shards`. |
+| `pipelock_evidence_chain_head_age_seconds` | gauge | (none) | Seconds since the newest chain entry on any receipt chain, omitted when evidence health is not measured. |
 | `pipelock_evidence_heartbeat_interval_seconds` | gauge | (none) | Configured receipt heartbeat interval in seconds; absent from JSON stats until heartbeats are enabled. |
-| `pipelock_evidence_anchor_lag_receipts` | gauge | (none) | Receipts between the live chain head and the latest accepted anchor-state marker. |
-| `pipelock_evidence_last_anchor_timestamp_seconds` | gauge | (none) | Unix timestamp of the latest accepted local anchor-state marker, or zero when never anchored. |
-| `pipelock_evidence_anchored_final_seq` | gauge | (none) | Final receipt sequence covered by the latest accepted local anchor-state marker. |
+| `pipelock_evidence_anchor_lag_receipts` | gauge | (none) | Receipts between a chain head and that chain's latest accepted anchor-state marker; the largest lag across receipt chains. |
+| `pipelock_evidence_last_anchor_timestamp_seconds` | gauge | (none) | Unix timestamp of the oldest chain's latest accepted local anchor-state marker, or zero while any chain has never been anchored. |
+| `pipelock_evidence_anchored_final_seq` | gauge | (none) | Final receipt sequence covered by that same marker, or zero while any chain has never been anchored. |
 | `pipelock_evidence_sequence_gaps_total` | counter | `source` | Observed sequence gaps by bounded source. Source labels are `resume`, `self_audit`, and `unknown`. |
 | `pipelock_evidence_fsync_errors_total` | counter | `gated` | Per-action durability confirmation failures. `gated=true` means fail-closed receipt gating was active. |
-| `pipelock_evidence_selfaudit_ok` | gauge | (none) | One while evidence self-audit checks pass; latches to zero after a failure in the process. |
+| `pipelock_evidence_selfaudit_ok` | gauge | (none) | One while evidence self-audit checks pass; latches to zero after a proven failure in the process. An unverified chain (pending) does not latch it; see `self_audit.state`. |
 | `pipelock_evidence_selfaudit_failures_total` | counter | `check` | Evidence self-audit failures by bounded check label: `durability_invariant`, `tail_divergence`, or `sampler_error`. |
 
 The `/stats` endpoint also includes a nullable `evidence_health` object. In the
@@ -170,6 +174,26 @@ The `/stats` endpoint also includes a nullable `evidence_health` object. In the
 - `requirements.heartbeats` becomes true only after this process has recorded a
   heartbeat. A fresh process is pending until its first scheduled heartbeat;
   the generated corpus alert does not consume this process-local diagnostic.
+- `self_audit.state` is the worst per-chain tail state. `verified` means each
+  chain's last action receipt on disk matched that chain's in-memory head.
+  `pending` means a chain could not be compared: it was never audited, failed
+  to initialize, its evidence is missing or shrank during the read, a
+  read failed, its last receipt lies beyond the self-audit's read bound (8 MiB
+  of a file, four files), or the newest receipt was written by another run,
+  as when a reload's replacement writer opens before it goes live. A newest
+  receipt from another run that persists for three checks of the same live
+  writer is reported failed. Pending is not green and does not latch.
+  `failed` is a proven mismatch (the newest receipt on disk is not the one the
+  chain last wrote, a receipt's position was assigned but its write was not
+  confirmed, or the tail is malformed) and
+  latches `selfaudit_ok` for the process lifetime. `self_audit.shards` lists
+  each chain's session, head, emitter health, tail state, and anchor coverage.
+  Every field in one entry comes from that chain alone. The self-audit checks
+  that the newest complete receipt on disk matches the chain head; it does not
+  verify the rest of the file. Use `pipelock evidence doctor` for that.
+- `requirements.emitter_healthy` and `requirements.anchoring_fresh` cover every
+  receipt chain: one unhealthy or unanchored chain makes them false. The
+  top-level `anchor` object is `null` while any chain is unanchored.
 - `run_state` is `OPEN` while the recorder process is running. `run_id` is `null`
   until bounded per-run recording exists. These are lifecycle facts, not
   verification states.
@@ -184,6 +208,21 @@ During a rolling upgrade, old instances may still emit numeric
 aggregate that legacy series across versions. Migrate alerts to
 `pipelock_evidence_local_recorder_operational` and keep the process-local scope
 in the alert text.
+
+## Audit Sink Metrics
+
+These metrics report delivery state for the built-in audit sinks. Every series uses only the bounded `sink` label: `webhook`, `syslog`, or `otlp`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `pipelock_audit_sink_delivered_total` | counter | `sink` | Audit events delivered successfully, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_failed_total` | counter | `sink` | Audit event delivery failures, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_dropped_total` | counter | `sink` | Audit events dropped before delivery, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_abandoned_total` | counter | `sink` | Queued audit events abandoned during shutdown, cumulative for the process lifetime and preserved across sink reloads. |
+| `pipelock_audit_sink_queue_depth` | gauge | `sink` | Current number of queued audit events. |
+| `pipelock_audit_sink_queue_capacity` | gauge | `sink` | Configured capacity of the audit event delivery queue. |
+| `pipelock_audit_sink_degraded` | gauge | `sink` | One while the sink has an unresolved delivery failure or drop; otherwise zero. |
+| `pipelock_audit_sink_last_error_present` | gauge | `sink` | One while the sink has a current last error; otherwise zero. Error text is not exported. |
 
 ## Session Profiling Metrics
 
@@ -289,7 +328,7 @@ integrations. Disabled by default; set `scan_api.listen` to enable.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `pipelock_receipt_emit_failures_total` | counter | `reason` | Signed action-receipt emission failures. A non-zero rate means receipts are not being recorded; check the flight-recorder signing key and chain state. `reason` values are `chain_init`, `sign`, `hash`, `marshal`, `record`, `sealed`, or `unknown`. |
+| `pipelock_receipt_emit_failures_total` | counter | `reason` | Signed action-receipt emission failures. A non-zero rate means receipts are not being recorded; check the flight-recorder signing key and chain state. `reason` values are `chain_init`, `sign`, `hash`, `marshal`, `record`, `ael`, `sync`, `durability_inherited`, `sealed`, `unavailable`, or `unknown`. `durability_inherited` is a receipt refused because an earlier sync on the same chain failed. |
 
 ## Capture System Metrics
 

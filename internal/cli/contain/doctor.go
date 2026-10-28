@@ -6,19 +6,23 @@ package contain
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
 // `pipelock contain doctor` is a live self-test for the contained agent's
@@ -47,6 +51,11 @@ const (
 type doctorEnv struct {
 	port           int
 	agentUserName  string
+	proxyUserName  string
+	pipelockTarget string
+	bashPath       string
+	lookupUser     lookupUserFunc
+	lstat          func(string) (os.FileInfo, error)
 	wrapperDir     string
 	caBundlePath   string
 	undiciShimPath string
@@ -58,9 +67,26 @@ type doctorEnv struct {
 	// contain verify. Nil means attribution is unavailable, never PASS.
 	dropCounter    func(ctx context.Context) (uint64, error)
 	chainStructure func(ctx context.Context) doctorResult
+	doorwaySockets func(ctx context.Context) doctorResult
 	dialCtx        dialFunc
 	readFile       func(path string) ([]byte, error)
 	stat           func(path string) (os.FileInfo, error)
+	configPath     string
+	// displayUnitPath locates the managed display unit and, beside it, the
+	// viewer units. Empty means the installed default.
+	displayUnitPath     string
+	agentHome           string
+	rfbSocketPath       string
+	displayTmpfilesPath string
+	lookPath            func(string) (string, error)
+	platformFamily      string
+	filesystemProbe     func(context.Context, *probeEnv) (string, string)
+	runtimeSocketProbe  func(context.Context, *doctorEnv) doctorResult
+	operatorUser        string
+	workspaceInvPath    string
+	configDir           string
+	groupIDs            groupIDsFunc
+	now                 func() time.Time
 }
 
 // doctorEnvFactory builds the live doctor environment. It is a package var so
@@ -74,20 +100,35 @@ func defaultDoctorEnv() *doctorEnv {
 	platform := detectContainPlatform(os.ReadFile, os.Stat, exec.LookPath)
 	counterEnv := defaultProbeEnv()
 	env := &doctorEnv{
-		port:           defaultProxyPort,
-		agentUserName:  defaultAgentUser,
-		wrapperDir:     defaultWrapperDir,
-		caBundlePath:   defaultCABundlePath,
-		undiciShimPath: defaultUndiciShimPath,
-		canaryURL:      canaryURL,
-		curlPath:       platform.curlPath,
-		runCmd:         realRunCommand,
-		dialCtx:        realDial,
-		readFile:       os.ReadFile,
-		stat:           os.Stat,
+		port:             defaultProxyPort,
+		proxyUserName:    defaultProxyUser,
+		pipelockTarget:   defaultPipelockTarget,
+		bashPath:         platform.bashPath,
+		lookupUser:       user.Lookup,
+		lstat:            os.Lstat,
+		agentUserName:    defaultAgentUser,
+		wrapperDir:       defaultWrapperDir,
+		caBundlePath:     defaultCABundlePath,
+		undiciShimPath:   defaultUndiciShimPath,
+		canaryURL:        canaryURL,
+		curlPath:         platform.curlPath,
+		runCmd:           realRunCommand,
+		dialCtx:          realDial,
+		readFile:         os.ReadFile,
+		stat:             os.Stat,
+		configPath:       defaultConfigDir + "/pipelock.yaml",
+		agentHome:        "/home/" + defaultAgentUser,
+		lookPath:         exec.LookPath,
+		platformFamily:   platform.family,
+		operatorUser:     counterEnv.operatorUser,
+		workspaceInvPath: counterEnv.workspaceInvPath,
+		configDir:        counterEnv.configDir,
+		groupIDs:         counterEnv.groupIDs,
+		now:              counterEnv.now,
 	}
 	env.dropCounter = doctorDropCounterReader(counterEnv, env)
 	env.chainStructure = doctorChainStructureReader(counterEnv, env)
+	env.doorwaySockets = doctorDoorwaySocketReader(counterEnv, env)
 	return env
 }
 
@@ -121,19 +162,379 @@ func doctorChainStructureReader(base *probeEnv, env *doctorEnv) func(context.Con
 	return func(ctx context.Context) doctorResult {
 		probe := doctorCounterProbeEnv(base, env)
 		probe.nftPersistUnitPath = ""
-		status, detail := probeNFTContainment(ctx, &probe)
-		switch status {
-		case statusPass:
+		status, detail, readErr := probeNFTContainmentClassified(ctx, &probe)
+		switch {
+		case status == statusPass:
 			return pass("managed chain structure is as installed; enforcement is observed by the raw-egress check")
-		case statusFail:
-			if strings.Contains(detail, containmentBypassDetailPrefix) {
-				return fail(classInfra, detail, "remove the offending nftables rule and rerun `pipelock contain install`")
-			}
-			return unknownInfra("managed chain structure could not establish containment: " + detail)
+		case status == statusFail && strings.Contains(detail, containmentBypassDetailPrefix):
+			return fail(classInfra, detail, "remove the offending nftables rule and "+installRemedyForPort(env.port))
+		case status == statusFail && !readErr:
+			return unknownInfra("managed chain structure could not establish containment: "+detail, env.port)
 		default:
-			return unknownInfra("managed chain structure could not be read: " + detail)
+			return unknownInfra("managed chain structure could not be read: "+detail, env.port)
 		}
 	}
+}
+
+func doctorDoorwaySocketReader(base *probeEnv, env *doctorEnv) func(context.Context) doctorResult {
+	return func(ctx context.Context) doctorResult {
+		probe := doctorCounterProbeEnv(base, env)
+		services, problem, unusable := declaredContainmentLoopbackServicesForVerify(&probe, probe.port)
+		if unusable {
+			return fail(classInfra, "containment.loopback_services cannot be honored: "+problem, "correct the managed containment configuration and "+installRemedyForPort(env.port))
+		}
+		if problem != "" && !strings.HasPrefix(problem, "no managed config was found at ") {
+			return unknown("containment.loopback_services could not be determined: "+problem, "restore access to the managed containment configuration and rerun `"+doctorCommandForPort(env.port)+"`")
+		}
+		return doctorDoorwayState(ctx, &probe, services)
+	}
+}
+
+const (
+	systemctlMasked   = "masked"
+	systemctlNotFound = "not-found"
+	systemctlFailed   = "failed"
+	installRemedy     = "rerun `pipelock contain install`"
+)
+
+// Diagnostic commands validate --port before constructing their environments.
+// Only the numeric port is added to the fixed install command, never a path or
+// other caller-supplied shell text. Zero is an unset internal probe environment;
+// the CLI rejects it before running diagnostics. Preserve default-port wording.
+func installCommandForPort(port int) string {
+	const command = "pipelock contain install"
+	if port == 0 || port == defaultProxyPort {
+		return command
+	}
+	return fmt.Sprintf("%s --proxy-port %d", command, port)
+}
+
+// doctorCommandForPort keeps rechecks on the same proxy as the failed probe.
+func doctorCommandForPort(port int) string {
+	const command = "pipelock contain doctor"
+	if port == 0 || port == defaultProxyPort {
+		return command
+	}
+	return fmt.Sprintf("%s --port %d", command, port)
+}
+
+// verifyCommandForPort keeps verification on the same proxy as the failed probe.
+func verifyCommandForPort(port int) string {
+	const command = "pipelock contain verify"
+	if port == 0 || port == defaultProxyPort {
+		return command
+	}
+	return fmt.Sprintf("%s --port %d", command, port)
+}
+
+func installRemedyForPort(port int) string {
+	if port == 0 || port == defaultProxyPort {
+		return installRemedy
+	}
+	return "rerun `" + installCommandForPort(port) + "`"
+}
+
+// doctorUnitState reads one unit's enablement and activity through the same
+// systemctl seam the other contain probes use. An execution error or empty
+// state output is inconclusive and never a pass. Nonzero exit codes with
+// state output remain usable observations, such as disabled or inactive.
+func doctorUnitState(ctx context.Context, env *probeEnv, unit string) (enabled, active string, ok bool) {
+	enabledOut, _, err := env.runCmd(ctx, "systemctl", "is-enabled", unit)
+	if err != nil {
+		return "", "", false
+	}
+	activeOut, _, err := env.runCmd(ctx, "systemctl", "is-active", unit)
+	if err != nil {
+		return "", "", false
+	}
+	enabled, active = strings.TrimSpace(enabledOut), strings.TrimSpace(activeOut)
+	return enabled, active, enabled != "" && active != ""
+}
+
+// observeNamespaceForwarderReadiness uses systemd's effective service state,
+// including drop-ins. Active/running on a notify service means READY=1 was
+// accepted. A historical restart count alone does not condemn a recovered unit.
+// A forwarder on the exact pre-readiness definition may load as Type=simple;
+// it is still refused while restart-looping or not running.
+func observeNamespaceForwarderReadiness(ctx context.Context, env *probeEnv, doorway managedDoorway, state doorwayUnitState) doctorResult {
+	out, code, err := env.runCmd(ctx, "systemctl", "show", doorway.forwarder,
+		"--property=ActiveState,SubState,Type,NRestarts")
+	if err != nil || code != 0 {
+		return unknown("namespace forwarder "+doorway.forwarder+" readiness state could not be read", doorwayInspectionRemedy)
+	}
+	fields := parseSystemdShow(out)
+	active, sub, kind := fields["ActiveState"], fields["SubState"], fields["Type"]
+	restarts, parseErr := strconv.ParseUint(fields["NRestarts"], 10, 64)
+	if active == "" || sub == "" || kind == "" || parseErr != nil {
+		return unknown("namespace forwarder "+doorway.forwarder+" readiness properties are incomplete", doorwayInspectionRemedy)
+	}
+	if kind != "notify" && (kind != "simple" || !doorway.legacySimple) {
+		return fail(classInfra, "namespace forwarder "+doorway.forwarder+" does not use Type=notify bind readiness (Type="+oneLine(kind)+")", "inspect systemd drop-ins for a Type override, then "+installRemedyForPort(env.port))
+	}
+	detail := fmt.Sprintf("namespace forwarder %s is not ready on %s inside the agent network namespace (ActiveState=%s SubState=%s NRestarts=%d)", doorway.forwarder, doorway.listen, oneLine(active), oneLine(sub), restarts)
+	if sub == "auto-restart" || sub == "auto-restart-queued" || (active == "activating" && restarts > 0) {
+		return fail(classInfra, detail, "check for an address/port collision at "+doorway.listen+" inside the agent network namespace; inspect `journalctl -u "+doorway.forwarder+"`, then run `"+namespaceForwarderRemedy(doorway.forwarder, state.enabled, systemctlFailed, env.port)+"`")
+	}
+	if doorwayStateChanging(active) {
+		return doorwayTransitionResult("namespace forwarder", doorway.forwarder, active, "namespace forwarder")
+	}
+	if active != systemctlActive || sub != "running" {
+		return fail(classInfra, detail, namespaceForwarderRemedy(doorway.forwarder, state.enabled, active, env.port))
+	}
+	return pass("namespace forwarder " + doorway.forwarder + " is ready")
+}
+
+// doctorDoorwayState inspects every managed doorway socket and every
+// in-namespace forwarder service. Every admitted doorway contributes its
+// result so an earlier failure cannot hide a later installation failure.
+func doctorDoorwayState(ctx context.Context, env *probeEnv, services []config.ContainmentLoopbackService) doctorResult {
+	doorways, result := observeManagedDoorwayDefinitions(env, services)
+	results := make([]doctorResult, 0, len(doorways)+1)
+	results = append(results, result)
+	for _, doorway := range doorways {
+		results = append(results, doctorSingleDoorwayState(ctx, env, doorway))
+	}
+	combined := combineDoorwayResults(results)
+	if note := legacyNamespaceForwarderNote(doorways, env.port); note != "" && combined.status == statusPass {
+		combined.detail += "; " + note
+	}
+	return combined
+}
+
+func doctorSingleDoorwayState(ctx context.Context, env *probeEnv, doorway managedDoorway) doctorResult {
+	socket, relay := doorway.socket, doorway.relay
+	enabled, active, socketOK := doctorUnitState(ctx, env, socket)
+	relayEnabled, relayState, relayOK := doctorUnitState(ctx, env, relay)
+	forwarderEnabled, forwarderActive, forwarderOK := doctorUnitState(ctx, env, doorway.forwarder)
+	forwarder := doorwayUnitState{forwarderEnabled, forwarderActive}
+	var results []doctorResult
+	if forwarderOK && (forwarder.active == systemctlActive || forwarder.active == "activating") {
+		results = append(results, observeNamespaceForwarderReadiness(ctx, env, doorway, forwarder))
+	}
+	for _, observation := range []struct {
+		kind, unit string
+		ok         bool
+	}{
+		{"managed doorway socket", socket, socketOK},
+		{"managed doorway relay", relay, relayOK},
+		{"namespace forwarder", doorway.forwarder, forwarderOK},
+	} {
+		if !observation.ok {
+			results = append(results, unknown(observation.kind+" "+observation.unit+" state could not be read", doorwayInspectionRemedy))
+		}
+	}
+	var missing []string
+	for _, unit := range []struct{ name, enabled string }{{socket, enabled}, {relay, relayEnabled}, {doorway.forwarder, forwarderEnabled}} {
+		if unit.enabled == systemctlNotFound {
+			missing = append(missing, unit.name)
+		}
+	}
+	if len(missing) != 0 {
+		results = append(results, fail(classInfra, "managed doorway unit is missing: "+strings.Join(missing, ", ")+" ("+systemctlNotFound+")", installRemedyForPort(env.port)))
+		return combineDoorwayResults(results)
+	}
+	// systemctl(1), "is-enabled output", distinguishes unit-file state
+	// from activity. Disabled/static and the other startable states can
+	// still be socket-activated; masked units cannot start. "bad" means
+	// an invalid unit or another error, and unrecognized output is not
+	// evidence that the relay can start.
+	if relayOK {
+		switch relayEnabled {
+		case systemctlEnabled, "enabled-runtime", "linked", "linked-runtime", "alias", "static", "indirect", "disabled", "generated", "transient", systemctlMasked, systemctlMasked + "-runtime":
+		case "bad":
+			results = append(results, fail(classInfra, "managed doorway relay "+relay+" has invalid or unreadable unit-file state (bad)", installRemedyForPort(env.port)))
+		default:
+			results = append(results, unknown("managed doorway relay "+relay+" has unrecognized unit-file state "+oneLine(relayEnabled), doorwayInspectionRemedy))
+		}
+	}
+	socketDetail := ""
+	if socketOK {
+		switch {
+		case enabled != systemctlEnabled:
+			socketDetail = fmt.Sprintf("managed doorway socket %s is not persistently enabled (%s)", socket, oneLine(enabled))
+		case !doorwayStateChanging(active) && active != systemctlActive:
+			socketDetail = fmt.Sprintf("managed doorway socket %s is %s", socket, oneLine(active))
+		}
+		if doorwayStateChanging(active) {
+			transition := doorwayTransitionResult("managed doorway socket", socket, active, "socket")
+			results = append(results, transition)
+			if socketDetail != "" {
+				results = append(results, fail(classInfra, socketDetail, transition.remediation))
+				socketDetail = ""
+			}
+		}
+	}
+	if socketOK && enabled == systemctlEnabled && active == systemctlActive {
+		if env.lstat == nil {
+			results = append(results, unknown("managed doorway socket pathname inspection is unavailable", doorwayInspectionRemedy))
+		} else {
+			info, err := env.lstat(doorway.path)
+			switch {
+			case errors.Is(err, os.ErrNotExist):
+				socketDetail = "managed doorway socket pathname " + doorway.path + " is missing despite an active socket unit"
+			case err != nil:
+				results = append(results, unknown("managed doorway socket pathname "+doorway.path+" could not be read: "+err.Error(), doorwayInspectionRemedy))
+			case info.Mode()&os.ModeSocket == 0:
+				results = append(results, fail(classInfra, "managed doorway socket pathname "+doorway.path+" is not a socket", "inspect and remove the unexpected pathname, then "+installRemedyForPort(env.port)))
+			}
+		}
+	}
+	relayDetail := ""
+	relayBroken := relayOK && (relayEnabled == systemctlMasked || relayEnabled == systemctlMasked+"-runtime" || relayState == systemctlFailed)
+	if relayBroken {
+		relayDetail = fmt.Sprintf("managed doorway relay %s is %s (%s)", relay, oneLine(relayState), oneLine(relayEnabled))
+	} else if relayOK && relayState != systemctlActive && relayState != "inactive" {
+		if doorwayStateChanging(relayState) {
+			results = append(results, doorwayTransitionResult("managed doorway relay", relay, relayState, "relay"))
+		} else {
+			results = append(results, unknown("managed doorway relay "+relay+" has unrecognized state "+oneLine(relayState), doorwayInspectionRemedy))
+		}
+	}
+	forwarderDetail := ""
+	if forwarderOK {
+		if doorwayStateChanging(forwarder.active) {
+			transition := doorwayTransitionResult("namespace forwarder", doorway.forwarder, forwarder.active, "namespace forwarder")
+			results = append(results, transition)
+			if forwarder.enabled != systemctlEnabled {
+				detail := fmt.Sprintf("namespace forwarder %s is not persistently enabled (%s)", doorway.forwarder, oneLine(forwarder.enabled))
+				results = append(results, fail(classInfra, detail, transition.remediation))
+			}
+		} else if forwarder.enabled != systemctlEnabled || forwarder.active != systemctlActive {
+			forwarderDetail = fmt.Sprintf("namespace forwarder %s is %s (%s); the agent has no proxy listener inside its namespace and its launch is refused", doorway.forwarder, oneLine(forwarder.active), oneLine(forwarder.enabled))
+		}
+	}
+	if socketDetail != "" {
+		details := []string{socketDetail}
+		for _, detail := range []string{relayDetail, forwarderDetail} {
+			if detail != "" {
+				details = append(details, detail)
+			}
+		}
+		remedy := doorwayInspectionRemedy
+		if relayOK {
+			remedy = doorwayRecoveryRemedy(doorway, doorwayUnitState{enabled, active}, doorwayUnitState{relayEnabled, relayState}, forwarder, env.port)
+		} else if forwarderDetail != "" {
+			// Repairing the socket requires a relay observation first, but
+			// that does not hide an independently observed forwarder repair.
+			details = []string{socketDetail}
+			results = append(results, fail(classInfra, forwarderDetail, namespaceForwarderRemedy(doorway.forwarder, forwarder.enabled, forwarder.active, env.port)))
+		}
+		results = append(results, fail(classInfra, strings.Join(details, "; "), remedy))
+	} else {
+		if relayDetail != "" {
+			results = append(results, fail(classInfra, relayDetail, doorwayRelayRemedy(relay, doorwayUnitState{relayEnabled, relayState})))
+		}
+		if forwarderDetail != "" {
+			results = append(results, fail(classInfra, forwarderDetail, namespaceForwarderRemedy(doorway.forwarder, forwarder.enabled, forwarder.active, env.port)))
+		}
+	}
+	return combineDoorwayResults(results)
+}
+
+// doorwayRelayRemedy leaves an independently healthy socket listening.
+// systemd.socket(5) activates the relay on demand; systemctl(1) reset-failed
+// clears the failed state and start limit so the next connection can activate it.
+func doorwayRelayRemedy(unit string, state doorwayUnitState) string {
+	var steps []string
+	if state.enabled == systemctlMasked || state.enabled == systemctlMasked+"-runtime" {
+		steps = append(steps, doorwayUnmaskCommand(unit, state.enabled))
+	}
+	if state.active == systemctlFailed {
+		steps = append(steps, "systemctl reset-failed "+unit)
+	}
+	return strings.Join(steps, " && ")
+}
+
+// systemctl(1) defines these activity states as an in-progress unit change.
+// A transition cannot establish health or justify interrupting the unit.
+func doorwayStateChanging(active string) bool {
+	switch active {
+	case "activating", "deactivating", "reloading", "refreshing", "maintenance":
+		return true
+	}
+	return false
+}
+
+func doorwayTransitionResult(kind, unit, active, subject string) doctorResult {
+	return unknown(kind+" "+unit+" is "+active, "rerun the diagnostic after the "+subject+" finishes changing state")
+}
+
+type doorwayUnitState struct{ enabled, active string }
+
+// doorwayRecoveryRemedy follows the install lifecycle: close the socket before
+// stopping its relay so incoming connections cannot activate the relay again.
+func doorwayRecoveryRemedy(doorway managedDoorway, socketState, relay, forwarder doorwayUnitState, port int) string {
+	enabled, active, relayEnabled, relayState := socketState.enabled, socketState.active, relay.enabled, relay.active
+	if forwarder.enabled == systemctlNotFound {
+		return installRemedyForPort(port)
+	}
+	if doorwayStateChanging(relay.active) {
+		return doorwayTransitionResult("managed doorway relay", doorway.relay, relay.active, "relay").remediation
+	}
+	if forwarder.enabled == "" || forwarder.active == "" {
+		return doorwayInspectionRemedy
+	}
+	if doorwayStateChanging(forwarder.active) {
+		return doorwayTransitionResult("namespace forwarder", doorway.forwarder, forwarder.active, "namespace forwarder").remediation
+	}
+	var steps []string
+	if enabled == systemctlMasked || enabled == systemctlMasked+"-runtime" {
+		steps = append(steps, doorwayUnmaskCommand(doorway.socket, enabled))
+	}
+	if relayEnabled == systemctlMasked || relayEnabled == systemctlMasked+"-runtime" {
+		steps = append(steps, doorwayUnmaskCommand(doorway.relay, relayEnabled))
+	}
+	steps = append(steps, "systemctl stop "+doorway.socket, "systemctl stop "+doorway.relay)
+	if active == systemctlFailed {
+		steps = append(steps, "systemctl reset-failed "+doorway.socket)
+	}
+	if relayState == systemctlFailed {
+		steps = append(steps, "systemctl reset-failed "+doorway.relay)
+	}
+	if enabled == systemctlEnabled {
+		steps = append(steps, "systemctl start "+doorway.socket)
+	} else {
+		steps = append(steps, "systemctl enable --now "+doorway.socket)
+	}
+	// systemd.unit(5), Requires=: explicitly stopping the socket also stops
+	// its dependent namespace forwarder. Starting the socket alone does not
+	// restore that dependent, even when it was healthy at observation time.
+	if forwarder.enabled == systemctlEnabled && forwarder.active == systemctlActive {
+		steps = append(steps, "systemctl start "+doorway.forwarder)
+	} else {
+		steps = append(steps, namespaceForwarderRemedy(doorway.forwarder, forwarder.enabled, forwarder.active, port))
+	}
+	return strings.Join(steps, " && ")
+}
+
+// doorwayUnmaskCommand selects the configuration layer reported by systemd.
+// systemctl(1) --runtime changes /run rather than the persistent /etc layer.
+func doorwayUnmaskCommand(unit, enabled string) string {
+	if enabled == systemctlMasked+"-runtime" {
+		return "systemctl unmask --runtime " + unit
+	}
+	return "systemctl unmask " + unit
+}
+
+// namespaceForwarderRemedy names the commands that restore an in-namespace
+// forwarder service for the state doctor observed.
+func namespaceForwarderRemedy(unit, enabled, active string, port int) string {
+	if enabled == systemctlNotFound {
+		return "the unit is missing; " + installRemedyForPort(port)
+	}
+	var steps []string
+	if enabled == systemctlMasked || enabled == systemctlMasked+"-runtime" {
+		steps = append(steps, doorwayUnmaskCommand(unit, enabled))
+	}
+	if active == systemctlFailed {
+		steps = append(steps, "systemctl reset-failed "+unit)
+	}
+	if enabled == systemctlEnabled {
+		steps = append(steps, "systemctl restart "+unit)
+	} else {
+		steps = append(steps, "systemctl enable --now "+unit)
+	}
+	return strings.Join(steps, " && ")
 }
 
 // doctorResult is one check outcome. remediation is the operator's next step
@@ -155,19 +556,21 @@ func skip(detail, remediation string) doctorResult {
 	return doctorResult{status: statusSkip, detail: detail, remediation: remediation}
 }
 
-// unknown returns an inconclusive result that must never count as a pass.
-func unknown(class, detail, remediation string) doctorResult {
+// unknown returns an inconclusive result that must never count as a pass. An
+// inconclusive probe is always attributed to infrastructure: doctor could not
+// establish the fact, which is never a policy or proxy-compatibility verdict.
+func unknown(detail, remediation string) doctorResult {
 	return doctorResult{
 		status:      statusUnknown,
 		detail:      detail,
 		remediation: remediation,
-		class:       class,
+		class:       classInfra,
 	}
 }
 
 // unknownInfra returns an inconclusive infrastructure-attribution result.
-func unknownInfra(detail string) doctorResult {
-	return unknown(classInfra, detail, rawEgressAttributionRemediation)
+func unknownInfra(detail string, port int) doctorResult {
+	return unknown(detail, rawEgressAttributionRemediation(port))
 }
 
 type doctorCheck struct {
@@ -186,18 +589,200 @@ func allDoctorChecks() []doctorCheck {
 		{5, "dns_failure_clean", "DNS failures surface as a clean proxy error, not a hang", checkDNSFailure},
 		{6, "raw_egress_blocked", "direct (proxy-bypassing) egress is blocked for the agent", checkRawEgressBlocked},
 		{7, "managed_chain_structure", "managed nftables chain has the installed structure (a definite agent bypass is a FAIL)", checkManagedChainStructure},
+		{8, "managed_doorway_sockets", "managed containment doorway sockets and namespace forwarders are active", checkManagedDoorwaySockets},
+		{9, "filesystem_confinement", "contained-agent filesystem profile", checkFilesystemConfinement},
+		{14, "runtime_socket_isolation", "managed wrappers and configured units specify runtime socket masks", checkRuntimeSocketIsolation},
 	}
+}
+
+func checkRuntimeSocketIsolation(ctx context.Context, env *doctorEnv) doctorResult {
+	if env.runtimeSocketProbe != nil {
+		return env.runtimeSocketProbe(ctx, env)
+	}
+	return probeDoctorRuntimeSockets(ctx, env)
+}
+
+// filesystemProbeEnvForDoctor starts from the same defaults verify and
+// contain run use, then applies doctor's live overrides. Display and the
+// X server path stay on those defaults so an omitted display setting resolves
+// the same socket for all three.
+func filesystemProbeEnvForDoctor(env *doctorEnv) *probeEnv {
+	probe := defaultProbeEnv()
+	if env == nil {
+		return probe
+	}
+	probe.configPath = env.configPath
+	probe.configDir = env.configDir
+	probe.agentUserName = env.agentUserName
+	probe.agentHome = env.agentHome
+	probe.operatorUser = env.operatorUser
+	probe.workspaceInvPath = env.workspaceInvPath
+	probe.groupIDs = env.groupIDs
+	probe.now = env.now
+	probe.readFile = env.readFile
+	probe.stat = env.stat
+	probe.lookupUser = env.lookupUser
+	probe.runCmd = env.runCmd
+	probe.filesystemProbe = env.filesystemProbe
+	probe.pipelockTarget = env.pipelockTarget
+	probe.port = env.port
+	probe.proxyUserName = env.proxyUserName
+	return probe
+}
+
+func checkFilesystemConfinement(ctx context.Context, env *doctorEnv) doctorResult {
+	status, detail := probeFilesystemConfinement(ctx, filesystemProbeEnvForDoctor(env))
+	switch status {
+	case statusPass:
+		return pass(detail)
+	case statusFilesystemOff:
+		return doctorResult{status: statusFilesystemOff, detail: detail}
+	case statusSkip:
+		return skip(detail, "rerun "+verifyCommandForPort(env.port)+" on Linux as root")
+	default:
+		return fail(classInfra, detail, filesystemDoctorRemediation(detail))
+	}
+}
+
+func filesystemDoctorRemediation(detail string) string {
+	if strings.Contains(detail, "run this command through sudo from the operator account") {
+		return "run this command through sudo from the operator account"
+	}
+	return "repair containment.filesystem.mode or the paths it binds"
+}
+
+func doctorChecksForEnv(env *doctorEnv) []doctorCheck {
+	checks := allDoctorChecks()
+	if env.configPath == "" {
+		return checks
+	}
+	cfg, err := config.LoadForInspection(env.configPath)
+	if err != nil {
+		return checks
+	}
+	if cfg.Containment.Display.IsEnabled(true) && cfg.Containment.Display.EffectiveBackend() == "xvnc" {
+		checks = append(checks, doctorCheck{10, "agent_display_rfb", "TigerVNC display RFB socket is available", checkDoctorDisplayRFB})
+		checks = append(checks, doctorCheck{11, "viewer_service", "viewer socket is available to its operator", checkDoctorViewerService})
+		checks = append(checks, doctorCheck{12, "viewer_rfb_access", "viewer RFB socket group is exact", checkDoctorViewerRFBAccess})
+	}
+	// Runs whenever the config loaded, independent of the configured
+	// backend: a leftover legacy grant from a PRIOR install must still be
+	// caught even if the operator has since switched away from xvnc.
+	if env.agentHome != "" {
+		checks = append(checks, doctorCheck{13, "legacy_viewer_acl", "obsolete agent-home viewer access is absent", checkDoctorLegacyViewerACL})
+	}
+	return checks
+}
+
+func checkDoctorLegacyViewerACL(ctx context.Context, env *doctorEnv) doctorResult {
+	_, err := config.LoadForInspection(env.configPath)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fail(classInfra, "viewer config: "+err.Error(), "check display viewer configuration")
+	}
+	lstat := env.lstat
+	if lstat == nil {
+		lstat = env.stat
+	}
+	if err := checkLegacyViewerACL(ctx, env.runCmd, lstat, env.agentHome, env.proxyUserName); err != nil {
+		return fail(classInfra, err.Error(), installRemedyForPort(env.port))
+	}
+	return pass("obsolete agent-home viewer access is absent")
+}
+
+func checkDoctorDisplayRFB(_ context.Context, env *doctorEnv) doctorResult {
+	install := &installEnv{stat: env.stat, lookPath: env.lookPath, platformFamily: env.platformFamily}
+	if _, err := findXvnc(install); err != nil {
+		return fail(classInfra, err.Error(), err.Error())
+	}
+	path := displayRFBPath(env.rfbSocketPath)
+	mode := os.FileMode(0o600)
+	if cfg, err := config.LoadForInspection(env.configPath); err == nil && viewerRFBEnabled(cfg.Containment.Display) {
+		mode = 0o660
+	}
+	if env.lstat == nil {
+		return fail(classInfra, "RFB socket lstat unavailable", installRemedyForPort(env.port))
+	}
+	if result := checkDisplayRuntime(env.lstat, env.readFile, env.lookupUser, env.displayTmpfilesPath, path, env.port); result.status != statusPass {
+		return result
+	}
+	if err := checkDisplaySocket(env.lstat, path, mode); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return unknown("inspect RFB socket: "+err.Error(), displayInspectionRootRemedy)
+		}
+		return fail(classInfra, "RFB socket missing or unsafe: "+err.Error(), "RFB socket missing; "+installRemedyForPort(env.port))
+	}
+	info, err := env.lstat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			return unknown("inspect RFB socket: "+err.Error(), displayInspectionRootRemedy)
+		}
+		return fail(classInfra, "RFB socket: "+err.Error(), installRemedyForPort(env.port))
+	}
+	if env.lookupUser == nil {
+		return fail(classInfra, "RFB owner lookup unavailable", installRemedyForPort(env.port))
+	}
+	agent, err := env.lookupUser(env.agentUserName)
+	if err != nil {
+		return fail(classInfra, "lookup RFB owner: "+err.Error(), installRemedyForPort(env.port))
+	}
+	uid, err := strconv.ParseUint(agent.Uid, 10, 32)
+	if err != nil {
+		return fail(classInfra, "parse RFB owner uid: "+err.Error(), installRemedyForPort(env.port))
+	}
+	ownerUID, ok := fileOwnerUID(info)
+	if !ok || uint64(ownerUID) != uid {
+		return fail(classInfra, "RFB socket is not owned by the contained agent uid", installRemedyForPort(env.port))
+	}
+	return pass(fmt.Sprintf("RFB socket is available with mode %04o", mode))
+}
+
+func doctorViewerProbeEnv(env *doctorEnv) *probeEnv {
+	unitPath := env.displayUnitPath
+	if unitPath == "" {
+		unitPath = defaultDisplayUnitPath
+	}
+	return &probeEnv{port: env.port, configPath: env.configPath, displayUnitPath: unitPath, agentHome: env.agentHome, rfbSocketPath: env.rfbSocketPath, displayTmpfilesPath: env.displayTmpfilesPath, agentUserName: env.agentUserName, proxyUserName: env.proxyUserName, pipelockTarget: env.pipelockTarget, lookupUser: env.lookupUser, stat: env.stat, lstat: env.lstat, readFile: env.readFile, runCmd: env.runCmd}
+}
+
+func checkDoctorViewerService(ctx context.Context, env *doctorEnv) doctorResult {
+	cfg, err := config.LoadForInspection(env.configPath)
+	if err != nil {
+		return fail(classInfra, "viewer config missing: "+err.Error(), "check display viewer configuration")
+	}
+	if !viewerRFBEnabled(cfg.Containment.Display) {
+		status, detail := probeViewerService(ctx, doctorViewerProbeEnv(env))
+		if status != statusPass {
+			return fail(classInfra, detail, installRemedyForPort(env.port))
+		}
+		return pass(detail)
+	}
+	if env.lookPath != nil {
+		if _, err := env.lookPath("setfacl"); err != nil {
+			return fail(classInfra, "setfacl missing", "install acl")
+		}
+	}
+	status, detail := probeViewerService(ctx, doctorViewerProbeEnv(env))
+	if status != statusPass {
+		return fail(classInfra, detail, installRemedyForPort(env.port))
+	}
+	return pass(detail)
+}
+
+func checkDoctorViewerRFBAccess(ctx context.Context, env *doctorEnv) doctorResult {
+	status, detail := probeViewerRFBAccess(ctx, doctorViewerProbeEnv(env))
+	if status != statusPass {
+		return fail(classInfra, detail, "RFB access mismatch: "+installRemedyForPort(env.port))
+	}
+	return pass(detail)
 }
 
 // ---------------------------------------------------------------------------
 // Shared check helpers
 // ---------------------------------------------------------------------------
 
-const remediationRunAsRoot = "re-run as root: sudo pipelock contain doctor"
-
-const remediationInstall = "run `pipelock contain install` first"
-
-const rawEgressAttributionRemediation = "verify the managed nftables owner-match DROP counter is readable and increasing (`pipelock contain verify`)"
+func rawEgressAttributionRemediation(port int) string {
+	return "verify the managed nftables owner-match DROP counter is readable and increasing (`" + verifyCommandForPort(port) + "`)"
+}
 
 // sudoAgent prefixes a command so it runs as the contained agent. doctor is an
 // operator/root diagnostic; root can sudo to the agent without a password.
@@ -208,15 +793,15 @@ func (env *doctorEnv) sudoAgent(args ...string) (string, []string) {
 // classifyAgentRun maps the generic sudo/agent failure modes to a skip result.
 // Returns (result, true) when the run could not proceed and the caller should
 // return that skip; (zero, false) when the command actually executed.
-func classifyAgentRun(out string, err error, tool string) (doctorResult, bool) {
+func classifyAgentRun(out string, err error, tool string, port int) (doctorResult, bool) {
 	if err != nil {
-		return skip(fmt.Sprintf("%s could not be launched: %v", tool, err), remediationRunAsRoot), true
+		return skip(fmt.Sprintf("%s could not be launched: %v", tool, err), "re-run as root: sudo "+doctorCommandForPort(port)), true
 	}
 	if isSudoRefusal(out) {
-		return skip("sudo refused without a password", remediationRunAsRoot), true
+		return skip("sudo refused without a password", "re-run as root: sudo "+doctorCommandForPort(port)), true
 	}
 	if isSudoUserMissing(out) {
-		return skip(fmt.Sprintf("agent user %q is not present", "pipelock-agent"), remediationInstall), true
+		return skip(fmt.Sprintf("agent user %q is not present", "pipelock-agent"), "run `"+installCommandForPort(port)+"` first"), true
 	}
 	return doctorResult{}, false
 }
@@ -275,7 +860,7 @@ func checkGatewayHealth(ctx context.Context, env *doctorEnv) doctorResult {
 	if err != nil {
 		return fail(classInfra,
 			fmt.Sprintf("could not connect to the proxy at %s: %v", addr, err),
-			"start the service: systemctl status pipelock (or `pipelock contain verify`)")
+			"start the service: systemctl status pipelock (or `"+verifyCommandForPort(env.port)+"`)")
 	}
 	_ = conn.Close()
 	return pass(fmt.Sprintf("proxy accepting connections on %s", addr))
@@ -286,9 +871,12 @@ func checkGatewayHealth(ctx context.Context, env *doctorEnv) doctorResult {
 // ---------------------------------------------------------------------------
 
 func checkCurlThroughProxy(ctx context.Context, env *doctorEnv) doctorResult {
+	if res, disabled := checkDisabledForwardProxy(env); disabled {
+		return res
+	}
 	name, args := env.sudoAgent(env.curlProxyArgs(env.canaryURL)...)
 	out, code, err := env.runCmd(ctx, name, args...)
-	if res, done := classifyAgentRun(out, err, "curl"); done {
+	if res, done := classifyAgentRun(out, err, "curl", env.port); done {
 		return res
 	}
 	if isSudoTargetCommandMissing(out) {
@@ -336,10 +924,13 @@ except ImportError:
 `
 
 func checkPythonThroughProxy(ctx context.Context, env *doctorEnv) doctorResult {
+	if res, disabled := checkDisabledForwardProxy(env); disabled {
+		return res
+	}
 	wrapper := filepath.Join(env.wrapperDir, "pipelock-python")
 	name, args := env.sudoAgent(wrapper, "-c", pythonProbeScript, env.canaryURL)
 	out, code, err := env.runCmd(ctx, name, args...)
-	if res, done := classifyAgentRun(out, err, "python"); done {
+	if res, done := classifyAgentRun(out, err, "python", env.port); done {
 		return res
 	}
 	if code == 127 || isSudoTargetCommandMissing(out) {
@@ -370,15 +961,18 @@ const nodeProbeScript = "(async()=>{try{" +
 	"}catch(e){process.stderr.write(String((e&&e.message)||e));process.exit(1);}})()"
 
 func checkNodeThroughProxy(ctx context.Context, env *doctorEnv) doctorResult {
+	if res, disabled := checkDisabledForwardProxy(env); disabled {
+		return res
+	}
 	// The shim is what makes node's fetch() honor HTTPS_PROXY; surface a clear
 	// remediation if it is missing rather than letting node fail on --require.
 	if _, err := env.stat(env.undiciShimPath); err != nil {
-		return skip(fmt.Sprintf("undici shim missing at %s", env.undiciShimPath), "re-run `pipelock contain install` to write the shim")
+		return skip(fmt.Sprintf("undici shim missing at %s", env.undiciShimPath), "re-run `"+installCommandForPort(env.port)+"` to write the shim")
 	}
 	wrapper := filepath.Join(env.wrapperDir, "pipelock-node")
 	name, args := env.sudoAgent(wrapper, "-e", nodeProbeScript, env.canaryURL)
 	out, code, err := env.runCmd(ctx, name, args...)
-	if res, done := classifyAgentRun(out, err, "node"); done {
+	if res, done := classifyAgentRun(out, err, "node", env.port); done {
 		return res
 	}
 	if code == 127 || isSudoTargetCommandMissing(out) {
@@ -411,6 +1005,9 @@ const dnsFailureHost = "pipelock-doctor-nonexistent.invalid"
 // checkDNSFailure proves an invalid hostname is rejected by the proxy rather
 // than succeeding, hanging, or failing without proxy attribution.
 func checkDNSFailure(ctx context.Context, env *doctorEnv) doctorResult {
+	if res, disabled := checkDisabledForwardProxy(env); disabled {
+		return res
+	}
 	// %{http_connect} is the proxy's CONNECT response. It gives this check a
 	// positive attribution signal: the local Pipelock CONNECT response proves the
 	// proxy handled the request. Pipelock returns 403 for a scanner/policy denial
@@ -419,7 +1016,7 @@ func checkDNSFailure(ctx context.Context, env *doctorEnv) doctorResult {
 	// transport error.
 	name, args := env.sudoAgent(env.curlProxyArgsWithWriteOut("https://"+dnsFailureHost+"/", "%{http_connect}")...)
 	out, code, err := env.runCmd(ctx, name, args...)
-	if res, done := classifyAgentRun(out, err, "curl"); done {
+	if res, done := classifyAgentRun(out, err, "curl", env.port); done {
 		return res
 	}
 	if isSudoTargetCommandMissing(out) {
@@ -434,10 +1031,22 @@ func checkDNSFailure(ctx context.Context, env *doctorEnv) doctorResult {
 			fmt.Sprintf("an unresolvable host completed proxy CONNECT with HTTP %d — a bogus name resolved or DNS was intercepted", connectCode),
 			"investigate DNS interception / captive portal; the agent should never reach "+dnsFailureHost)
 	}
-	return unknown(classInfra,
+	return unknown(
 		fmt.Sprintf("DNS-failure probe was inconclusive (curl exit %d, proxy CONNECT status %s): %s",
 			code, formatObservedHTTPCode(connectCode, ok), oneLine(out)),
 		"confirm the proxy is healthy, then inspect Pipelock logs for the "+dnsFailureHost+" resolution failure")
+}
+
+// Attribute disabled forwarding only to a successfully inspected effective
+// config. CONNECT 405 alone can come from a different proxy or endpoint.
+func checkDisabledForwardProxy(env *doctorEnv) (doctorResult, bool) {
+	cfg, err := config.LoadForInspection(env.configPath)
+	if err != nil || cfg.ForwardProxy.Enabled {
+		return doctorResult{}, false
+	}
+	return fail(classInfra,
+		"managed config disables forwarding; contained clients require CONNECT and absolute-URI requests",
+		"set forward_proxy.enabled: true in "+env.configPath+" and "+installRemedyForPort(env.port)+", then rerun `"+doctorCommandForPort(env.port)+"`"), true
 }
 
 // formatObservedHTTPCode renders a parsed status or an explicit parse failure.
@@ -457,9 +1066,16 @@ func formatObservedHTTPCode(code int, ok bool) string {
 // established exclusively by check 6's direct-egress canary.
 func checkManagedChainStructure(ctx context.Context, env *doctorEnv) doctorResult {
 	if env.chainStructure == nil {
-		return unknownInfra("managed chain structure reader is unavailable")
+		return unknownInfra("managed chain structure reader is unavailable", env.port)
 	}
 	return env.chainStructure(ctx)
+}
+
+func checkManagedDoorwaySockets(ctx context.Context, env *doctorEnv) doctorResult {
+	if env.doorwaySockets == nil {
+		return unknownInfra("managed doorway socket inspection is unavailable", env.port)
+	}
+	return env.doorwaySockets(ctx)
 }
 
 // curlDirectArgs builds the bounded DNS-free direct-egress probe.
@@ -479,7 +1095,7 @@ func checkRawEgressBlocked(ctx context.Context, env *doctorEnv) doctorResult {
 
 	name, args := env.sudoAgent(env.curlDirectArgs()...)
 	out, code, err := env.runCmd(ctx, name, args...)
-	if res, done := classifyAgentRun(out, err, "curl"); done {
+	if res, done := classifyAgentRun(out, err, "curl", env.port); done {
 		return res
 	}
 	if isSudoTargetCommandMissing(out) {
@@ -488,7 +1104,7 @@ func checkRawEgressBlocked(ctx context.Context, env *doctorEnv) doctorResult {
 	if rule, ok := definiteContainmentBypassRule(beforeErr); ok {
 		return fail(classInfra,
 			fmt.Sprintf(containmentBypassDetailFormat, rule),
-			"remove the offending nftables rule and rerun `pipelock contain install`")
+			"remove the offending nftables rule and "+installRemedyForPort(env.port))
 	}
 	if code == 0 {
 		httpCode, ok := trailingHTTPCode(out)
@@ -497,7 +1113,7 @@ func checkRawEgressBlocked(ctx context.Context, env *doctorEnv) doctorResult {
 			detail = fmt.Sprintf("CONTAINMENT HOLE: agent reached %s directly (HTTP %d), bypassing the proxy", directEgressCanaryURL, httpCode)
 		}
 		return fail(classInfra, detail,
-			"the nftables owner-match egress rule is missing or broken; run `pipelock contain verify` and re-install")
+			"the nftables owner-match egress rule is missing or broken; run `"+verifyCommandForPort(env.port)+"` and re-install")
 	}
 	dialCompletion := parseDirectCurlDialCompletion(out)
 	outcome, after, afterErr := classifyDirectEgressAttribution(code, dialCompletion, env.dropCounter != nil, before, beforeErr, func() (uint64, error) {
@@ -507,19 +1123,19 @@ func checkRawEgressBlocked(ctx context.Context, env *doctorEnv) doctorResult {
 	case egressAttrFailPostConnect:
 		return fail(classInfra,
 			fmt.Sprintf("CONTAINMENT HOLE: direct egress reached the network before curl failed (exit %d): %s", code, oneLine(out)),
-			"verify the nftables owner-match drop is present (`pipelock contain verify`); a post-connect error means the outbound dial escaped containment")
+			"verify the nftables owner-match drop is present (`"+verifyCommandForPort(env.port)+"`); a post-connect error means the outbound dial escaped containment")
 	case egressAttrUnknownDialCompletion:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but probe-specific time_connect was missing or unparseable; refusing to claim containment", code))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but probe-specific time_connect was missing or unparseable; refusing to claim containment", code), env.port)
 	case egressAttrUnknownNoCounter:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but no DROP counter reader is available; containment attribution is inconclusive", code))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but no DROP counter reader is available; containment attribution is inconclusive", code), env.port)
 	case egressAttrUnknownBeforeErr:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but reading the DROP counter before the probe failed: %v", code, beforeErr))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but reading the DROP counter before the probe failed: %v", code, beforeErr), env.port)
 	case egressAttrUnknownAfterErr:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but reading the DROP counter after the probe failed: %v", code, afterErr))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but reading the DROP counter after the probe failed: %v", code, afterErr), env.port)
 	case egressAttrUnknownNoDelta:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but the managed DROP counter did not increase (%d -> %d)", code, before, after))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed (exit %d), but the managed DROP counter did not increase (%d -> %d)", code, before, after), env.port)
 	case egressAttrUnknownUnexpectedExit:
-		return unknownInfra(fmt.Sprintf("direct egress curl failed with unexpected exit %d despite a counter delta; the DNS-free HTTP canary expected a connect refusal or timeout", code))
+		return unknownInfra(fmt.Sprintf("direct egress curl failed with unexpected exit %d despite a counter delta; the DNS-free HTTP canary expected a connect refusal or timeout", code), env.port)
 	case egressAttrPass:
 		return doctorResult{
 			status: statusPass,
@@ -530,7 +1146,7 @@ func checkRawEgressBlocked(ctx context.Context, env *doctorEnv) doctorResult {
 		}
 	default:
 		// Fail closed: an unhandled attribution outcome must never claim PASS.
-		return unknownInfra(fmt.Sprintf("unexpected direct-egress attribution outcome %d (exit %d); refusing to claim containment", outcome, code))
+		return unknownInfra(fmt.Sprintf("unexpected direct-egress attribution outcome %d (exit %d); refusing to claim containment", outcome, code), env.port)
 	}
 }
 
@@ -627,8 +1243,9 @@ func runDoctor(cmd *cobra.Command, env *doctorEnv, opts doctorOpts) error {
 		}
 	}
 
-	var passN, failN, skipN, unknownN int
-	for _, c := range allDoctorChecks() {
+	var passN, failN, skipN, unknownN, offN int
+	checks := doctorChecksForEnv(env)
+	for _, c := range checks {
 		res := c.fn(ctx, env)
 		switch res.status {
 		case statusPass:
@@ -639,6 +1256,8 @@ func runDoctor(cmd *cobra.Command, env *doctorEnv, opts doctorOpts) error {
 			skipN++
 		case statusUnknown:
 			unknownN++
+		case statusFilesystemOff:
+			offN++
 		default:
 			failN++
 			res.detail = fmt.Sprintf("invalid status %q (detail: %s)", res.status, res.detail)
@@ -678,17 +1297,14 @@ func runDoctor(cmd *cobra.Command, env *doctorEnv, opts doctorOpts) error {
 			Fail:     failN,
 			Skip:     skipN,
 			Unknown:  unknownN,
-			Total:    len(allDoctorChecks()),
+			Off:      offN,
+			Total:    len(checks),
 			ExitCode: exitCode,
 		}}); err != nil {
 			return fmt.Errorf("encoding aggregate JSON: %w", err)
 		}
 	} else {
-		if unknownN > 0 {
-			_, _ = fmt.Fprintf(w, "Result: %d PASS / %d FAIL / %d SKIP / %d UNKNOWN — exit %d\n", passN, failN, skipN, unknownN, exitCode)
-		} else {
-			_, _ = fmt.Fprintf(w, "Result: %d PASS / %d FAIL / %d SKIP — exit %d\n", passN, failN, skipN, exitCode)
-		}
+		_, _ = fmt.Fprint(w, formatContainAggregate(passN, failN, skipN, unknownN, offN, exitCode))
 		printEvidencePaths(w)
 		if err := textWriter.Err(); err != nil {
 			return fmt.Errorf("writing doctor aggregate: %w", err)
@@ -718,6 +1334,8 @@ func writeDoctorLine(w io.Writer, c doctorCheck, res doctorResult) {
 		tag = "[SKIP]"
 	case statusUnknown:
 		tag = "[UNKNOWN]"
+	case statusFilesystemOff:
+		tag = "[OFF]"
 	}
 	line := fmt.Sprintf("  %s check %d: %s", tag, c.n, c.desc)
 	if res.detail != "" {

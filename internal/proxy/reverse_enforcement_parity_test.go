@@ -73,7 +73,7 @@ func TestReverseURLDLPBlockRecordsAdaptiveSignal(t *testing.T) {
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	sess := sm.GetOrCreate(sessionKeyFor("", clientHost, envelope.ActorAuthUnknown))
+	sess := sm.GetOrCreate(sessionKeyFor(nil, "", clientHost, envelope.ActorAuthUnknown))
 	scope := adaptiveScopeForHost(upstreamURL.Hostname())
 	// Identical retries of an already-enforced denial score ONCE. Repeating a
 	// blocked request is not new information about the client, and letting a
@@ -109,7 +109,9 @@ func TestReverseURLDLPAuditModeRecordsOneNearMiss(t *testing.T) {
 
 	rp, p, upstreamURL := newReverseParityHarness(t, cfg, nil)
 	const clientHost = "10.0.0.33"
-	apiKey := "AKIA" + "IOSFODNN7EXAMPLE"
+	// Non-core credential: audit mode blocks the core floor, so the near-miss
+	// path needs a finding outside it.
+	apiKey := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	rec := reverseParityRequest(t, rp, http.MethodGet, "http://reverse.example/x?token="+apiKey, clientHost+":9000", nil)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("audit-mode URL DLP status = %d, want 200: %s", rec.Code, rec.Body.String())
@@ -118,10 +120,10 @@ func TestReverseURLDLPAuditModeRecordsOneNearMiss(t *testing.T) {
 		t.Fatalf("audit-mode URL DLP body = %q, want upstream body %q", rec.Body.String(), "ok")
 	}
 
-	sess := p.SessionMgrPtr().Load().GetOrCreate(sessionKeyFor("", clientHost, envelope.ActorAuthUnknown))
+	sess := p.SessionMgrPtr().Load().GetOrCreate(sessionKeyFor(nil, "", clientHost, envelope.ActorAuthUnknown))
 	scope := adaptiveScopeForHost(upstreamURL.Hostname())
-	if score := sess.ScopedThreatScore(scope); score != session.SignalPoints[session.SignalNearMiss] {
-		t.Fatalf("audit-mode URL DLP score = %.4f, want one near-miss score %.4f", score, session.SignalPoints[session.SignalNearMiss])
+	if score := sess.ScopedThreatScore(scope); score != session.SignalPoints[session.SignalWarning] {
+		t.Fatalf("audit-mode URL DLP score = %.4f, want zero-point observation %.4f", score, session.SignalPoints[session.SignalWarning])
 	}
 }
 
@@ -175,7 +177,7 @@ func TestReverseHeaderDLPBlockRecordsAdaptiveSignal(t *testing.T) {
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	sess := sm.GetOrCreate(sessionKeyFor("", clientHost, envelope.ActorAuthUnknown))
+	sess := sm.GetOrCreate(sessionKeyFor(nil, "", clientHost, envelope.ActorAuthUnknown))
 	scope := adaptiveScopeForHost(upstreamURL.Hostname())
 	// Identical retries of an already-enforced denial score ONCE; see the URL
 	// case above for why a retry loop must not pump escalation.
@@ -267,7 +269,7 @@ func TestReverseDLPBlockAdaptiveSignalHonorsExemptDomain(t *testing.T) {
 			if sm == nil {
 				t.Fatal("session manager not initialized")
 			}
-			sess := sm.GetOrCreate(sessionKeyFor("", clientHost, envelope.ActorAuthUnknown))
+			sess := sm.GetOrCreate(sessionKeyFor(nil, "", clientHost, envelope.ActorAuthUnknown))
 			scope := adaptiveScopeForHost(upstreamURL.Hostname())
 			score := sess.ScopedThreatScore(scope)
 			if tc.exempt {
@@ -286,7 +288,7 @@ func TestReverseDLPBlockAdaptiveSignalHonorsExemptDomain(t *testing.T) {
 	}
 }
 
-func TestReverseDLPWarnRecordsAdaptiveNearMiss(t *testing.T) {
+func TestReverseDLPWarnRecordsAdaptiveObservation(t *testing.T) {
 	cases := []struct {
 		name   string
 		header bool
@@ -349,7 +351,7 @@ func TestReverseDLPWarnRecordsAdaptiveNearMiss(t *testing.T) {
 				t.Fatalf("warn-mode DLP body = %q, want upstream body %q", rr.Body.String(), "ok")
 			}
 
-			sess := p.SessionMgrPtr().Load().GetOrCreate(sessionKeyFor("", clientHost, envelope.ActorAuthUnknown))
+			sess := p.SessionMgrPtr().Load().GetOrCreate(sessionKeyFor(nil, "", clientHost, envelope.ActorAuthUnknown))
 			score := sess.ScopedThreatScore(adaptiveScopeForHost(upstreamURL.Hostname()))
 			if tc.exempt {
 				if got := sess.BaselineMetrics().Requests; got != 1 {
@@ -358,8 +360,8 @@ func TestReverseDLPWarnRecordsAdaptiveNearMiss(t *testing.T) {
 				if score != 0 {
 					t.Fatalf("adaptive-exempt warn finding score = %.4f, want 0", score)
 				}
-			} else if want := session.SignalPoints[session.SignalNearMiss]; score != want {
-				t.Fatalf("warn finding score = %.4f, want near-miss score %.4f", score, want)
+			} else if want := session.SignalPoints[session.SignalWarning]; score != want {
+				t.Fatalf("warn finding score = %.4f, want observation score %.4f", score, want)
 			}
 		})
 	}
@@ -581,7 +583,7 @@ func TestReverseTaintAskRefusedWithoutApproverBlocks(t *testing.T) {
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	rec := sm.GetOrCreate(responseTaintSessionKey(resolved.Name, clientHost, resolved.Auth))
+	rec := sm.GetOrCreate(responseTaintSessionKey(nil, resolved.Name, clientHost, resolved.Auth))
 	// Seed UNTRUSTED (not hostile) external taint: an external read with no
 	// injection (promptHit=false), so a later write ASKs rather than BLOCKS.
 	observeHTTPResponseTaint(rec, cfg, "https://news.vendor.example/article/42", "text/html", "reverse_response", false)
@@ -658,7 +660,7 @@ func TestReverseCEEBlockAllDeniesGloballyEscalatedSession(t *testing.T) {
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	sess := sm.GetOrCreate(ceeSessionKey(resolved.Name, clientHost, resolved.Auth))
+	sess := sm.GetOrCreate(ceeSessionKey(nil, resolved.Name, clientHost, resolved.Auth))
 
 	// Escalate the GLOBAL lane to block_all via a scope OTHER than the reverse
 	// upstream's, using the production scoped-signal API. RecordScopedSignal

@@ -34,6 +34,8 @@ type ExemptionInventory struct {
 	InertCount       int
 	MisdirectedCount int
 	TrackingNote     string
+	// Diagnostics contain fixed configuration guidance, with no raw values.
+	Diagnostics []config.Warning
 	// RawRedacted is true when this view was rendered without raw access, so
 	// the sensitive configured values (destinations, IPs, addresses, paths,
 	// rules, reasons) have been stripped and the template shows a "raw access
@@ -159,6 +161,7 @@ func (m *ReadModel) Exemptions() ExemptionInventory {
 		Entries:         entries,
 		ConfiguredCount: len(entries),
 		TrackingNote:    trackingNote,
+		Diagnostics:     m.cfg.MCPTaintDiagnostics(),
 	}
 	for _, entry := range entries {
 		switch entry.State {
@@ -229,6 +232,11 @@ func enumerateExemptionEntries(cfg *config.Config) []ExemptionEntry {
 	addDomainList("TLS interception", diag.ConfigScopeTLSPassthroughDomains, cfg.TLSInterception.PassthroughDomains)
 	addDomainList("SSRF", "trusted_domains", cfg.TrustedDomains)
 	addDomainList("SSRF", "ssrf.ip_allowlist", cfg.SSRF.IPAllowlist)
+	for _, grant := range cfg.DestinationGrants {
+		scope := fmt.Sprintf("%s://%s:%d", grant.Protocol, grant.Host, grant.Port)
+		entries = append(entries, newExemptionEntry("SSRF", "destination_grants", scope, scope,
+			attr("protocol", grant.Protocol), attr("host", grant.Host), attr("port", fmt.Sprint(grant.Port))))
+	}
 	for _, cidr := range cfg.KillSwitch.AllowlistIPs {
 		entries = append(entries, newExemptionEntry("Kill switch", "kill_switch.allowlist_ips", cidr, cidr))
 	}

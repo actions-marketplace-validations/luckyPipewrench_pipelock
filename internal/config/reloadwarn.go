@@ -6,6 +6,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -14,8 +15,29 @@ import (
 
 // ReloadWarning describes a potential security downgrade from a config reload.
 type ReloadWarning struct {
-	Field   string
-	Message string
+	Field       string
+	Message     string
+	Disposition ReloadWarningDisposition
+}
+
+// ReloadWarningDisposition describes whether a reload warning can be accepted
+// by a required security contract. Its zero value is deliberately rejectable:
+// a new or unclassified warning must not weaken a required contract.
+type ReloadWarningDisposition string
+
+const (
+	// ReloadWarningDispositionAdvisory marks a warning that does not weaken a
+	// required security contract, including restart-only notices and changes
+	// that restore coverage.
+	ReloadWarningDispositionAdvisory ReloadWarningDisposition = "advisory"
+)
+
+func advisoryReloadWarning(field, message string) ReloadWarning {
+	return ReloadWarning{
+		Field:       field,
+		Message:     message,
+		Disposition: ReloadWarningDispositionAdvisory,
+	}
 }
 
 func defaultMCPResponseTrust(trust string, existed bool) string {
@@ -29,6 +51,9 @@ func defaultMCPResponseTrust(trust string, existed bool) string {
 // potential security downgrades. Warnings don't block the reload.
 func ValidateReload(old, updated *Config) []ReloadWarning {
 	var warnings []ReloadWarning
+	if (old.PromptInjectionMode() == ActionBlock && updated.PromptInjectionMode() != ActionBlock) || (old.PromptInjectionMode() == ActionWarn && updated.PromptInjectionMode() == ActionAllow) {
+		warnings = append(warnings, ReloadWarning{Field: "prompt_injection_detection", Message: updated.PromptInjectionNotice()})
+	}
 
 	// Mode downgrade: strict → balanced → audit
 	modeRank := map[string]int{ModeStrict: 3, ModeBalanced: 2, ModeAudit: 1}
@@ -36,6 +61,22 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		warnings = append(warnings, ReloadWarning{
 			Field:   "mode",
 			Message: fmt.Sprintf("mode downgraded from %s to %s", old.Mode, updated.Mode),
+		})
+	}
+
+	// Declared credential-audience hosts widen where a core credential may
+	// go. Adding one is a weakening with the zero (rejectable) disposition,
+	// so strict mode and require_receipts refuse it; removing one narrows.
+	if added := exactStringsAdded(old.DLP.GitHubEnterpriseHosts, updated.DLP.GitHubEnterpriseHosts); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.github_enterprise_hosts",
+			Message: "GitHub enterprise credential audience widened: " + strings.Join(added, ", ") + " — GitHub tokens are now allowed to these hosts on an encrypted Authorization header",
+		})
+	}
+	if added := exactStringsAdded(old.DLP.GitLabHosts, updated.DLP.GitLabHosts); len(added) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "dlp.gitlab_hosts",
+			Message: "GitLab credential audience widened: " + strings.Join(added, ", ") + " — GitLab PAT and CI job tokens are now allowed to these hosts on their documented headers",
 		})
 	}
 
@@ -362,12 +403,8 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 			})
 		}
 	}
-	if old.A2AScanning.SessionSmugglingDetection && !updated.A2AScanning.SessionSmugglingDetection {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "a2a_scanning.session_smuggling_detection",
-			Message: "A2A session smuggling detection disabled",
-		})
-	}
+	// session_smuggling_detection is reserved and not enforced, so turning it
+	// off lowers no protection and raises no warning.
 	if old.A2AScanning.ScanRawParts && !updated.A2AScanning.ScanRawParts {
 		warnings = append(warnings, ReloadWarning{
 			Field:   "a2a_scanning.scan_raw_parts",
@@ -394,6 +431,20 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 				Message: fmt.Sprintf("passthrough domains added: %s — these CONNECT tunnels now bypass body scanning", strings.Join(added, ", ")),
 			})
 		}
+	}
+
+	// Blocklist entries removed. The exclusion lists below reduce coverage by
+	// GROWING; the blocklist reduces it by SHRINKING, so the comparison runs the
+	// other way: any entry present before and absent now is a destination that
+	// was denied and is reachable after this reload.
+	if removed := passthroughDomainsAdded(
+		updated.FetchProxy.Monitoring.Blocklist,
+		old.FetchProxy.Monitoring.Blocklist,
+	); len(removed) > 0 {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "fetch_proxy.monitoring.blocklist",
+			Message: fmt.Sprintf("blocklist entries removed: %s — these destinations are no longer denied", strings.Join(removed, ", ")),
+		})
 	}
 
 	// Subdomain entropy exclusions expanded (reduces detection coverage)
@@ -432,8 +483,9 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		updated.FetchProxy.Monitoring.PathEntropyExclusions,
 	); len(removed) > 0 {
 		warnings = append(warnings, ReloadWarning{
-			Field:   "fetch_proxy.monitoring.path_entropy_exclusions",
-			Message: fmt.Sprintf("path entropy exclusions removed: %s — path-entropy coverage restored on these routes", strings.Join(removed, ", ")),
+			Field:       "fetch_proxy.monitoring.path_entropy_exclusions",
+			Message:     fmt.Sprintf("path entropy exclusions removed: %s — path-entropy coverage restored on these routes", strings.Join(removed, ", ")),
+			Disposition: ReloadWarningDispositionAdvisory,
 		})
 	}
 	if added := queryEntropyParamExclusionsAdded(
@@ -450,10 +502,13 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		updated.FetchProxy.Monitoring.QueryEntropyParamExclusions,
 	); len(removed) > 0 {
 		warnings = append(warnings, ReloadWarning{
-			Field:   "fetch_proxy.monitoring.query_entropy_param_exclusions",
-			Message: fmt.Sprintf("query entropy parameter exclusions removed: %s — matching requests will again be subject to query-value entropy blocks", strings.Join(removed, ", ")),
+			Field:       "fetch_proxy.monitoring.query_entropy_param_exclusions",
+			Message:     fmt.Sprintf("query entropy parameter exclusions removed: %s — matching requests will again be subject to query-value entropy blocks", strings.Join(removed, ", ")),
+			Disposition: ReloadWarningDispositionAdvisory,
 		})
 	}
+
+	appendOAuthAuthorizationReloadWarnings(&warnings, old, updated)
 
 	if old.FetchProxy.Monitoring.ScanNestedURLsEnabled() && !updated.FetchProxy.Monitoring.ScanNestedURLsEnabled() {
 		warnings = append(warnings, ReloadWarning{
@@ -462,6 +517,13 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		})
 	}
 
+	// Exact grants widen destination admission and private-address access.
+	if destinationGrantsAdded(old.DestinationGrants, updated.DestinationGrants) {
+		warnings = append(warnings, ReloadWarning{
+			Field:   "destination_grants",
+			Message: "exact destination grants added: strict admission and ordinary private-IP checks are bypassed for these destinations",
+		})
+	}
 	// Trusted domains expanded (SSRF protection scope reduced)
 	if added := passthroughDomainsAdded(old.TrustedDomains, updated.TrustedDomains); len(added) > 0 {
 		warnings = append(warnings, ReloadWarning{
@@ -523,7 +585,7 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 			})
 		}
 	}
-	if added := passthroughDomainsAdded(old.RequestBodyScanning.ContentEntropyExclusions, updated.RequestBodyScanning.ContentEntropyExclusions); len(added) > 0 {
+	if added := entropyHostExclusionsAdded(old.RequestBodyScanning.ContentEntropyExclusions, updated.RequestBodyScanning.ContentEntropyExclusions); len(added) > 0 {
 		warnings = append(warnings, ReloadWarning{
 			Field:   "request_body_scanning.content_entropy_exclusions",
 			Message: fmt.Sprintf("request body content entropy exclusions added: %s — per-message body/frame entropy bypassed for these hosts", strings.Join(added, ", ")),
@@ -541,7 +603,7 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 			Message: fmt.Sprintf("request body SigV4 credential routes added or materially changed: %s — matching bodies may carry a structurally valid presigned URL", strings.Join(added, ", ")),
 		})
 	}
-	if added := passthroughDomainsAdded(old.WebSocketProxy.ContentEntropyExclusions, updated.WebSocketProxy.ContentEntropyExclusions); len(added) > 0 {
+	if added := entropyHostExclusionsAdded(old.WebSocketProxy.ContentEntropyExclusions, updated.WebSocketProxy.ContentEntropyExclusions); len(added) > 0 {
 		warnings = append(warnings, ReloadWarning{
 			Field:   "websocket_proxy.content_entropy_exclusions",
 			Message: fmt.Sprintf("WebSocket content entropy exclusions added: %s — per-message WebSocket entropy bypassed for these hosts", strings.Join(added, ", ")),
@@ -646,36 +708,36 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 
 	// Kill switch API listen address changed (requires restart)
 	if old.KillSwitch.APIListen != updated.KillSwitch.APIListen {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "kill_switch.api_listen",
-			Message: "api_listen cannot change at runtime (requires restart) — ignoring",
-		})
+		warnings = append(warnings, advisoryReloadWarning(
+			"kill_switch.api_listen",
+			"api_listen cannot change at runtime (requires restart) — ignoring",
+		))
 	}
 
 	// Metrics listen address changed (requires restart)
 	if old.MetricsListen != updated.MetricsListen {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "metrics_listen",
-			Message: "metrics_listen cannot change at runtime (requires restart) — ignoring",
-		})
+		warnings = append(warnings, advisoryReloadWarning(
+			"metrics_listen",
+			"metrics_listen cannot change at runtime (requires restart) — ignoring",
+		))
 	}
 
 	// Health watchdog settings are startup-only: the goroutine interval and
 	// enabled/disabled wiring are established when the proxy is constructed.
 	if old.HealthWatchdog.Enabled != updated.HealthWatchdog.Enabled ||
 		old.HealthWatchdog.IntervalSeconds != updated.HealthWatchdog.IntervalSeconds {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "health_watchdog",
-			Message: "health_watchdog config changes require restart — ignored on reload",
-		})
+		warnings = append(warnings, advisoryReloadWarning(
+			"health_watchdog",
+			"health_watchdog config changes require restart — ignored on reload",
+		))
 	}
 	if !boolPtrEqual(old.DashboardSnapshot.Enabled, updated.DashboardSnapshot.Enabled) ||
 		old.DashboardSnapshot.Path != updated.DashboardSnapshot.Path ||
 		old.DashboardSnapshot.Interval != updated.DashboardSnapshot.Interval {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "dashboard_snapshot",
-			Message: "dashboard_snapshot config changes require restart — ignored on reload",
-		})
+		warnings = append(warnings, advisoryReloadWarning(
+			"dashboard_snapshot",
+			"dashboard_snapshot config changes require restart — ignored on reload",
+		))
 	}
 
 	// Secrets file changed or removed (security-relevant)
@@ -696,57 +758,42 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 
 	// Sentry DSN changed (requires restart - scrubber is built once at init)
 	if old.Sentry.DSN != updated.Sentry.DSN {
-		warnings = append(warnings, ReloadWarning{Field: "sentry.dsn", Message: "Sentry DSN changes require restart"})
+		warnings = append(warnings, advisoryReloadWarning("sentry.dsn", "Sentry DSN changes require restart"))
 	}
 
 	// Sentry scrubber uses DLP patterns, env secrets, and file secrets from
 	// init time. Warn on ANY change that would affect scrubbing coverage.
 	if dlpPatternsChanged(old.DLP.Patterns, updated.DLP.Patterns) {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "sentry",
-			Message: "DLP patterns changed; Sentry scrubber uses init-time patterns until restart",
-		})
+		warnings = append(warnings, advisoryReloadWarning("sentry", "DLP patterns changed; Sentry scrubber uses init-time patterns until restart"))
 	}
 	if old.DLP.ScanEnv != updated.DLP.ScanEnv {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "sentry",
-			Message: "dlp.scan_env changed; Sentry scrubber uses init-time env secrets until restart",
-		})
+		warnings = append(warnings, advisoryReloadWarning("sentry", "dlp.scan_env changed; Sentry scrubber uses init-time env secrets until restart"))
 	}
 	if old.DLP.SecretsFile != updated.DLP.SecretsFile {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "sentry",
-			Message: "dlp.secrets_file changed; Sentry scrubber uses init-time file secrets until restart",
-		})
+		warnings = append(warnings, advisoryReloadWarning("sentry", "dlp.secrets_file changed; Sentry scrubber uses init-time file secrets until restart"))
 	}
 
 	// File sentry config is startup-only (watches are armed once at init).
 	// ALL fields are reload-immutable, not just enabled/best_effort.
 	if fileSentryChanged(old, updated) {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "file_sentry",
-			Message: "file_sentry config changes require restart — ignored on reload",
-		})
+		warnings = append(warnings, advisoryReloadWarning("file_sentry", "file_sentry config changes require restart — ignored on reload"))
 	}
 
 	// The learn-lock block constructs one coupled runtime: its trust root,
 	// roster, active-store watcher, environment binding, signature threshold,
 	// and enforcement mode must all agree. Server reload preserves this block
-	// from the running configuration rather than rebuilding that runtime.
+	// from the running configuration, so a changed setting is ignored. The
+	// proxy still rebuilds the contract loader from the preserved settings on
+	// reload and moves the active-manifest watcher onto it; a promoted
+	// manifest itself applies live through that watcher and needs no reload.
 	if old.LearnLock != updated.LearnLock {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "learn_lock",
-			Message: "learn_lock config changes require restart — ignored on reload",
-		})
+		warnings = append(warnings, advisoryReloadWarning("learn_lock", "learn_lock config changes require restart — ignored on reload"))
 	}
 
 	// Sandbox config is startup-only. Warn if any sandbox fields changed
 	// so operators know the reload had no effect on the running sandbox.
 	if sandboxChanged(old, updated) {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "sandbox",
-			Message: "sandbox config changes require restart — ignored on reload",
-		})
+		warnings = append(warnings, advisoryReloadWarning("sandbox", "sandbox config changes require restart — ignored on reload"))
 	}
 
 	// reverse_proxy.profile is startup-only: the listener binds once and the
@@ -757,10 +804,7 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 	// operator restarts rather than trusting a no-op reload. The listen/
 	// upstream addresses are already restart-only for the same reason.
 	if old.ReverseProxy.Profile != updated.ReverseProxy.Profile {
-		warnings = append(warnings, ReloadWarning{
-			Field:   "reverse_proxy",
-			Message: "reverse_proxy.profile change requires restart — dial path and listener are fixed at startup, reload ignored",
-		})
+		warnings = append(warnings, advisoryReloadWarning("reverse_proxy", "reverse_proxy.profile change requires restart — dial path and listener are fixed at startup, reload ignored"))
 	}
 
 	// Media policy downgrades. Each toggle that weakens protection gets a
@@ -869,11 +913,11 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 	// start emitting signatures no verifier can check. Warn on change.
 	if old.MediationEnvelope.Sign && updated.MediationEnvelope.Sign &&
 		old.MediationEnvelope.KeyID != updated.MediationEnvelope.KeyID {
-		warnings = append(warnings, ReloadWarning{
-			Field: "mediation_envelope.key_id",
-			Message: fmt.Sprintf("mediation envelope signing key_id changed from %q to %q — verifiers must have the new public key published",
+		warnings = append(warnings, advisoryReloadWarning(
+			"mediation_envelope.key_id",
+			fmt.Sprintf("mediation envelope signing key_id changed from %q to %q — verifiers must have the new public key published",
 				old.MediationEnvelope.KeyID, updated.MediationEnvelope.KeyID),
-		})
+		))
 	}
 	if old.MediationEnvelope.Sign && updated.MediationEnvelope.Sign {
 		updatedComponents := make(map[string]struct{}, len(updated.MediationEnvelope.SignedComponents))
@@ -924,6 +968,8 @@ func ValidateReload(old, updated *Config) []ReloadWarning {
 		})
 	}
 
+	appendMCPIdentityReloadWarnings(&warnings, old.MCPIdentities, updated.MCPIdentities)
+
 	return warnings
 }
 
@@ -943,18 +989,26 @@ func contentEntropyReloadConsumed(c *Config) bool {
 // reason on reload does not read as a policy downgrade, which matches how the
 // canonical policy hash treats the same fields.
 func pathEntropyExclusionTuple(entry PathEntropyExclusion) string {
+	return pathEntropyExclusionIdentity(entry) + scannerExceptionExpiryIdentity(entry.Expires)
+}
+
+func pathEntropyExclusionIdentity(entry PathEntropyExclusion) string {
 	return entry.Scheme + "://" + entry.Host + entry.PathPrefix
 }
 
+func scannerExceptionExpiryWidened(previous, updated string) bool {
+	return previous != "" && (updated == "" || updated > previous)
+}
+
 func pathEntropyExclusionsAdded(old, updated []PathEntropyExclusion) []string {
-	oldSet := make(map[string]struct{}, len(old))
+	oldSet := make(map[string]string, len(old))
 	for _, entry := range canonicalPathEntropyExclusions(old) {
-		oldSet[pathEntropyExclusionTuple(entry)] = struct{}{}
+		oldSet[pathEntropyExclusionIdentity(entry)] = entry.Expires
 	}
 	var added []string
 	for _, entry := range canonicalPathEntropyExclusions(updated) {
 		tuple := pathEntropyExclusionTuple(entry)
-		if _, ok := oldSet[tuple]; !ok {
+		if previous, ok := oldSet[pathEntropyExclusionIdentity(entry)]; !ok || scannerExceptionExpiryWidened(previous, entry.Expires) {
 			added = append(added, tuple)
 		}
 	}
@@ -965,12 +1019,12 @@ func pathEntropyExclusionsAdded(old, updated []PathEntropyExclusion) []string {
 func pathEntropyExclusionsRemoved(old, updated []PathEntropyExclusion) []string {
 	newSet := make(map[string]struct{}, len(updated))
 	for _, entry := range canonicalPathEntropyExclusions(updated) {
-		newSet[pathEntropyExclusionTuple(entry)] = struct{}{}
+		newSet[pathEntropyExclusionIdentity(entry)] = struct{}{}
 	}
 	var removed []string
 	for _, entry := range canonicalPathEntropyExclusions(old) {
 		tuple := pathEntropyExclusionTuple(entry)
-		if _, ok := newSet[tuple]; !ok {
+		if _, ok := newSet[pathEntropyExclusionIdentity(entry)]; !ok {
 			removed = append(removed, tuple)
 		}
 	}
@@ -979,14 +1033,14 @@ func pathEntropyExclusionsRemoved(old, updated []PathEntropyExclusion) []string 
 }
 
 func queryEntropyParamExclusionsAdded(old, updated []QueryEntropyParamExclusion) []string {
-	oldSet := make(map[string]struct{}, len(old))
+	oldSet := make(map[string]string, len(old))
 	for _, entry := range canonicalQueryEntropyParamExclusions(old) {
-		oldSet[queryEntropyParamTuple(entry)] = struct{}{}
+		oldSet[queryEntropyParamIdentity(entry)] = entry.Expires
 	}
 	var added []string
 	for _, entry := range canonicalQueryEntropyParamExclusions(updated) {
 		tuple := queryEntropyParamTuple(entry)
-		if _, ok := oldSet[tuple]; !ok {
+		if previous, ok := oldSet[queryEntropyParamIdentity(entry)]; !ok || scannerExceptionExpiryWidened(previous, entry.Expires) {
 			added = append(added, tuple)
 		}
 	}
@@ -997,12 +1051,12 @@ func queryEntropyParamExclusionsAdded(old, updated []QueryEntropyParamExclusion)
 func queryEntropyParamExclusionsRemoved(old, updated []QueryEntropyParamExclusion) []string {
 	updatedSet := make(map[string]struct{}, len(updated))
 	for _, entry := range canonicalQueryEntropyParamExclusions(updated) {
-		updatedSet[queryEntropyParamTuple(entry)] = struct{}{}
+		updatedSet[queryEntropyParamIdentity(entry)] = struct{}{}
 	}
 	var removed []string
 	for _, entry := range canonicalQueryEntropyParamExclusions(old) {
 		tuple := queryEntropyParamTuple(entry)
-		if _, ok := updatedSet[tuple]; !ok {
+		if _, ok := updatedSet[queryEntropyParamIdentity(entry)]; !ok {
 			removed = append(removed, tuple)
 		}
 	}
@@ -1011,6 +1065,10 @@ func queryEntropyParamExclusionsRemoved(old, updated []QueryEntropyParamExclusio
 }
 
 func queryEntropyParamTuple(entry QueryEntropyParamExclusion) string {
+	return queryEntropyParamIdentity(entry) + scannerExceptionExpiryIdentity(entry.Expires)
+}
+
+func queryEntropyParamIdentity(entry QueryEntropyParamExclusion) string {
 	scheme := entry.Scheme
 	if scheme == "" {
 		scheme = QueryEntropyParamDefaultScheme
@@ -1046,9 +1104,11 @@ func appendActionDowngradeWarnings(warnings *[]ReloadWarning, old, updated *Conf
 				Message: "admission downgraded from withhold to admit",
 			})
 		}
+		appendMCPAckReloadWarnings(warnings, old.MCPToolScanning.AcknowledgedFindings, updated.MCPToolScanning.AcknowledgedFindings)
 	}
 	if old.MCPToolPolicy.Enabled && updated.MCPToolPolicy.Enabled {
 		appendActionDowngradeWarning(warnings, "mcp_tool_policy.action", old.MCPToolPolicy.Action, updated.MCPToolPolicy.Action)
+		appendActionDowngradeWarning(warnings, "mcp_tool_policy.on_incomplete_check", incompleteCheckAction(old.MCPToolPolicy), incompleteCheckAction(updated.MCPToolPolicy))
 		appendToolPolicyRuleActionDowngrades(warnings, old.MCPToolPolicy, updated.MCPToolPolicy)
 	}
 	if old.MCPBinaryIntegrity.Enabled && updated.MCPBinaryIntegrity.Enabled {
@@ -1078,6 +1138,14 @@ func appendActionDowngradeWarnings(warnings *[]ReloadWarning, old, updated *Conf
 		appendActionDowngradeWarning(warnings, "tool_chain_detection.action", old.ToolChainDetection.Action, updated.ToolChainDetection.Action)
 		appendToolChainActionDowngrades(warnings, old.ToolChainDetection, updated.ToolChainDetection)
 	}
+}
+
+// incompleteCheckAction resolves an omitted on_incomplete_check to warn.
+func incompleteCheckAction(p MCPToolPolicy) string {
+	if p.OnIncompleteCheck == "" {
+		return ActionWarn
+	}
+	return p.OnIncompleteCheck
 }
 
 func appendActionDowngradeWarning(warnings *[]ReloadWarning, field, oldAction, newAction string) {
@@ -1426,6 +1494,41 @@ func passthroughDomainsAdded(old, updated []string) []string {
 	return added
 }
 
+// entropyHostExclusionsAdded is passthroughDomainsAdded for entries that may
+// carry an expiry. An entry is new when its host, expiry or metadata is not in
+// the old list, so swapping an expiring entry for a permanent one, or
+// extending an expiry, is reported. Adding an expiry to a permanent entry is not.
+// A plain entry reports as its bare host, as before.
+func entropyHostExclusionsAdded(old, updated []EntropyHostExclusion) []string {
+	identity := func(e EntropyHostExclusion) string {
+		return strings.ToLower(e.Host) + "\x00" + e.Expires + "\x00" + e.Owner + "\x00" + e.Reason
+	}
+	oldSet := make(map[string]struct{}, len(old))
+	oldPermanent := make(map[string]struct{}, len(old))
+	for _, e := range old {
+		oldSet[identity(e)] = struct{}{}
+		if !e.temporary() {
+			oldPermanent[strings.ToLower(e.Host)] = struct{}{}
+		}
+	}
+	var added []string
+	for _, e := range updated {
+		if _, exists := oldSet[identity(e)]; exists {
+			continue
+		}
+		// Giving an existing permanent exclusion an expiry narrows it.
+		if _, wasPermanent := oldPermanent[strings.ToLower(e.Host)]; wasPermanent && e.temporary() {
+			continue
+		}
+		if e.Expires != "" {
+			added = append(added, fmt.Sprintf("%s (expires %s)", e.Host, e.Expires))
+		} else {
+			added = append(added, e.Host)
+		}
+	}
+	return added
+}
+
 func entropyWarnRoutesAdded(old, updated []RequestBodyEntropyWarnRoute) []string {
 	oldSet := make(map[string]struct{}, len(old))
 	for _, entry := range old {
@@ -1443,8 +1546,8 @@ func entropyWarnRoutesAdded(old, updated []RequestBodyEntropyWarnRoute) []string
 }
 
 func entropyWarnRouteIdentity(entry RequestBodyEntropyWarnRoute) string {
-	return fmt.Sprintf("host=%q path=%q methods=%q content_types=%q owner=%q reason=%q expires=%q",
-		strings.TrimSuffix(strings.ToLower(entry.Host), "."), entry.Path, entry.Methods, entry.ContentTypes, entry.Owner, entry.Reason, entry.Expires)
+	return fmt.Sprintf("host=%q path=%q path_prefix=%q methods=%q content_types=%q owner=%q reason=%q expires=%q",
+		strings.TrimSuffix(strings.ToLower(entry.Host), "."), entry.Path, entry.PathPrefix, entry.Methods, entry.ContentTypes, entry.Owner, entry.Reason, entry.Expires)
 }
 
 func sigV4CredentialRoutesAdded(old, updated []RequestBodySigV4CredentialRoute) []string {
@@ -1670,4 +1773,124 @@ func removedOrWeakenedResponsePatterns(old, updated []ResponseScanPattern) []str
 	return removedOrWeakenedPatterns(old, updated,
 		func(p ResponseScanPattern) string { return p.Name },
 		func(p ResponseScanPattern) string { return p.Regex })
+}
+
+// appendMCPIdentityReloadWarnings reports mcp_identities changes. A new or
+// edited registration changes which launches are named, pinned and bound, so it
+// warns like any other relaxation. A removed one only stops refusing launches
+// that claim its name, so it is advisory and says what then happens.
+func appendMCPIdentityReloadWarnings(warnings *[]ReloadWarning, old, updated []MCPIdentity) {
+	const field = "mcp_identities"
+	updatedNames := make(map[string]bool, len(updated))
+	for _, e := range updated {
+		updatedNames[e.Name] = true
+		prior, _, existed := FindMCPIdentity(old, e.Name)
+		if !existed {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   field,
+				Message: fmt.Sprintf("mcp identity %q added: launches matching its matcher are now named and pinned by it", e.Name),
+			})
+			continue
+		}
+		for _, change := range mcpIdentityChanges(prior, e) {
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   field,
+				Message: fmt.Sprintf("mcp identity %q %s", e.Name, change),
+			})
+		}
+	}
+	for _, e := range old {
+		if !updatedNames[e.Name] {
+			*warnings = append(*warnings, advisoryReloadWarning(field,
+				fmt.Sprintf("mcp identity %q removed: launches claiming the name are no longer refused as impersonation, and acknowledgments with server_binding_mode verified-local-session for it are refused at load", e.Name)))
+		}
+	}
+}
+
+// mcpIdentityChanges names each class of change between two registrations of
+// the same identity. It compares canonical forms, so reordering mapped files
+// or environment keys is not a change.
+func mcpIdentityChanges(prior, next MCPIdentity) []string {
+	a, b := canonicalMCPIdentities([]MCPIdentity{prior})[0], canonicalMCPIdentities([]MCPIdentity{next})[0]
+	if reflect.DeepEqual(a, b) {
+		return nil
+	}
+	av, bv := a.VerifiedLocalService, b.VerifiedLocalService
+	if av == nil || bv == nil {
+		return []string{"matcher changed: the registration kind differs"}
+	}
+	var out []string
+	if av.Scheme != bv.Scheme || av.Host != bv.Host || av.Path != bv.Path {
+		out = append(out, "matcher changed: the upstream scheme, host or path it matches differs")
+	}
+	if av.ExecutableSHA256 != bv.ExecutableSHA256 {
+		out = append(out, "pin changed: executable_sha256 differs")
+	}
+	if !reflect.DeepEqual(av.MappedFiles, bv.MappedFiles) {
+		out = append(out, "pin changed: mapped_files differ")
+	}
+	if !reflect.DeepEqual(av.ControlEnvironment, bv.ControlEnvironment) {
+		out = append(out, "pin changed: control_environment differs")
+	}
+	if !reflect.DeepEqual(av.PrincipalUID, bv.PrincipalUID) {
+		out = append(out, "pin changed: principal_uid differs")
+	}
+	if !reflect.DeepEqual(av.SessionHeader, bv.SessionHeader) {
+		switch {
+		case av.SessionHeader == nil:
+			out = append(out, "session header scope added: one header is no longer bound by acknowledgments")
+		case bv.SessionHeader == nil:
+			out = append(out, "session header scope removed: every header is bound by acknowledgments again")
+		default:
+			out = append(out, "session header scope changed: a different header is excluded from acknowledgment binding")
+		}
+	}
+	return out
+}
+
+func mcpAckReloadKey(e MCPAcknowledgedFinding) string {
+	return fmt.Sprintf("server %q tool %q", e.Server, e.Tool)
+}
+
+// appendMCPAckReloadWarnings reports acknowledgment changes. A new or edited
+// entry lifts a finding, so it warns like any other relaxation. A removed
+// entry only makes the tool's finding follow mcp_tool_scanning.action again,
+// which may be warn rather than block, so it is advisory and says exactly that.
+func appendMCPAckReloadWarnings(warnings *[]ReloadWarning, old, updated []MCPAcknowledgedFinding) {
+	oldByKey := make(map[string]MCPAcknowledgedFinding, len(old))
+	for _, e := range old {
+		oldByKey[mcpAckReloadKey(e)] = e
+	}
+	updatedKeys := make(map[string]bool, len(updated))
+	for _, e := range updated {
+		key := mcpAckReloadKey(e)
+		updatedKeys[key] = true
+		prior, existed := oldByKey[key]
+		switch {
+		case !existed:
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   "mcp_tool_scanning.acknowledged_findings",
+				Message: "acknowledgment added for " + key + ": its Credential Request Directive finding is lifted while every occurrence still matches",
+			})
+		case !reflect.DeepEqual(prior, e):
+			*warnings = append(*warnings, ReloadWarning{
+				Field:   "mcp_tool_scanning.acknowledged_findings",
+				Message: "acknowledgment changed for " + key + ": the new entry applies only if it matches the tool exactly; otherwise the tools/list is refused",
+			})
+		}
+	}
+	for _, e := range old {
+		if key := mcpAckReloadKey(e); !updatedKeys[key] {
+			*warnings = append(*warnings, advisoryReloadWarning("mcp_tool_scanning.acknowledged_findings",
+				"acknowledgment removed for "+key+": its Credential Request Directive finding follows mcp_tool_scanning.action again"))
+		}
+	}
+}
+
+// Expiry changes the duration of effective enforcement. Metadata does not.
+func scannerExceptionExpiryIdentity(expires string) string {
+	if expires == "" {
+		return ""
+	}
+	return " expires=" + expires
 }

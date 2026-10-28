@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,12 +18,25 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 type initChildResult struct {
 	stderr    string
 	exitCode  int
 	waitState syscall.WaitStatus
+}
+
+func initBridgeSocketFixture(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(shortTempDir(t), "proxy.sock")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return path
 }
 
 func runInitChildFailureCase(t *testing.T, binary string, env []string) initChildResult {
@@ -41,7 +55,7 @@ func runNamespacedInitChildFailureCase(t *testing.T, binary string, env []string
 func runInitChildFailureCaseWithNamespaces(t *testing.T, binary string, env []string, namespaced bool) initChildResult {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(10*time.Second))
 	defer cancel()
 
 	var stderr bytes.Buffer
@@ -122,7 +136,7 @@ func requireInitFailure(t *testing.T, result initChildResult, wantStderr string)
 func TestIntegration_InitChildrenRejectUnsafeResolvedPolicies(t *testing.T) {
 	binary := buildTestBinaryWithoutSandboxProbe(t)
 	workspace := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "proxy.sock")
+	socketPath := initBridgeSocketFixture(t)
 	missingPath := filepath.Join(t.TempDir(), "missing")
 
 	protectedHome := t.TempDir()
@@ -192,7 +206,7 @@ func TestIntegration_InitChildrenRejectUnsafeResolvedPolicies(t *testing.T) {
 func TestIntegration_InitChildrenFailClosedOnEnvironmentAndNetworkStartup(t *testing.T) {
 	binary := buildTestBinaryWithoutSandboxProbe(t)
 	workspace := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "proxy.sock")
+	socketPath := initBridgeSocketFixture(t)
 
 	t.Run("dangerous extra environment", func(t *testing.T) {
 		for _, mode := range []struct {
@@ -255,7 +269,7 @@ func TestIntegration_InitChildrenFailClosedOnEnvironmentAndNetworkStartup(t *tes
 func TestIntegration_InitChildrenPropagateCommandFailures(t *testing.T) {
 	binary := buildTestBinaryWithoutSandboxProbe(t)
 	workspace := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "proxy.sock")
+	socketPath := initBridgeSocketFixture(t)
 
 	t.Run("mcp rejects inaccessible working directory", func(t *testing.T) {
 		restrictedWorkspace := t.TempDir()
@@ -393,7 +407,7 @@ func TestIntegration_InitChildrenPropagateCommandFailures(t *testing.T) {
 func TestIntegration_MCPInitBridgePropagatesSignals(t *testing.T) {
 	binary := buildTestBinaryWithoutSandboxProbe(t)
 	workspace := t.TempDir()
-	socketPath := filepath.Join(t.TempDir(), "proxy.sock")
+	socketPath := initBridgeSocketFixture(t)
 
 	probe := runNamespacedInitChildFailureCase(t, binary, []string{
 		initEnvKey + "=1",
@@ -494,10 +508,10 @@ func TestIntegration_MCPInitBridgePropagatesSignals(t *testing.T) {
 				data, _ := os.ReadFile(stderrFile.Name())
 				t.Fatalf("wrapper exit = %v, want code 42\nstderr: %s", err, data)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Deadline(5 * time.Second)):
 			_ = cmd.Process.Kill()
-			<-waitDone
-			t.Fatal("sandbox init child did not exit after SIGTERM")
+			err := <-waitDone
+			t.Fatalf("sandbox init child did not exit after SIGTERM; wait error: %v", err)
 		}
 	})
 }

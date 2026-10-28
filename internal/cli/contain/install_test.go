@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/serviceenv"
 )
 
 type fakeFileInfo struct {
@@ -37,7 +38,7 @@ func (f fakeFileInfo) Sys() any           { return f.sys }
 
 func TestDefaultInstallEnvWiresContainmentDefaults(t *testing.T) {
 	env := defaultInstallEnv(io.Discard)
-	if env.runCmd == nil || env.stat == nil || env.lstat == nil || env.writeFile == nil || env.lookupUser == nil {
+	if env.runCmd == nil || env.checkServiceConfig == nil || env.stat == nil || env.lstat == nil || env.writeFile == nil || env.lookupUser == nil {
 		t.Fatal("default env has nil OS hooks")
 	}
 	if env.proxyUserName != defaultProxyUser || env.agentUserName != defaultAgentUser {
@@ -119,6 +120,12 @@ func (f *fakeRunner) run(_ context.Context, name string, args ...string) (string
 	if r, ok := f.responses[key]; ok {
 		return r.out, r.code, r.err
 	}
+	if key == "id -u "+viewerUserName {
+		return "900\n", 0, nil
+	}
+	if name == "getfacl" {
+		return "user::rwx\ngroup::r-x\nother::---\n", 0, nil
+	}
 	return "", 0, nil
 }
 
@@ -175,7 +182,9 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 	runner := newFakeRunner()
 	out := &bytes.Buffer{}
 	env := &installEnv{
-		runCmd: runner.run,
+		displayTmpfilesPath: filepath.Join(root, "etc", "tmpfiles.d", "pipelock-agent-display.conf"),
+		rfbSocketPath:       filepath.Join(root, "run", "pipelock-agent-display", "rfb.sock"),
+		runCmd:              runner.run,
 		dialCtx: func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
 			client, server := net.Pipe()
 			_ = server.Close()
@@ -187,6 +196,7 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 		readFile: func(p string) ([]byte, error) {
 			return os.ReadFile(filepath.Clean(p))
 		},
+		readDir:   os.ReadDir,
 		writeFile: writeFileAtomic,
 		removeFile: func(p string) error {
 			err := os.Remove(p)
@@ -199,8 +209,23 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 		// chown/lchown can't really run under non-root tests; no-op so the
 		// orchestration progresses. Tests that need to assert ownership calls
 		// can substitute their own hooks.
-		chown:   func(string, int, int) error { return nil },
-		lchown:  func(string, int, int) error { return nil },
+		chown:                func(string, int, int) error { return nil },
+		lchown:               func(string, int, int) error { return nil },
+		agentBrowserFchown:   func(*os.File, int, int) error { return nil },
+		agentBrowserDirOwner: func(*os.File, int) bool { return true },
+		// Unprivileged stand-in for the descriptor-based owner: keeps the
+		// symlink refusal and the mode change, drops only the chown, which
+		// needs root. The real one is exercised in browser_ca_test.go.
+		ownLeafNoFollow: func(path string, mode os.FileMode, _, _ int) error {
+			info, err := os.Lstat(path)
+			if err != nil {
+				return err
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("open %s without following symlinks: is a symlink", path)
+			}
+			return os.Chmod(path, mode)
+		},
 		rename:  os.Rename,
 		chmod:   os.Chmod,
 		symlink: os.Symlink,
@@ -224,42 +249,50 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 			h := sha256.Sum256(data)
 			return hex.EncodeToString(h[:]), nil
 		},
-		out:                  out,
-		errOut:               out,
-		operatorUser:         containInstallOperatorUser,
-		proxyUserName:        "pipelock-proxy",
-		agentUserName:        "pipelock-agent",
-		configDir:            filepath.Join(root, "etc", "pipelock"),
-		dataDir:              filepath.Join(root, "var", "lib", "pipelock"),
-		wrapperDir:           filepath.Join(root, "usr", "local", "bin"),
-		systemUnitPath:       filepath.Join(root, "etc", "systemd", "system", "pipelock.service"),
-		nftRulesPath:         filepath.Join(root, "etc", "nftables.d", "50-pipelock-containment.nft"),
-		nftMainPath:          filepath.Join(root, "etc", "sysconfig", "nftables.conf"),
-		nftPersistUnitPath:   filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-nft.service"),
-		nftExpiryServicePath: filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.service"),
-		nftExpiryTimerPath:   filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.timer"),
-		sudoersPath:          filepath.Join(root, "etc", "sudoers.d", "50-pipelock-agent"),
-		caBundlePath:         filepath.Join(root, "etc", "pipelock", "combined-ca.pem"),
-		systemCABundlePath:   filepath.Join(root, "etc", "ssl", "certs", "ca-certificates.crt"),
-		caExportPath:         filepath.Join(root, "etc", "pipelock", "ca.pem"),
-		integrityDir:         filepath.Join(root, "etc", "pipelock", "integrity"),
-		integrityPin:         filepath.Join(root, "etc", "pipelock", "integrity", "binary-pin.sha256"),
-		wrapperInvPath:       filepath.Join(root, "etc", "pipelock", "contain", "wrappers.json"),
-		toolsListPath:        filepath.Join(root, "etc", "pipelock", "contain", "tools.list"),
-		workspaceInvPath:     filepath.Join(root, "etc", "pipelock", "contain", "workspaces.json"),
-		evidenceACLInvPath:   filepath.Join(root, "etc", "pipelock", "contain", "evidence-acls.json"),
-		guardScriptPath:      filepath.Join(root, "usr", "local", "bin", "plk-cred-guard"),
-		guardServiceUnit:     filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.service"),
-		guardPathUnit:        filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.path"),
-		undiciShimPath:       filepath.Join(root, "etc", "pipelock", "contain", "undici-shim.cjs"),
-		profileScriptPath:    filepath.Join(root, "etc", "profile.d", "pipelock-contain.sh"),
-		agentHome:            filepath.Join(root, "home", "pipelock-agent"),
-		pipelockTarget:       filepath.Join(root, "usr", "local", "bin", "pipelock"),
-		bashPath:             "/bin/bash",
-		nologinPath:          "/usr/sbin/nologin",
-		nftPath:              testNFT,
-		curlPath:             "/usr/bin/curl",
-		proxyPort:            8888,
+		out:                           out,
+		errOut:                        out,
+		operatorUser:                  containInstallOperatorUser,
+		proxyUserName:                 "pipelock-proxy",
+		agentUserName:                 "pipelock-agent",
+		configDir:                     filepath.Join(root, "etc", "pipelock"),
+		dataDir:                       filepath.Join(root, "var", "lib", "pipelock"),
+		wrapperDir:                    filepath.Join(root, "usr", "local", "bin"),
+		systemUnitPath:                filepath.Join(root, "etc", "systemd", "system", "pipelock.service"),
+		nftRulesPath:                  filepath.Join(root, "etc", "nftables.d", "50-pipelock-containment.nft"),
+		nftMainPath:                   filepath.Join(root, "etc", "sysconfig", "nftables.conf"),
+		nftPersistUnitPath:            filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-nft.service"),
+		networkNamespaceUnitPath:      filepath.Join(root, "etc", "systemd", "system", containedNetworkNamespaceUnit),
+		proxyForwarderSocketPath:      filepath.Join(root, "etc", "systemd", "system", containedProxyForwarderUnit+".socket"),
+		proxyForwarderServicePath:     filepath.Join(root, "etc", "systemd", "system", containedProxyForwarderUnit+".service"),
+		namespaceForwarderServicePath: filepath.Join(root, "etc", "systemd", "system", containedNamespaceForwarderUnit),
+		ownedLoopbackAnchorUnitPath:   filepath.Join(root, "etc", "systemd", "system", "pipelock-contained-anchor.service"),
+		nftExpiryServicePath:          filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.service"),
+		nftExpiryTimerPath:            filepath.Join(root, "etc", "systemd", "system", "pipelock-containment-expiry.timer"),
+		sudoersPath:                   filepath.Join(root, "etc", "sudoers.d", "50-pipelock-agent"),
+		caBundlePath:                  filepath.Join(root, "etc", "pipelock", "combined-ca.pem"),
+		systemCABundlePath:            filepath.Join(root, "etc", "ssl", "certs", "ca-certificates.crt"),
+		caExportPath:                  filepath.Join(root, "etc", "pipelock", "ca.pem"),
+		integrityDir:                  filepath.Join(root, "etc", "pipelock", "integrity"),
+		integrityPin:                  filepath.Join(root, "etc", "pipelock", "integrity", "binary-pin.sha256"),
+		wrapperInvPath:                filepath.Join(root, "etc", "pipelock", "contain", "wrappers.json"),
+		toolsListPath:                 filepath.Join(root, "etc", "pipelock", "contain", "tools.list"),
+		workspaceInvPath:              filepath.Join(root, "etc", "pipelock", "contain", "workspaces.json"),
+		loopbackForwarderInvPath:      filepath.Join(root, "etc", "pipelock", "contain", "loopback-forwarders.json"),
+		evidenceACLInvPath:            filepath.Join(root, "etc", "pipelock", "contain", "evidence-acls.json"),
+		viewerAccountMarkerPath:       filepath.Join(root, "etc", "pipelock", "contain", "viewer-account.marker"),
+		guardScriptPath:               filepath.Join(root, "usr", "local", "bin", "plk-cred-guard"),
+		guardServiceUnit:              filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.service"),
+		guardPathUnit:                 filepath.Join(root, "etc", "systemd", "system", "pipelock-cred-guard.path"),
+		undiciShimPath:                filepath.Join(root, "etc", "pipelock", "contain", "undici-shim.cjs"),
+		profileScriptPath:             filepath.Join(root, "etc", "profile.d", "pipelock-contain.sh"),
+		agentHome:                     filepath.Join(root, "home", "pipelock-agent"),
+		displayAuthorityPath:          filepath.Join(root, "var", "lib", "pipelock-agent", "Xauthority"),
+		pipelockTarget:                filepath.Join(root, "usr", "local", "bin", "pipelock"),
+		bashPath:                      "/bin/bash",
+		nologinPath:                   "/usr/sbin/nologin",
+		nftPath:                       testNFT,
+		curlPath:                      "/usr/bin/curl",
+		proxyPort:                     8888,
 	}
 
 	// Plant the source binary the install will copy.
@@ -270,7 +303,6 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 		t.Fatalf("write fake src: %v", err)
 	}
 	env.pipelockBinary = filepath.Join(root, "src", "pipelock")
-
 	// Pre-create the wrapperDir so wrapper writes don't fail.
 	if err := os.MkdirAll(env.wrapperDir, 0o755); err != nil { //nolint:gosec // tmpdir
 		t.Fatalf("mkdir wrapperDir: %v", err)
@@ -301,7 +333,39 @@ func newFakeEnv(t *testing.T) (*installEnv, *fakeRunner, *bytes.Buffer) {
 	for _, unit := range []string{filepath.Base(env.nftExpiryTimerPath), filepath.Base(env.nftExpiryServicePath)} {
 		runner.on(argvFor(testSystemctl, "is-active", unit), "inactive\n", 3, nil)
 	}
+	runner.on(argvFor(testSudoCmd, "-n", "-u", env.proxyUserName, "--", env.pipelockTarget, "tls", "show-ca"), testPEMCA(t), 0, nil)
 
+	runner.on(argvFor(env.nftPath, "-n", "list", "chain", "inet", env.nftTableOrDefault(), legacyOwnedLoopbackInputChain),
+		"No such file or directory", 1, nil)
+
+	nss := &fakeNSS{db: filepath.Join(env.agentHome, nssDBRelLegacy()), entries: make(map[string]fakeNSSEntry)}
+	env.lookPath = func(string) (string, error) { return "/usr/bin/certutil", nil }
+	env.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+		if name == browserCACertutilName {
+			return nss.run(ctx, name, args...)
+		}
+		return runner.run(ctx, name, args...)
+	}
+
+	uid := uint32(os.Getuid()) // #nosec G115 -- Linux uid_t is uint32.
+	env.viewerACLUID = &uid
+	env.runViewerACL = func(ctx context.Context, file *os.File, name string, args ...string) (string, int, error) {
+		args = append([]string(nil), args...)
+		args[len(args)-1] = file.Name()
+		return runner.run(ctx, name, args...)
+	}
+	env.checkServiceConfig = func(ctx context.Context, opts serviceenv.CheckOptions) error {
+		// Isolate installer tests from the actual manager and child process.
+		// Resolver/identity/secret behavior is tested in serviceenv itself.
+		_, code, err := env.runCmd(ctx, opts.Binary, "check", "--config", opts.ConfigFile, "--require-build-compatibility")
+		if err != nil {
+			return errors.New("validator command failed")
+		}
+		if code != 0 {
+			return fmt.Errorf("pipelock check exited %d; validator output withheld", code)
+		}
+		return nil
+	}
 	return env, runner, out
 }
 
@@ -423,7 +487,7 @@ func TestRunInstall_SelfPathFallback(t *testing.T) {
 func TestRunInstall_DryRunSucceedsWithoutMutation(t *testing.T) {
 	env, runner, buf := newFakeEnv(t)
 	src := filepath.Join(t.TempDir(), "pipelock.yaml")
-	if err := os.WriteFile(src, []byte("mode: balanced\n"), 0o600); err != nil {
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 	err := runInstall(context.Background(), env, installOpts{dryRun: true, configSource: src})
@@ -483,7 +547,7 @@ func TestRunInstall_EndToEndWithExistingUsers(t *testing.T) {
 		t.Fatalf("write ca export: %v", err)
 	}
 	src := filepath.Join(t.TempDir(), "pipelock.yaml")
-	if err := os.WriteFile(src, []byte("mode: balanced\n"), 0o600); err != nil {
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -496,6 +560,7 @@ func TestRunInstall_EndToEndWithExistingUsers(t *testing.T) {
 		env.systemUnitPath,
 		env.nftRulesPath,
 		filepath.Join(env.wrapperDir, "plk-launch"),
+		filepath.Join(env.wrapperDir, "plk-contained-launch"),
 		filepath.Join(env.wrapperDir, "plk"),
 		filepath.Join(env.wrapperDir, "plk-claude"),
 		env.wrapperInvPath,
@@ -518,14 +583,17 @@ func TestRunInstall_UpgradeRotatesExistingBackups(t *testing.T) {
 	cfgDir := t.TempDir()
 	cfg1 := filepath.Join(cfgDir, "pipelock-1.yaml")
 	cfg2 := filepath.Join(cfgDir, "pipelock-2.yaml")
-	if err := os.WriteFile(cfg1, []byte("mode: balanced\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfg1, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
 		t.Fatalf("write cfg1: %v", err)
 	}
-	if err := os.WriteFile(cfg2, []byte("mode: strict\n"), 0o600); err != nil {
+	if err := os.WriteFile(cfg2, []byte("mode: strict\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
 		t.Fatalf("write cfg2: %v", err)
 	}
 
 	enabledTools := map[string]bool{"claude": true}
+	env.toolCanExecute = func(path string) bool {
+		return filepath.Dir(path) == "/usr/local/bin" && enabledTools[filepath.Base(path)]
+	}
 	origStat := env.stat
 	env.stat = func(path string) (os.FileInfo, error) {
 		if path == env.nftPath {
@@ -536,8 +604,8 @@ func TestRunInstall_UpgradeRotatesExistingBackups(t *testing.T) {
 				if path != filepath.Join(dir, tool) {
 					continue
 				}
-				if enabledTools[tool] {
-					return origStat(env.pipelockBinary)
+				if enabledTools[tool] && dir == "/usr/local/bin" {
+					return fakeFileInfo{mode: 0o755}, nil
 				}
 				return nil, os.ErrNotExist
 			}
@@ -615,6 +683,16 @@ func TestRunInstall_UpgradeRotatesExistingBackups(t *testing.T) {
 	}
 
 	for _, path := range tracked {
+		if path == filepath.Join(env.wrapperDir, "plk") || path == filepath.Join(env.wrapperDir, "plk-claude") {
+			// These dispatchers now target the fixed contained-launch boundary,
+			// so changing the agent identity does not rewrite them. Their
+			// first-install backups therefore remain in place unchanged.
+			assertFileContents(t, path+".bak", legacyBody(path, legacyBodies))
+			if archives := backupArchives(t, path); len(archives) != 0 {
+				t.Fatalf("unchanged %s unexpectedly rotated backups: %v", path, archives)
+			}
+			continue
+		}
 		assertFileContents(t, path+".bak", firstLive[path])
 		archives := backupArchives(t, path)
 		if len(archives) != 1 {
@@ -797,6 +875,8 @@ func TestStepPreflightChecksRequiredBinaries(t *testing.T) {
 			return origStat(path)
 		}
 		t.Setenv("PATH", binDir)
+		writeRunnableToolsList(t, env)
+		agentIsCurrentUser(t, env)
 		applied, err := s.apply(context.Background(), env)
 		if err != nil {
 			t.Fatalf("preflight: %v", err)
@@ -819,6 +899,429 @@ func TestStepPreflightChecksRequiredBinaries(t *testing.T) {
 			t.Fatalf("err: %v", err)
 		}
 	})
+}
+
+// preflightReadyEnv returns an env whose required binaries, nft path and
+// agent allow-list all satisfy stepPreflight.
+func preflightReadyEnv(t *testing.T) *installEnv {
+	t.Helper()
+	env, _, _ := newFakeEnv(t)
+	binDir := installContainCommandFixtures(t)
+	env.nftPath = filepath.Join(binDir, "nft")
+	realStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		if path == env.nftPath {
+			return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+		}
+		return realStat(path)
+	}
+	writeRunnableToolsList(t, env)
+	hideDefaultTools(env)
+	agentIsCurrentUser(t, env)
+	return env
+}
+
+// agentIsCurrentUser maps pipelock-agent to the test process's uid and gid, so
+// fixtures under t.TempDir (0700, owned by the test user) are reachable by the
+// agent identity that agentCanExecute judges.
+func agentIsCurrentUser(t *testing.T, env *installEnv) {
+	t.Helper()
+	me, err := user.Current()
+	if err != nil {
+		t.Fatalf("current user: %v", err)
+	}
+	orig := env.lookupUser
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == env.agentUserName {
+			return &user.User{Uid: me.Uid, Gid: me.Gid, Username: name, HomeDir: "/home/pipelock-agent"}, nil
+		}
+		return orig(name)
+	}
+}
+
+// runnableFixtureTarget returns a real executable regular file outside the
+// agent PATH: a copy of the running test binary in a fresh temp dir, so a test
+// can chmod it without touching the binary itself.
+func runnableFixtureTarget(t *testing.T) string {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatalf("test binary: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Clean(self))
+	if err != nil {
+		t.Fatalf("read test binary: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "custom")
+	if err := os.WriteFile(target, data, 0o600); err != nil {
+		t.Fatalf("write tool target: %v", err)
+	}
+	info, err := os.Stat(filepath.Clean(self))
+	if err != nil {
+		t.Fatalf("stat test binary: %v", err)
+	}
+	if err := os.Chmod(target, info.Mode().Perm()); err != nil {
+		t.Fatalf("chmod tool target: %v", err)
+	}
+	return target
+}
+
+// writeRunnableToolsList writes a tools.list whose only entry pins a real
+// executable outside the agent PATH, and returns that target.
+func writeRunnableToolsList(t *testing.T, env *installEnv) string {
+	t.Helper()
+	target := runnableFixtureTarget(t)
+	if err := os.MkdirAll(filepath.Dir(env.toolsListPath), 0o750); err != nil {
+		t.Fatalf("mkdir tools.list parent: %v", err)
+	}
+	if err := os.WriteFile(env.toolsListPath, []byte("custom\t"+target+"\n"), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	return target
+}
+
+// hideDefaultTools makes every default tool name unresolvable through env.stat,
+// so a test does not depend on which agent tools the test host has installed.
+func hideDefaultTools(env *installEnv) {
+	realStat := env.stat
+	env.stat = func(path string) (os.FileInfo, error) {
+		for _, name := range defaultToolNames() {
+			if filepath.Base(path) == name {
+				return nil, os.ErrNotExist
+			}
+		}
+		return realStat(path)
+	}
+}
+
+func TestStepPreflightRefusesMissingLaterPrerequisites(t *testing.T) {
+	t.Run("ready host passes", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err != nil || !applied {
+			t.Fatalf("applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("missing curl", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == env.curlPath {
+				return nil, os.ErrNotExist
+			}
+			return realStat(path)
+		}
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied || !strings.Contains(err.Error(), "curl") {
+			t.Fatalf("preflight must refuse a host without curl: applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("missing certutil", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		env.platformFamily = platformFamilyDebian
+		env.lookPath = func(string) (string, error) { return "", os.ErrNotExist }
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied {
+			t.Fatalf("preflight must refuse a host without certutil: applied=%v err=%v", applied, err)
+		}
+		if !strings.Contains(err.Error(), "certutil not found") || !strings.Contains(err.Error(), "libnss3-tools") {
+			t.Fatalf("err: %v", err)
+		}
+	})
+
+	t.Run("no agent tool and no allow-list", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.Remove(env.toolsListPath); err != nil {
+			t.Fatalf("remove tools.list: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == env.nftPath || path == env.toolsListPath {
+				return realStat(path)
+			}
+			for _, name := range defaultToolNames() {
+				if filepath.Base(path) == name {
+					return nil, os.ErrNotExist
+				}
+			}
+			return realStat(path)
+		}
+		applied, err := stepPreflight(installOpts{}).apply(context.Background(), env)
+		if err == nil || applied || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("applied=%v err=%v", applied, err)
+		}
+	})
+
+	t.Run("only target not executable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		if err := os.Chmod(target, 0o600); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("a tools.list whose only target cannot run must be refused: err=%v", err)
+		}
+	})
+
+	t.Run("malformed allow-list refused even with a default tool", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.WriteFile(env.toolsListPath, []byte("not-a-valid-line\n"), 0o600); err != nil {
+			t.Fatalf("write tools.list: %v", err)
+		}
+		hidden := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if filepath.Base(path) == "claude" && filepath.Dir(path) == "/usr/local/bin" {
+				return fakeFileInfo{mode: 0o755}, nil
+			}
+			return hidden(path)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "tools.list") {
+			t.Fatalf("malformed tools.list must fail preflight, not a later step: err=%v", err)
+		}
+	})
+
+	t.Run("empty allow-list and no agent tool", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		if err := os.WriteFile(env.toolsListPath, []byte("# only a comment\n"), 0o600); err != nil {
+			t.Fatalf("write tools.list: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			for _, name := range defaultToolNames() {
+				if filepath.Base(path) == name {
+					return nil, os.ErrNotExist
+				}
+			}
+			return realStat(path)
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("err: %v", err)
+		}
+	})
+}
+
+func TestAgentCanExecuteJudgesAsPipelockAgent(t *testing.T) {
+	t.Run("owner-only target owned by another uid", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == target {
+				return fakeFileInfo{mode: 0o700, sys: fakeFileSysWithUID(0)}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, target) {
+			t.Fatal("a 0700 target owned by root must not count as runnable by pipelock-agent")
+		}
+		if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+			t.Fatalf("preflight: %v", err)
+		}
+	})
+
+	t.Run("directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		target := writeRunnableToolsList(t, env)
+		orig := env.lookupUser
+		env.lookupUser = func(name string) (*user.User, error) {
+			if name == env.agentUserName {
+				return &user.User{Uid: "4000000001", Gid: "4000000001", Username: name}, nil
+			}
+			return orig(name)
+		}
+		if agentCanExecute(env, target) {
+			t.Fatalf("a target under a 0700 directory owned by another user must not be runnable: %s", target)
+		}
+	})
+
+	t.Run("symlink into a directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		hiddenDir := t.TempDir()
+		target := filepath.Join(hiddenDir, "tool")
+		if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		link := filepath.Join(t.TempDir(), "tool-link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			switch path {
+			case hiddenDir:
+				return fakeFileInfo{mode: os.ModeDir | 0o700, sys: fakeFileSysWithUID(0)}, nil
+			case link, target:
+				return fakeFileInfo{mode: 0o755}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, link) {
+			t.Fatal("a link into a root-only directory must not count as runnable by pipelock-agent")
+		}
+	})
+
+	t.Run("nested symlink through a directory the agent cannot search", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		openDir := t.TempDir()
+		tool := runnableFixtureTarget(t)
+		hiddenDir := t.TempDir()
+		inner := filepath.Join(hiddenDir, "inner")
+		if err := os.Symlink(tool, inner); err != nil {
+			t.Fatalf("inner symlink: %v", err)
+		}
+		outer := filepath.Join(openDir, "outer")
+		if err := os.Symlink(inner, outer); err != nil {
+			t.Fatalf("outer symlink: %v", err)
+		}
+		if !agentCanExecute(env, outer) {
+			t.Fatal("positive control: the chain is runnable while every directory is searchable")
+		}
+		realStat := env.stat
+		env.stat = func(path string) (os.FileInfo, error) {
+			if path == hiddenDir {
+				return fakeFileInfo{mode: os.ModeDir | 0o700, sys: fakeFileSysWithUID(0)}, nil
+			}
+			return realStat(path)
+		}
+		if agentCanExecute(env, outer) {
+			t.Fatal("a link chain through a root-only directory must not count as runnable, even when it ends somewhere searchable")
+		}
+	})
+
+	t.Run("dot, trailing slash and dot-dot after a file are not runnable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		if !agentCanExecute(env, tool) {
+			t.Fatal("positive control: the plain target is runnable")
+		}
+		// The kernel refuses each of these with ENOTDIR; a lexical clean would
+		// have turned every one back into the runnable file.
+		for _, p := range []string{tool + "/.", tool + "/", tool + "/./", tool + "/../" + filepath.Base(tool)} {
+			if agentCanExecute(env, p) {
+				t.Errorf("%q must not count as runnable", p)
+			}
+		}
+	})
+
+	t.Run("symlink whose target ends in a dot component is not runnable", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		link := filepath.Join(t.TempDir(), "tool-link")
+		if err := os.Symlink(tool+"/.", link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if agentCanExecute(env, link) {
+			t.Fatal("a link to file/. must not count as runnable")
+		}
+	})
+
+	t.Run("dot-dot resolves after the symlink, not lexically", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		tool := runnableFixtureTarget(t)
+		realDir := filepath.Dir(tool)
+		sub := filepath.Join(realDir, "sub")
+		if err := os.Mkdir(sub, 0o750); err != nil {
+			t.Fatalf("mkdir sub: %v", err)
+		}
+		linkDir := t.TempDir()
+		link := filepath.Join(linkDir, "link")
+		if err := os.Symlink(sub, link); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		// link/.. is the physical parent of sub (where the tool lives); read as
+		// text it would be linkDir, which holds no tool.
+		if !agentCanExecute(env, link+"/../"+filepath.Base(tool)) {
+			t.Fatal("link/../tool must resolve through the link's target")
+		}
+		if agentCanExecute(env, filepath.Join(linkDir, filepath.Base(tool))) {
+			t.Fatal("control: the tool is not in the link's own directory")
+		}
+	})
+
+	t.Run("symlink loop", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		dir := t.TempDir()
+		a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+		if err := os.Symlink(b, a); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if err := os.Symlink(a, b); err != nil {
+			t.Fatalf("symlink: %v", err)
+		}
+		if agentCanExecute(env, a) {
+			t.Fatal("a symlink loop must not count as runnable")
+		}
+	})
+
+	t.Run("agent not created yet uses other bits", func(t *testing.T) {
+		env := preflightReadyEnv(t)
+		env.lookupUser = func(name string) (*user.User, error) { return nil, user.UnknownUserError(name) }
+		if !agentCanExecute(env, "/bin/sh") {
+			t.Fatal("/bin/sh is world-executable and must be runnable before the agent exists")
+		}
+	})
+}
+
+func TestStepPreflightChecksFirstEntryPerName(t *testing.T) {
+	env := preflightReadyEnv(t)
+	good := runnableFixtureTarget(t)
+	broken := filepath.Join(t.TempDir(), "custom")
+	if err := os.WriteFile(broken, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write broken target: %v", err)
+	}
+	list := "custom\t" + broken + "\ncustom\t" + good + "\n"
+	if err := os.WriteFile(env.toolsListPath, []byte(list), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	if _, err := stepPreflight(installOpts{}).apply(context.Background(), env); err == nil || !strings.Contains(err.Error(), "no agent tools found") {
+		t.Fatalf("plk-launch uses the first matching line, so a broken first entry must be refused: err=%v", err)
+	}
+}
+
+func TestStepWriteToolsListRepairsModeWhenContentUnchanged(t *testing.T) {
+	env := preflightReadyEnv(t)
+	plan, err := plannedToolsList(env)
+	if err != nil {
+		t.Fatalf("plan: %v", err)
+	}
+	if err := os.WriteFile(env.toolsListPath, []byte(renderToolsList(plan.entries)), 0o600); err != nil {
+		t.Fatalf("write tools.list: %v", err)
+	}
+	if err := os.Chmod(env.toolsListPath, 0o600); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	if again, err := plannedToolsList(env); err != nil || again.changed {
+		t.Fatalf("fixture must have unchanged content: changed=%v err=%v", again.changed, err)
+	}
+	applied, err := stepWriteToolsList().apply(context.Background(), env)
+	if err != nil || !applied {
+		t.Fatalf("a root-only tools.list must be rewritten: applied=%v err=%v", applied, err)
+	}
+	info, err := os.Stat(env.toolsListPath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != modeAllowListReadable {
+		t.Fatalf("tools.list mode = %v, want %v", info.Mode().Perm(), modeAllowListReadable)
+	}
+	applied, err = stepWriteToolsList().apply(context.Background(), env)
+	if err != nil || applied {
+		t.Fatalf("a correct tools.list must be left alone: applied=%v err=%v", applied, err)
+	}
+}
+
+func TestMergeDefaultToolEntriesKeepsUnresolvedPinnedDefault(t *testing.T) {
+	existing := []toolsListEntry{{name: "claude", target: "/opt/agent/bin/claude"}, {name: "custom", target: "/opt/agent/bin/custom"}}
+	merged, changed := mergeDefaultToolEntries(existing, nil)
+	if changed || len(merged) != 2 || merged[0].name != "claude" {
+		t.Fatalf("an unresolved default must not delete its pinned entry: merged=%v changed=%v", merged, changed)
+	}
+	merged, changed = mergeDefaultToolEntries(existing, []toolsListEntry{{name: "claude", target: "/usr/local/bin/claude"}})
+	if !changed || len(merged) != 2 || merged[0].target != "/usr/local/bin/claude" {
+		t.Fatalf("a resolved default replaces the same name: merged=%v changed=%v", merged, changed)
+	}
 }
 
 func TestStepPreflightRejectsUntrustedNFTPath(t *testing.T) {
@@ -1041,7 +1544,7 @@ func TestRenderLaunchWrapper_HasExpectedEnv(t *testing.T) {
 		"HTTPS_PROXY=http://127.0.0.1:8888",
 		"https_proxy=http://127.0.0.1:8888",
 		"NO_PROXY=127.0.0.1,localhost,::1",
-		"NODE_EXTRA_CA_CERTS=" + env.caExportPath,
+		"NODE_EXTRA_CA_CERTS=" + env.caBundlePath,
 		"SSL_CERT_FILE=" + env.caBundlePath,
 		"GIT_SSL_CAINFO=" + env.caBundlePath,
 		"NODE_OPTIONS='--require " + env.undiciShimPath + "'",
@@ -1070,11 +1573,11 @@ func TestRenderLaunchWrapper_HasExpectedEnv(t *testing.T) {
 func TestRenderToolWrapper_UsesSudo(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	body := renderToolWrapper(env, "claude")
-	if !strings.Contains(body, "sudo -n -u pipelock-agent") {
+	if !strings.Contains(body, "sudo -n ") || strings.Contains(body, "sudo -n -u") {
 		t.Errorf("missing outer non-interactive sudo: %s", body)
 	}
-	if !strings.Contains(body, "plk-launch claude") {
-		t.Errorf("missing plk-launch dispatch: %s", body)
+	if !strings.Contains(body, "plk-contained-launch claude") {
+		t.Errorf("missing contained launcher dispatch: %s", body)
 	}
 }
 
@@ -1084,7 +1587,7 @@ func TestRenderMetaWrapper_UsesSudoAndDispatchesArgs(t *testing.T) {
 	if !strings.Contains(body, "usage: plk <tool> [args...]") {
 		t.Errorf("missing usage: %s", body)
 	}
-	if !strings.Contains(body, "sudo -n -u pipelock-agent") {
+	if !strings.Contains(body, "sudo -n ") || strings.Contains(body, "sudo -n -u") {
 		t.Errorf("missing outer non-interactive sudo: %s", body)
 	}
 	if !strings.Contains(body, `=~ ^[a-z0-9][a-z0-9_-]{0,30}$`) {
@@ -1093,18 +1596,18 @@ func TestRenderMetaWrapper_UsesSudoAndDispatchesArgs(t *testing.T) {
 	if !strings.Contains(body, "missing or empty allow-list") {
 		t.Errorf("missing allow-list precheck: %s", body)
 	}
-	if !strings.Contains(body, "plk-launch") || !strings.Contains(body, `"$@"`) {
-		t.Errorf("missing full argv dispatch to plk-launch: %s", body)
+	if !strings.Contains(body, "plk-contained-launch") || !strings.Contains(body, `"$@"`) {
+		t.Errorf("missing full argv dispatch to contained launcher: %s", body)
 	}
 }
 
 func TestRenderSudoers_HasOperatorAndLauncher(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	body := renderSudoers(env)
-	if !strings.Contains(body, "operator ALL=(pipelock-agent) NOPASSWD: ") {
+	if !strings.Contains(body, "operator ALL=(root) NOPASSWD: ") {
 		t.Errorf("sudoers missing rule: %s", body)
 	}
-	if !strings.Contains(body, "plk-launch *") {
+	if !strings.Contains(body, "plk-contained-launch *") {
 		t.Errorf("sudoers missing glob: %s", body)
 	}
 }
@@ -1413,6 +1916,83 @@ func TestStepInstallNFTRules_ReloadsWhenLoadedTableDrifted(t *testing.T) {
 		t.Fatal("expected live drift repair")
 	}
 
+	assertManagedChainReload(t, runner, env)
+}
+
+func TestStepInstallNFTRulesNewTableFailureNeedsRollback(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	body := renderNFTRules(1000, 988, 987, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), "No such file or directory", 1, nil)
+	runner.on(argvFor("systemctl", "daemon-reload"), "", 1, nil)
+	changed, err := stepInstallNFTRulesApply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("later-step failure = %v, want daemon-reload error", err)
+	}
+	if !changed {
+		t.Fatal("new table was loaded but rollback was not requested")
+	}
+	loaded := false
+	for _, call := range runner.calls {
+		if call.name == testNFT && strings.Join(call.args, " ") == "-f "+env.nftRulesPath {
+			loaded = true
+		}
+	}
+	if !loaded {
+		t.Fatal("positive control: new nft table was not loaded")
+	}
+}
+
+func TestStepInstallNFTRules_MigratesReceiverlessOwnedLoopbackMarks(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, proxyUID, agentUID := 1000, 988, 987
+	body := renderNFTRules(operatorUID, proxyUID, agentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	live := `table inet pipelock_containment {
+	chain output_filter { type filter hook output priority filter; policy accept;
+	meta skuid 987 oifname "lo" ip daddr 127.0.0.1 socket cgroupv2 level 1 "pipelock_contained.slice" ct state new ct mark set 0x504c4b01 accept # handle 70
+	meta skuid 987 oifname "lo" ip6 daddr ::1 socket cgroupv2 level 1 "pipelock_contained.slice" ct state 0x8 ct mark set 0x504c4b01 accept # handle 71
+	}
+}`
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), live, 0, nil)
+	runner.on(argvFor(testNFT, "-n", "list", "chain", "inet", defaultNFTTable, legacyOwnedLoopbackInputChain), "No such file or directory", 1, nil)
+
+	var reloadScript string
+	writeFile := env.writeFile
+	env.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if path == managedChainReloadPath(env) {
+			reloadScript = string(data)
+		}
+		return writeFile(path, data, mode)
+	}
+
+	applied, err := stepInstallNFTRules().apply(context.Background(), env)
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied {
+		t.Fatal("receiverless owned-loopback marks must trigger canonical rules reload")
+	}
+	for _, handle := range []int{70, 71} {
+		if !strings.Contains(reloadScript, "delete rule inet pipelock_containment output_filter handle "+itoa(handle)) {
+			t.Fatalf("reload script did not remove stale mark handle %d:\n%s", handle, reloadScript)
+		}
+	}
+	if strings.Contains(reloadScript, "delete chain inet pipelock_containment "+legacyOwnedLoopbackInputChain) {
+		t.Fatalf("receiverless migration attempted to delete an absent receiver chain:\n%s", reloadScript)
+	}
 	assertManagedChainReload(t, runner, env)
 }
 
@@ -1839,6 +2419,8 @@ func TestStepInstallNFTRules_UndoRestoresPreviousLiveTableAndServiceState(t *tes
 func TestStepInstallNFTRules_UndoValidatesCapturedRestoreBeforeDeletingLiveTable(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
 	env.prevNFTTableStateKnown = true
+	// This attempt loaded rules over the captured table, so undo restores it.
+	env.nftTableMutatedByInstall = true
 	env.prevNFTTableDump = "table inet " + defaultNFTTable + " {\n"
 	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
 		t.Fatalf("mkdir rules parent: %v", err)
@@ -1864,6 +2446,8 @@ func TestStepInstallNFTRules_UndoValidatesCapturedRestoreBeforeDeletingLiveTable
 func TestStepInstallNFTRules_UndoRejectsWrongCapturedTableBeforeDeletingLiveTable(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
 	env.prevNFTTableStateKnown = true
+	// This attempt loaded rules over the captured table, so undo restores it.
+	env.nftTableMutatedByInstall = true
 	env.prevNFTTableDump = `table inet other_containment {
 		chain output_filter {
 			meta skuid 987 drop
@@ -2157,12 +2741,14 @@ func TestStepCreateDirRejectsSymlinkParent(t *testing.T) {
 }
 
 func TestInstallSteps_Count(t *testing.T) {
-	// Sanity: the install flow has 31 steps total after combining the runtime
-	// contract steps, credential guard, operator evidence ACL, and final
-	// readiness gate. Changing this count changes documented dry-run output.
+	// Sanity: the install flow has 40 steps total after combining the runtime
+	// contract steps, credential guard, operator evidence ACL, browser CA
+	// trust, agent-browser defaults, config-mode repair, published services,
+	// and final readiness gate. Changing this count changes documented dry-run
+	// output.
 	steps := installSteps(installOpts{})
-	if len(steps) != 31 {
-		t.Errorf("installSteps count: got %d, want 31", len(steps))
+	if len(steps) != 40 {
+		t.Errorf("installSteps count: got %d, want 40", len(steps))
 	}
 }
 
@@ -2241,7 +2827,7 @@ func TestInstallCmdDryRunSkipsHostPreflightAndPrintsPlan(t *testing.T) {
 	env, _, out := newFakeEnv(t)
 	newContainInstallEnv = func(io.Writer) *installEnv { return env }
 	src := filepath.Join(t.TempDir(), "pipelock.yaml")
-	if err := os.WriteFile(src, []byte("mode: balanced\n"), 0o600); err != nil {
+	if err := os.WriteFile(src, []byte("mode: balanced\nforward_proxy:\n  enabled: true\n"), 0o600); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
@@ -3037,4 +3623,45 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// A UID change: the rules file on disk and the live chain were rendered with
+// earlier UIDs. Install must pass the UIDs from that file's header to reload,
+// so the reload script removes every rule of the old managed block.
+func TestStepInstallNFTRules_ReloadRemovesOldBlockAfterUIDChange(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	operatorUID, oldProxyUID, oldAgentUID := 1000, 1038, 1037
+	old := renderNFTRules(operatorUID, oldProxyUID, oldAgentUID, env.proxyPort, defaultNFTTable, defaultNFTChain)
+	if err := os.MkdirAll(filepath.Dir(env.nftRulesPath), 0o750); err != nil {
+		t.Fatalf("mkdir rules parent: %v", err)
+	}
+	if err := os.WriteFile(env.nftRulesPath, []byte(old), 0o600); err != nil {
+		t.Fatalf("write rules: %v", err)
+	}
+	writeNFTPersistUnitFixture(t, env)
+	live := nftListingFromRulesBodyForTest(old, 40)
+	runner.on(argvFor(testNFT, "-n", "-a", "list", "chain", "inet", defaultNFTTable, defaultNFTChain), live, 0, nil)
+	reloadPath := managedChainReloadPath(env)
+	var script string
+	originalWrite := env.writeFile
+	env.writeFile = func(path string, data []byte, mode os.FileMode) error {
+		if path == reloadPath {
+			script = string(data)
+		}
+		return originalWrite(path, data, mode)
+	}
+
+	if _, err := stepInstallNFTRules().apply(context.Background(), env); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	assertManagedChainReload(t, runner, env)
+	oldRules := nftRulesWithHandles(live)
+	if len(oldRules) < 5 {
+		t.Fatalf("fixture has too few old rules: %d", len(oldRules))
+	}
+	for _, rule := range oldRules {
+		if !strings.Contains(script, fmt.Sprintf("delete rule inet %s %s handle %d\n", defaultNFTTable, defaultNFTChain, rule.handle)) {
+			t.Fatalf("old-UID rule %q (handle %d) survived the reload:\n%s", rule.line, rule.handle, script)
+		}
+	}
 }

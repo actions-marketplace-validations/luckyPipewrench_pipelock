@@ -20,8 +20,8 @@ you have not set that token, the CLI will refuse to connect. See
 | `pipelock session risk [<key>] [--json]` | Compact adaptive risk view: score, level, block-all state, and auto-recover ETA |
 | `pipelock session explain <key> [--json]` | Why the session is where it is: trigger, evidence, destination scopes, next auto-recovery time |
 | `pipelock session reset <key> [--json]` | Clear adaptive score, destination-scoped airlock, and block_all without cutting connections |
-| `pipelock session release <key> [--to none\|soft]` | Move session-wide airlock to a lower tier. Does not clear destination adaptive scores. |
-| `pipelock session terminate <key>` | Destructive: reset enforcement state, cut in-flight connections, clear CEE state |
+| `pipelock session release <key> [--to none\|soft]` | Set the session-wide airlock and every destination-scope airlock to a lower tier. Does not clear destination adaptive scores or block_all. |
+| `pipelock session terminate <key>` | Destructive: reset enforcement state, cut in-flight connections, clear CEE state. Taint is kept; the session's task boundary clears it. |
 | `pipelock session recover <key> [--choice ...]` | Interactive workflow: inspect → explain → pick an action. Prefer reset when a destination scope is the blocker. |
 | `pipelock session deferred list [--json]` | Enumerate held (deferred) MCP actions awaiting an operator decision |
 | `pipelock session deferred approve <defer-id>` | Approve a held action (opens it only if its rule permits) |
@@ -75,8 +75,8 @@ The interactive `pipelock session recover <key>` command runs the
 inspect → explain → action portion of this workflow for the supplied
 key (it does not perform the discovery/list step above). Use
 `--choice reset|release-none|release-soft|terminate|leave` to script the
-workflow non-interactively. Option 1 is reset, because release-to-none is a
-no-op when session-wide airlock is already none.
+workflow non-interactively. Option 1 is reset, because release does not clear
+a destination's accumulated adaptive score.
 
 ## Resolving the admin API endpoint
 
@@ -127,7 +127,13 @@ pipelock session risk [<key>] [--json]
 
 Shows the compact adaptive-enforcement state for one session: threat
 score, escalation level, block-all state, auto-recover ETA, and the
-operator recovery hint. When `<key>` is omitted, the command calls the
+operator recovery hint. The score and level are the session-wide
+aggregate over every destination, and block-all and the airlock tier
+shown here are the session-wide ones. HTTP findings are enforced per
+destination, so a session whose aggregate reads `critical` can still
+show `block_all: false` and tier `none` when no single destination has
+reached critical; use `session explain` to see which destination scopes
+are elevated or quarantined. When `<key>` is omitted, the command calls the
 `adaptive whoami` endpoint and reports the risk state for the caller's
 own identity session.
 
@@ -163,11 +169,31 @@ healthchecks.
 pipelock session release <key> --to none|soft
 ```
 
-Moves the session back to a lower tier via the admin API's airlock
-endpoint. The `--to` flag accepts `none` (default, fully release),
-`normal` (alias for `none`), and `soft` (observe-only). Upward
-transitions are not allowed through this command — use the airlock
-endpoint directly for upward admin overrides.
+Sets the session-wide airlock and every destination-scope airlock to a
+lower tier via the admin API's airlock endpoint. The `--to` flag accepts
+`none` (default, fully release), `normal` (alias for `none`), and `soft`
+(observe-only). Release does not clear a destination's accumulated
+adaptive score or its `block_all` flag; if a destination is still denied
+because of its own score, use `session reset`. Upward transitions are not
+allowed through this command — use the airlock endpoint directly for
+upward admin overrides.
+
+## session reset
+
+```sh
+pipelock session reset <key> [--json]
+```
+
+Clears the session's adaptive threat score, escalation level, every
+destination-scoped airlock, and the `block_all` flag, and returns the
+session-wide airlock to `none`. Also clears the per-IP burst window shared
+by every identity on that client address. In-flight connections are left
+running.
+
+Invocation sessions (ephemeral MCP transport keys like `mcp-stdio-42`) are
+rejected with a `400` error — those contexts are not safely mutable
+through the admin API. A key that matches no session prints "no session
+matched that key; nothing was reset."
 
 ## session terminate
 
@@ -178,8 +204,10 @@ pipelock session terminate <key>
 Destructive. Resets the session's enforcement state (threat score,
 escalation level, airlock tier, block-all flag), fires all registered
 cancel funcs so in-flight long-lived connections are torn down,
-clears the cross-request entropy tracker and fragment buffer for the
-session's agent/IP pair.
+clears the cross-request entropy tracker and fragment buffer for both
+the named key (`agent|ip`) and the folded client-IP key. The folded key
+is shared by every self-declared or header-matched caller on that IP, so
+their accumulated cross-request evidence is cleared too.
 
 Terminate rejects invocation sessions (ephemeral MCP transport keys
 like `mcp-stdio-42`) with a `400` error — those contexts are not

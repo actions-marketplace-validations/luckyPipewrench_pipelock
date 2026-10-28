@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import binascii
 import json
+import re
 import sys
 from typing import IO, Any
 
@@ -34,10 +35,14 @@ from .appraise import (
 )
 from .chain import comparable_chain, verify_chain
 from .envelope import unmarshal
+from .group import GROUP_VALID, verify_receipt_group
+from .input_file import read_verifier_file
+from .line_space import trim_go_space_bytes
 from .provenance_proof import MAX_FIXTURE_BYTES, compact_fixture_json
 from .receipt import (
     UNPINNED_RECEIPT_BANNER,
-    verify_evidence_chain_file,
+    load_receipt_chains,
+    verify_evidence_chain,
     verify_receipt_file,
 )
 from .svid import SVIDConfigError, appraise_with_svid, load_svid_file
@@ -47,6 +52,7 @@ ED25519_PUBLIC_KEY_SIZE = 32
 EXIT_OK = 0
 EXIT_GENERAL = 1
 EXIT_CONFIG = 2
+EXIT_PREFIX = 3
 EXIT_USAGE = 64
 
 # Allowed keys in the trust file (Go uses DisallowUnknownFields on these).
@@ -68,8 +74,7 @@ def _load_trust_file(path: str) -> VerifyOptions:
     if path == "":
         return opts
     try:
-        with open(path, "rb") as fh:
-            data = fh.read()
+        data = read_verifier_file(path)
     except OSError as exc:
         raise ConfigError(f"read trust file: {exc}") from exc
     try:
@@ -134,10 +139,11 @@ def _emit_fatal(stdout: IO[str], stderr: IO[str], json_mode: bool, cause: str) -
 
 
 def _run_chain(stdout: IO[str], stderr: IO[str], data: bytes, json_mode: bool) -> int:
-    lines = data.strip().split(b"\n")
+    lines = data.split(b"\n")
     envs = []
     for i, line in enumerate(lines):
-        if line.strip() == b"":
+        line = trim_go_space_bytes(line)
+        if line == b"":
             continue
         try:
             envs.append(unmarshal(line))
@@ -196,8 +202,7 @@ def _run_aarp(
             return EXIT_CONFIG
 
     try:
-        with open(target, "rb") as fh:
-            data = fh.read()
+        data = read_verifier_file(target)
     except OSError as exc:
         stderr.write(f"read envelope: {exc}\n")
         return EXIT_CONFIG
@@ -292,17 +297,88 @@ def _run_receipt(
     json_mode: bool,
     chain_mode: bool,
     allow_unpinned: bool,
+    group_id: str = "",
+    allow_prefix: bool = False,
+    expect_head: str = "",
+    expect_seq: int | None = None,
 ) -> int:
-    report = (
-        verify_evidence_chain_file(target, key_hex, allow_unpinned)
-        if chain_mode
-        else verify_receipt_file(target, key_hex, allow_unpinned)
-    )
+    if group_id:
+        pinned_keys = [key.strip().lower() for key in key_hex.split(",") if key.strip()]
+        report = verify_receipt_group(target, group_id, pinned_keys)
+        valid = report.get("verdict") == GROUP_VALID
+        report.update(
+            integrity="valid" if valid else "invalid",
+            end_proof={
+                "proven": valid,
+                "evidence": ["receipt_group_close"] if valid else [],
+            },
+            scope="receipt_group",
+            status="CHAIN VALID" if valid else "CHAIN BROKEN",
+        )
+        if json_mode:
+            stdout.write(json.dumps(report, separators=(",", ":"), ensure_ascii=False))
+            stdout.write("\n")
+        else:
+            stdout.write(f"receipt group: {report['verdict']}\n")
+            if report.get("error"):
+                stdout.write(f"  error: {report['error']}\n")
+        return EXIT_OK if report.get("verdict") == GROUP_VALID else EXIT_GENERAL
+    if chain_mode:
+        proof = []
+        companion_closed = True
+        try:
+            action, evidence = load_receipt_chains(target)
+            receipts = evidence or action
+            companion_closed = True
+            if action and evidence:
+                companion = verify_evidence_chain(action, key_hex, allow_unpinned)
+                if not companion.get("valid"):
+                    raise ValueError(
+                        "action receipt chain: " + companion.get("error", "invalid")
+                    )
+                companion_closed = _close_ends_chain(action)
+            report = {
+                "path": target,
+                **verify_evidence_chain(receipts, key_hex, allow_unpinned),
+            }
+            if report.get("valid"):
+                if _close_ends_chain(receipts):
+                    proof.append("session_close")
+                if expect_head:
+                    if report.get("root_hash") != expect_head:
+                        raise ValueError(
+                            "chain tip does not match expected head (tail truncated)"
+                        )
+                    proof.append("operator_head")
+                if expect_seq is not None:
+                    if report.get("final_seq") != expect_seq:
+                        raise ValueError("final_seq does not match expected seq")
+                    proof.append("operator_seq")
+        except Exception as exc:  # noqa: BLE001 - CLI reports malformed evidence
+            report = {"path": target, "valid": False, "error": str(exc)}
+        if not report.get("valid"):
+            proof = []
+        report.update(
+            integrity="valid" if report.get("valid") else "invalid",
+            end_proof={"proven": bool(proof) and companion_closed, "evidence": proof},
+            scope="receipt_chain",
+            status="CHAIN BROKEN"
+            if not report.get("valid")
+            else "CHAIN UNPINNED"
+            if proof and companion_closed and report.get("unpinned")
+            else "CHAIN VALID"
+            if proof and companion_closed
+            else "VALID PREFIX, END UNPROVEN",
+        )
+    else:
+        report = verify_receipt_file(target, key_hex, allow_unpinned)
     if json_mode:
         stdout.write(json.dumps(report, separators=(",", ":"), ensure_ascii=False))
         stdout.write("\n")
     else:
-        if report.get("unpinned"):
+        if chain_mode:
+            status = report["status"]
+        elif report.get("unpinned"):
             status = "UNPINNED"
         else:
             status = "valid" if report.get("valid") else "invalid"
@@ -312,7 +388,45 @@ def _run_receipt(
             stdout.write(f"  warning: {UNPINNED_RECEIPT_BANNER}\n")
         if report.get("error"):
             stdout.write(f"  error: {report['error']}\n")
+    if (
+        chain_mode
+        and report.get("valid")
+        and not report["end_proof"]["proven"]
+        and not allow_prefix
+    ):
+        return EXIT_PREFIX
     return EXIT_OK if report.get("valid") else EXIT_GENERAL
+
+
+def _close_ends_chain(receipts: list[dict]) -> bool:
+    """Report whether a verified chain's trailing session_close ends the chain.
+
+    A close ends its run, and it ends the chain only when no later run can
+    continue that chain. Pipelock never resumes a per-run recorder session
+    ("<base>.run.<hex>"); a restart resumed a legacy shared session ("proxy")
+    after its close, so deleting the later runs leaves a chain that ends at a
+    genuine close. The session comes from the closed run's signed session_open.
+    """
+    if not receipts:
+        return False
+    control = receipts[-1].get("action_record", {}).get("session_control") or {}
+    if control.get("kind") != "session_close":
+        return False
+    run_nonce = (control.get("close") or {}).get("run_nonce")
+    for item in reversed(receipts):
+        ctrl = item.get("action_record", {}).get("session_control") or {}
+        opened = ctrl.get("open") or {}
+        if ctrl.get("kind") != "session_open" or opened.get("run_nonce") != run_nonce:
+            continue
+        session = opened.get("recorder_session")
+        if not isinstance(session, str):
+            return False
+        base, sep, suffix = session.partition(".run.")
+        return (
+            bool(base) and bool(sep) and "/" not in base and "\\" not in base
+            and re.fullmatch(r"[0-9a-f]{32}", suffix) is not None
+        )
+    return False
 
 
 def _run_provenance(
@@ -372,6 +486,28 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="allow structural-only verification without a trusted signer key",
     )
+    receipt_p.add_argument(
+        "--group",
+        default="",
+        help=(
+            "verify a signed group in PATH; --key accepts comma-separated "
+            "pinned public keys"
+        ),
+    )
+    receipt_p.add_argument(
+        "--allow-prefix",
+        action="store_true",
+        help="accept a valid prefix while reporting its unproven end",
+    )
+    receipt_p.add_argument(
+        "--expect-head", default="", help="independently known final receipt hash"
+    )
+    receipt_p.add_argument(
+        "--expect-seq",
+        type=int,
+        default=None,
+        help="independently known final sequence",
+    )
     provenance_p = sub.add_parser(
         "provenance",
         help="verify an experimental fixture-only evidence-provenance proof",
@@ -390,6 +526,18 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     if args.command == "receipt":
+        if (
+            (args.allow_prefix or args.expect_head or args.expect_seq is not None)
+            and not args.chain
+            and not args.group
+        ) or (args.group and (args.expect_head or args.expect_seq is not None)):
+            sys.stderr.write(
+                "endpoint flags require a receipt chain; pins cannot select groups\n"
+            )
+            return EXIT_USAGE
+        if args.expect_seq is not None and not 0 <= args.expect_seq <= (1 << 64) - 1:
+            sys.stderr.write("--expect-seq requires an unsigned 64-bit integer\n")
+            return EXIT_USAGE
         return _run_receipt(
             sys.stdout,
             args.path,
@@ -397,6 +545,10 @@ def main(argv: list[str] | None = None) -> int:
             args.json,
             args.chain,
             args.allow_unpinned,
+            args.group,
+            args.allow_prefix,
+            args.expect_head,
+            args.expect_seq,
         )
     if args.command == "provenance":
         return _run_provenance(sys.stdout, sys.stderr, args.path, args.allow_incomplete)

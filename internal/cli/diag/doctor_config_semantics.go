@@ -382,14 +382,16 @@ func checkDoctorSuppressEntries(cfg *config.Config) []doctorReportCheck {
 }
 
 // analyzeDoctorInertExemptions flags exempt_domains lists configured on
-// scanners that are disabled, so the exemption cannot affect anything.
+// scanners that are disabled. For response scanning the streaming bypass is
+// inactive, but core response findings on a matching host can still be
+// downgraded to warn, which the finding text says.
 func analyzeDoctorInertExemptions(cfg *config.Config) []ConfigSemanticFinding {
 	var findings []ConfigSemanticFinding
 
 	if !cfg.ResponseScanning.Enabled {
 		for _, domain := range cfg.ResponseScanning.ExemptDomains {
 			findings = append(findings, newConfigSemanticFinding(
-				ConfigSemanticKindInert,
+				ConfigSemanticKindAdvisory,
 				ConfigScopeResponseExemptDomains,
 				domain,
 				responseScanExemptDisabledDoctor,
@@ -447,7 +449,8 @@ func analyzeDoctorInertExemptions(cfg *config.Config) []ConfigSemanticFinding {
 	}
 
 	if !cfg.RequestBodyScanning.Enabled || !cfg.RequestBodyScanning.ContentEntropyEnabled {
-		for _, domain := range cfg.RequestBodyScanning.ContentEntropyExclusions {
+		for _, exclusion := range cfg.RequestBodyScanning.ContentEntropyExclusions {
+			domain := exclusion.Host
 			detail := "request_body_scanning.content_entropy_exclusions is set but request_body_scanning.enabled=false; this body/frame entropy exemption is inert"
 			next := "enable request_body_scanning and request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
 			if cfg.RequestBodyScanning.Enabled {
@@ -465,7 +468,8 @@ func analyzeDoctorInertExemptions(cfg *config.Config) []ConfigSemanticFinding {
 	}
 	wsTextScanEnabled := cfg.WebSocketProxy.ScanTextFrames == nil || *cfg.WebSocketProxy.ScanTextFrames
 	if !cfg.WebSocketProxy.Enabled || !wsTextScanEnabled || !cfg.RequestBodyScanning.Enabled || !cfg.RequestBodyScanning.ContentEntropyEnabled {
-		for _, domain := range cfg.WebSocketProxy.ContentEntropyExclusions {
+		for _, exclusion := range cfg.WebSocketProxy.ContentEntropyExclusions {
+			domain := exclusion.Host
 			detail := "websocket_proxy.content_entropy_exclusions is set but websocket_proxy.enabled=false; this WebSocket entropy exemption is inert"
 			next := "enable websocket_proxy, websocket_proxy.scan_text_frames, request_body_scanning, and request_body_scanning.content_entropy_enabled to make the exemption effective, or remove the content_entropy_exclusions entry"
 			switch {

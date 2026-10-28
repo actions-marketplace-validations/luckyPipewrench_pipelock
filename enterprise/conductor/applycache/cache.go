@@ -8,6 +8,7 @@
 package applycache
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/enterprise/conductor/emergency"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
+	"github.com/luckyPipewrench/pipelock/internal/securefile"
 )
 
 const (
@@ -80,6 +82,11 @@ type verifyOptions struct {
 	LocalVersion  string
 	Now           func() time.Time
 	AllowRollback bool
+	// RecoverActive allows the durable active bundle's expiry to be handled by
+	// DecideStale. An expired durable bundle's validity window, including its
+	// not-before boundary, is checked at ExpiresAt. Network staging never sets
+	// this option. Signature-key lifecycle still uses the current time.
+	RecoverActive bool
 }
 
 type Cache struct {
@@ -87,10 +94,14 @@ type Cache struct {
 	bundlesDir string
 	configsDir string
 	now        func() time.Time
+	write      func(path string, data []byte) error
 	mu         sync.Mutex
 }
 
 type VerifiedBundle struct {
+	// baseHash is the active pointer observed while staging. Compensation may
+	// restore the previous runtime only while that same pointer remains active.
+	baseHash   string
 	Bundle     conductor.PolicyBundle
 	BundleHash string
 	VerifiedAt time.Time
@@ -220,10 +231,10 @@ func (c *Cache) stageVerified(bundle conductor.PolicyBundle, opts verifyOptions)
 	configName := bundleHash + configExt
 	recordName := bundleHash + recordExt
 	configPath := filepath.Join(c.configsDir, configName)
-	if err := durableWrite(filepath.Join(c.bundlesDir, recordName), recordBytes); err != nil {
+	if err := c.writeDurably(filepath.Join(c.bundlesDir, recordName), recordBytes); err != nil {
 		return VerifiedBundle{}, err
 	}
-	if err := durableWrite(configPath, []byte(bundle.Payload.ConfigYAML)); err != nil {
+	if err := c.writeDurably(configPath, []byte(bundle.Payload.ConfigYAML)); err != nil {
 		return VerifiedBundle{}, err
 	}
 	return VerifiedBundle{
@@ -231,6 +242,7 @@ func (c *Cache) stageVerified(bundle conductor.PolicyBundle, opts verifyOptions)
 		BundleHash: bundleHash,
 		VerifiedAt: now,
 		ConfigPath: configPath,
+		baseHash:   baseHash,
 	}, nil
 }
 
@@ -263,7 +275,12 @@ func (c *Cache) activate(verified VerifiedBundle) error {
 	if currentErr != nil && !errors.Is(currentErr, ErrNoValidBundle) {
 		return currentErr
 	}
-	if currentErr == nil && !strings.EqualFold(record.BaseHash, current.BundleHash) {
+	// A directory fsync can report an error after the active-pointer rename has
+	// already taken effect. Retrying that exact activation must be allowed: it
+	// re-durabilizes the same verified pointer rather than treating the already
+	// visible candidate as a competing concurrent apply.
+	alreadyActive := currentErr == nil && strings.EqualFold(current.BundleHash, verified.BundleHash)
+	if currentErr == nil && !alreadyActive && !strings.EqualFold(record.BaseHash, current.BundleHash) {
 		return fmt.Errorf("%w: active bundle changed since staging", ErrInvalidActiveRecord)
 	}
 	if errors.Is(currentErr, ErrNoValidBundle) && record.BaseHash != "" {
@@ -271,7 +288,7 @@ func (c *Cache) activate(verified VerifiedBundle) error {
 	}
 	configName := verified.BundleHash + configExt
 	configPath := filepath.Join(c.configsDir, configName)
-	if err := validateRegularFile(configPath, conductor.MaxConfigYAMLBytes); err != nil {
+	if err := validateConfigPayload(configPath, verified.Bundle.Payload.ConfigYAML); err != nil {
 		return err
 	}
 	active := activeRecord{
@@ -287,7 +304,7 @@ func (c *Cache) activate(verified VerifiedBundle) error {
 	if err != nil {
 		return fmt.Errorf("conductor apply cache: marshal active record: %w", err)
 	}
-	if err := durableWrite(filepath.Join(c.dir, activeRecordName), activeBytes); err != nil {
+	if err := c.writeDurably(filepath.Join(c.dir, activeRecordName), activeBytes); err != nil {
 		return err
 	}
 	return nil
@@ -300,6 +317,13 @@ func (c *Cache) Active() (VerifiedBundle, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.readActiveLocked()
+}
+
+func (c *Cache) writeDurably(path string, data []byte) error {
+	if c.write != nil {
+		return c.write(path, data)
+	}
+	return durableWrite(path, data)
 }
 
 // BundleLookup reports a stored bundle plus the hash of the bundle that was
@@ -341,7 +365,7 @@ func (c *Cache) LookupBundle(hash string) (BundleLookup, error) {
 	if err := validateContainedPath(c.dir, configPath); err != nil {
 		return BundleLookup{}, err
 	}
-	if err := validateRegularFile(configPath, conductor.MaxConfigYAMLBytes); err != nil {
+	if err := validateConfigPayload(configPath, record.Bundle.Payload.ConfigYAML); err != nil {
 		return BundleLookup{}, err
 	}
 	return BundleLookup{
@@ -374,7 +398,7 @@ func (c *Cache) readActiveLocked() (VerifiedBundle, error) {
 	if err := validateContainedPath(c.dir, configPath); err != nil {
 		return VerifiedBundle{}, err
 	}
-	if err := validateRegularFile(configPath, conductor.MaxConfigYAMLBytes); err != nil {
+	if err := validateConfigPayload(configPath, bundleRecord.Bundle.Payload.ConfigYAML); err != nil {
 		return VerifiedBundle{}, err
 	}
 	return VerifiedBundle{
@@ -468,7 +492,11 @@ func verifyBundle(now time.Time, bundle conductor.PolicyBundle, opts verifyOptio
 	// stopped followers applying policy for the whole of a rolling upgrade.
 	// Moving this call above VerifySignaturesAt would apply a bundle whose
 	// provenance was never established.
-	if err := bundle.ValidateAtTimeAllowLegacyPolicyHash(now); err != nil {
+	validationTime := now
+	if opts.RecoverActive && now.After(bundle.ExpiresAt) {
+		validationTime = bundle.ExpiresAt
+	}
+	if err := bundle.ValidateAtTimeAllowLegacyPolicyHash(validationTime); err != nil {
 		return err
 	}
 	if bundle.StreamSwitchAuthorization != nil {
@@ -659,20 +687,9 @@ func readBundleRecord(path string) (diskBundleRecord, error) {
 }
 
 func readJSONFile(path string, maxBytes int, dst any) error {
-	if err := validateRegularFile(path, maxBytes); err != nil {
-		return err
-	}
-	f, err := os.Open(filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-	data, err := io.ReadAll(io.LimitReader(f, int64(maxBytes)+1))
+	data, err := readCacheFile(path, maxBytes)
 	if err != nil {
 		return fmt.Errorf("%w: read JSON record: %w", ErrInvalidActiveRecord, err)
-	}
-	if len(data) > maxBytes {
-		return fmt.Errorf("%w: file_bytes>%d", conductor.ErrPayloadTooLarge, maxBytes)
 	}
 	if err := jsonscan.RejectDuplicateKeys(data); err != nil {
 		return fmt.Errorf("%w: decode JSON record: %w", ErrInvalidActiveRecord, err)
@@ -703,6 +720,39 @@ func validateRegularFile(path string, maxBytes int) error {
 		return fmt.Errorf("%w: file_bytes=%d cap=%d", conductor.ErrPayloadTooLarge, info.Size(), maxBytes)
 	}
 	return nil
+}
+
+// validateConfigPayload binds the on-disk staged config to the signed bundle
+// record that names it. A regular file at the expected path is not enough:
+// recovery and stale decisions must never treat a substituted policy file as
+// the cached signed policy.
+func validateConfigPayload(path, expected string) error {
+	contents, err := readCacheFile(path, conductor.MaxConfigYAMLBytes)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(contents, []byte(expected)) {
+		return fmt.Errorf("%w: cached config does not match signed bundle payload", ErrInvalidActiveRecord)
+	}
+	return nil
+}
+
+// readCacheFile uses the shared secure reader for both policy and metadata.
+// Its descriptor identity and bounded read remain authoritative if the path
+// changes after the preliminary format/size check. The preliminary check keeps
+// the existing cache error classifications for stable invalid files.
+func readCacheFile(path string, maxBytes int) ([]byte, error) {
+	if err := validateRegularFile(path, maxBytes); err != nil {
+		return nil, err
+	}
+	data, err := securefile.Read(path, securefile.Options{
+		MaxBytes:      int64(maxBytes),
+		RejectSymlink: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: reading cache file: %w", ErrInvalidActiveRecord, err)
+	}
+	return data, nil
 }
 
 func validateHash(hash string) error {

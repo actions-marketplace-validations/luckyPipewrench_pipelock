@@ -4,6 +4,7 @@
 package diag
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/serviceenv"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
@@ -25,8 +27,15 @@ import (
 var ErrURLBlocked = errors.New("url blocked")
 
 func CheckCmd() *cobra.Command {
+	return checkCmdWithServiceValidator(serviceenv.Check, os.Executable)
+}
+
+func checkCmdWithServiceValidator(validate func(context.Context, serviceenv.CheckOptions) error, executable func() (string, error)) *cobra.Command {
 	var configFile string
 	var scanURL string
+	var service string
+	var requireBuildCompatibility bool
+	var resolveRuntimeCredentials bool
 
 	cmd := &cobra.Command{
 		Use:   "check",
@@ -35,20 +44,52 @@ func CheckCmd() *cobra.Command {
 
 Examples:
   pipelock check --config pipelock.yaml
+  pipelock check --config /etc/pipelock/pipelock.yaml --service pipelock
   pipelock check --config pipelock.yaml --url https://example.com
   pipelock check --url https://pastebin.com/raw/abc123`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if cmd.Flags().Changed("service") {
+				if configFile == "" || configFile == "-" || scanURL != "" {
+					return errors.New("--service requires a config file and cannot be combined with --url")
+				}
+				path, err := filepath.Abs(configFile)
+				if err != nil {
+					return errors.New("cannot resolve candidate config path")
+				}
+				binary, err := executable()
+				if err != nil {
+					return errors.New("cannot locate config validator")
+				}
+				if err := validate(cmd.Context(), serviceenv.CheckOptions{Binary: binary, ConfigFile: path, Service: service, RequireBuildCompatibility: requireBuildCompatibility}); err != nil {
+					return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+				}
+				cmd.Println("Config validation: OK (valid for pipelock.service configuration environment)")
+				return nil
+			}
 			// Load and validate config
 			var cfg *config.Config
 			if configFile != "" {
 				var err error
-				cfg, err = config.Load(configFile)
+				if resolveRuntimeCredentials {
+					cfg, err = config.LoadForRuntime(configFile)
+				} else {
+					cfg, err = config.Load(configFile)
+				}
 				if err != nil {
 					cmd.PrintErrf("Config validation FAILED: %v\n", err)
 					return err
 				}
+				if requireBuildCompatibility {
+					if err := checkBuildConfigCompatibility(cfg); err != nil {
+						cmd.PrintErrf("Config validation FAILED: %v\n", err)
+						return err
+					}
+				}
 				cmd.Println("Config validation: OK")
+				if cfg.KillSwitch.APITokenFile != "" && !resolveRuntimeCredentials {
+					cmd.Println("  Runtime credential file not checked; use --service pipelock to validate it in the service environment")
+				}
 				cmd.Printf("  Mode:           %s\n", cfg.Mode)
 				cmd.Printf("  Listen:         %s\n", cfg.FetchProxy.Listen)
 				cmd.Printf("  API allowlist:  %d domains\n", len(cfg.APIAllowlist))
@@ -126,8 +167,29 @@ Examples:
 
 	cmd.Flags().StringVarP(&configFile, "config", "c", "", "config file path to validate")
 	cmd.Flags().StringVar(&scanURL, "url", "", "URL to scan through the configured scanners")
+	cmd.Flags().StringVar(&service, "service", "", "validate with the local system pipelock.service configuration environment and static identity (Linux)")
+	cmd.Flags().BoolVar(&resolveRuntimeCredentials, "resolve-runtime-credentials", false, "read runtime credential files in the validator environment")
+	_ = cmd.Flags().MarkHidden("resolve-runtime-credentials")
+	cmd.Flags().BoolVar(&requireBuildCompatibility, "require-build-compatibility", false, "require this build to enforce every configured capability")
+	_ = cmd.Flags().MarkHidden("require-build-compatibility")
 
 	return cmd
+}
+
+// checkBuildConfigCompatibility rejects configuration that this build can
+// parse but cannot enforce. contain install executes the candidate binary's
+// check command before replacing the installed binary, so this guard prevents
+// a core/dev build from silently removing named-profile listeners.
+func checkBuildConfigCompatibility(cfg *config.Config) error {
+	if config.ValidateAgentsFunc != nil {
+		return nil
+	}
+	for name := range cfg.Agents {
+		if name != "_default" {
+			return errors.New("named agent profiles require an enterprise build")
+		}
+	}
+	return nil
 }
 
 // checkConfigAdvisories returns non-fatal advisory messages for the loaded

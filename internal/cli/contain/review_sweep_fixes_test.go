@@ -10,7 +10,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -87,8 +89,8 @@ func TestProbeWorkspaceAccess_FailsOnUnreadableInventory(t *testing.T) {
 	env := makeProbeEnv(t)
 	env.workspaceInvErr = errors.New("permission denied")
 	probes := probesForEnv(env)
-	if probes[len(probes)-2].name != "workspace_access" {
-		t.Fatalf("workspace_access probe must run when the inventory is unreadable; got %q", probes[len(probes)-2].name)
+	if !slices.ContainsFunc(probes, func(p probe) bool { return p.name == "workspace_access" }) {
+		t.Fatalf("workspace_access probe must run when the inventory is unreadable; got %v", probes)
 	}
 	status, detail := probeWorkspaceAccess(context.Background(), env)
 	if status != statusFail || !strings.Contains(detail, "could not be read") {
@@ -164,5 +166,54 @@ func TestRunGrantWorkspace_RecordsAgentUser(t *testing.T) {
 	}
 	if inv.Workspaces[0].AgentUser != env.agentUserName {
 		t.Fatalf("agent_user = %q, want %q", inv.Workspaces[0].AgentUser, env.agentUserName)
+	}
+}
+
+// TestProbeWorkspaceAccess_CredentialGuardRootsAreTraverseOnly proves verify
+// agrees with the credential guard: a guarded config root passes with
+// traverse alone, an ordinary workspace still needs read, and an unknown
+// operator keeps the read requirement everywhere.
+func TestProbeWorkspaceAccess_CredentialGuardRootsAreTraverseOnly(t *testing.T) {
+	home := t.TempDir()
+	guarded := filepath.Join(home, ".claude")
+	project := filepath.Join(home, "project")
+	for _, dir := range []string{guarded, project} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	traverseOnly := func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name != "sudo" {
+			return "", 0, nil
+		}
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, "test -r") {
+			return "", 1, nil // the agent has --x only, as the guard sets it
+		}
+		return "", 0, nil
+	}
+	newEnv := func(operator string, paths ...string) *probeEnv {
+		env := makeProbeEnv(t)
+		env.now = func() time.Time { return testNow }
+		env.operatorUser = operator
+		env.lookupUser = func(string) (*user.User, error) {
+			return &user.User{Uid: "1000", Username: "operator", HomeDir: home}, nil
+		}
+		env.workspacePaths = paths
+		env.runCmd = traverseOnly
+		return env
+	}
+
+	status, detail := probeWorkspaceAccess(context.Background(), newEnv("operator", guarded))
+	if status != statusPass {
+		t.Fatalf("guarded root: status=%q detail=%q, want pass with traverse only", status, detail)
+	}
+	status, detail = probeWorkspaceAccess(context.Background(), newEnv("operator", project))
+	if status != statusFail || !strings.Contains(detail, project) {
+		t.Fatalf("ordinary workspace: status=%q detail=%q, want fail without read", status, detail)
+	}
+	status, detail = probeWorkspaceAccess(context.Background(), newEnv("", guarded))
+	if status != statusFail || !strings.Contains(detail, guarded) {
+		t.Fatalf("unknown operator: status=%q detail=%q, want the read requirement kept", status, detail)
 	}
 }

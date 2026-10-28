@@ -17,6 +17,10 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
+// defaultMCPListenerSensitiveHeaders is the config default
+// request_body_scanning.sensitive_headers list plus the MCP listener's
+// Last-Event-ID carrier. TestDefaultMCPListenerSensitiveHeadersParity keeps
+// the two in step.
 var defaultMCPListenerSensitiveHeaders = []string{
 	"Authorization",
 	"Cookie",
@@ -25,6 +29,8 @@ var defaultMCPListenerSensitiveHeaders = []string{
 	"X-Token",
 	"Proxy-Authorization",
 	"X-Goog-Api-Key",
+	"Private-Token",
+	"Job-Token",
 }
 
 type mcpListenerHeaderDLPResult struct {
@@ -177,6 +183,11 @@ func mcpListenerHeadersToScan(headers http.Header, cfg *config.RequestBodyScanni
 		if strings.HasPrefix(strings.ToLower(name), mcpParamHeaderPrefix) {
 			out[http.CanonicalHeaderKey(name)] = values
 		}
+	}
+	// The client controls this upstream routing value, even when it was
+	// originally issued by a server. Never exempt its bytes from DLP.
+	if values := headers.Values("Mcp-Session-Id"); len(values) > 0 {
+		out["Mcp-Session-Id"] = values
 	}
 	return out
 }

@@ -101,10 +101,19 @@ func (p *compiledPattern) matchSpan(text string) (start, end int, ok bool) {
 // candidate is suppressed only when that same candidate genuinely existed
 // mid-word in source; otherwise the scanner manufactured the adjacency.
 func (p *compiledPattern) matchSpanInView(text, source string) (start, end int, ok bool) {
+	if p.requiresEquals && strings.IndexByte(text, '=') < 0 {
+		return 0, 0, false
+	}
+	if p.minASCIIDigits > 0 && !hasMinimumASCIIDigits(text, p.minASCIIDigits) {
+		return 0, 0, false
+	}
+	if !p.shapeGate.admits(text) {
+		return 0, 0, false
+	}
 	if p.withoutLeftBoundary == nil {
 		for _, loc := range p.re.FindAllStringIndex(text, -1) {
-			if p.validate == nil || p.validate(text[loc[0]:loc[1]]) {
-				return loc[0], loc[1], true
+			if start, end, ok := p.acceptedSpan(text, loc[0], loc[1]); ok {
+				return start, end, true
 			}
 		}
 		return 0, 0, false
@@ -117,7 +126,7 @@ func (p *compiledPattern) matchSpanInView(text, source string) (start, end int, 
 			}
 			start = loc[0] + bodyLoc[0]
 			end = loc[0] + bodyLoc[1]
-			if p.validate == nil || p.validate(text[start:end]) {
+			if p.accepts(text, start, end) {
 				return start, end, true
 			}
 		}
@@ -133,7 +142,33 @@ func (p *compiledPattern) matchSpanInView(text, source string) (start, end int, 
 			invalidIndex++
 			continue
 		}
-		if p.validate == nil || p.validate(text[start:end]) {
+		if p.accepts(text, start, end) {
+			return start, end, true
+		}
+	}
+	return 0, 0, false
+}
+
+// matchSpanInJoinedView is matchSpanInView for the whitespace-joined view,
+// where offsets maps each joined byte to its offset in source. A pattern with a
+// joined-view validator must also pass it; a rejected candidate never hides a
+// later genuine one. Patterns without one behave exactly as in matchSpanInView.
+func (p *compiledPattern) matchSpanInJoinedView(text, source string, offsets []int) (start, end int, ok bool) {
+	if p.validateJoined == nil || p.withoutLeftBoundary != nil {
+		return p.matchSpanInView(text, source)
+	}
+	if p.requiresEquals && strings.IndexByte(text, '=') < 0 {
+		return 0, 0, false
+	}
+	if p.minASCIIDigits > 0 && !hasMinimumASCIIDigits(text, p.minASCIIDigits) {
+		return 0, 0, false
+	}
+	if !p.shapeGate.admits(text) {
+		return 0, 0, false
+	}
+	for _, loc := range p.re.FindAllStringIndex(text, -1) {
+		start, end, ok := p.acceptedSpan(text, loc[0], loc[1])
+		if ok && p.validateJoined(text, start, end, source, offsets) {
 			return start, end, true
 		}
 	}

@@ -35,11 +35,14 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/emitformat"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/identitykey"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/media"
 	"github.com/luckyPipewrench/pipelock/internal/secperm"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
+
+var containmentGeometryPattern = regexp.MustCompile(`^[1-9][0-9]{0,4}x[1-9][0-9]{0,4}$`)
 
 // ValidateTrustedDomains validates and normalizes a slice of trusted domain
 // entries. Each entry is lowercased, trimmed, and checked for: empty values,
@@ -171,6 +174,75 @@ func validateUnscannablePassthrough(entries []UnscannablePassthroughEntry) error
 	return nil
 }
 
+// validateCoreObserveExceptions checks every declared floor-observe entry.
+//
+// Each field is required and every failure refuses the config, because this is
+// the only mechanism that withholds a block on the immutable response floor.
+// The host must be one exact host: a wildcard here would hand back the breadth
+// of exempt_domains that this valve exists to replace, so it is refused the
+// same way the passthrough and credential-route entries refuse one.
+func validateCoreObserveExceptions(entries []CoreObserveException) error {
+	type identity struct{ host, pattern string }
+	seen := make(map[identity]int, len(entries))
+	for i := range entries {
+		entry := &entries[i]
+		field := fmt.Sprintf("response_scanning.core_observe_exceptions[%d]", i)
+
+		host := []string{entry.Host}
+		if err := ValidateTrustedDomains(host, field+".host"); err != nil {
+			return err
+		}
+		if strings.ContainsAny(host[0], "*?[]") {
+			return fmt.Errorf("%s.host must be one exact host without wildcards; this entry withholds a block on the immutable response floor, so it may not cover a whole subtree", field)
+		}
+		entry.Host = canonicalCoreObserveHost(host[0])
+
+		entry.Pattern = strings.TrimSpace(entry.Pattern)
+		if entry.Pattern == "" {
+			return fmt.Errorf("%s.pattern is required; name exactly one core response pattern", field)
+		}
+		if !IsCoreResponsePatternName(entry.Pattern) {
+			return fmt.Errorf("%s.pattern %q is not a core response pattern; only the immutable floor needs this valve, and a configured pattern already has response_scanning.suppress. Valid names: %s", field, entry.Pattern, strings.Join(CoreResponsePatternNames(), ", "))
+		}
+
+		for _, text := range []struct {
+			name  string
+			value *string
+		}{
+			{name: "reason", value: &entry.Reason},
+			{name: "owner", value: &entry.Owner},
+		} {
+			*text.value = strings.TrimSpace(*text.value)
+			if *text.value == "" {
+				return fmt.Errorf("%s.%s is required", field, text.name)
+			}
+			if len(*text.value) > 200 {
+				return fmt.Errorf("%s.%s must be 200 characters or fewer", field, text.name)
+			}
+			if strings.IndexFunc(*text.value, unicode.IsControl) >= 0 {
+				return fmt.Errorf("%s.%s must not contain control characters", field, text.name)
+			}
+		}
+
+		entry.Expires = strings.TrimSpace(entry.Expires)
+		if entry.Expires == "" {
+			return fmt.Errorf("%s.expires is required", field)
+		}
+		// Startup reaches this through Validate, which does not run
+		// ValidateExpiryAuthorizations, so the horizon is enforced here as well.
+		if err := validateTemporaryExpiryDate(field+".expires", entry.Expires, MaxCoreObserveExceptionHorizon); err != nil {
+			return err
+		}
+
+		key := identity{host: entry.Host, pattern: strings.ToLower(entry.Pattern)}
+		if prior, ok := seen[key]; ok {
+			return fmt.Errorf("%s duplicates response_scanning.core_observe_exceptions[%d] for host %q and pattern %q; declare one entry with the expiry you mean", field, prior, entry.Host, entry.Pattern)
+		}
+		seen[key] = i
+	}
+	return nil
+}
+
 func validateUnscannablePassthroughExpiryHorizons(entries []UnscannablePassthroughEntry) error {
 	for i, entry := range entries {
 		field := fmt.Sprintf("response_scanning.unscannable_passthrough[%d].expires", i)
@@ -201,13 +273,52 @@ func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
 		}
 		entry.Host = host[0]
 
-		path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
-		if !ok {
-			return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+		hasPath := strings.TrimSpace(entry.Path) != ""
+		hasPrefix := strings.TrimSpace(entry.PathPrefix) != ""
+		switch {
+		case hasPath && hasPrefix:
+			return fmt.Errorf("%s sets both path and path_prefix; name exactly one", field)
+		case !hasPath && !hasPrefix:
+			return fmt.Errorf("%s requires exactly one of path or path_prefix", field)
+		case hasPath:
+			path, ok := CanonicalUnscannablePassthroughPath(strings.TrimSpace(entry.Path))
+			if !ok {
+				return fmt.Errorf("%s.path %q must be an exact non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.Path)
+			}
+			entry.Path = path
+			// A whitespace-only path_prefix counted as absent above; clear it so
+			// the runtime matcher, which requires the unused field to be empty,
+			// does not treat the accepted route as having both.
+			entry.PathPrefix = ""
+		default:
+			entry.Path = ""
+			prefix := strings.TrimSpace(entry.PathPrefix)
+			if err := validateEntropyPathPrefixShape(field, entry.PathPrefix, prefix); err != nil {
+				return err
+			}
+			// The runtime compares against the request path in the form
+			// CanonicalUnscannablePassthroughPath produces, so the stored prefix
+			// must be in that same form. The trailing slash is load-bearing and
+			// is carried across the canonicalization.
+			canonical, ok := CanonicalUnscannablePassthroughPath(strings.TrimSuffix(prefix, "/"))
+			if !ok {
+				return fmt.Errorf("%s.path_prefix %q must be a non-root canonical path without traversal, encoded topology changes, controls, or path parameters", field, entry.PathPrefix)
+			}
+			if strings.HasSuffix(prefix, "/") {
+				canonical += "/"
+			}
+			entry.PathPrefix = canonical
 		}
-		entry.Path = path
+		// An exact-path route keeps the original rule: only non-textual bodies,
+		// because the textual scanners are what the route must not blind. A
+		// prefix route exists for service-issued textual payloads, and still
+		// downgrades entropy findings only.
+		allowTextual := hasPrefix
 
 		if len(entry.ContentTypes) == 0 {
+			if allowTextual {
+				return fmt.Errorf("%s.content_types must contain at least one media type", field)
+			}
 			return fmt.Errorf("%s.content_types must contain at least one non-textual media type", field)
 		}
 		for j, raw := range entry.ContentTypes {
@@ -215,7 +326,7 @@ func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
 			if err != nil || mediaType == "" {
 				return fmt.Errorf("%s.content_types[%d] %q is invalid", field, j, raw)
 			}
-			if isTextualUnscannablePassthroughType(mediaType) {
+			if !allowTextual && isTextualUnscannablePassthroughType(mediaType) {
 				return fmt.Errorf("%s.content_types[%d] %q is textual/scannable and cannot downgrade entropy enforcement", field, j, raw)
 			}
 			entry.ContentTypes[j] = mediaType
@@ -248,7 +359,7 @@ func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
 		}
 
 		entry.Expires = strings.TrimSpace(entry.Expires)
-		if err := validateTemporaryExpiryDate(field+".expires", entry.Expires, MaxRequestBodyEntropyWarnRouteHorizon); err != nil {
+		if err := validateLapsingExpiryDate(field+".expires", entry.Expires, MaxRequestBodyEntropyWarnRouteHorizon); err != nil {
 			return err
 		}
 
@@ -259,8 +370,8 @@ func validateRequestBodyEntropyWarnRoutes(cfg *RequestBodyScanning) error {
 		for j := range i {
 			previous := cfg.ContentEntropyWarnRoutes[j]
 			methodsOverlap := len(previous.Methods) == 0 || len(entry.Methods) == 0 || sortedStringsOverlap(previous.Methods, entry.Methods)
-			if previous.Host == entry.Host && previous.Path == entry.Path && methodsOverlap && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
-				return fmt.Errorf("%s overlaps content_entropy_warn_routes[%d]; exact route exceptions must have one unambiguous owner and reason", field, j)
+			if previous.Host == entry.Host && entropyRoutePathsOverlap(previous, *entry) && methodsOverlap && sortedStringsOverlap(previous.ContentTypes, entry.ContentTypes) {
+				return fmt.Errorf("%s overlaps content_entropy_warn_routes[%d]; route exceptions must have one unambiguous owner and reason", field, j)
 			}
 		}
 	}
@@ -334,7 +445,7 @@ func validateRequestBodySigV4CredentialRoutes(cfg *RequestBodyScanning) error {
 		}
 
 		entry.Expires = strings.TrimSpace(entry.Expires)
-		if err := validateTemporaryExpiryDate(field+".expires", entry.Expires, MaxRequestBodySigV4CredentialRouteHorizon); err != nil {
+		if err := validateLapsingExpiryDate(field+".expires", entry.Expires, MaxRequestBodySigV4CredentialRouteHorizon); err != nil {
 			return err
 		}
 
@@ -477,12 +588,28 @@ func (c *Config) Validate() error {
 	return err
 }
 
+// MCPCompatibilityWarnings returns advisories for ambiguous legacy MCP settings.
+// These describe the loaded source, independently of later runtime resolution.
+func (c *Config) MCPCompatibilityWarnings() []Warning {
+	return append([]Warning(nil), c.mcpCompatibilityWarnings...)
+}
+
+// CopyMCPCompatibilityWarningsFrom preserves loaded-source advisories across
+// config transformations, independently of the effective profile settings.
+func (c *Config) CopyMCPCompatibilityWarningsFrom(src *Config) {
+	if src == nil {
+		c.mcpCompatibilityWarnings = nil
+		return
+	}
+	c.mcpCompatibilityWarnings = src.MCPCompatibilityWarnings()
+}
+
 // ValidateWithWarnings validates the config and returns any non-fatal
 // advisory warnings alongside the first hard error. Dispatch order matches
 // Validate() exactly. Warnings are returned even when err is non-nil, so
 // callers can surface every advisory emitted before the failing validator.
 func (c *Config) ValidateWithWarnings() ([]Warning, error) {
-	var warnings []Warning
+	warnings := c.MCPCompatibilityWarnings()
 	if err := c.validateIntegerDurationBounds(); err != nil {
 		return warnings, err
 	}
@@ -505,6 +632,9 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 		return warnings, err
 	}
 	if err := c.validateMCPInputScanning(); err != nil {
+		return warnings, err
+	}
+	if err := validateMCPIdentities(c.MCPIdentities); err != nil {
 		return warnings, err
 	}
 	if err := c.validateMCPToolScanning(&warnings); err != nil {
@@ -543,16 +673,28 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 	if err := c.validateRequestBodyScanning(&warnings); err != nil {
 		return warnings, err
 	}
-	if len(c.RequestBodyScanning.SigV4CredentialRoutes) > 0 {
+	activeSigV4, activeWarn := 0, 0
+	now := time.Now()
+	for _, entry := range c.RequestBodyScanning.SigV4CredentialRoutes {
+		if ScannerExceptionActive(entry.Expires, now) {
+			activeSigV4++
+		}
+	}
+	for _, entry := range c.RequestBodyScanning.ContentEntropyWarnRoutes {
+		if ScannerExceptionActive(entry.Expires, now) {
+			activeWarn++
+		}
+	}
+	if activeSigV4 > 0 {
 		warnings = append(warnings, Warning{
 			Field:   "request_body_scanning.sigv4_credential_routes",
-			Message: fmt.Sprintf("%d exact HTTPS route(s) allow request bodies to carry structurally valid SigV4 presigned URLs; all malformed, bare, and out-of-route credentials remain blocked", len(c.RequestBodyScanning.SigV4CredentialRoutes)),
+			Message: fmt.Sprintf("%d exact HTTPS route(s) allow request bodies to carry structurally valid SigV4 presigned URLs; all malformed, bare, and out-of-route credentials remain blocked", activeSigV4),
 		})
 	}
-	if len(c.RequestBodyScanning.ContentEntropyWarnRoutes) > 0 {
+	if activeWarn > 0 {
 		warnings = append(warnings, Warning{
 			Field:   "request_body_scanning.content_entropy_warn_routes",
-			Message: fmt.Sprintf("%d exact HTTPS route(s) downgrade request-body entropy findings from block to warn; DLP, injection, address, size, and redirect controls remain enforced", len(c.RequestBodyScanning.ContentEntropyWarnRoutes)),
+			Message: fmt.Sprintf("%d HTTPS route(s) downgrade request-body entropy findings from block to warn; DLP, injection, address, size, and redirect controls remain enforced", activeWarn),
 		})
 	}
 	if err := c.validateRequestPolicy(&warnings); err != nil {
@@ -584,7 +726,16 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 	if err := c.validateMetricsListen(); err != nil {
 		return warnings, err
 	}
-	if err := c.validateContainmentLoopbackServices(); err != nil {
+	if err := c.validateContainmentLoopbackServices(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.validateContainmentPublishedServices(&warnings); err != nil {
+		return warnings, err
+	}
+	if err := c.Containment.Display.Validate(); err != nil {
+		return warnings, err
+	}
+	if err := c.Containment.Filesystem.Validate(); err != nil {
 		return warnings, err
 	}
 	if err := c.validateEmit(); err != nil {
@@ -677,9 +828,17 @@ func (c *Config) ValidateWithWarnings() ([]Warning, error) {
 	if err := c.validateGuard(); err != nil {
 		return warnings, err
 	}
+	if _, err := c.DestinationGrantSet(); err != nil {
+		return warnings, err
+	}
 	// Advisory only, and last: it reads across sections that the validators
 	// above have already accepted, and it can never fail a config.
 	c.validateActionDivergence(&warnings)
+	// Retain warnings after a loader has already removed the expired entries.
+	// The private copy lets validation report lapses without mutating policy.
+	candidate := c.Clone()
+	candidate.partitionScannerExceptions(time.Now())
+	warnings = append(warnings, candidate.LapsedScannerExceptionWarnings()...)
 	return warnings, nil
 }
 
@@ -1391,13 +1550,31 @@ func (c *Config) validateDLP(warnings *[]Warning) error {
 }
 
 func (c *Config) validateDLPPatternConfig(warnings *[]Warning) error {
-	// Reject unsupported DLP action fields. Request-side DLP redaction (strip)
-	// is not implemented - DLP matches follow the transport-level action
-	// (request_body_scanning.action, mcp_input_scanning.action, or enforce mode).
-	// These fields exist on the struct so YAML doesn't silently drop them;
-	// validation rejects non-empty values with an explicit error.
+	// dlp.action is not supported: DLP matches follow the calling surface's
+	// action (request_body_scanning.action, mcp_input_scanning.action, or
+	// enforce mode). The field exists so YAML doesn't silently drop it, and a
+	// non-empty value is rejected with an explicit error. A per-pattern
+	// action accepts only "warn", and never on a built-in pattern.
 	if c.DLP.Action != "" {
 		return fmt.Errorf("dlp.action %q is not supported; DLP match behavior depends on the calling surface (request_body_scanning.action for HTTP bodies/headers, mcp_input_scanning.action for MCP input, enforce/audit mode for URL scanning, and response_scanning.action only for inbound prompt-injection response scanning)", c.DLP.Action)
+	}
+	if err := validateDeclaredCredentialHostList(c.DLP.GitHubEnterpriseHosts, "dlp.github_enterprise_hosts"); err != nil {
+		return err
+	}
+	if err := validateDeclaredCredentialHostList(c.DLP.GitLabHosts, "dlp.gitlab_hosts"); err != nil {
+		return err
+	}
+	if warnings != nil && len(c.DLP.GitHubEnterpriseHosts) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "dlp.github_enterprise_hosts",
+			Message: fmt.Sprintf("dlp.github_enterprise_hosts %v receives GitHub Token and GitHub Fine-Grained PAT on an encrypted Authorization header; a declared host the operator does not control receives the credential by design", c.DLP.GitHubEnterpriseHosts),
+		})
+	}
+	if warnings != nil && len(c.DLP.GitLabHosts) > 0 {
+		*warnings = append(*warnings, Warning{
+			Field:   "dlp.gitlab_hosts",
+			Message: fmt.Sprintf("dlp.gitlab_hosts %v receives GitLab token classes on their compiled headers over an encrypted scheme; a declared host the operator does not control receives the credential by design", c.DLP.GitLabHosts),
+		})
 	}
 
 	// Validate DLP patterns compile as valid regexes
@@ -1439,29 +1616,92 @@ func (c *Config) validateDLPPatternConfig(warnings *[]Warning) error {
 		// never grants. Refuse it at load and reload instead of shipping a knob
 		// that silently does nothing for that credential class.
 		if len(p.ExemptDomains) > 0 && IsCoreDLPPatternName(p.Name) {
-			return fmt.Errorf("DLP pattern %q is a core safety-floor pattern and cannot set exempt_domains; core credential classes are blocked on every destination", p.Name)
+			return fmt.Errorf("DLP pattern %q is a core safety-floor pattern and cannot set exempt_domains; core credential destinations are controlled only by immutable compiled policy", p.Name)
 		}
 		// Gate on the pattern's OWN compiled audience, matching the warn-action
-		// branch above. A customized pattern that merely reuses a built-in name
-		// carries no audience after normalize clears it, and the scanner also
-		// checks the compiled audience, so classifying its exempt_domains
-		// against the built-in list would make validation disagree with runtime.
-		if len(p.ExemptDomains) > 0 && len(p.CredentialAudienceHosts) > 0 {
-			if credentialAudienceDomainSubset(p.ExemptDomains, p.CredentialAudienceHosts) {
-				if warnings != nil {
+		// branch above. exempt_domains never costs a pattern its audience: an
+		// entry the audience already covers is redundant and ignored, and an
+		// entry outside it is honored by the scanner for that host only. The
+		// second is a widening the operator is entitled to choose, so it warns
+		// and the config loads, as the suppress and disable_patterns widenings do.
+		if len(p.ExemptDomains) > 0 && len(p.CredentialAudienceHosts) > 0 && warnings != nil {
+			// The scanner's audience includes declared enterprise hosts, so
+			// classify against the same set it enforces.
+			audienceHosts := AppendDeclaredCredentialAudienceHosts(p.Name, p.CredentialAudienceHosts, c.DLP.GitHubEnterpriseHosts, c.DLP.GitLabHosts)
+			var inside, outside []string
+			for _, domain := range p.ExemptDomains {
+				if credentialAudienceDomainSubset([]string{domain}, audienceHosts) {
+					inside = append(inside, domain)
+				} else {
+					outside = append(outside, domain)
+				}
+			}
+			field := fmt.Sprintf("dlp.patterns[%d].exempt_domains", i)
+			if len(inside) > 0 {
+				*warnings = append(*warnings, Warning{
+					Field:   field,
+					Message: fmt.Sprintf("%s %v is a redundant subset of the compiled credential audience for %q and is ignored; remove it", field, inside, p.Name),
+				})
+			}
+			if len(outside) > 0 {
+				*warnings = append(*warnings, Warning{
+					Field:   field,
+					Message: fmt.Sprintf("%s %v is outside the compiled credential audience %v for %q: the pattern is skipped for those destinations, so the credential can leave for a host its vendor does not own", field, outside, audienceHosts, p.Name),
+				})
+			}
+		}
+		// A pattern that reuses a built-in name replaces the built-in, and a
+		// changed regex, severity, validator or action costs it the compiled
+		// credential audience. A blocking replacement then blocks at the
+		// vendor's own destinations too, which looks like an outage to the
+		// operator and otherwise says nothing about why.
+		if warnings != nil && p.Bundle == "" && len(p.CredentialAudienceHosts) == 0 {
+			if builtIn, ok := builtInAudiencePattern(p.Name); ok {
+				if changed := changedFromBuiltIn(p, builtIn); len(changed) > 0 {
+					// The hostile preset intentionally ships these severity-only
+					// overrides without an audience. Recognize that exact shipped
+					// identity rather than warning on a supported preset. Custom
+					// regexes, actions, validators and exemptions still warn.
+					if len(changed) == 1 && changed[0] == "severity" &&
+						p.Severity == hostileDLPSeverityOverrides[p.Name] && len(p.ExemptDomains) == 0 {
+						continue
+					}
 					*warnings = append(*warnings, Warning{
-						Field:   fmt.Sprintf("dlp.patterns[%d].exempt_domains", i),
-						Message: fmt.Sprintf("dlp.patterns[%d].exempt_domains is a redundant subset of the compiled credential audience for %q and is ignored; remove it", i, p.Name),
+						Field:   fmt.Sprintf("dlp.patterns[%d]", i),
+						Message: fmt.Sprintf("dlp.patterns[%d] %q replaces the built-in pattern of the same name and changes its %s, so its compiled credential audience %v no longer applies; matches follow the configured action and exemptions instead of receiving the built-in destination-and-carrier allowance; keep the shipped regex, severity, validator and action to keep the audience, or give the pattern a different name", i, p.Name, strings.Join(changed, ", "), builtIn.CredentialAudienceHosts),
 					})
 				}
-				continue
 			}
-			return fmt.Errorf("dlp.patterns[%d].exempt_domains for %q would widen its compiled credential audience; delete dlp.patterns[%d].exempt_domains", i, p.Name, i)
 		}
 	}
 
 	if err := validateCanaryTokens(c); err != nil {
 		return fmt.Errorf("canary_tokens: %w", err)
+	}
+	return nil
+}
+
+// validateDeclaredCredentialHostList accepts only exact DNS hostnames.
+// Wildcards, IP literals, URLs, and host:port values are rejected. The
+// encrypted-scheme requirement is enforced when the request is matched.
+func validateDeclaredCredentialHostList(hosts []string, field string) error {
+	seen := make(map[string]struct{}, len(hosts))
+	for i := range hosts {
+		normalized, err := NormalizeAndCheckHostPattern(hosts[i])
+		if err != nil {
+			return fmt.Errorf("%s[%d] %q: %w", field, i, hosts[i], err)
+		}
+		if strings.Contains(normalized, "*") {
+			return fmt.Errorf("%s[%d] %q: wildcards are not allowed; name the exact host", field, i, hosts[i])
+		}
+		if net.ParseIP(normalized) != nil {
+			return fmt.Errorf("%s[%d] %q: IP literals are not allowed", field, i, hosts[i])
+		}
+		if _, dup := seen[normalized]; dup {
+			return fmt.Errorf("%s[%d] %q duplicates %q", field, i, hosts[i], normalized)
+		}
+		seen[normalized] = struct{}{}
+		hosts[i] = normalized
 	}
 	return nil
 }
@@ -1504,6 +1744,10 @@ func (c *Config) validateFetchProxy() error {
 		return err
 	}
 	if err := validateQueryEntropyParamExclusions(c.FetchProxy.Monitoring.QueryEntropyParamExclusions); err != nil {
+		return err
+	}
+
+	if err := validateOAuthAuthorizationEndpoints(c); err != nil {
 		return err
 	}
 
@@ -1823,6 +2067,38 @@ func validatePassthroughHostGrantList(hosts []string, label string) error {
 	return nil
 }
 
+// validateEntropyPathPrefixShape holds the path-prefix checks shared by every
+// entropy exception that names a prefix (path_entropy_exclusions and
+// content_entropy_warn_routes[].path_prefix), so neither carries a weaker copy.
+// raw is the operator's spelling, for messages; prefix is it trimmed.
+func validateEntropyPathPrefixShape(field, raw, prefix string) error {
+	if !strings.HasPrefix(prefix, "/") {
+		return fmt.Errorf("%s.path_prefix %q must start with /", field, raw)
+	}
+	if prefix == "/" {
+		return fmt.Errorf("%s.path_prefix %q exempts every path on the host; use subdomain_entropy_exclusions deliberately if that is the intent", field, raw)
+	}
+	if strings.Contains(prefix, "://") {
+		return fmt.Errorf("%s.path_prefix %q must be a path, not a URL", field, raw)
+	}
+	// Reuse the sibling exemption's path normalizer rather than repeating a
+	// weaker check beside it. It refuses an encoded slash or backslash, a
+	// query or fragment delimiter, a wildcard, a control character, a dot
+	// segment, and any non-canonical escape spelling. Those all matter here
+	// because the scanner compares a prefix against the request's ESCAPED
+	// path: a prefix carrying %2f could never match a canonical request, so
+	// accepting one would hand the operator a silently inert exemption.
+	// The trailing slash is trimmed first because it is load-bearing for
+	// prefix matching (it stops /document/de matching /document/d) while
+	// path.Clean treats it as non-canonical and would reject it.
+	// normalizeQueryEntropyParamPath now accepts one trailing slash itself, so
+	// trimming here as well would let a doubled slash ("/assets//") through.
+	if _, err := normalizeQueryEntropyParamPath(prefix); err != nil {
+		return fmt.Errorf("%s.path_prefix %q is not a canonical path: %w", field, raw, err)
+	}
+	return nil
+}
+
 // validatePathEntropyExclusions rejects an entry that would widen the path
 // entropy exemption beyond one route. An empty host or an empty path prefix
 // makes the entry match everything, which is a host-wide (or global) exemption
@@ -1837,8 +2113,11 @@ func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
 		if scheme == "" {
 			scheme = QueryEntropyParamDefaultScheme
 		}
-		if scheme != schemeHTTPS {
-			return fmt.Errorf("%s.scheme %q must be https", field, entry.Scheme)
+		// An omitted scheme stays https. An explicit http entry is a separate
+		// exemption for that cleartext route. Query-parameter exclusions stay
+		// https-only in validateQueryEntropyParamExclusions.
+		if scheme != schemeHTTPS && scheme != schemeHTTP {
+			return fmt.Errorf("%s.scheme %q must be http or https", field, entry.Scheme)
 		}
 
 		if err := RawHostASCIIError(entry.Host); err != nil {
@@ -1863,32 +2142,13 @@ func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
 		if prefix == "" {
 			return fmt.Errorf("%s.path_prefix is required; an entry without a prefix would exempt every path on the host", field)
 		}
-		if !strings.HasPrefix(prefix, "/") {
-			return fmt.Errorf("%s.path_prefix %q must start with /", field, entry.PathPrefix)
-		}
-		if prefix == "/" {
-			return fmt.Errorf("%s.path_prefix %q exempts every path on the host; use subdomain_entropy_exclusions deliberately if that is the intent", field, entry.PathPrefix)
-		}
-		if strings.Contains(prefix, "://") {
-			return fmt.Errorf("%s.path_prefix %q must be a path, not a URL", field, entry.PathPrefix)
-		}
-		// Reuse the sibling exemption's path normalizer rather than repeating a
-		// weaker check beside it. It refuses an encoded slash or backslash, a
-		// query or fragment delimiter, a wildcard, a control character, a dot
-		// segment, and any non-canonical escape spelling. Those all matter here
-		// because the scanner compares a prefix against the request's ESCAPED
-		// path: a prefix carrying %2f could never match a canonical request, so
-		// accepting one would hand the operator a silently inert exemption.
-		// The trailing slash is trimmed first because it is load-bearing for
-		// prefix matching (it stops /document/de matching /document/d) while
-		// path.Clean treats it as non-canonical and would reject it.
-		if _, err := normalizeQueryEntropyParamPath(strings.TrimSuffix(prefix, "/")); err != nil {
-			return fmt.Errorf("%s.path_prefix %q is not a canonical path: %w", field, entry.PathPrefix, err)
+		if err := validateEntropyPathPrefixShape(field, entry.PathPrefix, prefix); err != nil {
+			return err
 		}
 
 		expires := strings.TrimSpace(entry.Expires)
 		if expires != "" {
-			if err := validateTemporaryExpiryDate(field+".expires", expires, MaxPathEntropyExclusionHorizon); err != nil {
+			if err := validateLapsingExpiryDate(field+".expires", expires, MaxPathEntropyExclusionHorizon); err != nil {
 				return err
 			}
 		}
@@ -1908,9 +2168,15 @@ func validatePathEntropyExclusions(entries []PathEntropyExclusion) error {
 }
 
 func validateQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) error {
+	return validateQueryEntropyParamExclusionsAt(entries, "fetch_proxy.monitoring.query_entropy_param_exclusions", true)
+}
+
+// validateQueryEntropyParamExclusionsAt names errors after the field the
+// operator wrote. withParam is false for a list whose entries carry no param.
+func validateQueryEntropyParamExclusionsAt(entries []QueryEntropyParamExclusion, fieldName string, withParam bool) error {
 	seen := make(map[string]struct{}, len(entries))
 	for i := range entries {
-		field := fmt.Sprintf("fetch_proxy.monitoring.query_entropy_param_exclusions[%d]", i)
+		field := fmt.Sprintf("%s[%d]", fieldName, i)
 		entry := &entries[i]
 
 		scheme := strings.TrimSpace(strings.ToLower(entry.Scheme))
@@ -1938,7 +2204,7 @@ func validateQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) e
 		}
 		expires := strings.TrimSpace(entry.Expires)
 		if expires != "" {
-			if err := validateTemporaryExpiryDate(field+".expires", expires, MaxQueryEntropyParamExclusionHorizon); err != nil {
+			if err := validateLapsingExpiryDate(field+".expires", expires, MaxQueryEntropyParamExclusionHorizon); err != nil {
 				return err
 			}
 		}
@@ -1953,6 +2219,9 @@ func validateQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) e
 
 		tuple := strings.Join([]string{scheme, host, pathValue, param}, "\x00")
 		if _, ok := seen[tuple]; ok {
+			if !withParam {
+				return fmt.Errorf("%s duplicates normalized endpoint %s://%s%s", field, scheme, host, pathValue)
+			}
 			return fmt.Errorf("%s duplicates normalized query entropy parameter exclusion tuple %s://%s%s?%s", field, scheme, host, pathValue, param)
 		}
 		seen[tuple] = struct{}{}
@@ -2064,7 +2333,13 @@ func normalizeQueryEntropyParamPath(raw string) (string, error) {
 	if strings.ContainsAny(decoded, "?#*\\;") || strings.IndexFunc(decoded, unicode.IsControl) >= 0 {
 		return "", errors.New("decoded path must not contain query, fragment, wildcard, backslash, path-parameter, or control characters")
 	}
-	if decoded == "/" || path.Clean(decoded) != decoded {
+	// A route may end in one slash (a framework with trailing-slash routing
+	// serves /_next/image/), and the scanner matches the escaped request path
+	// exactly, slash included. Clean the path without that slash so the
+	// validator accepts the spelling the matcher can match. "//" and "/a//"
+	// still fail: a trimmed remainder of "/" or an empty one is not a route.
+	cleanable := strings.TrimSuffix(decoded, "/")
+	if decoded == "/" || cleanable == "" || cleanable == "/" || path.Clean(cleanable) != cleanable {
 		return "", errors.New("path must be canonical and must not contain traversal")
 	}
 	canonical := (&url.URL{Path: decoded}).EscapedPath()
@@ -2100,6 +2375,12 @@ func normalizeQueryEntropyParamName(raw string) (string, error) {
 }
 
 func (c *Config) validateResponseScanning(warnings *[]Warning) error {
+	if err := c.validatePromptInjectionDetection(); err != nil {
+		return err
+	}
+	if notice := c.PromptInjectionNotice(); notice != "" {
+		*warnings = append(*warnings, Warning{Field: "prompt_injection_detection", Message: notice})
+	}
 	// Validate response scanning config
 	if c.ResponseScanning.Enabled {
 		switch c.ResponseScanning.Action {
@@ -2132,6 +2413,9 @@ func (c *Config) validateResponseScanning(warnings *[]Warning) error {
 	if c.ResponseScanning.SizeExemptScanMaxBytes <= 0 {
 		return fmt.Errorf("response_scanning.size_exempt_scan_max_bytes must be > 0")
 	}
+	if int64(c.ResponseScanning.SizeExemptScanMaxBytes) == math.MaxInt64 {
+		return fmt.Errorf("response_scanning.size_exempt_scan_max_bytes must leave room for one probe byte")
+	}
 	if c.ResponseScanning.SizeExemptScanMaxInflightBytes <= 0 {
 		return fmt.Errorf("response_scanning.size_exempt_scan_max_inflight_bytes must be > 0")
 	}
@@ -2139,6 +2423,12 @@ func (c *Config) validateResponseScanning(warnings *[]Warning) error {
 		return fmt.Errorf("response_scanning.size_exempt_scan_max_inflight_bytes must be >= response_scanning.size_exempt_scan_max_bytes")
 	}
 	if err := validateUnscannablePassthrough(c.ResponseScanning.UnscannablePassthrough); err != nil {
+		return err
+	}
+	if err := c.ResponseScanning.validateSizeExemptScanLimits(warnings, time.Now()); err != nil {
+		return err
+	}
+	if err := validateCoreObserveExceptions(c.ResponseScanning.CoreObserveExceptions); err != nil {
 		return err
 	}
 	for i, entry := range c.ResponseScanning.UnscannablePassthrough {
@@ -2259,6 +2549,28 @@ func (c *Config) validateMCPInputScanning() error {
 
 func (c *Config) validateMCPToolScanning(warnings *[]Warning) error {
 	c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = nil
+	c.MCPToolScanning.AcknowledgmentKeyBytes = nil
+	if err := validateMCPAcknowledgedFindings(c.MCPToolScanning.AcknowledgedFindings, c.MCPIdentities, time.Now().UTC()); err != nil {
+		return err
+	}
+	// The key is resolved once here and pinned. With entries and no usable
+	// key the configuration is refused: there is no unkeyed fallback.
+	if c.MCPToolScanning.AcknowledgmentKey != "" || len(c.MCPToolScanning.AcknowledgedFindings) > 0 {
+		if c.MCPToolScanning.AcknowledgmentKey == "" {
+			return errors.New("mcp_tool_scanning.acknowledged_findings requires mcp_tool_scanning.acknowledgment_key")
+		}
+		key, err := resolveMCPAckKey(c.MCPToolScanning.AcknowledgmentKey)
+		if err != nil {
+			return err
+		}
+		c.MCPToolScanning.AcknowledgmentKeyBytes = key
+	}
+	if len(c.MCPToolScanning.AcknowledgedFindings) > 0 && !c.MCPToolScanning.Enabled && warnings != nil {
+		*warnings = append(*warnings, Warning{
+			Field:   "mcp_tool_scanning.acknowledged_findings",
+			Message: "acknowledged_findings has no effect while mcp_tool_scanning is disabled",
+		})
+	}
 	if c.NewToolActionAliasWarning != "" && warnings != nil {
 		*warnings = append(*warnings, Warning{
 			Field:   "mcp_tool_scanning.new_tool_action",
@@ -2349,6 +2661,12 @@ func (c *Config) validateMCPToolPolicy() error {
 	}
 	if c.MCPToolPolicy.Action == ActionDefer && !c.Defer.Enabled {
 		return fmt.Errorf("invalid mcp_tool_policy action %q: defer.enabled must be true", c.MCPToolPolicy.Action)
+	}
+	switch c.MCPToolPolicy.OnIncompleteCheck {
+	case "", ActionWarn, ActionBlock:
+		// valid; empty means warn
+	default:
+		return fmt.Errorf("invalid mcp_tool_policy on_incomplete_check %q: must be warn or block", c.MCPToolPolicy.OnIncompleteCheck)
 	}
 	// Validate redirect profiles.
 	for name, profile := range c.MCPToolPolicy.RedirectProfiles {
@@ -2453,9 +2771,6 @@ func validateToolPolicyArgSource(r ToolPolicyRule) error {
 	if r.ArgSource != "" && r.ArgPattern == "" {
 		return fmt.Errorf("mcp_tool_policy rule %q has arg_source without arg_pattern", r.Name)
 	}
-	if r.ArgSource != "" && r.ArgKey != "" {
-		return fmt.Errorf("mcp_tool_policy rule %q combines arg_source with arg_key", r.Name)
-	}
 	return nil
 }
 
@@ -2521,13 +2836,6 @@ func validateToolPolicyStructuralTypeCompatibility(r ToolPolicyRule) error {
 	return nil
 }
 
-const (
-	toolPolicyMaxNumberChars  = 4096
-	toolPolicyMaxNumberExpAbs = 10000
-)
-
-var toolPolicyJSONNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$`)
-
 // ParseBoundedJSONNumber parses a JSON number into an exact big.Rat, rejecting
 // values that are empty, over-long, malformed, or whose exponent magnitude
 // exceeds a safe bound. The exponent is bounded BEFORE any big-number
@@ -2538,49 +2846,7 @@ var toolPolicyJSONNumberPattern = regexp.MustCompile(`^-?(?:0|[1-9]\d*)(?:\.\d+)
 // bound can apply. Shared by config validation and the MCP tool-policy engine
 // so the parse+bounds logic has a single source of truth.
 func ParseBoundedJSONNumber(n json.Number) (*big.Rat, bool) {
-	s := n.String()
-	if len(s) == 0 || len(s) > toolPolicyMaxNumberChars || !toolPolicyJSONNumberPattern.MatchString(s) {
-		return nil, false
-	}
-
-	base, expPart, hasExp := strings.Cut(strings.ToLower(s), "e")
-	exp := 0
-	if hasExp {
-		parsed, err := strconv.Atoi(expPart)
-		if err != nil || parsed > toolPolicyMaxNumberExpAbs || parsed < -toolPolicyMaxNumberExpAbs {
-			return nil, false
-		}
-		exp = parsed
-	}
-
-	negative := strings.HasPrefix(base, "-")
-	base = strings.TrimPrefix(base, "-")
-	intPart, fracPart, hasFrac := strings.Cut(base, ".")
-	digits := intPart
-	scale := 0
-	if hasFrac {
-		digits += fracPart
-		scale = len(fracPart)
-	}
-	digits = strings.TrimLeft(digits, "0")
-	if digits == "" {
-		digits = "0"
-	}
-
-	num := new(big.Int)
-	if _, ok := num.SetString(digits, 10); !ok {
-		return nil, false
-	}
-	if negative {
-		num.Neg(num)
-	}
-	den := new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)
-	if exp >= 0 {
-		num.Mul(num, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(exp)), nil))
-	} else {
-		den.Mul(den, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(-exp)), nil))
-	}
-	return new(big.Rat).SetFrac(num, den), true
+	return jsonnumber.Parse(n)
 }
 
 func (c *Config) validateDefer(warnings *[]Warning) error {
@@ -2691,6 +2957,23 @@ func (c *Config) validateRequestPolicy(warnings *[]Warning) error {
 		}
 		if r.Discriminator != nil {
 			if err := validateRequestPolicyDiscriminator(r.Name, r.Discriminator); err != nil {
+				return err
+			}
+		}
+		if r.Except != nil {
+			if r.Action != ActionBlock || r.Shadow || r.GraphQL != nil || r.Discriminator != nil ||
+				len(r.Route.Hosts) == 0 || len(r.Route.Methods) == 0 ||
+				(len(r.Route.PathPrefixes) == 0 && len(r.Route.PathPatterns) == 0) {
+				return fmt.Errorf("request_policy rule %q except requires an enforced block rule scoped by host, method, and path without another predicate", r.Name)
+			}
+			for _, method := range r.Route.Methods {
+				switch method {
+				case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete, methodQuery:
+				default:
+					return fmt.Errorf("request_policy rule %q except requires a body-carrying HTTP method", r.Name)
+				}
+			}
+			if err := validateRequestPolicyException(r.Name, r.Except); err != nil {
 				return err
 			}
 		}
@@ -2817,6 +3100,19 @@ func validateRequestPolicyDiscriminator(rule string, d *RequestPolicyDiscriminat
 	return nil
 }
 
+func validateRequestPolicyException(rule string, e *RequestPolicyException) error {
+	e.Field = strings.TrimSpace(e.Field)
+	if e.Field == "" || len(e.Values) == 0 {
+		return fmt.Errorf("request_policy rule %q except requires a field and at least one exact value", rule)
+	}
+	for _, value := range e.Values {
+		if value == "" || strings.TrimSpace(value) != value {
+			return fmt.Errorf("request_policy rule %q except values must be non-empty exact strings without surrounding whitespace", rule)
+		}
+	}
+	return nil
+}
+
 // methodQuery is the HTTP QUERY method (draft-ietf-httpbis-safe-method-w-body).
 // Go's net/http has no constant for it. It is a safe method that carries a
 // request body, so operators may want to name it in request_policy rules and
@@ -2897,7 +3193,7 @@ func validateRequestPolicyFailureAction(field, action string) error {
 }
 
 func requestPolicyRuleNeedsInnerHTTP(r *RequestPolicyRule) bool {
-	if r.GraphQL != nil || r.Discriminator != nil {
+	if r.GraphQL != nil || r.Discriminator != nil || r.Except != nil {
 		return true
 	}
 	return requestPolicyRouteNeedsInnerHTTP(r.Route)
@@ -2987,7 +3283,7 @@ func (c *Config) validateForwardProxy() error {
 
 func (c *Config) validateWebSocketProxy(warnings *[]Warning) error {
 	// Validate WebSocket proxy config
-	if err := validateHostnamePatternList("websocket_proxy.content_entropy_exclusions", c.WebSocketProxy.ContentEntropyExclusions); err != nil {
+	if err := validateEntropyHostExclusions("websocket_proxy.content_entropy_exclusions", c.WebSocketProxy.ContentEntropyExclusions); err != nil {
 		return err
 	}
 	if !c.WebSocketProxy.Enabled {
@@ -3004,6 +3300,9 @@ func (c *Config) validateWebSocketProxy(warnings *[]Warning) error {
 	}
 	if c.WebSocketProxy.IdleTimeoutSeconds <= 0 {
 		return fmt.Errorf("websocket_proxy.idle_timeout_seconds must be positive")
+	}
+	if c.WebSocketProxy.CrossMessageFieldLimit < 0 || c.WebSocketProxy.CrossMessageFieldLimit > MaxWebSocketCrossMessageFieldLimit {
+		return fmt.Errorf("websocket_proxy.cross_message_field_limit must be between 0 and %d", MaxWebSocketCrossMessageFieldLimit)
 	}
 	switch c.WebSocketProxy.OriginPolicy {
 	case OriginPolicyRewrite, OriginPolicyForward, ActionStrip:
@@ -3382,7 +3681,7 @@ func (c *Config) validateRequestBodyScanning(warnings *[]Warning) error {
 	if c.RequestBodyScanning.ContentEntropyMinLength < 0 {
 		return fmt.Errorf("request_body_scanning.content_entropy_min_length must be non-negative")
 	}
-	if err := validateHostnamePatternList("request_body_scanning.content_entropy_exclusions", c.RequestBodyScanning.ContentEntropyExclusions); err != nil {
+	if err := validateEntropyHostExclusions("request_body_scanning.content_entropy_exclusions", c.RequestBodyScanning.ContentEntropyExclusions); err != nil {
 		return err
 	}
 	if err := validateRequestBodyEntropyWarnRoutes(&c.RequestBodyScanning); err != nil {
@@ -3532,11 +3831,11 @@ func (c *Config) validateTLSInterception() error {
 		return fmt.Errorf("tls_interception: %w", resolveErr)
 	}
 	if _, err := os.Stat(certPath); err != nil {
-		return fmt.Errorf("CA cert not found at %s (run 'pipelock tls init'): %w", certPath, err)
+		return fmt.Errorf("CA cert not found at %s (run 'pipelock tls init'): %w%s", certPath, err, c.caPathMismatchHint(certPath))
 	}
 	keyInfo, err := os.Stat(keyPath)
 	if err != nil {
-		return fmt.Errorf("CA key not found at %s (run 'pipelock tls init'): %w", keyPath, err)
+		return fmt.Errorf("CA key not found at %s (run 'pipelock tls init'): %w%s", keyPath, err, c.caPathMismatchHint(certPath))
 	}
 	// Reject world-readable, any writable, or any executable bits. Allow
 	// group-read (0o040) because Kubernetes fsGroup sets it on secret volumes.
@@ -3781,14 +4080,116 @@ func (c *Config) ValidateSuppressions() error {
 	return c.validateSuppress(nil)
 }
 
-// ValidateContainmentLoopbackServiceDeclarations validates the declared
-// loopback-service surface independently of the full config, for the same
-// reason ValidateSuppressions exists: a caller handing Reload an in-memory
-// config never passes through Load, so the whole-config validator that
-// normally catches a malformed, expired, or proxy-port-colliding declaration
-// never runs on that path.
-func (c *Config) ValidateContainmentLoopbackServiceDeclarations() error {
-	return c.validateContainmentLoopbackServices()
+// LapsedContainmentGrants returns the declared loopback and published service
+// entries that LapseExpiredContainmentGrants removed from the effective set.
+func (c *Config) LapsedContainmentGrants() []LapsedContainmentGrant {
+	return append([]LapsedContainmentGrant(nil), c.Containment.lapsed...)
+}
+
+// LapseExpiredContainmentGrants treats an expired containment.loopback_services
+// or containment.published_services entry as a lapsed grant rather than a
+// broken file: it removes only the expired entries from the effective lists,
+// so they are never exposed or rendered, and records them for reporting. Every
+// other defect (malformed, duplicate, proxy-port or published-port collision)
+// still returns an error and leaves the config untouched. It is idempotent and
+// returns every grant recorded so far. Call it on a config no other goroutine
+// is reading: Load, NewServer, and Reload each hold the candidate privately.
+func (c *Config) LapseExpiredContainmentGrants(now time.Time) ([]LapsedContainmentGrant, error) {
+	if len(c.Containment.LoopbackServices) == 0 && len(c.Containment.PublishedServices) == 0 {
+		return c.LapsedContainmentGrants(), nil
+	}
+	proxyPort, err := c.containmentProxyPort()
+	if err != nil {
+		return nil, err
+	}
+	activeLoopback, lapsedLoopback, err := ResolveContainmentLoopbackServices(c.Containment.LoopbackServices, proxyPort, now)
+	if err != nil {
+		return nil, err
+	}
+	activePublished, lapsedPublished, err := ResolveContainmentPublishedServices(c.Containment.PublishedServices, c.Containment.LoopbackServices, proxyPort, now)
+	if err != nil {
+		return nil, err
+	}
+	if len(lapsedLoopback) > 0 {
+		if activeLoopback == nil {
+			activeLoopback = []ContainmentLoopbackService{}
+		}
+		c.Containment.LoopbackServices = activeLoopback
+	}
+	if len(lapsedPublished) > 0 {
+		if activePublished == nil {
+			activePublished = []ContainmentPublishedService{}
+		}
+		c.Containment.PublishedServices = activePublished
+	}
+	// Build a fresh slice so a Config copy that shares the old one never sees
+	// it change.
+	merged := append([]LapsedContainmentGrant(nil), c.Containment.lapsed...)
+	merged = append(merged, lapsedLoopback...)
+	merged = append(merged, lapsedPublished...)
+	c.Containment.lapsed = merged
+	return c.LapsedContainmentGrants(), nil
+}
+
+// warnLapsedContainmentGrants appends one warning per lapsed grant of kind,
+// whether this call found it or an earlier LapseExpiredContainmentGrants
+// already dropped it, so the warning survives the second validation a
+// startup or reload performs after Load.
+func (c *Config) warnLapsedContainmentGrants(kind string, found []LapsedContainmentGrant, warnings *[]Warning) {
+	if warnings == nil {
+		return
+	}
+	for _, grant := range append(append([]LapsedContainmentGrant(nil), c.Containment.lapsed...), found...) {
+		if grant.Kind != kind {
+			continue
+		}
+		*warnings = append(*warnings, Warning{
+			Field:   ContainmentGrantField(kind),
+			Message: grant.Message + "; the entry is dropped from the effective set and grants nothing until it is renewed or removed",
+		})
+	}
+}
+
+func (c *Config) containmentProxyPort() (int, error) {
+	_, proxyPort, err := net.SplitHostPort(c.FetchProxy.Listen)
+	if err != nil {
+		return 0, fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+	}
+	port, err := strconv.Atoi(proxyPort)
+	if err != nil {
+		return 0, fmt.Errorf("invalid fetch_proxy.listen port %q: %w", proxyPort, err)
+	}
+	return port, nil
+}
+
+func (c *Config) validateContainmentPublishedServices(warnings *[]Warning) error {
+	if c.Containment.AgentListener != "" {
+		_, proxyPortText, err := net.SplitHostPort(c.FetchProxy.Listen)
+		if err != nil {
+			return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+		}
+		proxyPort, err := strconv.Atoi(proxyPortText)
+		if err != nil {
+			return fmt.Errorf("invalid fetch_proxy.listen port %q: %w", proxyPortText, err)
+		}
+		if err := validateContainmentAgentListener(c.Containment.AgentListener, c.Agents, c.LicenseDisabledAgents, c.LicenseDisabledReason, proxyPort); err != nil {
+			return err
+		}
+	}
+	if len(c.Containment.PublishedServices) == 0 {
+		c.warnLapsedContainmentGrants(ContainmentGrantPublishedService, nil, warnings)
+		return nil
+	}
+	port, err := c.containmentProxyPort()
+	if err != nil {
+		return err
+	}
+	_, lapsed, err := ResolveContainmentPublishedServices(c.Containment.PublishedServices, c.Containment.LoopbackServices, port, time.Now())
+	if err != nil {
+		return err
+	}
+	c.warnLapsedContainmentGrants(ContainmentGrantPublishedService, lapsed, warnings)
+	return nil
 }
 
 // credentialAudienceDomainSubset reports whether every candidate domain is
@@ -3849,6 +4250,9 @@ func credentialAudienceSuppressPathSubset(raw string, audience []string) bool {
 }
 
 func (c *Config) validateKillSwitch() error {
+	if err := c.validateKillSwitchTokenSource(); err != nil {
+		return err
+	}
 	// Validate kill switch allowlist CIDRs are parseable
 	for _, cidr := range c.KillSwitch.AllowlistIPs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
@@ -3872,26 +4276,28 @@ func (c *Config) validateKillSwitch() error {
 		if apiPort == proxyPort {
 			return fmt.Errorf("kill_switch.api_listen port %s collides with fetch_proxy.listen port %s", apiPort, proxyPort)
 		}
-		if c.KillSwitch.APIToken == "" && os.Getenv(EnvKillSwitchAPIToken) == "" {
-			return fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token or %s to be set", EnvKillSwitchAPIToken)
+		if c.KillSwitch.APIToken == "" && c.KillSwitch.APITokenFile == "" && os.Getenv(EnvKillSwitchAPIToken) == "" {
+			return fmt.Errorf("kill_switch.api_listen requires kill_switch.api_token, api_token_file or %s to be set", EnvKillSwitchAPIToken)
 		}
 	}
 	return nil
 }
 
-func (c *Config) validateContainmentLoopbackServices() error {
+func (c *Config) validateContainmentLoopbackServices(warnings *[]Warning) error {
 	if len(c.Containment.LoopbackServices) == 0 {
+		c.warnLapsedContainmentGrants(ContainmentGrantLoopbackService, nil, warnings)
 		return nil
 	}
-	_, proxyPort, err := net.SplitHostPort(c.FetchProxy.Listen)
+	port, err := c.containmentProxyPort()
 	if err != nil {
-		return fmt.Errorf("invalid fetch_proxy.listen %q: %w", c.FetchProxy.Listen, err)
+		return err
 	}
-	port, err := strconv.Atoi(proxyPort)
+	_, lapsed, err := ResolveContainmentLoopbackServices(c.Containment.LoopbackServices, port, time.Now())
 	if err != nil {
-		return fmt.Errorf("invalid fetch_proxy.listen port %q: %w", proxyPort, err)
+		return err
 	}
-	return ValidateContainmentLoopbackServices(c.Containment.LoopbackServices, port, time.Now())
+	c.warnLapsedContainmentGrants(ContainmentGrantLoopbackService, lapsed, warnings)
+	return nil
 }
 
 func (c *Config) validateMetricsListen() error {
@@ -3946,6 +4352,9 @@ func (c *Config) AllowEphemeralListenersForTesting() {
 
 func (c *Config) validateEmit() error {
 	// Validate emit config
+	if err := c.validateEmitCorrelationHeader(); err != nil {
+		return err
+	}
 	if err := validateEmitFilterValues("emit.filter.actions", c.Emit.Filter.Actions); err != nil {
 		return err
 	}
@@ -4683,10 +5092,13 @@ func normalizeReverseProxySubmitHost(host string) string {
 // | Field | Class | Maximum / reason |
 // | sandbox.best_effort_expiry | temporary | 30 days: cooperative proxy-only egress cannot replace kernel isolation for a release cycle. |
 // | response_scanning.unscannable_passthrough[].expires | temporary | 90 days: an opaque download needs a scanned or authenticated delivery path. |
+// | response_scanning.size_exempt_scan_limits[].expires | temporary | 90 days: a larger fully scanned download needs a bounded remediation window, matching unscannable_passthrough without relaxing a detection floor. |
 // | fetch_proxy.monitoring.path_entropy_exclusions[].expires | temporary | 180 days: an incident exemption needs time to prove the narrow route or move to policy. |
 // | fetch_proxy.monitoring.query_entropy_param_exclusions[].expires | temporary | 180 days: an incident exemption needs time to prove the parameter contract or move to policy. |
 // | request_body_scanning.content_entropy_warn_routes[].expires | temporary | 90 days: a block-to-warn route needs a bounded remediation window. |
+// | request_body_scanning.content_entropy_exclusions[].expires, websocket_proxy.content_entropy_exclusions[].expires | temporary | 90 days: a host-wide block-to-allow exception needs a bounded remediation window; the plain host string stays permanent. |
 // | request_body_scanning.sigv4_credential_routes[].expires | temporary | 30 days: this narrowly relaxes a credential floor while the integration changes. |
+// | response_scanning.core_observe_exceptions[].expires | temporary | 30 days: this narrowly relaxes the immutable response floor for one host and one pattern. |
 // | reverse_proxy.trusted_upstream.expires | durable | uncapped: an authenticated, host-and-port-bound upstream is reviewed, not churned through expiry. |.
 const (
 	// MaxBestEffortConfigHorizon bounds a configuration-sourced cooperative
@@ -4694,10 +5106,18 @@ const (
 	MaxBestEffortConfigHorizon = 30 * 24 * time.Hour
 
 	MaxUnscannablePassthroughHorizon          = 90 * 24 * time.Hour
+	MaxResponseSizeScanLimitHorizon           = MaxUnscannablePassthroughHorizon
 	MaxPathEntropyExclusionHorizon            = 180 * 24 * time.Hour
 	MaxQueryEntropyParamExclusionHorizon      = 180 * 24 * time.Hour
 	MaxRequestBodyEntropyWarnRouteHorizon     = 90 * 24 * time.Hour
 	MaxRequestBodySigV4CredentialRouteHorizon = 30 * 24 * time.Hour
+
+	// MaxCoreObserveExceptionHorizon matches the SigV4 credential-route
+	// horizon rather than the 90-day unscannable-passthrough one that shares
+	// its config block. The table above sets the length by what the exception
+	// RELAXES, not by where it lives: 30 days is what a narrow relaxation of a
+	// floor gets, and this relaxes the immutable response floor.
+	MaxCoreObserveExceptionHorizon = 30 * 24 * time.Hour
 )
 
 func validateTemporaryExpiryDate(field, value string, maximum time.Duration) error {
@@ -4732,31 +5152,25 @@ func (c *Config) ValidateExpiryAuthorizations() error {
 	if err := validateUnscannablePassthroughExpiryHorizons(c.ResponseScanning.UnscannablePassthrough); err != nil {
 		return err
 	}
-	for i, entry := range c.FetchProxy.Monitoring.PathEntropyExclusions {
-		if expires := strings.TrimSpace(entry.Expires); expires != "" {
-			field := fmt.Sprintf("fetch_proxy.monitoring.path_entropy_exclusions[%d].expires", i)
-			if err := validateTemporaryExpiryDate(field, expires, MaxPathEntropyExclusionHorizon); err != nil {
-				return err
-			}
-		}
+	if err := validateResponseSizeScanLimitExpiryHorizons(c.ResponseScanning.SizeExemptScanLimits, now); err != nil {
+		return err
 	}
-	for i, entry := range c.FetchProxy.Monitoring.QueryEntropyParamExclusions {
-		if expires := strings.TrimSpace(entry.Expires); expires != "" {
-			field := fmt.Sprintf("fetch_proxy.monitoring.query_entropy_param_exclusions[%d].expires", i)
-			if err := validateTemporaryExpiryDate(field, expires, MaxQueryEntropyParamExclusionHorizon); err != nil {
-				return err
-			}
-		}
+	// Direct reload callers bypass Load, so validate grant shape before any
+	// runtime state can change. Validation normalizes entries; keep the caller
+	// unchanged if an entry is malformed.
+	grantCandidate := c.Clone()
+	var grantWarnings []Warning
+	if err := grantCandidate.ResponseScanning.validateSizeExemptScanLimits(&grantWarnings, now); err != nil {
+		return err
 	}
-	for i, entry := range c.RequestBodyScanning.ContentEntropyWarnRoutes {
-		field := fmt.Sprintf("request_body_scanning.content_entropy_warn_routes[%d].expires", i)
-		if err := validateTemporaryExpiryDate(field, strings.TrimSpace(entry.Expires), MaxRequestBodyEntropyWarnRouteHorizon); err != nil {
-			return err
-		}
+	// Validate on a private copy: normalization and nested route sorting must
+	// not mutate the caller when a later declaration is malformed.
+	if err := c.Clone().validateScannerExceptions(); err != nil {
+		return err
 	}
-	for i, entry := range c.RequestBodyScanning.SigV4CredentialRoutes {
-		field := fmt.Sprintf("request_body_scanning.sigv4_credential_routes[%d].expires", i)
-		if err := validateTemporaryExpiryDate(field, strings.TrimSpace(entry.Expires), MaxRequestBodySigV4CredentialRouteHorizon); err != nil {
+	for i, entry := range c.ResponseScanning.CoreObserveExceptions {
+		field := fmt.Sprintf("response_scanning.core_observe_exceptions[%d].expires", i)
+		if err := validateTemporaryExpiryDate(field, strings.TrimSpace(entry.Expires), MaxCoreObserveExceptionHorizon); err != nil {
 			return err
 		}
 	}
@@ -4864,6 +5278,23 @@ func (c *Config) validateSandbox() error {
 
 func (c *Config) validateFlightRecorder(warnings *[]Warning) error {
 	c.FlightRecorder.PostureSignerPublicKey = nil
+	if len(c.FlightRecorder.ReceiptGroupPriorSignerKeys) > 32 {
+		return errors.New("flight_recorder.receipt_group_prior_signer_keys supports at most 32 keys")
+	}
+	seenPriorSigners := make(map[string]struct{}, len(c.FlightRecorder.ReceiptGroupPriorSignerKeys))
+	for _, key := range c.FlightRecorder.ReceiptGroupPriorSignerKeys {
+		decoded, err := hex.DecodeString(key)
+		if err != nil || len(decoded) != ed25519.PublicKeySize || key != strings.ToLower(key) {
+			return errors.New("flight_recorder.receipt_group_prior_signer_keys must contain lowercase 64-character Ed25519 public keys")
+		}
+		if _, exists := seenPriorSigners[key]; exists {
+			return errors.New("flight_recorder.receipt_group_prior_signer_keys contains a duplicate key")
+		}
+		seenPriorSigners[key] = struct{}{}
+	}
+	if c.FlightRecorder.ReceiptChains < 0 || c.FlightRecorder.ReceiptChains > 32 {
+		return fmt.Errorf("flight_recorder.receipt_chains must be between 0 and 32 (0 uses one chain)")
+	}
 	if err := c.validateFlightRecorderAnchor(warnings); err != nil {
 		return err
 	}
@@ -4903,6 +5334,17 @@ func (c *Config) validateFlightRecorder(warnings *[]Warning) error {
 		// `pipelock init` populates dir + signing key; without them the server
 		// prints a one-time notice that receipts are inert.
 		return nil
+	}
+	if c.FlightRecorder.ReceiptChainCount() > 1 {
+		if c.FlightRecorder.SigningKeyPath == "" {
+			return errors.New("flight_recorder.receipt_chains greater than one requires flight_recorder.signing_key_path")
+		}
+		if !c.FlightRecorder.SignCheckpoints {
+			return errors.New("flight_recorder.receipt_chains greater than one requires flight_recorder.sign_checkpoints: true")
+		}
+		if c.FlightRecorder.AnchorConfigured() {
+			return errors.New("flight_recorder.receipt_chains greater than one cannot use single-chain auto-anchoring")
+		}
 	}
 	if c.FlightRecorder.CheckpointInterval < 0 {
 		return fmt.Errorf("flight_recorder.checkpoint_interval must be non-negative")
@@ -5484,6 +5926,13 @@ func validateMCPServerNameList(serverNames []string, label string) error {
 	return nil
 }
 
+// ValidateMCPServerName applies the MCP server-name rules to a launch-supplied
+// name, so a name given on the command line is held to the same rules as one
+// written in configuration.
+func ValidateMCPServerName(serverName, field string) error {
+	return validateMCPServerName(serverName, field)
+}
+
 func validateMCPServerName(serverName, field string) error {
 	if serverName == "" {
 		return fmt.Errorf("%s is empty", field)
@@ -5562,17 +6011,20 @@ func (c *Config) validateMediaPolicy() error {
 }
 
 // ResolveCAPath returns resolved CA cert and key paths.
-// Empty config values resolve to ~/.pipelock/ca.pem and ~/.pipelock/ca-key.pem.
-// Returns an error if $HOME cannot be determined and paths are not set explicitly.
+// Empty config values resolve against the pipelock home directory: the
+// --home flag, then PIPELOCK_HOME, then ~/.pipelock. That is the precedence
+// `pipelock tls init` uses via signing.ResolveKeystoreDir, so the CA the
+// proxy loads is always the one the operator just generated.
+// Returns an error if the home directory cannot be determined and paths
+// are not set explicitly.
 func (c *Config) ResolveCAPath() (certPath, keyPath string, err error) {
 	certPath = c.TLSInterception.CACertPath
 	keyPath = c.TLSInterception.CAKeyPath
 	if certPath == "" || keyPath == "" {
-		home, homeErr := os.UserHomeDir()
-		if homeErr != nil {
-			return "", "", fmt.Errorf("resolve CA path: %w (set ca_cert and ca_key explicitly)", homeErr)
+		dir, dirErr := signing.ResolveKeystoreDir("")
+		if dirErr != nil {
+			return "", "", fmt.Errorf("resolve CA path: %w (set ca_cert and ca_key explicitly)", dirErr)
 		}
-		dir := filepath.Join(home, ".pipelock")
 		if certPath == "" {
 			certPath = filepath.Join(dir, "ca.pem")
 		}
@@ -5581,6 +6033,44 @@ func (c *Config) ResolveCAPath() (certPath, keyPath string, err error) {
 		}
 	}
 	return certPath, keyPath, nil
+}
+
+// caPathMismatchHint returns an extra sentence for a CA-not-found error when
+// the default dir resolved via --home/PIPELOCK_HOME and a CA also exists
+// under the bare ~/.pipelock (the directory `pipelock tls init` would have
+// used before --home/PIPELOCK_HOME was set). This is the case that used to
+// fail silently in the opposite direction: the proxy would find the OLD CA
+// at ~/.pipelock and sign with it while `tls show-ca` printed the NEW one.
+// Returns "" when ca_cert/ca_key are explicit, or no alternate CA exists.
+// resolvedPath is the cert path ResolveCAPath already produced, named
+// again in the hint so the operator sees both paths together.
+func (c *Config) caPathMismatchHint(resolvedPath string) string {
+	if c.TLSInterception.CACertPath != "" || c.TLSInterception.CAKeyPath != "" {
+		return ""
+	}
+	resolvedHome := signing.ResolvedHome()
+	if resolvedHome == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	altDir := filepath.Join(home, signing.DefaultPipelockDir)
+	if filepath.Clean(altDir) == filepath.Clean(resolvedHome) {
+		return ""
+	}
+	altCert := filepath.Join(altDir, "ca.pem")
+	if _, err := os.Stat(altCert); err != nil {
+		return ""
+	}
+	// Only offer "keep using it" for a usable pair: a lone certificate has
+	// no key to sign with.
+	if _, err := os.Stat(filepath.Join(altDir, "ca-key.pem")); err != nil {
+		return ""
+	}
+	return fmt.Sprintf(" (an existing CA is at %s, outside the pipelock home that resolved %s: set tls_interception.ca_cert and ca_key to keep using it, or run 'pipelock tls init' with that home to create a new CA that clients must then trust)",
+		altCert, resolvedPath)
 }
 
 // upgradeActionStrength returns a numeric strength for upgrade_warn/upgrade_ask values.

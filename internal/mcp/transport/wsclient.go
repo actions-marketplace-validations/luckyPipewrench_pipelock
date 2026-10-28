@@ -5,10 +5,13 @@ package transport
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"sync"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/gobwas/ws"
@@ -29,6 +32,26 @@ type WSClient struct {
 	// writeMu serializes writes. Reads are expected from a single goroutine.
 	writeMu   sync.Mutex
 	closeOnce sync.Once
+	closed    atomic.Bool
+}
+
+// redactDialURL drops the parts of an upstream URL that can carry a
+// credential (user info, query, fragment, or an opaque part) before it
+// reaches an error.
+func redactDialURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid>"
+	}
+	if u.Opaque != "" {
+		// An opaque URL ("ws:user:pass@host") keeps everything after the
+		// scheme in Opaque, credentials included, so none of it is shown.
+		return u.Scheme + ":<redacted>"
+	}
+	u.User = nil
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // NewWSClient establishes a WebSocket connection to the given URL and returns
@@ -45,7 +68,18 @@ func NewWSClientWithDialer(ctx context.Context, rawURL string, dialContext func(
 	dialer := ws.Dialer{NetDial: dialContext}
 	conn, br, _, err := dialer.Dial(ctx, rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("ws dial %s: %w", rawURL, err)
+		// A *url.Error's text repeats its URL exactly as given, user info
+		// and query included. A parse failure has nothing else worth
+		// keeping; any other keeps its cause, so errors.Is still sees a
+		// cancellation or a dialer's sentinel, without the URL text.
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			if urlErr.Op == "parse" {
+				return nil, fmt.Errorf("ws dial %s: invalid upstream URL", redactDialURL(rawURL))
+			}
+			return nil, fmt.Errorf("ws dial %s: %s: %w", redactDialURL(rawURL), urlErr.Op, urlErr.Err)
+		}
+		return nil, fmt.Errorf("ws dial %s: %w", redactDialURL(rawURL), err)
 	}
 	var reader io.Reader = conn
 	if br != nil {
@@ -77,10 +111,10 @@ func (c *WSClient) ReadMessage() ([]byte, error) {
 	for {
 		hdr, err := ws.ReadHeader(c.r)
 		if err != nil {
-			if plwsutil.IsExpectedCloseErr(err) {
+			if c.closed.Load() || (errors.Is(err, io.EOF) && !c.frag.Active) {
 				return nil, io.EOF
 			}
-			return nil, fmt.Errorf("reading ws header: %w", err)
+			return nil, fmt.Errorf("%w: reading ws header: %w", ErrIncompleteResponse, err)
 		}
 
 		// Enforce size limits before allocation to prevent memory DoS.
@@ -106,7 +140,10 @@ func (c *WSClient) ReadMessage() ([]byte, error) {
 		payload := make([]byte, n)
 		if n > 0 {
 			if _, err := io.ReadFull(c.r, payload); err != nil {
-				return nil, fmt.Errorf("reading ws payload: %w", err)
+				if c.closed.Load() {
+					return nil, io.EOF
+				}
+				return nil, fmt.Errorf("%w: reading ws payload: %w", ErrIncompleteResponse, err)
 			}
 		}
 
@@ -122,6 +159,9 @@ func (c *WSClient) ReadMessage() ([]byte, error) {
 			case ws.OpClose:
 				// Echo close frame back, then signal EOF.
 				c.writeCloseFrame(ws.StatusNormalClosure, "")
+				if c.frag.Active {
+					return nil, fmt.Errorf("%w: close interrupted fragmented message", ErrIncompleteResponse)
+				}
 				return nil, io.EOF
 			case ws.OpPing:
 				c.writeMu.Lock()
@@ -181,6 +221,7 @@ func (c *WSClient) WriteMessage(msg []byte) error {
 // Close sends a close frame and closes the underlying connection.
 // Safe to call from multiple goroutines; the close frame is sent at most once.
 func (c *WSClient) Close() error {
+	c.closed.Store(true)
 	c.closeOnce.Do(func() {
 		c.writeCloseFrame(ws.StatusNormalClosure, "")
 	})

@@ -4,7 +4,13 @@
 use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::fs;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -16,13 +22,18 @@ pub enum VerifierError {
     Runtime(String),
     #[error("{0}")]
     Invalid(String),
+    /// The evidence exists but could not be read (permissions, device I/O).
+    /// No verdict is reached, so it exits like a runtime error, and group
+    /// verification reports it as incomplete rather than invalid.
+    #[error("{0}")]
+    Unavailable(String),
 }
 
 impl VerifierError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Usage(_) => 64,
-            Self::Runtime(_) => 2,
+            Self::Runtime(_) | Self::Unavailable(_) => 2,
             Self::Invalid(_) => 1,
         }
     }
@@ -30,13 +41,163 @@ impl VerifierError {
 
 pub type Result<T> = std::result::Result<T, VerifierError>;
 
+pub const MAX_VERIFIER_INPUT_BYTES: u64 = 8 << 20;
+
+thread_local! { static PINNED_EVIDENCE_DIRECTORY: Cell<bool> = const { Cell::new(false) }; }
+
+pub(crate) fn pinned_evidence_directory() -> bool {
+    PINNED_EVIDENCE_DIRECTORY.with(Cell::get)
+}
+
+pub(crate) fn set_pinned_evidence_directory(active: bool) {
+    PINNED_EVIDENCE_DIRECTORY.with(|flag| flag.set(active));
+}
+
+pub(crate) fn same_open_file(a: &File, b: &File) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let a = a
+            .metadata()
+            .map_err(|err| VerifierError::Runtime(err.to_string()))?;
+        let b = b
+            .metadata()
+            .map_err(|err| VerifierError::Runtime(err.to_string()))?;
+        Ok(a.dev() == b.dev() && a.ino() == b.ino() && a.ino() != 0)
+    }
+    #[cfg(windows)]
+    {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        #[derive(Default, PartialEq, Eq)]
+        struct FileIdInfo {
+            volume: u64,
+            id: [u8; 16],
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandleEx(
+                handle: *mut c_void,
+                class: u32,
+                info: *mut c_void,
+                size: u32,
+            ) -> i32;
+        }
+        fn identity(file: &File) -> Result<FileIdInfo> {
+            let mut info = FileIdInfo::default();
+            // FileIdInfo = 0x12; an unsupported filesystem fails closed.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    0x12,
+                    (&mut info as *mut FileIdInfo).cast(),
+                    std::mem::size_of::<FileIdInfo>() as u32,
+                )
+            };
+            if ok == 0 || info.id == [0; 16] {
+                return Err(VerifierError::Runtime(
+                    "cannot identify opened evidence directory".to_string(),
+                ));
+            }
+            Ok(info)
+        }
+        return Ok(identity(a)? == identity(b)?);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        Err(VerifierError::Runtime(
+            "unsupported evidence directory platform".to_string(),
+        ))
+    }
+}
+
+pub fn open_verifier_file(path: &Path) -> Result<File> {
+    // Operator-supplied keys and endorsements were made absolute before the
+    // directory is entered. Only relative child names belong to the pinned
+    // evidence directory.
+    let pinned = pinned_evidence_directory() && !path.is_absolute();
+    if pinned {
+        let mut components = path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir));
+        if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(VerifierError::Runtime(
+                "evidence filename must be a base name".to_string(),
+            ));
+        }
+        if fs::symlink_metadata(path)
+            .map_err(|err| VerifierError::Runtime(format!("stat {}: {err}", path.display())))?
+            .file_type()
+            .is_symlink()
+        {
+            return Err(VerifierError::Runtime(
+                "refuse symlink in evidence directory".to_string(),
+            ));
+        }
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NONBLOCK | if pinned { libc::O_NOFOLLOW } else { 0 });
+    #[cfg(windows)]
+    if pinned {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path).map_err(|err| io_read_error(path, err))?;
+    let info = file
+        .metadata()
+        .map_err(|err| VerifierError::Runtime(format!("stat {}: {err}", path.display())))?;
+    if !info.is_file() {
+        return Err(VerifierError::Runtime(
+            "input must be a regular file".to_string(),
+        ));
+    }
+    if pinned && info.file_type().is_symlink() {
+        return Err(VerifierError::Runtime(
+            "refuse symlink in evidence directory".to_string(),
+        ));
+    }
+    Ok(file)
+}
+
+pub fn read_verifier_bytes(path: &Path) -> Result<Vec<u8>> {
+    let file = open_verifier_file(path)?;
+    let info = file
+        .metadata()
+        .map_err(|err| VerifierError::Runtime(format!("stat {}: {err}", path.display())))?;
+    if info.len() > MAX_VERIFIER_INPUT_BYTES {
+        return Err(VerifierError::Runtime(format!(
+            "input exceeds {MAX_VERIFIER_INPUT_BYTES} bytes"
+        )));
+    }
+    let mut data = Vec::new();
+    file.take(MAX_VERIFIER_INPUT_BYTES + 1)
+        .read_to_end(&mut data)
+        .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", path.display())))?;
+    if data.len() as u64 > MAX_VERIFIER_INPUT_BYTES {
+        return Err(VerifierError::Runtime(format!(
+            "input exceeds {MAX_VERIFIER_INPUT_BYTES} bytes"
+        )));
+    }
+    Ok(data)
+}
+
+pub fn read_verifier_text(path: &Path) -> Result<String> {
+    String::from_utf8(read_verifier_bytes(path)?)
+        .map_err(|err| VerifierError::Runtime(format!("input is not UTF-8: {err}")))
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
 pub fn parse_json_file(path: &Path) -> Result<Value> {
-    let text = fs::read_to_string(path)
-        .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", path.display())))?;
+    let text = read_verifier_text(path)?;
     parse_json_text(&text, "malformed JSON")
 }
 
@@ -46,6 +207,11 @@ pub fn parse_json_line(text: &str, label: &str) -> Result<Value> {
 
 pub fn parse_json_text(text: &str, label: &str) -> Result<Value> {
     use serde::Deserialize;
+    // For the new kind, enforce duplicate and nesting limits before building a
+    // parsed value. Source selector inspection preserves duplicate selectors.
+    if crate::secret_egress::selects_raw_payload(text) {
+        reject_duplicate_keys(text)?;
+    }
     let mut de = serde_json::Deserializer::from_str(text);
     // Keep normal parsing aligned with reject_duplicate_keys: serde_json's
     // built-in recursion limit rejects one level earlier than the shared
@@ -56,6 +222,7 @@ pub fn parse_json_text(text: &str, label: &str) -> Result<Value> {
         .map_err(|err| VerifierError::Runtime(format!("{label}: {err}")))?;
     de.end()
         .map_err(|err| VerifierError::Runtime(format!("{label}: {err}")))?;
+    crate::secret_egress::validate_raw_receipt(&value, text).map_err(VerifierError::Invalid)?;
     Ok(value)
 }
 
@@ -68,6 +235,15 @@ pub fn parse_json_text(text: &str, label: &str) -> Result<Value> {
 /// such input before signature verification. Implemented as a recursive serde
 /// Visitor so it reuses serde_json's tokenizer rather than a hand parser.
 pub fn reject_duplicate_keys(text: &str) -> Result<()> {
+    reject_keys(text, false)
+}
+
+/// Only schema objects use case-insensitive key identity.
+pub fn reject_folded_keys(text: &str) -> Result<()> {
+    reject_keys(text, true)
+}
+
+fn reject_keys(text: &str, folded: bool) -> Result<()> {
     use serde::de::DeserializeSeed;
     let mut de = serde_json::Deserializer::from_str(text);
     // serde_json's built-in recursion limit rejects one level earlier than the
@@ -75,10 +251,28 @@ pub fn reject_duplicate_keys(text: &str) -> Result<()> {
     // receipt-nesting bound explicitly in NoDupSeed so all four allow exactly
     // 128 nested JSON arrays/objects and reject the 129th.
     de.disable_recursion_limit();
-    match (NoDupSeed { depth: 0 }).deserialize(&mut de) {
+    match (NoDupSeed { depth: 0, folded }).deserialize(&mut de) {
         Ok(_) => Ok(()),
         Err(err) => Err(VerifierError::Invalid(err.to_string())),
     }
+}
+
+// Pin key identity to Go's simple-fold cycles; native lowercase differs.
+pub fn fold_key(key: &str) -> String {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static FOLD: OnceLock<HashMap<char, char>> = OnceLock::new();
+    let fold = FOLD.get_or_init(|| {
+        let mut table = HashMap::new();
+        for group in crate::key_fold_data::KEY_FOLD_GROUPS.split_whitespace() {
+            let canonical = group.chars().next().expect("nonempty fold cycle");
+            for c in group.chars() {
+                table.insert(c, canonical);
+            }
+        }
+        table
+    });
+    key.chars().map(|c| *fold.get(&c).unwrap_or(&c)).collect()
 }
 
 const MAX_NESTING_DEPTH: usize = 128;
@@ -88,6 +282,7 @@ const MAX_EXACT_JSON_INTEGER: u64 = (1_u64 << 53) - 1;
 /// object keys; it carries no data.
 struct NoDupSeed {
     depth: usize,
+    folded: bool,
 }
 
 impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
@@ -98,11 +293,12 @@ impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
         D: serde::de::Deserializer<'de>,
     {
         use serde::de::{self, MapAccess, SeqAccess, Visitor};
-        use std::collections::HashSet;
+        use std::collections::HashMap;
         use std::fmt;
 
         struct NoDupVisitor {
             depth: usize,
+            folded: bool,
         }
 
         impl<'de> Visitor<'de> for NoDupVisitor {
@@ -121,13 +317,23 @@ impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
                         "JSON nesting exceeds maximum depth {MAX_NESTING_DEPTH}"
                     )));
                 }
-                let mut seen: HashSet<String> = HashSet::new();
+                let mut seen: HashMap<String, String> = HashMap::new();
                 while let Some(key) = map.next_key::<String>()? {
-                    if !seen.insert(key.clone()) {
-                        return Err(de::Error::custom(format!("duplicate object key: {key}")));
+                    let identity = if self.folded {
+                        fold_key(&key)
+                    } else {
+                        key.clone()
+                    };
+                    if let Some(prior) = seen.insert(identity, key.clone()) {
+                        return Err(de::Error::custom(if self.folded && prior != key {
+                            format!("case-insensitive duplicate object keys: {prior:?} and {key:?}")
+                        } else {
+                            format!("duplicate object key: {key}")
+                        }));
                     }
                     map.next_value_seed(NoDupSeed {
                         depth: self.depth + 1,
+                        folded: self.folded,
                     })?;
                 }
                 Ok(())
@@ -145,6 +351,7 @@ impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
                 while seq
                     .next_element_seed(NoDupSeed {
                         depth: self.depth + 1,
+                        folded: self.folded,
                     })?
                     .is_some()
                 {}
@@ -209,7 +416,10 @@ impl<'de> serde::de::DeserializeSeed<'de> for NoDupSeed {
             }
         }
 
-        deserializer.deserialize_any(NoDupVisitor { depth: self.depth })
+        deserializer.deserialize_any(NoDupVisitor {
+            depth: self.depth,
+            folded: self.folded,
+        })
     }
 }
 
@@ -248,10 +458,7 @@ pub fn resolve_signer_key(input: &str) -> Result<String> {
 
     let path = Path::new(trimmed);
     let value = if path.exists() {
-        fs::read_to_string(path)
-            .map_err(|err| VerifierError::Runtime(format!("read {}: {err}", path.display())))?
-            .trim()
-            .to_string()
+        read_verifier_text(path)?.trim().to_string()
     } else {
         trimmed.to_string()
     };
@@ -385,6 +592,52 @@ pub fn string_vec_at(value: &Value, path: &[&str]) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn same_directory_identity(
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        before.is_dir() && after.is_dir()
+    }
+}
+
+pub(crate) fn metadata_identity(metadata: &std::fs::Metadata) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        [
+            metadata.dev().to_be_bytes().as_slice(),
+            metadata.ino().to_be_bytes().as_slice(),
+            metadata.ctime().to_be_bytes().as_slice(),
+            metadata.ctime_nsec().to_be_bytes().as_slice(),
+        ]
+        .concat()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Vec::new()
+    }
+}
+
+/// Classifies a failed open or read. A missing file stays a runtime error,
+/// because a missing claimed artifact is a verdict; any other I/O failure
+/// means the evidence is present but unavailable.
+pub(crate) fn io_read_error(path: &Path, err: std::io::Error) -> VerifierError {
+    let message = format!("read {}: {err}", path.display());
+    if err.kind() == std::io::ErrorKind::NotFound {
+        VerifierError::Runtime(message)
+    } else {
+        VerifierError::Unavailable(message)
+    }
 }
 
 #[cfg(test)]

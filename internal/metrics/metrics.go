@@ -59,6 +59,7 @@ type Metrics struct {
 	dlpWarnMatches              *prometheus.CounterVec
 	dlpDroppedMatches           *prometheus.CounterVec
 	dlpCredentialAudienceAllows *prometheus.CounterVec
+	issuerIDBlocks              *prometheus.CounterVec
 	AddressFindings             *prometheus.CounterVec
 	FileSentryFindings          *prometheus.CounterVec
 
@@ -125,16 +126,17 @@ type Metrics struct {
 	captureActionClassSanitized *prometheus.CounterVec
 
 	// Conductor audit transport (conductor.go).
-	conductorAuditQueuePending   prometheus.Gauge
-	conductorAuditQueueInflight  prometheus.Gauge
-	conductorAuditQueueDead      prometheus.Gauge
-	conductorAuditDeliveries     *prometheus.CounterVec
-	conductorServerRequests      *prometheus.CounterVec
-	conductorServerDuration      *prometheus.HistogramVec
-	conductorServerAuditIngest   *prometheus.CounterVec
-	conductorServerAuditQueries  *prometheus.CounterVec
-	conductorEmergencyQuarantine *prometheus.CounterVec
-	conductorPolicyHashStatuses  *prometheus.GaugeVec
+	conductorAuditQueuePending         prometheus.Gauge
+	conductorAuditQueueInflight        prometheus.Gauge
+	conductorAuditQueueDead            prometheus.Gauge
+	conductorAuditDeliveries           *prometheus.CounterVec
+	conductorAuditSessionFirstObserved prometheus.Counter
+	conductorServerRequests            *prometheus.CounterVec
+	conductorServerDuration            *prometheus.HistogramVec
+	conductorServerAuditIngest         *prometheus.CounterVec
+	conductorServerAuditQueries        *prometheus.CounterVec
+	conductorEmergencyQuarantine       *prometheus.CounterVec
+	conductorPolicyHashStatuses        *prometheus.GaugeVec
 
 	// Learn-and-lock observation pipeline (learn.go).
 	learnObservationEvents        *prometheus.CounterVec
@@ -156,6 +158,10 @@ type Metrics struct {
 	requiredReceiptBlocks    map[string]int64
 
 	// Evidence health (evidence.go).
+	evidenceTornTails           prometheus.Counter
+	evidenceTornTailPresent     prometheus.Gauge
+	evidenceTornTailSeen        map[evidenceTornTailKey]struct{}
+	evidenceTornTailStats       EvidenceTornTailStats
 	evidenceSequenceGaps        *prometheus.CounterVec
 	evidenceHeartbeatInterval   prometheus.Gauge
 	evidenceLastAnchorTimestamp prometheus.Gauge
@@ -249,6 +255,7 @@ func New() *Metrics {
 	m.registerProxyMetrics(reg)
 	m.registerWSMetrics(reg)
 	m.registerDLPMetrics(reg)
+	m.registerIssuerIDMetrics(reg)
 	m.registerSessionMetrics(reg)
 	m.registerTLSMetrics(reg)
 	m.registerAirlockMetrics(reg)

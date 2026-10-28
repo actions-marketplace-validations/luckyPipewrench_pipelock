@@ -96,6 +96,64 @@ func TestLogDLPCredentialAudienceAllow_EmitsBoundedFields(t *testing.T) {
 	}
 }
 
+func TestLogDLPIssuerCookieAllow_EmitsBoundedFields(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := New("json", "custom", "", true, true)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	logger.zl = logger.zl.Output(&buf)
+	ctx, err := NewHTTPLogContext("GET", "https://app.vendor.example/account", "192.0.2.5", "req-issuer-cookie", "agent-one")
+	if err != nil {
+		t.Fatalf("NewHTTPLogContext: %v", err)
+	}
+	logger.LogDLPIssuerCookieAllow(ctx, "AWS Access ID", "AWSALB", "app.vendor.example")
+
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(buf.String())), &entry); err != nil {
+		t.Fatalf("decode audit event: %v", err)
+	}
+	if entry["event"] != string(EventDLPIssuerCookieAllow) || entry["pattern"] != "AWS Access ID" ||
+		entry["cookie"] != "AWSALB" || entry["surface"] != "header" || entry["destination"] != "app.vendor.example" ||
+		entry["request_id"] != "req-issuer-cookie" {
+		t.Fatalf("issuer cookie allow audit fields = %#v", entry)
+	}
+}
+
+func TestLogDLPIssuerCookieAllow_EmitterReceivesEvent(t *testing.T) {
+	var buf bytes.Buffer
+	logger, err := New("json", "custom", "", true, true)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	logger.zl = logger.zl.Output(&buf)
+
+	sink := &collectingSink{}
+	emitter := emit.NewEmitter("test-dlp-issuer-cookie", sink)
+	logger.SetEmitter(emitter)
+	t.Cleanup(func() { _ = emitter.Close() })
+
+	ctx, err := NewHTTPLogContext("GET", "https://app.vendor.example/account", "192.0.2.6", "req-issuer-cookie-2", "agent-two")
+	if err != nil {
+		t.Fatalf("NewHTTPLogContext: %v", err)
+	}
+	logger.LogDLPIssuerCookieAllow(ctx, "JWT Token", "session", "app.vendor.example")
+	_ = emitter.Close()
+
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	if len(sink.events) == 0 {
+		t.Fatal("emitter should have received an event")
+	}
+	ev := sink.events[0]
+	if ev.Type != string(EventDLPIssuerCookieAllow) {
+		t.Errorf("emitted event type: want %q, got %q", EventDLPIssuerCookieAllow, ev.Type)
+	}
+	if ev.Fields["cookie"] != "session" {
+		t.Errorf("emitted cookie: want %q, got %v", "session", ev.Fields["cookie"])
+	}
+}
+
 func TestLogDLPDropped_EmitsInformationalReason(t *testing.T) {
 	var buf bytes.Buffer
 	logger, err := New("json", "custom", "", true, true)
@@ -114,6 +172,60 @@ func TestLogDLPDropped_EmitsInformationalReason(t *testing.T) {
 	}
 	if entry["reason"] != "suppressed" || entry["transport"] != "fetch" || entry["pattern"] != "test-pattern" {
 		t.Fatalf("dropped audit fields = %#v", entry)
+	}
+}
+
+func TestLogDLPInformational_SurfaceRemediation(t *testing.T) {
+	for _, mode := range []string{"warn", "suppressed"} {
+		for _, tc := range []struct {
+			surface string
+			want    string
+		}{
+			{"header", "false-positive header finding"},
+			{"body", "Request body DLP matched"},
+			{"fetch", "exempt_domains"},
+			{"mcp_stdio", "exempt_domains"},
+			{"unknown", "exempt_domains"},
+		} {
+			t.Run(mode+"/"+tc.surface, func(t *testing.T) {
+				var buf bytes.Buffer
+				logger, err := New("json", "custom", "", true, true)
+				if err != nil {
+					t.Fatal(err)
+				}
+				logger.zl = logger.zl.Output(&buf)
+				sink := &collectingSink{}
+				emitter := emit.NewEmitter("test-dlp-surface-hint", sink)
+				logger.SetEmitter(emitter)
+				t.Cleanup(func() { _ = emitter.Close() })
+				ctx, err := NewHTTPLogContext("POST", "https://api.vendor.example/path", "192.0.2.1", "req-hint", "")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "warn" {
+					logger.LogDLPWarn(ctx, "test-pattern", "high", tc.surface)
+				} else {
+					logger.LogDLPDropped(ctx, "test-pattern", "high", tc.surface, mode)
+				}
+				var entry map[string]any
+				if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
+					t.Fatal(err)
+				}
+				hint, ok := entry["remediation_hint"].(string)
+				if !ok || !strings.Contains(hint, tc.want) {
+					t.Fatalf("remediation_hint = %q, want %q", hint, tc.want)
+				}
+				if entry["transport"] != tc.surface || entry["reason"] != mode {
+					t.Fatalf("surface/reason changed: %#v", entry)
+				}
+				_ = emitter.Close()
+				sink.mu.Lock()
+				defer sink.mu.Unlock()
+				if len(sink.events) != 1 || sink.events[0].Fields["remediation_hint"] != hint {
+					t.Fatalf("emitter disagrees with audit hint: %#v", sink.events)
+				}
+			})
+		}
 	}
 }
 

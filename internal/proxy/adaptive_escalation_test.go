@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,6 +99,128 @@ func escalateRec(rec session.Recorder, targetLevel int) {
 	}
 }
 
+func TestURLHeuristicsDoNotRaiseAdaptiveScore(t *testing.T) {
+	cfg := adaptiveConfig()
+	logger := audit.NewNop()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+	p, err := New(cfg, logger, sc, metrics.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	cases := []struct {
+		name      string
+		result    scanner.Result
+		wantScore bool
+	}{
+		{"path or query entropy", scanner.Result{Scanner: scanner.ScannerEntropy, Class: scanner.ClassHeuristicEntropy, Score: 0.8}, false},
+		{"subdomain entropy", scanner.Result{Scanner: scanner.ScannerSubdomainEntropy, Class: scanner.ClassHeuristicEntropy, Score: 0.8}, false},
+		{"structural hostname", scanner.Result{Scanner: scanner.ScannerSubdomainEntropy, Reason: "subdomain payload chunked across 4 encoded labels of 4 (possible DNS exfiltration)", Score: 0.8}, true},
+		{"DLP", scanner.Result{Scanner: scanner.ScannerDLP, Score: 0.8}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			key := "entropy-" + tc.name
+			p.recordSessionActivityWithUserAgent(sessionActivityOptions{ClientIP: "192.0.2.1", Agent: key, ActorAuth: envelope.ActorAuthBound, Hostname: "api.vendor.example", RequestID: "req", Result: tc.result, Config: cfg, Logger: logger, DeferClean: true})
+			rec := p.sessionMgrPtr.Load().GetOrCreate(sessionKeyFor(nil, key, "192.0.2.1", envelope.ActorAuthBound))
+			if got := rec.ThreatScore() > 0; got != tc.wantScore {
+				t.Fatalf("adaptive score positive = %v, want %v (score %.1f)", got, tc.wantScore, rec.ThreatScore())
+			}
+		})
+	}
+}
+
+func TestForwardHTTP_BoundOpaqueTrafficDoesNotEscalate(t *testing.T) {
+	var upstreamHits atomic.Int32
+	upstream := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	cfg := adaptiveConfig()
+	cfg.DefaultAgentIdentity = "test-browser"
+	cfg.BindDefaultAgentIdentity = true
+	cfg.RequestBodyScanning.Enabled = true
+	cfg.RequestBodyScanning.Action = config.ActionWarn
+	cfg.RequestBodyScanning.ContentEntropyEnabled = true
+	cfg.RequestBodyScanning.ContentEntropyAction = config.ActionWarn
+	cfg.RequestBodyScanning.ContentEntropyThreshold = 4.5
+	cfg.RequestBodyScanning.ContentEntropyMinLength = 32
+	cfg.CrossRequestDetection.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.Enabled = true
+	cfg.CrossRequestDetection.EntropyBudget.BitsPerWindow = 1
+	cfg.CrossRequestDetection.EntropyBudget.Action = config.ActionWarn
+
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+	p, err := New(cfg, audit.NewNop(), sc, metrics.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+	handler := p.buildHandler(http.NewServeMux())
+	opaque := opaqueHighEntropyBodyValue()
+	send := func(h http.Handler, body, stage string) {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, upstream.URL+"/graphql?cursor="+opaque, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s status = %d, want 200: %s", stage, w.Code, w.Body.String())
+		}
+	}
+	graphqlBody := `{"query":"query Viewer { viewer { id } }","variables":{"cursor":"` + opaque + `"}}`
+	for i, body := range []string{
+		graphqlBody,
+		graphqlBody,
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch","arguments":{"cursor":"` + opaque + `"}}}`,
+	} {
+		send(handler, body, fmt.Sprintf("opaque request %d", i))
+	}
+	key := sessionKeyFor(nil, "test-browser", adaptiveSessionKeyHTTPTest, envelope.ActorAuthBound)
+	if upstreamHits.Load() != 3 {
+		t.Fatalf("upstream hits = %d, want 3", upstreamHits.Load())
+	}
+	if !p.currentCEEEntropy(testCEEIdentity(key)).Exceeded {
+		t.Fatal("bound session did not retain the cross-request entropy finding")
+	}
+	rec := p.sessionMgrPtr.Load().GetOrCreate(key)
+	if rec.ThreatScore() != 0 || rec.EscalationLevel() != 0 {
+		t.Fatalf("opaque traffic raised adaptive state: score=%.1f level=%d", rec.ThreatScore(), rec.EscalationLevel())
+	}
+
+	reloaded := cfg.Clone()
+	newScanner := scanner.MustNew(reloaded)
+	if !p.Reload(reloaded, newScanner) {
+		newScanner.Close()
+		t.Fatal("policy reload failed")
+	}
+	rec = p.sessionMgrPtr.Load().GetOrCreate(key)
+	escalateRec(rec, 1)
+	priorScore := rec.ThreatScore()
+	send(handler, graphqlBody, "elevated session after reload")
+	if rec.ThreatScore() != priorScore || rec.EscalationLevel() != 1 {
+		t.Fatalf("reloaded entropy warning changed adaptive state: score=%.1f level=%d", rec.ThreatScore(), rec.EscalationLevel())
+	}
+
+	freshScanner := scanner.MustNew(cfg)
+	defer freshScanner.Close()
+	fresh, err := New(cfg, audit.NewNop(), freshScanner, metrics.New())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	send(fresh.buildHandler(http.NewServeMux()), graphqlBody, "fresh process")
+	freshRec := fresh.sessionMgrPtr.Load().GetOrCreate(key)
+	if freshRec.ThreatScore() != 0 || freshRec.EscalationLevel() != 0 || upstreamHits.Load() != 5 {
+		t.Fatalf("fresh process adaptive state: score=%.1f level=%d upstream hits=%d", freshRec.ThreatScore(), freshRec.EscalationLevel(), upstreamHits.Load())
+	}
+}
+
 // --- handleForwardHTTP tests ---
 
 // TestForwardHTTP_Adaptive_BlockAll verifies that a clean forward HTTP request
@@ -160,7 +283,7 @@ func TestForwardHTTP_Adaptive_BlockAll(t *testing.T) {
 	}
 	ar := receipts[0].ActionRecord
 	if ar.Layer != adaptiveSessionDeny || ar.Verdict != config.ActionBlock || ar.Transport != TransportForward || ar.Target != upstream.URL+"/ok" {
-		t.Fatalf("session deny action record = %+v, want block/%s/%s for %s", ar, adaptiveSessionDeny, TransportForward, upstream.URL+"/ok")
+		t.Fatalf("session deny action record = %+v, want warn/%s for %s", ar, TransportForward, upstream.URL+"/ok")
 	}
 }
 
@@ -189,9 +312,9 @@ func TestForwardHTTP_Adaptive_WarnUpgradeToBlock(t *testing.T) {
 	rec := sm.GetOrCreate(adaptiveSessionKeyHTTPTest)
 	escalateRec(rec, 1)
 
-	// Send a request with an AWS key in the URL (DLP finding, audit mode = warn).
+	// Send a request with an Anthropic API key in the URL (DLP finding, audit mode = warn).
 	// Build the key at runtime to avoid gosec G101.
-	dlpURL := upstream.URL + "/text?key=" + "AKIA" + "IOSFODNN7EXAMPLE"
+	dlpURL := upstream.URL + "/text?key=" + "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, dlpURL, nil)
 	w := httptest.NewRecorder()
 
@@ -239,7 +362,7 @@ func TestForwardHTTP_Adaptive_HeaderDLPSignal(t *testing.T) {
 
 	// Send a request with a DLP secret in the Authorization header.
 	// Build at runtime to avoid gosec G101.
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, upstream.URL+"/ok", nil)
 	req.Header.Set("Authorization", "Bearer "+secret)
 	w := httptest.NewRecorder()
@@ -253,8 +376,8 @@ func TestForwardHTTP_Adaptive_HeaderDLPSignal(t *testing.T) {
 	}
 
 	scoreAfter := rec.ThreatScore()
-	if scoreAfter <= scoreBefore {
-		t.Errorf("expected threat score to increase from header DLP signal, before=%f after=%f", scoreBefore, scoreAfter)
+	if scoreAfter != scoreBefore {
+		t.Errorf("warning changed threat score, before=%f after=%f", scoreBefore, scoreAfter)
 	}
 }
 
@@ -269,17 +392,17 @@ func TestForwardHTTP_AdaptiveSelfDeclaredAgentRotationSharesSession(t *testing.T
 		cfg.AdaptiveEnforcement.Enabled = true
 		cfg.AdaptiveEnforcement.EscalationThreshold = 2
 		cfg.AdaptiveEnforcement.DecayPerCleanRequest = 0
-		enforceFalse := false
-		cfg.Enforce = &enforceFalse
+		enforceTrue := true
+		cfg.Enforce = &enforceTrue
 		cfg.RequestBodyScanning.Enabled = true
 		cfg.RequestBodyScanning.ScanHeaders = true
-		cfg.RequestBodyScanning.Action = config.ActionWarn
+		cfg.RequestBodyScanning.Action = config.ActionBlock
 	})
 	defer cleanup()
 	installForwardTestDialer(p, upstream.Listener.Addr().String())
 
 	client := forwardHTTPClient(t, proxyAddr)
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	requests := []struct {
 		agent string
 	}{
@@ -298,11 +421,8 @@ func TestForwardHTTP_AdaptiveSelfDeclaredAgentRotationSharesSession(t *testing.T
 			t.Fatalf("forward request for %q: %v", tc.agent, err)
 		}
 		_ = resp.Body.Close()
-		wantStatus := http.StatusOK
-		// The second near-miss is allowed in audit mode, but it is the one
-		// that crosses the shared threshold. With the fold removed, each
-		// request scores only one point in a different bucket and this test's
-		// escalation assertion below fails.
+		wantStatus := http.StatusForbidden
+		// Explicit DLP blocks remain enforced across caller-name rotation.
 		if resp.StatusCode != wantStatus {
 			t.Fatalf("forward request %d for %q status = %d, want %d", i+1, tc.agent, resp.StatusCode, wantStatus)
 		}
@@ -312,7 +432,7 @@ func TestForwardHTTP_AdaptiveSelfDeclaredAgentRotationSharesSession(t *testing.T
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	folded := sm.GetOrCreate(sessionKeyFor("caller-a", adaptiveSessionKeyLoopback, envelope.ActorAuthSelfDeclared))
+	folded := sm.GetOrCreate(sessionKeyFor(nil, "caller-a", adaptiveSessionKeyLoopback, envelope.ActorAuthSelfDeclared))
 	if got := folded.EscalationLevel(); got == 0 {
 		t.Fatalf("rotating self-declared agents did not cross the shared adaptive escalation threshold (score %.2f)", folded.ThreatScore())
 	}
@@ -320,15 +440,15 @@ func TestForwardHTTP_AdaptiveSelfDeclaredAgentRotationSharesSession(t *testing.T
 		t.Fatal("self-declared agent name created an independent adaptive session")
 	}
 	for _, auth := range []envelope.ActorAuth{envelope.ActorAuthBound, envelope.ActorAuthConfigDefault} {
-		if sessionKeyFor("caller-a", adaptiveSessionKeyLoopback, auth) == sessionKeyFor("caller-b", adaptiveSessionKeyLoopback, auth) {
+		if sessionKeyFor(nil, "caller-a", adaptiveSessionKeyLoopback, auth) == sessionKeyFor(nil, "caller-b", adaptiveSessionKeyLoopback, auth) {
 			t.Fatalf("%s identities must keep separate adaptive buckets", auth)
 		}
 	}
 }
 
-// TestForwardHTTP_Adaptive_BlockAllAfterCEE verifies that the post-CEE block_all
-// recheck in handleForwardHTTP fires when CEE escalates the session.
-func TestForwardHTTP_Adaptive_BlockAllAfterCEE(t *testing.T) {
+// TestForwardHTTP_Adaptive_EntropyBudgetWarnAddsNoScore verifies a CEE warning
+// does not push a nearly elevated session into block_all.
+func TestForwardHTTP_Adaptive_EntropyBudgetWarnAddsNoScore(t *testing.T) {
 	upstream := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, "ok")
@@ -352,8 +472,7 @@ func TestForwardHTTP_Adaptive_BlockAllAfterCEE(t *testing.T) {
 	}
 	defer p.Close()
 
-	// Pre-escalate nearly to elevated (just under threshold) so CEE signals
-	// push it over the edge into block_all territory.
+	// Prime just below the threshold; the CEE warning must leave it there.
 	sm := p.sessionMgrPtr.Load()
 	rec := sm.GetOrCreate(adaptiveSessionKeyHTTPTest)
 	// Record a near-miss (+1) to prime the score close to threshold.
@@ -362,19 +481,15 @@ func TestForwardHTTP_Adaptive_BlockAllAfterCEE(t *testing.T) {
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 
-	// Send a clean request. CEE entropy tracking on the URL path may push
-	// the session over the threshold, triggering block_all.
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, upstream.URL+"/data?token="+"highentropy"+"stringhere123", nil)
+	// Send a clean URL with enough query data to exceed the CEE budget.
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, upstream.URL+"/data?x=abc123", nil)
 	w := httptest.NewRecorder()
 
 	handler := p.buildHandler(http.NewServeMux())
 	handler.ServeHTTP(w, req)
 
-	// After escalation the request should be blocked by block_all or the
-	// CEE entropy budget. Either way: 403.
-	if w.Code != http.StatusForbidden {
-		t.Logf("body: %s", w.Body.String())
-		t.Errorf("expected 403 after CEE escalation + block_all, got %d", w.Code)
+	if w.Code != http.StatusOK || rec.EscalationLevel() != 0 || rec.ThreatScore() > 4 {
+		t.Errorf("entropy budget warning changed forward outcome or adaptive state: status=%d level=%d score=%.1f", w.Code, rec.EscalationLevel(), rec.ThreatScore())
 	}
 }
 
@@ -606,7 +721,7 @@ func TestWebSocket_Adaptive_WarnUpgradeToBlock(t *testing.T) {
 	escalateRec(rec, 1)
 
 	// WS URL with a DLP secret. Build at runtime to avoid gosec G101.
-	dlpURL := "ws://127.0.0.1:9999/ws?key=" + "AKIA" + "IOSFODNN7EXAMPLE"
+	dlpURL := "ws://127.0.0.1:9999/ws?key=" + "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/ws?url="+dlpURL, nil)
 	w := httptest.NewRecorder()
 
@@ -806,11 +921,11 @@ func TestFetch_Adaptive_BlockAll(t *testing.T) {
 	if !resp.Blocked {
 		t.Error("expected Blocked=true")
 	}
-	if resp.BlockReason != adaptiveBlockedReason {
+	if !strings.Contains(resp.BlockReason, "blocked by adaptive enforcement") {
 		t.Errorf("block reason = %q, want %q", resp.BlockReason, adaptiveBlockedReason)
 	}
 	body := w.Body.String()
-	for _, forbidden := range []string{"adaptive_level", "auto_recover_at", "recover_hint", "elevated", "high", "critical"} {
+	for _, forbidden := range []string{"Authorization", "Bearer", "caller-a", "caller-b"} {
 		if strings.Contains(body, forbidden) {
 			t.Fatalf("agent-facing fetch response leaked %q: %s", forbidden, body)
 		}
@@ -864,10 +979,9 @@ func TestFetch_Adaptive_HeaderDLPSignal(t *testing.T) {
 	}
 }
 
-// TestFetch_Adaptive_BlockAllAfterCEE verifies the post-CEE block_all recheck
-// in handleFetch. When CEE escalates the session to a block_all level, the
-// request is blocked even though the URL scan was clean.
-func TestFetch_Adaptive_BlockAllAfterCEE(t *testing.T) {
+// TestFetch_Adaptive_EntropyBudgetWarnAddsNoScore verifies a CEE warning
+// does not push a nearly elevated fetch session into block_all.
+func TestFetch_Adaptive_EntropyBudgetWarnAddsNoScore(t *testing.T) {
 	backend := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, "hello")
@@ -890,7 +1004,7 @@ func TestFetch_Adaptive_BlockAllAfterCEE(t *testing.T) {
 	}
 	defer p.Close()
 
-	// Prime the session close to threshold so CEE entropy signals push it over.
+	// Prime the session close to threshold; entropy must not push it over.
 	sm := p.sessionMgrPtr.Load()
 	rec := sm.GetOrCreate(adaptiveSessionKeyHTTPTest)
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
@@ -898,16 +1012,15 @@ func TestFetch_Adaptive_BlockAllAfterCEE(t *testing.T) {
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+backend.URL+"/data?token="+"highentropy"+"stringhere123", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+backend.URL+"/data?x=abc123", nil)
 	w := httptest.NewRecorder()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/fetch", p.handleFetch)
 	mux.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Logf("body: %s", w.Body.String())
-		t.Errorf("expected 403 after fetch CEE escalation + block_all, got %d", w.Code)
+	if w.Code != http.StatusOK || rec.EscalationLevel() != 0 || rec.ThreatScore() > 4 {
+		t.Errorf("entropy budget warning changed fetch outcome or adaptive state: status=%d level=%d score=%.1f", w.Code, rec.EscalationLevel(), rec.ThreatScore())
 	}
 }
 
@@ -1126,7 +1239,7 @@ func TestFetch_Adaptive_WarnUpgradeToBlock(t *testing.T) {
 	escalateRec(rec, 1)
 
 	// Fetch URL with a DLP secret. Build at runtime to avoid gosec G101.
-	dlpURL := backend.URL + "/text?key=" + "AKIA" + "IOSFODNN7EXAMPLE"
+	dlpURL := backend.URL + "/text?key=" + "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+dlpURL, nil)
 	w := httptest.NewRecorder()
 
@@ -1242,8 +1355,8 @@ func TestConnect_Adaptive_WarnUpgradeToBlock(t *testing.T) {
 	rec := sm.GetOrCreate(adaptiveSessionKeyLoopback)
 	escalateRec(rec, 1)
 
-	// CONNECT to a DLP-matching target (AWS key in host). Build at runtime.
-	dlpHost := "AKIA" + "IOSFODNN7EXAMPLE" + ".example.com:443"
+	// CONNECT to a DLP-matching target (Anthropic API key in host). Build at runtime.
+	dlpHost := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef" + ".example.com:443"
 	conn := dialProxy(t, proxyAddr)
 	defer func() { _ = conn.Close() }()
 
@@ -1349,10 +1462,9 @@ func TestConnect_Adaptive_PostCEEBlockAllRecheck(t *testing.T) {
 	}
 }
 
-// TestConnect_Adaptive_PostCEEBlockAllReceipt proves that a CEE finding carried
-// into CONNECT can escalate a near-threshold session and that the terminal
-// session denial is represented by a signed CONNECT receipt.
-func TestConnect_Adaptive_PostCEEBlockAllReceipt(t *testing.T) {
+// TestConnect_Adaptive_ExistingBlockAllReceipt proves that concrete evidence
+// establishing block_all still denies a CONNECT with a CEE entropy finding.
+func TestConnect_Adaptive_ExistingBlockAllReceipt(t *testing.T) {
 	targetLn := listenEcho(t)
 	defer func() { _ = targetLn.Close() }()
 
@@ -1384,11 +1496,11 @@ func TestConnect_Adaptive_PostCEEBlockAllReceipt(t *testing.T) {
 	go func() { _ = srv.Serve(ln) }()
 
 	rec := p.sessionMgrPtr.Load().GetOrCreate(adaptiveSessionKeyLoopback)
-	for range 4 {
+	for range 5 {
 		rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 	}
-	if rec.EscalationLevel() != 0 {
-		t.Fatalf("precondition: escalation level = %d, want 0", rec.EscalationLevel())
+	if rec.EscalationLevel() == 0 {
+		t.Fatalf("precondition: escalation level = %d, want block_all", rec.EscalationLevel())
 	}
 	et := p.entropyTrackerPtr.Load()
 	if et == nil {
@@ -1464,7 +1576,7 @@ func TestForwardHTTP_Adaptive_BodyDLPWarnUpgradeToBlock(t *testing.T) {
 	escalateRec(rec, 1)
 
 	// POST a body containing a DLP secret. Build at runtime to avoid gosec G101.
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	body := strings.NewReader("key=" + secret)
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, upstream.URL+"/upload", body)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -1481,10 +1593,8 @@ func TestForwardHTTP_Adaptive_BodyDLPWarnUpgradeToBlock(t *testing.T) {
 	}
 }
 
-// TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck verifies the post-header-DLP
-// block_all recheck path in handleForwardHTTP. After a header DLP near-miss
-// escalates the session to block_all level, subsequent clean requests are denied.
-func TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck(t *testing.T) {
+// A header warning cannot cross a nearly reached block_all threshold.
+func TestForwardHTTP_Adaptive_HeaderDLPWarnCannotTriggerBlockAll(t *testing.T) {
 	upstream := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, "ok")
@@ -1511,7 +1621,7 @@ func TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck(t *testing.T) {
 	}
 	defer p.Close()
 
-	// Prime near threshold so header DLP near-miss escalates to block_all level.
+	// Prime below threshold; a warning must neither escalate nor decay it.
 	sm := p.sessionMgrPtr.Load()
 	rec := sm.GetOrCreate(adaptiveSessionKeyHTTPTest)
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
@@ -1520,7 +1630,7 @@ func TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck(t *testing.T) {
 	rec.RecordSignal(session.SignalNearMiss, adaptiveTestThreshold)
 
 	// Build the secret at runtime to avoid gosec G101.
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, upstream.URL+"/ok", nil)
 	req.Header.Set("Authorization", "Bearer "+secret)
 	w := httptest.NewRecorder()
@@ -1528,10 +1638,10 @@ func TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck(t *testing.T) {
 	handler := p.buildHandler(http.NewServeMux())
 	handler.ServeHTTP(w, req)
 
-	// Either blocked by header DLP or by the post-DLP block_all recheck.
-	if w.Code != http.StatusForbidden {
+	// The warning remains a warning despite prior, sub-threshold evidence.
+	if w.Code != http.StatusOK {
 		t.Logf("body: %s", w.Body.String())
-		t.Errorf("expected 403 after forward header DLP near-miss escalation + block_all recheck, got %d", w.Code)
+		t.Errorf("expected header warning to remain allowed below block_all, got %d", w.Code)
 	}
 	waitForReceiptOrTimeout(t, receiptDir)
 	if err := receiptRecorder.Close(); err != nil {
@@ -1542,8 +1652,8 @@ func TestForwardHTTP_Adaptive_HeaderDLPBlockAllRecheck(t *testing.T) {
 		t.Fatalf("session deny receipts = %+v, want exactly one", receipts)
 	}
 	ar := receipts[0].ActionRecord
-	if ar.Layer != adaptiveSessionDeny || ar.Verdict != config.ActionBlock || ar.Transport != TransportForward || ar.Target != upstream.URL+"/ok" {
-		t.Fatalf("session deny action record = %+v, want block/%s/%s for %s", ar, adaptiveSessionDeny, TransportForward, upstream.URL+"/ok")
+	if ar.Verdict != config.ActionWarn || ar.Transport != TransportForward || ar.Target != upstream.URL+"/ok" {
+		t.Fatalf("session deny action record = %+v, want warn/%s for %s", ar, TransportForward, upstream.URL+"/ok")
 	}
 }
 
@@ -1583,7 +1693,7 @@ func TestInterceptTunnel_Adaptive_URLWarnUpgradeToBlock(t *testing.T) {
 	escalateRec(rec, 1)
 
 	// Build a URL with a DLP secret in the path. Build at runtime to avoid gosec G101.
-	dlpPath := "/search?key=" + "AKIA" + "IOSFODNN7EXAMPLE"
+	dlpPath := "/search?key=" + "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	handler := newInterceptHandler(&InterceptContext{
 		TargetHost: "127.0.0.1",
 		TargetPort: "80",
@@ -1650,7 +1760,7 @@ func TestInterceptTunnel_Adaptive_BodyDLPWarnUpgradeToBlock(t *testing.T) {
 	escalateRec(rec, 1)
 
 	// Build request body with DLP secret. Build at runtime to avoid gosec G101.
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	body := strings.NewReader("key=" + secret)
 
 	handler := newInterceptHandler(&InterceptContext{
@@ -1853,7 +1963,7 @@ func dialWSProxy(t *testing.T, proxyAddr, backendAddr string) net.Conn {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	wsURL := fmt.Sprintf("ws://%s/ws?url=ws://%s", proxyAddr, backendAddr)
-	conn, _, _, err := ws.Dialer{Extensions: nil}.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, ws.Dialer{Extensions: nil}, wsURL)
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
@@ -2370,14 +2480,8 @@ func TestCeeRecordSignalsAndBlockAll_NilGuard(t *testing.T) {
 
 // --- forward HTTP CEE block_all tests ---
 
-// TestForwardHTTP_CEE_BlockAllRecheck verifies the post-CEE block_all recheck
-// at forward.go:1412-1420. The URL scan must be clean (Allowed=true) so the
-// pre-CEE session-deny check does not fire. CEE entropy budget is set to 1 bit
-// (warn mode) so any query data triggers a CEE entropy hit. The session is
-// primed to 4.0 (below threshold 5.0, level 0). The CEE entropy hit
-// (+2 SignalEntropyBudget) pushes the score to 6.0, escalating to level 1
-// with block_all=true, and the ceeBlockAll branch fires.
-func TestForwardHTTP_CEE_BlockAllRecheck(t *testing.T) {
+// A warn-mode CEE hit must not move a session primed just below block_all.
+func TestForwardHTTP_CEE_EntropyWarnDoesNotEscalate(t *testing.T) {
 	upstream := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = fmt.Fprint(w, "ok")
@@ -2428,11 +2532,8 @@ func TestForwardHTTP_CEE_BlockAllRecheck(t *testing.T) {
 	handler := p.buildHandler(http.NewServeMux())
 	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("expected 403 from post-CEE block_all recheck, got %d: %s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), adaptiveBlockedReason) {
-		t.Errorf("expected generic adaptive block message, got %q", w.Body.String())
+	if w.Code != http.StatusOK || rec.EscalationLevel() != 0 || rec.ThreatScore() > 4 {
+		t.Errorf("entropy warning changed HTTP outcome or adaptive state: status=%d level=%d score=%.1f body=%s", w.Code, rec.EscalationLevel(), rec.ThreatScore(), w.Body.String())
 	}
 	waitForReceiptOrTimeout(t, receiptDir)
 	if err := receiptRecorder.Close(); err != nil {
@@ -2443,8 +2544,8 @@ func TestForwardHTTP_CEE_BlockAllRecheck(t *testing.T) {
 		t.Fatalf("session deny receipts = %+v, want exactly one", receipts)
 	}
 	ar := receipts[0].ActionRecord
-	if ar.Layer != adaptiveSessionDeny || ar.Verdict != config.ActionBlock || ar.Transport != TransportForward || ar.Target != upstream.URL+"/ok?x=abc123" {
-		t.Fatalf("session deny action record = %+v, want block/%s/%s for %s", ar, adaptiveSessionDeny, TransportForward, upstream.URL+"/ok?x=abc123")
+	if ar.Verdict != config.ActionAllow || ar.Transport != TransportForward || ar.Target != upstream.URL+"/ok?x=abc123" {
+		t.Fatalf("forward action record = %+v, want allow/%s for %s", ar, TransportForward, upstream.URL+"/ok?x=abc123")
 	}
 }
 
@@ -2453,7 +2554,7 @@ func TestForwardHTTP_CEE_BlockAllRecheck(t *testing.T) {
 // TestInterceptTunnel_CEE_BlockAllRecheck verifies the post-CEE block_all
 // recheck at intercept.go:1096-1115. Uses the newInterceptHandler directly
 // (no TLS, Proxy=nil) with CEE objects provided via InterceptContext fields.
-func TestInterceptTunnel_CEE_BlockAllRecheck(t *testing.T) {
+func TestInterceptTunnel_CEE_EntropyWarnDoesNotEscalate(t *testing.T) {
 	cfg := adaptiveConfigBlockAll()
 	cfg.TLSInterception.MaxResponseBytes = 1024 * 1024
 	// Enable CEE with very low entropy budget in warn mode.
@@ -2524,21 +2625,15 @@ func TestInterceptTunnel_CEE_BlockAllRecheck(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Errorf("expected 403 from intercept post-CEE block_all, got %d: %s", w.Code, w.Body.String())
-	}
-	if !strings.Contains(w.Body.String(), adaptiveBlockedReason) {
-		t.Errorf("expected generic adaptive block message, got %q", w.Body.String())
+	if w.Code != http.StatusOK || rec.EscalationLevel() != 0 || rec.ThreatScore() > 4 {
+		t.Errorf("entropy warning changed intercept outcome or adaptive state: status=%d level=%d score=%.1f body=%s", w.Code, rec.EscalationLevel(), rec.ThreatScore(), w.Body.String())
 	}
 }
 
 // --- WebSocket CEE block_all tests ---
 
-// TestWSRelay_CEE_BlockAll verifies the post-CEE block_all recheck at
-// websocket.go:1897-1916. A WS frame with enough entropy to exceed the 1-bit
-// budget triggers a CEE warn-mode hit, pushing the primed session over the
-// block_all threshold. The proxy closes the connection with a policy violation.
-func TestWSRelay_CEE_BlockAll(t *testing.T) {
+// A WS frame that exceeds the warn-mode CEE budget stays visible and forwards.
+func TestWSRelay_CEE_EntropyWarnDoesNotEscalate(t *testing.T) {
 	backendAddr, backendCleanup := wsEchoServer(t)
 	defer backendCleanup()
 
@@ -2614,17 +2709,13 @@ func TestWSRelay_CEE_BlockAll(t *testing.T) {
 	defer conn.Close() //nolint:errcheck // test
 
 	// Send a text frame with enough entropy to exceed the 1-bit budget.
-	// The CEE entropy hit (+2 SignalEntropyBudget) pushes the session from
-	// score 4.0 to 6.0, crossing the 5.0 threshold into block_all level.
+	// The CEE entropy hit must leave the score below block_all.
 	if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte("abc123def456")); err != nil {
 		t.Fatalf("write WS frame: %v", err)
 	}
 
-	// The proxy should close with a policy violation (CEE block_all).
 	_, _, err = wsutil.ReadServerData(conn)
-	if err == nil {
-		t.Fatal("expected connection close after CEE block_all, but read succeeded")
+	if err != nil || rec.EscalationLevel() != 0 || rec.ThreatScore() > 4 {
+		t.Fatalf("entropy warning changed WS outcome or adaptive state: read=%v level=%d score=%.1f", err, rec.EscalationLevel(), rec.ThreatScore())
 	}
-	// Any read error is acceptable: the server sends a close frame with
-	// StatusPolicyViolation, which manifests as a read error.
 }

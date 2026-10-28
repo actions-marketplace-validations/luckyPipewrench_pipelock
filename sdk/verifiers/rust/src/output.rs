@@ -1,7 +1,9 @@
 // Copyright 2026 Pipelock contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::types::{AuditPacketReport, ChainCommandReport, ReceiptReport};
+pub const PREFIX_STATUS: &str = "VALID PREFIX, END UNPROVEN";
+
+use crate::types::{AuditPacketReport, ChainCommandReport, ChainSetReport, ReceiptReport};
 use crate::util::{Result, VerifierError};
 
 pub fn write_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -130,20 +132,37 @@ pub fn emit_receipt(report: &ReceiptReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// Writes the one-line reason a verification failed to stderr, in text and
+/// JSON mode alike, so no failing exit is silent.
+pub fn report_failure(reason: &str) {
+    eprintln!("verification failed: {}", reason.replace(['\r', '\n'], " "));
+}
+
 pub fn emit_chain(report: &ChainCommandReport, json: bool) -> Result<()> {
     if json {
         return write_json(report);
     }
     if report.valid {
-        if report.unpinned == Some(true) {
+        if !report.end_proof.proven {
+            println!("{PREFIX_STATUS}: {}", report.path);
+        } else if report.unpinned == Some(true) {
             println!("CHAIN UNPINNED: {}", report.path);
-            if let Some(error) = &report.error {
-                println!("  warning:    {error}");
-            }
         } else {
             println!("CHAIN VALID: {}", report.path);
         }
+        if report.unpinned == Some(true) {
+            println!(
+                "  warning:    {}",
+                report
+                    .error
+                    .as_deref()
+                    .unwrap_or(crate::signing::UNPINNED_RECEIPT_BANNER)
+            );
+        }
         println!("  receipts:   {}", report.receipt_count);
+        if let (Some(action), Some(evidence)) = (report.action_receipts, report.evidence_receipts) {
+            println!("  by kind:    {action} action_receipt, {evidence} evidence_receipt");
+        }
         println!("  final seq:  {}", report.final_seq);
         println!(
             "  root hash:  {}",
@@ -167,5 +186,56 @@ pub fn emit_chain(report: &ChainCommandReport, json: bool) -> Result<()> {
     } else if report.error.is_some() {
         eprintln!("  broken at:  seq unknown");
     }
+    Ok(())
+}
+
+/// Prints each run's chain report, then the base's restart continuity in the
+/// same shape as the Go reference.
+pub fn emit_chain_set(report: &ChainSetReport, json: bool) -> Result<()> {
+    if json {
+        return write_json(report);
+    }
+    for chain in &report.chains {
+        emit_chain(&chain.report, false)?;
+    }
+    let c = &report.continuity;
+    let label = if c.healthy {
+        "RESTART CONTINUITY OK"
+    } else {
+        "RESTART CONTINUITY FAILED"
+    };
+    println!(
+        "{label}: base \"{}\": {} chain(s), {} linked, {} attested discontinuity(s), {} unlinked, {} finding(s)",
+        report.base,
+        c.chain_count,
+        c.linked.len(),
+        c.discontinuities.len(),
+        c.unlinked.len(),
+        c.findings.len()
+    );
+    for l in &c.linked {
+        println!(
+            "  linked:   {} continues {} at seq {} ({})",
+            l.session, l.predecessor_session, l.predecessor_tail_seq, l.trust
+        );
+    }
+    for discontinuity in &c.discontinuities {
+        println!(
+            "  discontinuity: {} continues {} across {} at byte {} (attested)",
+            discontinuity.session,
+            discontinuity.predecessor_session,
+            discontinuity.shard,
+            discontinuity.damage_offset
+        );
+    }
+    for s in &c.unlinked {
+        println!("  unlinked: {s}");
+    }
+    for f in &c.findings {
+        println!("  - {}: {}: {}", f.kind, f.session, f.detail);
+    }
+    println!("  Note: an unlinked run claims no predecessor. That is normal for a first run or concurrent runs,");
+    println!("  and it is also what a deleted link file looks like: this does not prove no run's evidence is missing.");
+    println!("  result:     {}", report.status.as_str());
     Ok(())
 }

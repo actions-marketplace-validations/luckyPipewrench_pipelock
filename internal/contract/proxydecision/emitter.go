@@ -23,13 +23,12 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/luckyPipewrench/pipelock/internal/receiptcontent"
 
 	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
@@ -39,7 +38,7 @@ import (
 
 const (
 	evidenceReceiptEntryType = "evidence_receipt"
-	recorderSessionID        = "proxy"
+	recorderSessionID        = recorder.DefaultSessionBase
 	signatureAlgorithm       = "ed25519"
 	signaturePrefix          = "ed25519:"
 	keyPurposeReceiptSigning = "receipt-signing"
@@ -149,6 +148,12 @@ type EmitterConfig struct {
 	// a fresh chain (ResumePrevHash defaults to GenesisHash).
 	ResumeSeq      uint64
 	ResumePrevHash string
+	// Session is the recorder session ID this emitter records under. It
+	// defaults to the historical literal "proxy" when unset. Every
+	// production caller sets this to the same run session ID that
+	// recorder.AcquireRunSession returned for the shared recorder, so every
+	// writer on that recorder agrees on one session.
+	Session string
 }
 
 // Emitter signs proxy_decision receipts and records them.
@@ -158,12 +163,16 @@ type Emitter struct {
 	sanitize  SanitizeFunc
 	principal string
 	actor     string
-	clock     func() time.Time
-	eventID   func() (string, error)
+	// stamper records with principal and actor fixed (see contentStamper).
+	stamper *contractreceipt.Stamper
+	clock   func() time.Time
+	eventID func() (string, error)
+	session string
 
 	mu            sync.Mutex
 	chainSeq      uint64
 	chainPrevHash string
+	healthErr     error
 }
 
 // NewEmitter returns nil when recorder or signer is missing, matching the
@@ -185,25 +194,33 @@ func NewEmitter(cfg EmitterConfig) *Emitter {
 	if prev == "" {
 		prev = recorder.GenesisHash
 	}
+	session := cfg.Session
+	if session == "" {
+		session = recorderSessionID
+	}
 	return &Emitter{
 		recorder:      cfg.Recorder,
 		signer:        cfg.Signer,
 		sanitize:      cfg.Sanitize,
 		principal:     cfg.Principal,
 		actor:         cfg.Actor,
+		stamper:       evidenceStamper.WithRetained(cfg.Principal, cfg.Actor),
 		clock:         clock,
 		eventID:       eventID,
 		chainSeq:      cfg.ResumeSeq,
 		chainPrevHash: prev,
+		session:       session,
 	}
 }
 
+// newEventID mints a UUIDv7 carrying this process's origin proof, so the
+// content boundary excludes it without trusting its spelling.
 func newEventID() (string, error) {
-	id, err := uuid.NewV7()
-	if err != nil {
-		return "", err
+	id := receiptcontent.NewGeneratedID().String()
+	if id == "" {
+		return "", errors.New("generate event id: system random source failed")
 	}
-	return id.String(), nil
+	return id, nil
 }
 
 // ChainState returns the current chain head (next seq, prev hash). A reload
@@ -218,18 +235,80 @@ func (e *Emitter) ChainState() (seq uint64, prevHash string) {
 	return e.chainSeq, e.chainPrevHash
 }
 
+// HealthError reports an uncertain write. A new emitter must not
+// resume from this chain head without reconciling the recorder's on-disk log.
+func (e *Emitter) HealthError() error {
+	if e == nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.healthErr
+}
+
+// ErrEmitterRetired marks an emitter whose chain head was handed to a successor.
+var ErrEmitterRetired = errors.New("proxydecision: emitter retired")
+
+// evidenceStamper is this package's capability to record the v2 receipts it
+// builds and signs. It never leaves the package.
+var evidenceStamper = contractreceipt.NewStamper("contract.proxydecision")
+
+// contentStamper is the stamper narrowed to this emitter's configured
+// principal and actor, which every receipt it writes stamps unchanged.
+func (e *Emitter) contentStamper() *contractreceipt.Stamper {
+	if e.stamper != nil {
+		return e.stamper
+	}
+	return evidenceStamper
+}
+
+// Retire atomically stops further emission and returns the final chain head,
+// so a successor resumes from the last recorded receipt even when requests
+// were still emitting while the successor was being built. An unhealthy
+// emitter returns its health error instead of a head that cannot be trusted.
+func (e *Emitter) Retire() (seq uint64, prevHash string, err error) {
+	if e == nil {
+		return 0, recorder.GenesisHash, nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.healthErr != nil {
+		return 0, "", e.healthErr
+	}
+	e.healthErr = ErrEmitterRetired
+	return e.chainSeq, e.chainPrevHash, nil
+}
+
+// ResumeAt moves an emitter that has not been published yet to a retired
+// predecessor's chain head.
+func (e *Emitter) ResumeAt(seq uint64, prevHash string) {
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.chainSeq = seq
+	e.chainPrevHash = prevHash
+}
+
 // Emit builds, signs, and records one v2 proxy_decision receipt. It is a no-op
 // on a nil receiver. The mutex spans the whole build→sign→hash→persist→advance
 // sequence so concurrent calls produce a well-ordered chain; chain state is
 // advanced only after a successful record, so a failed write leaves the chain
-// at its previous position (mirroring the v1 emitter and the shadow emitter).
+// at its previous position. The v1 emitter advances before persistence.
 func (e *Emitter) Emit(d Decision) error {
+	return e.emit(d, false)
+}
+
+// EmitDurable records a decision only when the recorder confirms durable storage.
+func (e *Emitter) EmitDurable(d Decision) error {
+	return e.emit(d, true)
+}
+
+func (e *Emitter) emit(d Decision, durable bool) error {
 	if e == nil {
 		return nil
 	}
-
-	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// Sanitize secret-bearing fields BEFORE signing, byte-identically to the v1
 	// emitter (#676). The signed target must never carry raw secret bytes.
@@ -240,7 +319,12 @@ func (e *Emitter) Emit(d Decision) error {
 		ruleID = receipt.CleanOrRedacted(ruleID, e.sanitize)
 	}
 
+	// Configured callbacks may be stateful, so they run under e.mu; the lock
+	// is released again for the content scan.
+	e.mu.Lock()
 	eventID, err := e.eventID()
+	templateTime := e.clock().UTC()
+	e.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("generate proxy_decision event id: %w", err)
 	}
@@ -258,11 +342,11 @@ func (e *Emitter) Emit(d Decision) error {
 		Transport:     d.Transport,
 		PolicyHash:    d.PolicyHash,
 		EventID:       eventID,
-		Timestamp:     e.clock().UTC(),
+		Timestamp:     templateTime,
 		Principal:     e.principal,
 		Actor:         e.actor,
-		ChainSeq:      e.chainSeq,
-		ChainPrevHash: e.chainPrevHash,
+		ChainSeq:      0,
+		ChainPrevHash: recorder.GenesisHash,
 	}
 	// Sanitize free-form span fields BEFORE the commitment is computed, for the
 	// same reason target/rule_id are scrubbed above (#676): these fields land in
@@ -270,6 +354,43 @@ func (e *Emitter) Emit(d Decision) error {
 	// preimage inputs, so scrubbing must happen before buildReceipt computes the
 	// HMAC.
 	evidence := sanitizeSpanEvidence(d.SourceSpanEvidence, e.sanitize)
+	stamp := contractruntime.ReceiptContext{
+		ActiveManifestHash: d.ActiveManifestHash,
+		ContractHash:       d.ContractHash,
+		SelectorID:         d.SelectorID,
+		ContractGeneration: d.ContractGeneration,
+	}
+
+	// Content does not depend on the chain position, timestamp or signature,
+	// so it is scanned here, outside e.mu: a slow scan must not hold every
+	// other decision behind it. The record step binds this scan to the final
+	// bytes and rescans them if their content differs.
+	template, err := buildReceipt(in, d.SpanHMACKey, evidence)
+	if err != nil {
+		return fmt.Errorf("build proxy_decision receipt: %w", err)
+	}
+	template = stamp.StampReceipt(template)
+	template.Signature = contractreceipt.SignatureProof{
+		SignerKeyID: e.signer.KeyID(),
+		KeyPurpose:  keyPurposeReceiptSigning,
+		Algorithm:   signatureAlgorithm,
+	}
+	prescan, prescanErr := e.contentStamper().Prescan(context.Background(), e.recorder, template)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.healthErr != nil {
+		return fmt.Errorf("proxy_decision emitter unhealthy: %w", e.healthErr)
+	}
+	if prescanErr != nil {
+		// A content rejection is deterministic for its input and consumes no
+		// chain position, so it never latches the emitter.
+		return fmt.Errorf("record proxy_decision receipt: %w", prescanErr)
+	}
+
+	in.Timestamp = e.clock().UTC()
+	in.ChainSeq = e.chainSeq
+	in.ChainPrevHash = e.chainPrevHash
 	rcpt, err := buildReceipt(in, d.SpanHMACKey, evidence)
 	if err != nil {
 		return fmt.Errorf("build proxy_decision receipt: %w", err)
@@ -278,12 +399,7 @@ func (e *Emitter) Emit(d Decision) error {
 	// Stamp the contract envelope only when a real resolved contract existed.
 	// For scanner / kill-switch decisions these fields are empty, so the stamp
 	// is a no-op (the fields are omitempty in the wire form).
-	rcpt = contractruntime.ReceiptContext{
-		ActiveManifestHash: d.ActiveManifestHash,
-		ContractHash:       d.ContractHash,
-		SelectorID:         d.SelectorID,
-		ContractGeneration: d.ContractGeneration,
-	}.StampReceipt(rcpt)
+	rcpt = stamp.StampReceipt(rcpt)
 
 	preimage, err := rcpt.SignablePreimage()
 	if err != nil {
@@ -310,19 +426,20 @@ func (e *Emitter) Emit(d Decision) error {
 	if err != nil {
 		return fmt.Errorf("hash proxy_decision receipt: %w", err)
 	}
-	rcptJSON, err := json.Marshal(rcpt)
-	if err != nil {
-		return fmt.Errorf("marshal proxy_decision receipt: %w", err)
+	recordErr := e.contentStamper().RecordPrescanned(context.Background(), e.recorder, e.session, rcpt, durable, prescan)
+	if errors.Is(recordErr, contractreceipt.ErrNoDurableRecorder) {
+		return errors.New("proxy_decision recorder does not support durable writes")
 	}
-
-	if err := e.recorder.Record(recorder.Entry{
-		SessionID: recorderSessionID,
-		Type:      evidenceReceiptEntryType,
-		EventKind: string(rcpt.PayloadKind),
-		Transport: d.Transport,
-		Summary:   fmt.Sprintf("%s: %s %s via %s", rcpt.PayloadKind, d.ActionType, d.Verdict, d.WinningSource),
-		Detail:    json.RawMessage(rcptJSON),
-	}); err != nil {
+	if err := recordErr; err != nil {
+		// The recorder rejects an oversized serialized line, and the content
+		// boundary rejects refused content, before opening or writing a file.
+		// Neither consumed a chain position, and both are deterministic for
+		// their input, so a later clean decision may still be recorded.
+		// Durability and other write failures remain sticky because their
+		// on-disk outcome can be uncertain.
+		if !errors.Is(err, recorder.ErrSerializedEntryTooLarge) && !errors.Is(err, receiptcontent.ErrRejected) {
+			e.healthErr = err
+		}
 		return fmt.Errorf("record proxy_decision receipt: %w", err)
 	}
 	e.chainPrevHash = rcptHash

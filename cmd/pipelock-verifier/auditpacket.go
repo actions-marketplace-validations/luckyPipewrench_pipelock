@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,18 +17,21 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	contractreceipt "github.com/luckyPipewrench/pipelock/internal/contract/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/evidence/completeness"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	auditpacket "github.com/luckyPipewrench/pipelock/sdk/audit-packet"
 )
 
 // Stable status labels emitted in the textual report and the JSON
 // schema_check / chain_check / cross_check fields.
 const (
-	statusPass    = "pass"
-	statusFail    = "fail"
-	statusSkipped = "skipped"
+	statusPass                         = "pass"
+	statusFail                         = "fail"
+	statusSkipped                      = "skipped"
+	statusSchemaCheckedTrustUnverified = "schema_checked_trust_unverified"
 )
 
 // Stable values for the lifecycle_assessment field.
@@ -67,12 +71,14 @@ PATH may be either:
 
 Without --offline, the verifier reads artifacts.evidence (as recorded in
 the packet) and re-verifies the chain. With --offline, only the packet
-itself is validated.
+itself is validated; trust remains unverified and the command exits nonzero.
 
-Without --key the verifier confirms internal chain self-consistency
-(prev-hash linkage, signer agreement) but cannot prove provenance. A
-packet that claims verdict=valid AND trusted=true MUST carry signer_key,
-and --key (or the packet's own signer_key) must match.`,
+Trusted Audit Packet verification requires --key or --expect-sha256.
+The packet's embedded signer_key isn't an independent trust anchor.
+--key pins the signer; --expect-sha256 pins the packet bytes and permits
+using its declared signer_key. Without either anchor, default verification
+fails. --no-trust-required and --allow-self-consistent-only permit weaker
+checks under their documented conditions.`,
 		Args:          exactOneArg,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -181,8 +187,10 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("unmarshal packet: %w", err))
 	}
 
-	report.Verdict = packet.Verifier.Verdict
-	report.Trusted = packet.Verifier.Trusted
+	if !opts.offline {
+		report.Verdict = packet.Verifier.Verdict
+		report.Trusted = packet.Verifier.Trusted
+	}
 	populateReportFromPacket(&report, &packet)
 
 	if err := packet.Validate(); err != nil {
@@ -195,12 +203,12 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 
 	if opts.offline {
 		report.LifecycleAssessmentReason = lifecycleReasonOffline
-		report.Valid = trustVerdict(&packet, opts)
+		report.Verdict = statusSchemaCheckedTrustUnverified
+		report.Trusted = false
+		report.Valid = false
+		report.Errors = append(report.Errors, "schema checked, trust unverified: chain and signer were not verified")
 		emitReport(stdout, stderr, report, opts.jsonOutput)
-		if !report.Valid {
-			return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("packet not trusted"))
-		}
-		return nil
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("schema checked, trust unverified"))
 	}
 
 	signerKey, keyErr := auditPacketSignerKey(&packet, opts)
@@ -266,6 +274,23 @@ func runAuditPacket(stdout, stderr io.Writer, target string, opts auditPacketOpt
 	return nil
 }
 
+// withoutClaimedTrust keeps a failed verification from repeating the
+// packet's own trust claim. The report starts with the packet's verdict and
+// trusted fields, so any failure after that point would otherwise print
+// "verdict: valid, trusted: true" beside an INVALID result. A report that is
+// not valid never claims trust, and a success verdict becomes invalid. A
+// successful report and the offline report are unchanged.
+func withoutClaimedTrust(r auditPacketReport) auditPacketReport {
+	if r.Valid {
+		return r
+	}
+	r.Trusted = false
+	if r.Verdict == auditpacket.VerdictValid || r.Verdict == auditpacket.VerdictSelfConsistentOnly {
+		r.Verdict = auditpacket.VerdictInvalid
+	}
+	return r
+}
+
 func populateReportFromPacket(r *auditPacketReport, p *auditpacket.Packet) {
 	totals := map[string]int{
 		"allow":    p.Summary.Totals.Allow,
@@ -296,7 +321,10 @@ func populateReportFromPacket(r *auditPacketReport, p *auditpacket.Packet) {
 // resolvePacketPath accepts either a directory or a packet.json path and
 // returns (packet.json path, sibling-artifact base directory).
 func resolvePacketPath(target string) (string, string, error) {
-	clean := filepath.Clean(target)
+	clean, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve %q: %w", target, err)
+	}
 	info, err := os.Stat(clean)
 	if err != nil {
 		return "", "", fmt.Errorf("stat %q: %w", target, err)
@@ -366,7 +394,24 @@ func reverifyChain(baseDir string, packet *auditpacket.Packet, signerOverride st
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("evidence: %w", err)
 	}
-	receipts, err := receipt.ExtractReceipts(evidencePath)
+	// Classify and verify the same bounded snapshot. A second read could see a
+	// different file and let an action chain pass while v2 or recorder checks
+	// inspect different evidence.
+	bare, data, err := isBareActionReceiptJSONL(evidencePath)
+	if err != nil {
+		return receipt.ChainResult{}, nil, fmt.Errorf("read evidence: %w", err)
+	}
+	var receipts []receipt.Receipt
+	var evidenceReceipts []contractreceipt.EvidenceReceipt
+	if bare {
+		receipts, err = receipt.ExtractReceiptsBytes(data)
+	} else {
+		var entries []recorder.Entry
+		entries, err = recorder.ReadHistoryEntriesFromReader(bytes.NewReader(data))
+		if err == nil {
+			receipts, evidenceReceipts, _, err = receipt.RecorderFileChains(filepath.Base(evidencePath), entries)
+		}
+	}
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("extract receipts: %w", err)
 	}
@@ -374,6 +419,16 @@ func reverifyChain(baseDir string, packet *auditpacket.Packet, signerOverride st
 	resolvedKey, err := resolveSignerKey(keyHex)
 	if err != nil {
 		return receipt.ChainResult{}, nil, fmt.Errorf("resolve signer key: %w", err)
+	}
+	if len(evidenceReceipts) > 0 {
+		var trusted []string
+		if resolvedKey != "" {
+			trusted = []string{resolvedKey}
+		}
+		res := receipt.VerifyEvidenceChainTrusted(evidenceReceipts, trusted, contractreceipt.ChainVerifyOptions{})
+		if !res.Valid {
+			return receipt.ChainResult{}, nil, fmt.Errorf("evidence receipt chain rejected at seq %d: %s", res.BrokenAtSeq, res.Error)
+		}
 	}
 	if len(receipts) == 0 {
 		// Empty evidence is a completed, failed chain verification rather than

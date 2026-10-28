@@ -22,6 +22,11 @@ import (
 
 const severityCritical = "critical"
 
+// maxScanFileBytes is the largest config or manifest file the project scan
+// reads. Files over it are skipped for secrets and reported as uninspected
+// for dependencies.
+const maxScanFileBytes = 1 << 20
+
 // Finding represents a single security finding from the project scan.
 type Finding struct {
 	Severity string `json:"severity"` // critical, warning, info
@@ -287,6 +292,9 @@ type compiledDLP struct {
 	name     string
 	re       *regexp.Regexp
 	validate func(string) bool
+	// cardPrefixRetry gives the canonical card rule the scanner's accepted-span
+	// policy, so project scans and runtime scanning agree on card endpoints.
+	cardPrefixRetry bool
 }
 
 func compileDLPPatterns() ([]compiledDLP, error) {
@@ -312,6 +320,7 @@ func compileDLPPatternsFrom(patternDefs []config.DLPPattern) ([]compiledDLP, err
 				return nil, fmt.Errorf("unknown DLP validator %q for pattern %q", p.Validator, p.Name)
 			}
 			cp.validate = fn
+			cp.cardPrefixRetry = scanner.RetriesCardPrefixes(p)
 		}
 		patterns = append(patterns, cp)
 	}
@@ -326,7 +335,7 @@ func (p compiledDLP) matches(text string) bool {
 		return p.re.MatchString(text)
 	}
 	for _, match := range p.re.FindAllString(text, -1) {
-		if p.validate(match) {
+		if scanner.AcceptsMatch(match, p.validate, p.cardPrefixRetry) {
 			return true
 		}
 	}
@@ -358,7 +367,7 @@ func scanFiles(dir string, patterns []compiledDLP) []Finding {
 
 		// Skip large files (>1MB)
 		info, err := d.Info()
-		if err != nil || info.Size() > 1<<20 {
+		if err != nil || info.Size() > maxScanFileBytes {
 			return nil
 		}
 

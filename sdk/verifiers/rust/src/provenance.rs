@@ -5,7 +5,7 @@
 
 use base64::{alphabet, engine::general_purpose, Engine};
 use data_encoding::BASE32;
-use percent_encoding::percent_decode_str;
+use percent_encoding::{percent_decode, percent_decode_str};
 use serde_json::{Map, Value};
 use std::collections::BTreeSet;
 use unicode_normalization::{char::is_combining_mark, UnicodeNormalization};
@@ -15,6 +15,12 @@ pub const PROFILE_DIGEST_V1: &str =
     "sha256:3de14968449593cae58da869cfc97855cb098e491494390a12ba742cb0b70f94";
 pub const PROFILE_DIGEST_V2: &str =
     "sha256:01e022d444562a25591cd379e894f5f6cde9eda9527fb92af2330373a25e7af7";
+pub const PROFILE_DIGEST_V3: &str =
+    "sha256:4f7b178addc2bafd55b6d524ac94d6b2ee7ccbe3595e836dd02dc579cc1b251e";
+pub const PROFILE_DIGEST_V4: &str =
+    "sha256:925a91d9137c52ba70a7e71450929e5b11a00c0f979ee5fa3bc1e227789ffd37";
+pub const PROFILE_DIGEST_V5: &str =
+    "sha256:1ba7ea1a9a18622e259531bab86e4e2671fbfabe8259fde38223b0d80ca6d441";
 // Retained for v1-oriented callers; receipt replay always resolves the exact
 // supplied digest rather than falling back to this value.
 pub const PROFILE_DIGEST: &str = PROFILE_DIGEST_V1;
@@ -39,10 +45,20 @@ struct Operation {
 enum ProfileVersion {
     V1,
     V2,
+    V3,
+    V4,
+    V5,
 }
 
 pub fn is_known_profile_digest(digest: &str) -> bool {
-    matches!(digest, PROFILE_DIGEST_V1 | PROFILE_DIGEST_V2)
+    matches!(
+        digest,
+        PROFILE_DIGEST_V1
+            | PROFILE_DIGEST_V2
+            | PROFILE_DIGEST_V3
+            | PROFILE_DIGEST_V4
+            | PROFILE_DIGEST_V5
+    )
 }
 
 impl Recipe {
@@ -62,12 +78,24 @@ impl Recipe {
             .enumerate()
             .map(|(i, v)| Operation::from_json(v).map_err(|e| format!("recipe operation {i}: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
-        if profile == ProfileVersion::V1
-            && operations
-                .iter()
-                .any(|operation| operation.kind == "ascii_alphanumeric_strip")
-        {
-            return Err("ascii_alphanumeric_strip is unsupported by transform profile".to_string());
+        for operation in &operations {
+            if (profile == ProfileVersion::V1 && operation.kind == "ascii_alphanumeric_strip")
+                || (!matches!(
+                    profile,
+                    ProfileVersion::V3 | ProfileVersion::V4 | ProfileVersion::V5
+                ) && ["ascii_upper", "json_unicode_escape"].contains(&operation.kind.as_str()))
+                || (!matches!(
+                    profile,
+                    ProfileVersion::V3 | ProfileVersion::V4 | ProfileVersion::V5
+                ) && ["base32_decode", "base32_decode_liberal"]
+                    .contains(&operation.kind.as_str())
+                    && operation.fields.contains_key("alphabet"))
+            {
+                return Err(format!(
+                    "{} is unsupported by transform profile",
+                    operation.kind
+                ));
+            }
         }
         Ok(Self {
             digest: digest.to_string(),
@@ -146,11 +174,14 @@ impl ProcessingBudget {
 }
 
 trait Budget {
-    fn charge(&mut self, value: &str) -> Result<(), String>;
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String>;
+    fn charge(&mut self, value: &str) -> Result<(), String> {
+        self.charge_bytes(value.as_bytes())
+    }
 }
 
 impl Budget for ProcessingBudget {
-    fn charge(&mut self, value: &str) -> Result<(), String> {
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String> {
         self.remaining = match self.remaining.checked_sub(value.len()) {
             Some(remaining) => remaining,
             None => {
@@ -168,9 +199,9 @@ struct CombinedBudget<'a> {
 }
 
 impl Budget for CombinedBudget<'_> {
-    fn charge(&mut self, value: &str) -> Result<(), String> {
-        self.per_recipe.charge(value)?;
-        self.total.charge(value)
+    fn charge_bytes(&mut self, value: &[u8]) -> Result<(), String> {
+        self.per_recipe.charge_bytes(value)?;
+        self.total.charge_bytes(value)
     }
 }
 
@@ -214,12 +245,14 @@ impl Operation {
             | "hostname_dot_remove"
             | "canary_canonicalize"
             | "ascii_alphanumeric_strip" => (&["kind"], &[]),
+            "ascii_upper" | "json_unicode_escape" => (&["kind"], &[]),
             "url_component" => (&["kind", "component"], &["selector", "occurrence"]),
             "percent_decode" => (&["kind", "passes"], &[]),
             "dlp_normalize" | "matching_normalize" => (&["kind", "profile"], &[]),
-            "base32_decode" | "base64_decode" | "base32_decode_liberal" => {
-                (&["kind"], &["decode_padding"])
+            "base32_decode" | "base32_decode_liberal" => {
+                (&["kind"], &["decode_padding", "alphabet"])
             }
+            "base64_decode" => (&["kind"], &["decode_padding"]),
             "base64_decode_liberal" => (&["kind", "alphabet"], &["decode_padding"]),
             "encoded_token_normalize" => (&["kind", "alphabet"], &[]),
             "text_segment" => (&["kind"], &["occurrence"]),
@@ -289,7 +322,15 @@ impl Operation {
                     required_str(&self.fields, "profile")?
                 ))
             }
-            "base32_decode" | "base64_decode" | "base32_decode_liberal" => {
+            "base32_decode" | "base32_decode_liberal" => {
+                optional_bool(&self.fields, "decode_padding")?;
+                if let Some(alphabet) = self.fields.get("alphabet") {
+                    if !["standard", "base32hex"].contains(&alphabet.as_str().unwrap_or("")) {
+                        return Err(format!("unknown base32 alphabet {alphabet:?}"));
+                    }
+                }
+            }
+            "base64_decode" => {
                 optional_bool(&self.fields, "decode_padding")?;
             }
             "base64_decode_liberal" => {
@@ -356,11 +397,23 @@ impl Operation {
             "url_component" => url_component(
                 value,
                 required_str(&self.fields, "component")?,
-                self.fields.get("selector").and_then(Value::as_str),
-                optional_u32(&self.fields, "occurrence")?.unwrap_or(0),
+                URLSelection {
+                    selector: self.fields.get("selector").and_then(Value::as_str),
+                    occurrence: optional_u32(&self.fields, "occurrence")?.unwrap_or(0),
+                    portable: profile == ProfileVersion::V5,
+                },
                 budget,
             ),
             "percent_decode" => {
+                if profile == ProfileVersion::V5 {
+                    let mut bytes = value.as_bytes().to_vec();
+                    for _ in 0..required_u32(&self.fields, "passes")? {
+                        budget.charge_bytes(&bytes)?;
+                        bytes = strict_percent_bytes(&bytes, false)
+                            .map_err(|e| format!("percent decode: {e}"))?;
+                    }
+                    return operation_text(bytes);
+                }
                 let mut v = value.to_string();
                 for _ in 0..required_u32(&self.fields, "passes")? {
                     budget.charge(&v)?;
@@ -376,6 +429,8 @@ impl Operation {
                 .chars()
                 .map(|c| c.to_lowercase().next().unwrap_or(c))
                 .collect()),
+            "ascii_upper" => Ok(value.chars().map(|c| c.to_ascii_uppercase()).collect()),
+            "json_unicode_escape" => json_unicode_escape(value),
             "invisible_strip" => Ok(map_invisible(value, None)),
             "hex_decode" => strict_hex(value, true, "hex decode"),
             "base32_decode" => base32_decode(
@@ -383,6 +438,10 @@ impl Operation {
                 optional_bool(&self.fields, "decode_padding")?.unwrap_or(false),
                 true,
                 "base32 decode",
+                self.fields
+                    .get("alphabet")
+                    .and_then(Value::as_str)
+                    .unwrap_or("standard"),
             ),
             "base64_decode" => base64_decode(
                 value,
@@ -413,18 +472,29 @@ impl Operation {
                     x => x,
                 })
                 .collect()),
-            "query_unescape" => query_unescape(value, budget),
+            "query_unescape" => {
+                if profile == ProfileVersion::V5 {
+                    return operation_text(query_unescape_bytes(value, budget)?);
+                }
+                query_unescape(value, budget, profile == ProfileVersion::V4)
+            }
             "invisible_space" => Ok(map_invisible(value, Some(' '))),
-            "matching_normalize" => Ok(matching_normalize(value)),
+            "matching_normalize" => Ok(matching_normalize(value, profile)),
             "hex_decode_liberal" => strict_hex(value, false, "liberal hex decode"),
+            // The liberal decoders reproduce Go's scanner, whose RFC 4648
+            // decoders ignore carriage returns and line feeds anywhere.
             "base32_decode_liberal" => base32_decode(
-                value,
+                &value.replace(['\r', '\n'], ""),
                 optional_bool(&self.fields, "decode_padding")?.unwrap_or(false),
                 false,
                 "liberal base32 decode",
+                self.fields
+                    .get("alphabet")
+                    .and_then(Value::as_str)
+                    .unwrap_or("standard"),
             ),
             "base64_decode_liberal" => base64_decode(
-                value,
+                &value.replace(['\r', '\n'], ""),
                 required_str(&self.fields, "alphabet")? == "url",
                 optional_bool(&self.fields, "decode_padding")?.unwrap_or(false),
                 false,
@@ -439,18 +509,43 @@ impl Operation {
                 value,
                 optional_u32(&self.fields, "occurrence")?.unwrap_or(0),
             ),
+            "html_entity_decode" if profile == ProfileVersion::V5 => html_decode_v5(value, budget),
             "html_entity_decode" => html_decode(value, budget),
             "whitespace_compact" => Ok(value.chars().filter(|c| !c.is_whitespace()).collect()),
             "url_noise_strip" => Ok(url_noise_strip(value, profile)),
+            "ordered_query_concat" if profile == ProfileVersion::V5 => {
+                let mut out = Vec::new();
+                for v in query_values(value) {
+                    out.extend(query_unescape_bytes(&v, budget)?);
+                }
+                operation_text(out)
+            }
             "ordered_query_concat" => query_values(value)
                 .into_iter()
-                .map(|v| query_unescape(&v, budget))
+                .map(|v| query_unescape(&v, budget, profile == ProfileVersion::V4))
                 .collect(),
             "query_subsequence" => {
+                if profile == ProfileVersion::V5 {
+                    let values = query_values(value)
+                        .into_iter()
+                        .take(20)
+                        .map(|v| query_unescape_bytes(&v, budget))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let mut out = Vec::new();
+                    for index in self.fields["indices"].as_array().unwrap() {
+                        let i = index.as_u64().unwrap() as usize;
+                        out.extend(
+                            values.get(i).ok_or_else(|| {
+                                format!("query subsequence: index {i} unavailable")
+                            })?,
+                        );
+                    }
+                    return operation_text(out);
+                }
                 let values = query_values(value)
                     .into_iter()
                     .take(20)
-                    .map(|v| query_unescape(&v, budget))
+                    .map(|v| query_unescape(&v, budget, profile == ProfileVersion::V4))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.fields["indices"]
                     .as_array()
@@ -497,6 +592,9 @@ fn validate_digest(digest: &str) -> Result<ProfileVersion, String> {
     match digest {
         PROFILE_DIGEST_V1 => Ok(ProfileVersion::V1),
         PROFILE_DIGEST_V2 => Ok(ProfileVersion::V2),
+        PROFILE_DIGEST_V3 => Ok(ProfileVersion::V3),
+        PROFILE_DIGEST_V4 => Ok(ProfileVersion::V4),
+        PROFILE_DIGEST_V5 => Ok(ProfileVersion::V5),
         _ => Err("recipe: transform profile digest: unknown profile".to_string()),
     }
 }
@@ -546,7 +644,62 @@ fn strict_percent_decode(s: &str, plus: bool) -> Result<String, String> {
     String::from_utf8(percent_decode_str(&bytes).collect())
         .map_err(|_| "output: invalid UTF-8".to_string())
 }
-fn query_unescape<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> {
+
+fn strict_percent_bytes(bytes: &[u8], plus: bool) -> Result<Vec<u8>, String> {
+    for (i, b) in bytes.iter().enumerate() {
+        if *b == b'%'
+            && (i + 2 >= bytes.len()
+                || !bytes[i + 1].is_ascii_hexdigit()
+                || !bytes[i + 2].is_ascii_hexdigit())
+        {
+            return Err("invalid URL escape".to_string());
+        }
+    }
+    let input: Vec<u8> = bytes
+        .iter()
+        .map(|b| if plus && *b == b'+' { b' ' } else { *b })
+        .collect();
+    Ok(percent_decode(&input).collect())
+}
+
+fn operation_text(bytes: Vec<u8>) -> Result<String, String> {
+    String::from_utf8(bytes).map_err(|_| "output: invalid UTF-8".to_string())
+}
+
+fn query_unescape_bytes<B: Budget>(s: &str, budget: &mut B) -> Result<Vec<u8>, String> {
+    let mut value = s.as_bytes().to_vec();
+    for _ in 0..500 {
+        budget.charge_bytes(&value)?;
+        let input: Vec<u8> = value
+            .iter()
+            .map(|b| if *b == b'+' { b' ' } else { *b })
+            .collect();
+        let next: Vec<u8> = percent_decode(&input).collect();
+        if next == value {
+            break;
+        }
+        value = next;
+    }
+    Ok(value)
+}
+fn query_unescape<B: Budget>(s: &str, budget: &mut B, partial: bool) -> Result<String, String> {
+    if partial {
+        // Keep intermediate bytes until the operation's UTF-8 boundary.
+        let mut value = s.as_bytes().to_vec();
+        for _ in 0..500 {
+            budget.charge_bytes(&value)?;
+            let plus_decoded: Vec<u8> = value
+                .iter()
+                .map(|b| if *b == b'+' { b' ' } else { *b })
+                .collect();
+            let next: Vec<u8> = percent_decode(&plus_decoded).collect();
+            if next == value {
+                break;
+            }
+            value = next;
+        }
+        return String::from_utf8(value).map_err(|_| "output: invalid UTF-8".to_string());
+    }
     let mut v = s.to_string();
     for _ in 0..500 {
         budget.charge(&v)?;
@@ -557,13 +710,24 @@ fn query_unescape<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> 
     }
     Ok(v)
 }
+
+struct URLSelection<'a> {
+    selector: Option<&'a str>,
+    occurrence: u32,
+    portable: bool,
+}
+
 fn url_component(
     value: &str,
     component: &str,
-    selector: Option<&str>,
-    occurrence: u32,
+    selection: URLSelection<'_>,
     budget: &mut impl Budget,
 ) -> Result<String, String> {
+    let URLSelection {
+        selector,
+        occurrence,
+        portable,
+    } = selection;
     let u = Url::parse(value).map_err(|_| "URL parse: invalid absolute URL".to_string())?;
     if u.scheme().is_empty() || u.host_str().is_none() {
         return Err("URL parse: invalid absolute URL".to_string());
@@ -583,6 +747,32 @@ fn url_component(
         "raw_query" => Ok(u.query().unwrap_or("").to_string()),
         "query_key" | "query_value" => {
             let key = selector.ok_or_else(|| "query component: missing selector".to_string())?;
+            if portable {
+                let mut values = Vec::new();
+                for pair in u.query().unwrap_or("").split('&').filter(|p| !p.is_empty()) {
+                    if pair.contains(';') {
+                        return Err("query parse: invalid semicolon separator".to_string());
+                    }
+                    let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+                    // URL selection has no iterative passes to charge. Its
+                    // operation input was charged by the recipe executor.
+                    let decoded_key = strict_percent_bytes(k.as_bytes(), true)
+                        .map_err(|e| format!("query parse: {e}"))?;
+                    let decoded_value = strict_percent_bytes(v.as_bytes(), true)
+                        .map_err(|e| format!("query parse: {e}"))?;
+                    if decoded_key == key.as_bytes() {
+                        values.push(decoded_value);
+                    }
+                }
+                let selected = values.get(occurrence as usize).ok_or_else(|| {
+                    format!("query component: occurrence {occurrence} unavailable")
+                })?;
+                return if component == "query_key" {
+                    Ok(key.to_string())
+                } else {
+                    operation_text(selected.clone())
+                };
+            }
             let pairs = strict_query(u.query().unwrap_or(""), budget)?;
             let values: Vec<_> = pairs
                 .into_iter()
@@ -641,7 +831,13 @@ fn strict_hex(s: &str, canonical: bool, label: &str) -> Result<String, String> {
     }
     String::from_utf8(b).map_err(|_| format!("{label} output: invalid UTF-8"))
 }
-fn base32_decode(s: &str, padded: bool, canonical: bool, label: &str) -> Result<String, String> {
+fn base32_decode(
+    s: &str,
+    padded: bool,
+    canonical: bool,
+    label: &str,
+    alphabet: &str,
+) -> Result<String, String> {
     let data_len = s.trim_end_matches('=').len();
     let padding = s.len() - data_len;
     let expected_padding = match data_len % 8 {
@@ -655,8 +851,12 @@ fn base32_decode(s: &str, padded: bool, canonical: bool, label: &str) -> Result<
     if (padded && padding != expected_padding) || (!padded && padding != 0) {
         return Err(format!("{label}: invalid padding"));
     }
-    let b = liberal_base32_bytes(s).map_err(|e| format!("{label}: {e}"))?;
-    let encoded = BASE32.encode(&b);
+    let b = liberal_base32_bytes(s, alphabet).map_err(|e| format!("{label}: {e}"))?;
+    let encoded = if alphabet == "base32hex" {
+        data_encoding::BASE32HEX.encode(&b)
+    } else {
+        BASE32.encode(&b)
+    };
     let want = if padded {
         encoded
     } else {
@@ -671,7 +871,7 @@ fn base32_decode(s: &str, padded: bool, canonical: bool, label: &str) -> Result<
 // Go's encoding/base32 decoder deliberately accepts non-zero unused trailing
 // bits. The liberal profile operation pins that behavior; strict mode gets its
 // canonicality from the re-encode comparison above.
-fn liberal_base32_bytes(s: &str) -> Result<Vec<u8>, String> {
+fn liberal_base32_bytes(s: &str, alphabet: &str) -> Result<Vec<u8>, String> {
     let data = s.trim_end_matches('=');
     if s[data.len()..].chars().any(|c| c != '=') {
         return Err("invalid base32 padding".to_string());
@@ -680,10 +880,18 @@ fn liberal_base32_bytes(s: &str) -> Result<Vec<u8>, String> {
     let mut count = 0_u8;
     let mut out = Vec::new();
     for byte in data.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'2'..=b'7' => byte - b'2' + 26,
-            _ => return Err("invalid base32 character".to_string()),
+        let value = if alphabet == "base32hex" {
+            match byte {
+                b'0'..=b'9' => byte - b'0',
+                b'A'..=b'V' => byte - b'A' + 10,
+                _ => return Err("invalid base32 character".to_string()),
+            }
+        } else {
+            match byte {
+                b'A'..=b'Z' => byte - b'A',
+                b'2'..=b'7' => byte - b'2' + 26,
+                _ => return Err("invalid base32 character".to_string()),
+            }
         } as u32;
         bits = (bits << 5) | value;
         count += 5;
@@ -878,7 +1086,55 @@ fn dlp_normalize(s: &str) -> String {
         .filter(|c| !is_combining_mark(*c))
         .collect()
 }
-fn matching_normalize(s: &str) -> String {
+fn json_unicode_escape(s: &str) -> Result<String, String> {
+    // Lenient by profile: a well-formed escape or surrogate pair decodes, an
+    // unpaired surrogate escape becomes U+FFFD, and any other text beginning
+    // with \u is copied unchanged. Nothing rejects.
+    let bytes = s.as_bytes();
+    let hex4 = |at: usize| -> Option<u32> {
+        let digits = bytes.get(at..at + 4)?;
+        if !digits.iter().all(u8::is_ascii_hexdigit) {
+            return None;
+        }
+        u32::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()
+    };
+    let is_escape = |at: usize| bytes.get(at..at + 2) == Some(b"\\u".as_slice());
+    let mut output = String::with_capacity(s.len());
+    let mut copied = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let high = if is_escape(i) { hex4(i + 2) } else { None };
+        let Some(high) = high else {
+            i += 1;
+            continue;
+        };
+        output.push_str(&s[copied..i]);
+        let (decoded, size) = if !(0xd800..=0xdfff).contains(&high) {
+            (
+                char::from_u32(high).ok_or("json unicode escape: invalid scalar")?,
+                6,
+            )
+        } else if high <= 0xdbff && is_escape(i + 6) {
+            match hex4(i + 8) {
+                Some(low) if (0xdc00..=0xdfff).contains(&low) => (
+                    char::from_u32(0x10000 + ((high - 0xd800) << 10) + low - 0xdc00)
+                        .ok_or("json unicode escape: invalid scalar")?,
+                    12,
+                ),
+                _ => ('\u{fffd}', 6),
+            }
+        } else {
+            ('\u{fffd}', 6)
+        };
+        output.push(decoded);
+        i += size;
+        copied = i;
+    }
+    output.push_str(&s[copied..]);
+    Ok(output)
+}
+
+fn matching_normalize(s: &str, profile: ProfileVersion) -> String {
     let x = map_invisible(s, None)
         .nfkc()
         .map(confusable)
@@ -888,6 +1144,14 @@ fn matching_normalize(s: &str) -> String {
         .collect::<String>();
     // ForMatching maps the explicit exotic set to spaces, but deliberately
     // preserves leading/trailing and repeated ordinary whitespace.
+    let x = if matches!(
+        profile,
+        ProfileVersion::V3 | ProfileVersion::V4 | ProfileVersion::V5
+    ) {
+        x.nfc().collect::<String>()
+    } else {
+        x
+    };
     x.chars().map(|c| if exotic(c) { ' ' } else { c }).collect()
 }
 
@@ -1022,7 +1286,7 @@ fn encoded_token_normalize_v1(s: &str, a: &str) -> String {
 fn url_noise_strip(value: &str, profile: ProfileVersion) -> String {
     match profile {
         ProfileVersion::V1 => strip_chars(value, "./ \t\n\r+,;|"),
-        ProfileVersion::V2 => value
+        ProfileVersion::V2 | ProfileVersion::V3 | ProfileVersion::V4 | ProfileVersion::V5 => value
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '='))
             .collect(),
@@ -1073,6 +1337,116 @@ fn html_decode<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> {
     }
     Ok(v)
 }
+
+// HTML numeric references always produce Unicode scalars. html-escape leaves
+// invalid scalar references unchanged; the v5 profile replaces them instead,
+// including values too large for a fixed-width accumulator.
+fn html_numeric_references(s: &str) -> String {
+    const C1: [u32; 32] = [
+        0x20ac, 0x81, 0x201a, 0x192, 0x201e, 0x2026, 0x2020, 0x2021, 0x2c6, 0x2030, 0x160, 0x2039,
+        0x152, 0x8d, 0x17d, 0x8f, 0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+        0x2dc, 0x2122, 0x161, 0x203a, 0x153, 0x9d, 0x17e, 0x178,
+    ];
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("&#") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        let mut pos = 2;
+        let radix = if matches!(rest.as_bytes().get(pos), Some(b'x' | b'X')) {
+            pos += 1;
+            16
+        } else {
+            10
+        };
+        let digits = pos;
+        let mut cp = 0u32;
+        while let Some(digit) = rest
+            .as_bytes()
+            .get(pos)
+            .and_then(|b| (*b as char).to_digit(radix))
+        {
+            cp = cp.saturating_mul(radix).saturating_add(digit);
+            pos += 1;
+        }
+        if pos == digits {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        }
+        if rest.as_bytes().get(pos) == Some(&b';') {
+            pos += 1;
+        }
+        if (0x80..=0x9f).contains(&cp) {
+            cp = C1[(cp - 0x80) as usize];
+        }
+        out.push(if cp == 0 {
+            '\u{fffd}'
+        } else {
+            char::from_u32(cp).unwrap_or('\u{fffd}')
+        });
+        rest = &rest[pos..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn html_decode_v5<B: Budget>(s: &str, budget: &mut B) -> Result<String, String> {
+    let mut value = s.to_string();
+    if !value.contains('&') {
+        return Ok(value);
+    }
+    for _ in 0..16 {
+        budget.charge(&value)?;
+        // Every reference sees only the original pass input. Generated
+        // ampersands wait for the next charged pass.
+        let mut next = String::new();
+        let mut rest = value.as_str();
+        while let Some(start) = rest.find('&') {
+            next.push_str(&rest[..start]);
+            rest = &rest[start..];
+            let end = rest[1..].find('&').map_or(rest.len(), |p| p + 1);
+            let part = &rest[..end];
+            if part.starts_with("&#") {
+                next.push_str(&html_numeric_references(part));
+            } else {
+                next.push_str(&html_named_reference_v5(part));
+            }
+            rest = &rest[end..];
+        }
+        next.push_str(rest);
+        if next == value {
+            break;
+        }
+        value = next;
+    }
+    Ok(value)
+}
+
+// Longest WHATWG text-state match, including the legacy semicolon-less keys.
+// The ASCII bound also ensures every candidate ends on a UTF-8 boundary.
+fn html_named_reference_v5(s: &str) -> String {
+    use crate::html5_entities_v5::{MAX_NAME_BYTES, NAMED};
+    let mut end = 1;
+    while end < s.len() && end <= MAX_NAME_BYTES {
+        let byte = s.as_bytes()[end];
+        if byte == b';' {
+            end += 1;
+            break;
+        }
+        if !byte.is_ascii_alphanumeric() {
+            break;
+        }
+        end += 1;
+    }
+    while end > 1 {
+        if let Ok(index) = NAMED.binary_search_by_key(&&s[1..end], |(name, _)| name) {
+            return format!("{}{}", NAMED[index].1, &s[end..]);
+        }
+        end -= 1;
+    }
+    s.to_string()
+}
 fn strip_chars(s: &str, chars: &str) -> String {
     s.chars().filter(|c| !chars.contains(*c)).collect()
 }
@@ -1115,6 +1489,24 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn v4_nested_utf8_charges_intermediate_bytes() {
+        let recipe =
+            Recipe::from_json(PROFILE_DIGEST_V4, &json!([{"kind": "query_unescape"}])).unwrap();
+        let mut budget = ProcessingBudget::new(22);
+        assert_eq!(
+            recipe
+                .apply_with_budget_impl("%C3%25A9", &mut budget)
+                .unwrap(),
+            "é"
+        );
+        assert_eq!(budget.remaining, 0);
+        let mut exhausted = ProcessingBudget::new(21);
+        assert!(recipe
+            .apply_with_budget_impl("%C3%25A9", &mut exhausted)
+            .is_err());
+    }
+
+    #[test]
     fn recipe_limits_reject_unbounded_verifier_work() {
         // Keep the normative boundary independent of MAX_OPERATIONS so
         // neutralizing the guard makes this test fail rather than move with it.
@@ -1152,5 +1544,32 @@ mod tests {
         let recipe =
             Recipe::from_json(PROFILE_DIGEST, &json!([{"kind": "ordered_query_concat"}])).unwrap();
         assert_eq!(recipe.apply(&input).unwrap(), "x".repeat(21));
+    }
+
+    #[test]
+    fn v5_shared_corpus_charges_bytes_before_processing() {
+        let corpus: Value = serde_json::from_str(include_str!(
+            "../../../conformance/testdata/transform-profile/evidence-provenance-v5.json"
+        ))
+        .unwrap();
+        for vector in corpus["vectors"].as_array().unwrap() {
+            let Some(limit) = vector["processed_bytes"].as_u64() else {
+                continue;
+            };
+            let input = general_purpose::STANDARD
+                .decode(vector["input_b64"].as_str().unwrap())
+                .unwrap();
+            let input = std::str::from_utf8(&input).unwrap();
+            let recipe = Recipe::from_json(PROFILE_DIGEST_V5, &vector["recipe"]).unwrap();
+            let mut budget = ProcessingBudget::new(limit as usize);
+            recipe.apply_with_budget(input, &mut budget).unwrap();
+            assert_eq!(budget.remaining, 0, "{}", vector["id"]);
+            let mut tight = ProcessingBudget::new(limit as usize - 1);
+            assert!(recipe
+                .apply_with_budget(input, &mut tight)
+                .unwrap_err()
+                .contains("recipe: exceeds cumulative processing budget"));
+            assert!(tight.exhausted());
+        }
     }
 }

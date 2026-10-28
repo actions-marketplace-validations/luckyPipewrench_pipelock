@@ -101,6 +101,11 @@ const (
 	maxBundleExpandedBytes = 32 << 20
 )
 
+// MaxBundleFileBytes caps a bundle file read before extraction. It equals the
+// expanded-size cap and the browser verifier's download limit, so the offline
+// tools refuse the same oversized bundles the published viewer does.
+const MaxBundleFileBytes = maxBundleExpandedBytes
+
 // requiredChecks is the full set of check names that must all appear and pass
 // for a run to be considered verified. finalize uses this to enforce that the
 // entire chain ran -- a future early-return that forgets to append a Check
@@ -323,46 +328,93 @@ func VerifyArchivedReplay(dir, orchestratorPubHex string) (VerifyReport, error) 
 
 func verifyRun(dir, orchestratorPubHex string, archive bool) (VerifyReport, error) {
 	cleanDir := filepath.Clean(dir)
+	root, err := os.OpenRoot(cleanDir)
+	if err != nil {
+		return VerifyReport{OrchestratorKey: orchestratorPubHex}, fmt.Errorf("open run directory: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	remaining := int64(maxBundleExpandedBytes)
 	var artifacts RunArtifacts
-	var err error
-	if artifacts.LaunchManifest, err = readRunArtifact(cleanDir, launchManifestFile); err != nil {
+	if artifacts.LaunchManifest, err = readRunArtifact(root, &remaining, launchManifestFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.OrchestratorDelegation, err = readRunArtifact(cleanDir, orchestratorDelegationFile); err != nil {
+	if artifacts.OrchestratorDelegation, err = readRunArtifact(root, &remaining, orchestratorDelegationFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.ReplayArchiveAuthorization, err = readRunArtifact(cleanDir, replayArchiveAuthorizationFile); err != nil {
+	if artifacts.ReplayArchiveAuthorization, err = readRunArtifact(root, &remaining, replayArchiveAuthorizationFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.Witness, err = readRunArtifact(cleanDir, witnessFile); err != nil {
+	if artifacts.Witness, err = readRunArtifact(root, &remaining, witnessFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.RedWitness, err = readRunArtifact(cleanDir, redWitnessFile); err != nil {
+	if artifacts.RedWitness, err = readRunArtifact(root, &remaining, redWitnessFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.HostContainmentWitness, err = readRunArtifact(cleanDir, hostContainmentWitnessFile); err != nil {
+	if artifacts.HostContainmentWitness, err = readRunArtifact(root, &remaining, hostContainmentWitnessFile); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.PacketJSON, err = readRunArtifact(cleanDir, filepath.Join(packetSubdir, packetJSONFile)); err != nil {
+	if artifacts.PacketJSON, err = readRunArtifact(root, &remaining, filepath.Join(packetSubdir, packetJSONFile)); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.PacketEvidenceJSONL, err = readRunArtifact(cleanDir, filepath.Join(packetSubdir, packetEvidenceFile)); err != nil {
+	if artifacts.PacketEvidenceJSONL, err = readRunArtifact(root, &remaining, filepath.Join(packetSubdir, packetEvidenceFile)); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
-	if artifacts.PacketManifestJSON, err = readRunArtifact(cleanDir, filepath.Join(packetSubdir, packetManifestFile)); err != nil {
+	if artifacts.PacketManifestJSON, err = readRunArtifact(root, &remaining, filepath.Join(packetSubdir, packetManifestFile)); err != nil {
 		return VerifyReport{OrchestratorKey: orchestratorPubHex}, err
 	}
 	return verifyRunArtifacts(artifacts, orchestratorPubHex, archive)
 }
 
-func readRunArtifact(cleanDir, name string) ([]byte, error) {
-	data, err := os.ReadFile(filepath.Clean(filepath.Join(cleanDir, name)))
+func readRunArtifact(root *os.Root, remaining *int64, name string) ([]byte, error) {
+	return readRunArtifactWithSeams(root, remaining, name, openRunArtifact, readOpenedArtifact)
+}
+
+func readRunArtifactWithOpen(root *os.Root, remaining *int64, name string, open func(*os.Root, string) (*os.File, error)) ([]byte, error) {
+	return readRunArtifactWithSeams(root, remaining, name, open, readOpenedArtifact)
+}
+
+func readOpenedArtifact(file *os.File, limit int64) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(file, limit+1))
+}
+
+func readRunArtifactWithSeams(root *os.Root, remaining *int64, name string, open func(*os.Root, string) (*os.File, error), read func(*os.File, int64) ([]byte, error)) ([]byte, error) {
+	info, err := root.Lstat(name)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("cannot read %s: %w", name, err)
 	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("cannot read %s: artifact must be a regular file", name)
+	}
+	if info.Size() > maxBundleMemberBytes || info.Size() > *remaining {
+		return nil, fmt.Errorf("cannot read %s: artifact exceeds size limit", name)
+	}
+	file, err := open(root, name)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", name, err)
+	}
+	defer func() { _ = file.Close() }()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: stat opened artifact: %w", name, err)
+	}
+	if !openedInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("cannot read %s: artifact must be a regular file", name)
+	}
+	if openedInfo.Size() > maxBundleMemberBytes || openedInfo.Size() > *remaining {
+		return nil, fmt.Errorf("cannot read %s: artifact exceeds size limit", name)
+	}
+	limit := min(int64(maxBundleMemberBytes), *remaining)
+	data, err := read(file, limit)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", name, err)
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("cannot read %s: artifact exceeds size limit", name)
+	}
+	*remaining -= int64(len(data))
 	return data, nil
 }
 

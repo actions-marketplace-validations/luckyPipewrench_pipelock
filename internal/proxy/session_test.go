@@ -397,6 +397,32 @@ func TestSessionState_EscalationThresholdDoubles(t *testing.T) {
 	}
 }
 
+// TestSessionState_EscalationLadderCumulative pins the documented ladder: with
+// a base threshold T the levels are reached at T, 2T and 4T, because the
+// threshold doubles after each escalation. docs/configuration.md once said 3T.
+func TestSessionState_EscalationLadderCumulative(t *testing.T) {
+	cfg := testSessionConfig()
+	sm := NewSessionManager(cfg, nil, nil)
+	defer sm.Close()
+	sess := sm.GetOrCreate(testClientIP)
+
+	const base = 5.0
+	reachedAt := map[int]float64{}
+	for range 40 {
+		before := sess.EscalationLevel()
+		sess.RecordSignal(session.SignalNearMiss, base) // +1 each
+		if lvl := sess.EscalationLevel(); lvl != before {
+			reachedAt[lvl] = sess.ThreatScore()
+		}
+	}
+	want := map[int]float64{1: base, 2: 2 * base, 3: 4 * base}
+	for lvl, score := range want {
+		if got := reachedAt[lvl]; got != score {
+			t.Errorf("level %d reached at score %.1f, want %.1f", lvl, got, score)
+		}
+	}
+}
+
 func TestSessionState_EscalationSticky(t *testing.T) {
 	cfg := testSessionConfig()
 	sm := NewSessionManager(cfg, nil, nil)
@@ -890,14 +916,13 @@ func TestSessionManager_Cleanup_EscalatedGaugeDecrement(t *testing.T) {
 	}
 }
 
-// TestSessionManager_EvictOldest_EscalatedGaugeDecrement verifies that when
-// an escalated session is evicted due to capacity overflow, the adaptive session
-// level gauge is decremented.
-func TestSessionManager_EvictOldest_EscalatedGaugeDecrement(t *testing.T) {
+// TestSessionManager_EvictOldest_PreservesEscalatedGauge verifies that
+// capacity pressure preserves an escalated session and its adaptive gauge.
+func TestSessionManager_EvictOldest_PreservesEscalatedGauge(t *testing.T) {
 	cfg := testSessionConfig()
 	cfg.MaxSessions = 2
 	m := metrics.New()
-	sm := NewSessionManager(cfg, nil, m)
+	sm := NewSessionManager(cfg, capacityAdaptiveConfig(), m)
 	defer sm.Close()
 
 	// Create and escalate the first session.
@@ -910,7 +935,7 @@ func TestSessionManager_EvictOldest_EscalatedGaugeDecrement(t *testing.T) {
 	}
 
 	// Simulate the gauge increment that proxy code would emit on escalation.
-	// evictOldest() must decrement this back to zero when the session is evicted.
+	// Capacity eviction must retain the gauge while this session remains live.
 	m.SetAdaptiveSessionLevel(testLevelElevated, 1)
 
 	if got := adaptiveElevatedGaugeValue(t, m); got != 1 {
@@ -921,8 +946,7 @@ func TestSessionManager_EvictOldest_EscalatedGaugeDecrement(t *testing.T) {
 	setSessionLastActivity(t, sess, time.Now().Add(-time.Minute))
 	sm.GetOrCreate("second-session")
 
-	// Adding a third session when at capacity evicts "escalated-session"
-	// (oldest lastActivity). This must decrement the adaptive gauge.
+	// The newer clean session is the only eligible capacity candidate.
 	sm.GetOrCreate("third-session")
 
 	if sm.Len() != 2 {
@@ -931,11 +955,14 @@ func TestSessionManager_EvictOldest_EscalatedGaugeDecrement(t *testing.T) {
 
 	// Eviction metric must be recorded.
 	if !scrapeMetric(t, m, "pipelock_sessions_evicted_total") {
-		t.Error("expected eviction metric after capacity eviction of escalated session")
+		t.Error("expected eviction metric after capacity eviction of clean session")
 	}
-	// After eviction the gauge must be decremented back to zero.
-	if got := adaptiveElevatedGaugeValue(t, m); got != 0 {
-		t.Errorf("adaptive gauge for %q after eviction = %.0f, want 0", testLevelElevated, got)
+	if sm.SessionByKey("escalated-session") != sess || sm.SessionByKey("second-session") != nil {
+		t.Fatal("capacity eviction discarded escalation instead of the clean session")
+	}
+	// The retained session still owns its gauge.
+	if got := adaptiveElevatedGaugeValue(t, m); got != 1 {
+		t.Errorf("adaptive gauge for %q after eviction = %.0f, want 1", testLevelElevated, got)
 	}
 }
 

@@ -5,9 +5,12 @@
 // workspace between the start and end of a session, and emits it as a signed
 // evidence statement bound to that session's posture capsule.
 //
-// This is evidence, not backup: no content is stored, only path/kind/size/
-// mtime/digest metadata sufficient to name what changed. There is no
-// snapshot store, no restore path, no dedup, no retention policy.
+// This is evidence, not backup: snapshots hold only path/kind/size/mtime/
+// digest and symlink-target metadata, in memory, sufficient to name what
+// changed. The signed statement carries the resulting path lists and
+// statement-level metadata, but not the snapshots' per-entry comparison
+// metadata. There is no snapshot store, no restore path, no dedup, no
+// retention policy.
 package workspacediff
 
 import (
@@ -24,6 +27,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
 // EntryKind names the filesystem object kind recorded for a path. Symlinks
@@ -728,7 +733,9 @@ func signablePayload(signed SignedStatement) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("workspacediff: marshal signable payload: %w", err)
 	}
-	return b, nil
+	// Invalid UTF-8 must sign the bytes a verifier re-encodes after parsing, on
+	// every Go release; see jsonscan.NormalizeReplacementEscapes.
+	return jsonscan.NormalizeReplacementEscapes(b), nil
 }
 
 // WriteJSON atomically writes signed as indented JSON at 0o600 inside

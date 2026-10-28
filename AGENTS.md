@@ -7,7 +7,7 @@ Pipelock is an agent firewall: a network and tool proxy that mediates AI-agent H
 | Item | Value |
 |------|-------|
 | Module | `github.com/luckyPipewrench/pipelock` |
-| Go | 1.25+; CI tests Go 1.25 and 1.26 |
+| Go | 1.26+; CI tests Go 1.26 and 1.27 |
 | License | Apache 2.0 core, ELv2 under `enterprise/` |
 | Binary | Single Go binary; size varies by OS, build tags, and release flags |
 | Dependencies | See `go.mod`. Run `make stats` before citing the current direct-dependency count. |
@@ -23,8 +23,9 @@ The code-checked capability manifest is docs/security/capability-manifest.json. 
 | HTTP, WebSocket, and proxy mediation | Free | pipelock run | Applies only to traffic routed through Pipelock; direct agent egress needs containment or network policy. |
 | MCP proxy scanning | Free | pipelock mcp proxy | Applies only to MCP transports that run through the Pipelock proxy. |
 | Signed action receipts | Free | flight_recorder |  |
-| Host containment for agent processes | Free | pipelock contain | Kernel-enforced containment requires Linux, nftables, and the managed identities; other targets cannot provide this containment path. |
-| Single-agent process sandbox | Free | pipelock sandbox | Kernel isolation requires Linux user namespaces. Without them, best-effort network isolation only sets HTTP(S)_PROXY; seccomp adds restrictions only on linux/amd64. |
+| Host containment for agent processes | Free | pipelock contain | Kernel-enforced containment requires Linux, a private network namespace, nftables, and the managed identities. The recommended unprivileged systemd service emits signed pre-launch posture from a root signer that verifies its own managed namespace, live runtime mounts, and proxy doorway; contain run instead signs a host-side preflight and also emits a post-session workspace statement. Filesystem confinement is a separate containment.filesystem.mode setting. enforce hides the host filesystem with ProtectSystem=strict and ProtectHome=tmpfs and binds the agent home plus unexpired workspace grants. Every managed launch hides host /run and /dev/shm and binds only the namespace identity under /run; systemd may add its own read-only, empty mount-propagation directory at /run/systemd/incoming. Omitted or off otherwise retains host filesystem visibility. A process that can create a user namespace can remount, same-uid /proc stays visible, private /tmp is shared with the network-namespace anchor and its forwarders, and operator-written units are left unchanged. |
+| Single-agent process sandbox | Free | pipelock sandbox | Kernel isolation requires Linux user namespaces. Without them, best-effort network isolation only sets HTTP(S)_PROXY; seccomp adds restrictions only on linux/amd64. Unix socket isolation uses Landlock ABI 9 for pathname sockets and ABI 6 for abstract sockets; older linux/amd64 kernels deny Unix socket creation and datagram socketpairs in the workload while retaining connected stream and sequenced-packet pairs and the proxy bridge. |
+| Cooperative command launch | Free | pipelock exec | Steers cooperative Unix and Windows clients through a running proxy; programs can ignore environment settings. Use contain or sandbox for operating-system enforcement. |
 | Global canary tokens | Free | canary_tokens |  |
 | Named agent profiles | Pro | agents.<profile> |  |
 | Per-agent sandbox overrides | Pro | agents.<profile>.sandbox |  |
@@ -42,7 +43,7 @@ The code-checked capability manifest is docs/security/capability-manifest.json. 
 | Adaptive enforcement | Free | adaptive_enforcement |  |
 | TLS interception | Free | tls_interception | Requires a configured local CA that the intercepted client trusts; passthrough traffic remains encrypted and cannot be body-scanned. |
 | A2A protocol scanning | Free | a2a_scanning | Applies to A2A traffic carried on Pipelock's supported forward-proxy and MCP HTTP paths. |
-| Browser shield | Free | browser_shield | Applies only to supported browser response traffic that flows through Pipelock. |
+| Browser shield | Free | browser_shield | Applies only to supported browser response traffic that flows through Pipelock. JavaScript responses are scanned but not rewritten. |
 | Offline receipt verification | Free | pipelock verify-receipt |  |
 | Verdict explanations | Free | pipelock explain |  |
 | Deployment diagnostics | Free | pipelock doctor |  |
@@ -64,18 +65,22 @@ make docker         # Docker image
 make stats          # Canonical local stats for docs
 ```
 
-Pre-commit parity for OSS and enterprise builds:
+Before committing, run targeted tests with `-race` for changed packages and affected consumers in both build modes, plus lint for new issues. For example, for a change confined to `internal/gitprotect`:
 
 ```bash
+go test -race -count=1 ./internal/gitprotect
+go test -race -count=1 -tags enterprise ./internal/gitprotect
 golangci-lint run --new-from-rev=HEAD ./...
 golangci-lint run --build-tags enterprise --new-from-rev=HEAD ./...
-make test
-make test-sharded-enterprise
 ```
 
-Full-repo CI-equivalent lint:
+Choose the packages for your change; the example isn't a fixed test list. For workflow, script, or documentation changes, run the relevant policy checks instead of unrelated Go tests. Required CI checks must pass before merge. CI owns the full OSS and enterprise race suites on pushes to `main` and before releases; CI-policy pull requests also run the Go 1.27 race suites before merge.
+
+Optional full-repository validation:
 
 ```bash
+make test
+make test-sharded-enterprise
 golangci-lint run ./...
 golangci-lint run --build-tags enterprise ./...
 ```
@@ -103,7 +108,7 @@ Three proxy modes share the main listener:
 7. SigV4 presigned-URL credential carve-out
 8. Core DLP immutable floor
 9. DLP (65 built-in credential patterns + checksum validators + env/file leak detection)
-10. Path entropy analysis
+10. Path entropy analysis (also runs query entropy; a final filename may discount one copy of its immediately preceding semantic version)
 11. Subdomain entropy analysis
 12. Nested URL destinations in query parameters (allowlist, blocklist, SSRF on URL-shaped values)
 13. SSRF / DNS resolution for private IPs, metadata, and rebinding
@@ -134,13 +139,13 @@ Configured MCP upstream dialing uses the cloud metadata floor in `internal/mcp/u
 
 `internal/config/schema.go` is the authoritative list of top-level YAML fields and action constants. Config loads from YAML; hot reload uses fsnotify plus SIGHUP with atomic swaps of config, scanner, and session state. Kill switch runtime activation state persists across reloads.
 
-The kill switch controller in `internal/killswitch/killswitch.go` OR-composes six activation sources: config, API, remote kill, stale bundle, SIGUSR1, and sentinel file. Any active source denies traffic, subject to endpoint and IP exemptions in the controller.
+The kill switch controller in `internal/killswitch/killswitch.go` OR-composes seven activation sources: config, API, remote kill, stale bundle, uncertain Conductor apply, SIGUSR1, and sentinel file. Any active source denies traffic. Endpoint and IP exemptions apply only on the HTTP front door (`IsActiveHTTP`, `IsActiveForIP`); MCP, reverse-proxy and relay paths call `IsActive`/`IsActiveMCP` and ignore them, and IP allowlist exemptions do not apply during uncertain Conductor apply.
 
 Emission is non-blocking for webhook output through an async buffer; syslog is synchronous UDP. Event severity is defined by event type, while configuration controls emission thresholds.
 
 ## Testing
 
-- Race detector command: `make test` (OSS) or `make test-sharded-enterprise` (enterprise)
+- Local tests: targeted `go test -race -count=1` in both build modes as above. Optional full race suites: `make test` (OSS) and `make test-sharded-enterprise` (enterprise).
 - Coverage target for new code: 95%, including error paths.
 - Test-count command: `go test -v ./... 2>&1 | grep -c -- '--- PASS:'`
 - Synchronization uses channels or poll-with-deadline, not `time.Sleep`.

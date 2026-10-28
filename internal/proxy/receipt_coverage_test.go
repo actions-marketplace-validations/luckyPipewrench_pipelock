@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -20,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -224,7 +226,16 @@ func extractReceiptsFromDir(t *testing.T, dir string) []receipt.Receipt {
 		if de.IsDir() || !strings.HasSuffix(de.Name(), ".jsonl") {
 			continue
 		}
-		receipts, rErr := receipt.ExtractReceipts(filepath.Join(dir, de.Name()))
+		// The recorder may still be appending: a stable read refuses a file
+		// that changed underneath it. That is a retry, not a test failure; any
+		// other error fails now.
+		path := filepath.Join(dir, de.Name())
+		var receipts []receipt.Receipt
+		var rErr error
+		testwait.For(t, waitForReceiptTimeout, func() bool {
+			receipts, rErr = receipt.ExtractReceipts(path)
+			return !errors.Is(rErr, recorder.ErrEvidenceChanged)
+		}, "stable read of %s", de.Name())
 		if rErr != nil {
 			t.Fatalf("ExtractReceipts(%s): %v", de.Name(), rErr)
 		}
@@ -282,6 +293,7 @@ func newCoverageEmitter(t *testing.T, dir string) (*receipt.Emitter, *recorder.R
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   rec,
@@ -1344,6 +1356,158 @@ func TestReceiptCoverage_ForwardHeaderDLPEmitsReceipt(t *testing.T) {
 	}
 }
 
+// jwtCookieActionCases are the two configured header actions a JWT-only Cookie
+// must follow: it is denied under block and forwarded with warn evidence under
+// warn, the same as the token in any other header.
+var jwtCookieActionCases = []struct {
+	action       string
+	wantStatus   int
+	wantUpstream bool
+}{
+	{config.ActionBlock, http.StatusForbidden, false},
+	{config.ActionWarn, http.StatusOK, true},
+}
+
+func TestInterceptJWTSessionCookieFollowsActionAndRecordsEvidence(t *testing.T) {
+	for _, tc := range jwtCookieActionCases {
+		t.Run(tc.action, func(t *testing.T) {
+			runInterceptJWTSessionCookie(t, tc.action, tc.wantStatus, tc.wantUpstream)
+		})
+	}
+}
+
+func runInterceptJWTSessionCookie(t *testing.T, action string, wantStatus int, wantUpstream bool) {
+	t.Helper()
+	jwt := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" +
+		"." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" +
+		"." + "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHit.Store(true)
+		if got := r.Header.Get("Cookie"); got != "session="+jwt {
+			t.Errorf("Cookie = %q, want JWT session cookie", got)
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(upstream.Close)
+
+	cache, pool, cfg, _, _, m := testInterceptSetup(t)
+	cfg.Mode = config.ModeStrict
+	cfg.RequestBodyScanning.Enabled = true
+	cfg.RequestBodyScanning.ScanHeaders = true
+	cfg.RequestBodyScanning.Action = action
+	cfg.RequestBodyScanning.HeaderMode = config.HeaderModeSensitive
+	cfg.RequestBodyScanning.SensitiveHeaders = []string{"Cookie"}
+	cfg.APIAllowlist = []string{upstream.Listener.Addr().(*net.TCPAddr).IP.String()}
+
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New("json", "file", auditPath, true, true)
+	if err != nil {
+		t.Fatalf("audit logger: %v", err)
+	}
+	t.Cleanup(logger.Close)
+
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(sc.Close)
+	rph := newReceiptProxyHelper(t)
+	p, err := New(cfg, logger, sc, m, WithReceiptEmitter(rph.emitter))
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+	t.Cleanup(p.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, upstream.URL+"/app", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Cookie", "session="+jwt)
+	resp := interceptAndRequestWithProxy(t, upstream, cache, pool, cfg, sc, logger, m, req, p)
+	if resp.StatusCode != wantStatus {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, wantStatus, body)
+	}
+	_ = resp.Body.Close()
+	if upstreamHit.Load() != wantUpstream {
+		t.Fatalf("upstream hit = %v, want %v", upstreamHit.Load(), wantUpstream)
+	}
+
+	// A denial and a warning are recorded under different receipt layers.
+	layer := "dlp_header"
+	if action == config.ActionBlock {
+		layer = "header_dlp"
+	}
+	recorded := rph.requireReceipt(t, layer)
+	if recorded.ActionRecord.Verdict != action {
+		t.Fatalf("receipt verdict = %q, want %s", recorded.ActionRecord.Verdict, action)
+	}
+	if action == config.ActionWarn && !strings.Contains(recorded.ActionRecord.Pattern, "JWT Token") {
+		t.Fatalf("warn receipt pattern = %q, want JWT evidence", recorded.ActionRecord.Pattern)
+	}
+
+	logger.Close()
+	auditBytes, err := os.ReadFile(filepath.Clean(auditPath))
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	if !bytes.Contains(auditBytes, []byte(`"event":"header_dlp"`)) || !bytes.Contains(auditBytes, []byte("JWT Token")) {
+		t.Fatalf("audit log missing JWT header finding: %s", auditBytes)
+	}
+}
+
+func TestFetchJWTSessionCookieFollowsActionAndRecordsEvidence(t *testing.T) {
+	for _, tc := range jwtCookieActionCases {
+		t.Run(tc.action, func(t *testing.T) {
+			runFetchJWTSessionCookie(t, tc.action, tc.wantStatus, tc.wantUpstream)
+		})
+	}
+}
+
+func runFetchJWTSessionCookie(t *testing.T, action string, wantStatus int, wantUpstream bool) {
+	t.Helper()
+	jwt := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" +
+		"." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" +
+		"." + "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit.Store(true)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(upstream.Close)
+
+	rph := newReceiptProxyHelper(t)
+	h := setupFetchProxyWithReceipts(t, rph, func(cfg *config.Config) {
+		cfg.Mode = config.ModeStrict
+		cfg.APIAllowlist = []string{"127.0.0.1"}
+		cfg.RequestBodyScanning.Enabled = true
+		cfg.RequestBodyScanning.ScanHeaders = true
+		cfg.RequestBodyScanning.Action = action
+		cfg.RequestBodyScanning.HeaderMode = config.HeaderModeSensitive
+		cfg.RequestBodyScanning.SensitiveHeaders = []string{"Cookie"}
+	})
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+url.QueryEscape(upstream.URL+"/app"), nil)
+	req.Header.Set("Cookie", "session="+jwt)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != wantStatus {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, wantStatus, rec.Body.String())
+	}
+	if upstreamHit.Load() != wantUpstream {
+		t.Fatalf("upstream hit = %v, want %v", upstreamHit.Load(), wantUpstream)
+	}
+
+	// The receipt names the finding differently for a denial than a warning.
+	wantPattern := "request_header_secret"
+	if action == config.ActionBlock {
+		wantPattern = "request header contains secret"
+	}
+	recorded := rph.requireReceipt(t, "dlp_header")
+	if recorded.ActionRecord.Verdict != action || recorded.ActionRecord.Pattern != wantPattern {
+		t.Fatalf("receipt verdict/pattern = %q/%q, want %s/%q", recorded.ActionRecord.Verdict, recorded.ActionRecord.Pattern, action, wantPattern)
+	}
+}
+
 // setupWSProxyWithReceipts boots a real WS proxy with receipt emission.
 func setupWSProxyWithReceipts(t *testing.T, rph *receiptProxyHelper, cfgMod func(*config.Config)) (string, func()) {
 	t.Helper()
@@ -2089,7 +2253,7 @@ func TestReceiptCoverage_WSSessionClose_RedactionSummary(t *testing.T) {
 	rph := newReceiptProxyHelper(t)
 	proxyAddr, cleanup := setupWSProxyWithReceipts(t, rph, func(cfg *config.Config) {
 		cfg.Enforce = ptrBool(false)
-		applyRedactionTestProfile(cfg)
+		applyWSRedactionTestProfile(cfg)
 	})
 	defer cleanup()
 
@@ -2098,7 +2262,7 @@ func TestReceiptCoverage_WSSessionClose_RedactionSummary(t *testing.T) {
 		t.Fatalf("dialWSConn: %v", err)
 	}
 
-	secret := redactionE2ESecret()
+	secret := wsRedactionE2ESecret()
 	payload := []byte(`{"prompt":"use ` + secret + ` to deploy"}`)
 	if writeErr := wsutil.WriteClientText(conn, payload); writeErr != nil {
 		t.Fatalf("WriteClientText: %v", writeErr)
@@ -2109,7 +2273,7 @@ func TestReceiptCoverage_WSSessionClose_RedactionSummary(t *testing.T) {
 	if readErr != nil {
 		t.Fatalf("ReadServerData: %v", readErr)
 	}
-	if !strings.Contains(string(data), placeholderAWS) {
+	if !strings.Contains(string(data), wsPlaceholderAnthropic) {
 		t.Fatalf("echoed payload missing redaction placeholder: %q", string(data))
 	}
 
@@ -2128,8 +2292,8 @@ func TestReceiptCoverage_WSSessionClose_RedactionSummary(t *testing.T) {
 	if r.ActionRecord.Redaction.TotalRedactions != 1 {
 		t.Fatalf("total redactions = %d, want 1", r.ActionRecord.Redaction.TotalRedactions)
 	}
-	if got := r.ActionRecord.Redaction.ByClass[string(redact.ClassAWSAccessKey)]; got != 1 {
-		t.Fatalf("aws-access-key redactions = %d, want 1", got)
+	if got := r.ActionRecord.Redaction.ByClass[string(redact.ClassAnthropicKey)]; got != 1 {
+		t.Fatalf("anthropic-api-key redactions = %d, want 1", got)
 	}
 }
 
@@ -2800,4 +2964,49 @@ func TestCallerReceiptHeader_BlockPathsWithoutEmitterStaySilent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestForwardA2ARepeatedExtensionsHeader_Blocks proves the forward proxy scans
+// every A2A-Extensions field line, not only the first.
+func TestForwardA2ARepeatedExtensionsHeader_Blocks(t *testing.T) {
+	t.Parallel()
+
+	var reached atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		_, _ = io.WriteString(w, "should not reach here")
+	}))
+	defer upstream.Close()
+
+	rph := newReceiptProxyHelper(t)
+	proxyAddr, cleanup := setupForwardProxyWithReceipts(t, rph, func(cfg *config.Config) {
+		cfg.Enforce = ptrBool(true)
+		cfg.A2AScanning.Enabled = true
+		cfg.A2AScanning.Action = config.ActionBlock
+	})
+	defer cleanup()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		upstream.URL+"/message:send", strings.NewReader(`{"method":"tasks/send"}`))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/a2a+json")
+	req.Header.Add("A2A-Extensions", "https://ext.example.com/v1")
+	req.Header.Add("A2A-Extensions", "file:///etc/passwd")
+
+	resp, err := proxyClient(proxyAddr).Do(req)
+	if err != nil {
+		t.Fatalf("client.Do: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a blocked URI on a repeated A2A-Extensions line", resp.StatusCode)
+	}
+	if reached.Load() {
+		t.Fatal("request reached upstream despite a blocked repeated A2A-Extensions line")
+	}
+	rph.requireReceipt(t, "a2a_header")
 }

@@ -8,7 +8,7 @@ mode and HTTP fetch proxy mode.
 
 ```bash
 # 1. Install pipelock
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 
 # 2. Verify it works
@@ -228,6 +228,8 @@ This registers pipelock as a `PreToolUse` hook for security-relevant tools:
 | Matcher | Tools | What's scanned |
 |---------|-------|----------------|
 | `Bash\|WebFetch\|Write\|Edit` | Built-in tools | Commands, URLs, file content for DLP and policy |
+| `Read`, `Grep` | Built-in file reads | File path against the same credential-path policy as other file reads (SSH private keys, AWS credentials, `/etc/shadow` and similar; SSH public keys stay allowed), plus DLP and injection on every argument. A `Grep` whose target (or, with no path, the working directory) is `~/.ssh` or `~/.aws`, sits inside one, or contains one, such as your home directory, is refused. A recursive search that reaches a `.env` or `.netrc` file elsewhere is not path-checked, because the hook sees the search target, not the files the search opens |
+| `NotebookEdit` | Built-in notebook edits | Notebook path and new cell content for DLP and policy, the same as `Write`/`Edit` |
 | `mcp__.*` | All MCP tools | Tool arguments for DLP and injection |
 
 ### Fail-closed defaults
@@ -263,11 +265,38 @@ CONNECT tunnels.
 To enable it:
 
 1. Generate a CA and enable TLS interception (see the [TLS Interception Guide](tls-interception.md))
-2. Trust the CA for Node.js (used by Claude Code's MCP servers):
+2. Launch Claude Code with the running proxy's config and CA:
 
 ```bash
-export NODE_EXTRA_CA_CERTS=~/.pipelock/ca.pem
+pipelock exec --config pipelock.yaml -- claude
 ```
+
+[`pipelock exec`](../cli/exec.md) checks the running proxy before launch and sets the proxy and trust variables below. It steers cooperative clients; use containment or sandboxing for operating-system enforcement. For built-in Node HTTP/HTTPS and fetch clients, use Node 22.21+ or 24.5+.
+
+<!-- BEGIN launchcontract:exec -->
+| Variable | Value |
+|---|---|
+| `HTTP_PROXY` | proxy URL |
+| `http_proxy` | proxy URL |
+| `HTTPS_PROXY` | proxy URL |
+| `https_proxy` | proxy URL |
+| `ALL_PROXY` | proxy URL |
+| `all_proxy` | proxy URL |
+| `NO_PROXY` | explicit bypass list |
+| `no_proxy` | explicit bypass list |
+| `npm_config_noproxy` | explicit bypass list |
+| `SSL_CERT_FILE` | combined CA bundle |
+| `REQUESTS_CA_BUNDLE` | combined CA bundle |
+| `CURL_CA_BUNDLE` | combined CA bundle |
+| `GIT_SSL_CAINFO` | combined CA bundle |
+| `CARGO_HTTP_CAINFO` | combined CA bundle |
+| `PIP_CERT` | combined CA bundle |
+| `NODE_EXTRA_CA_CERTS` | combined CA bundle |
+| `npm_config_cafile` | combined CA bundle |
+| `CODEX_CA_CERTIFICATE` | Pipelock CA file |
+| `DENO_CERT` | combined CA bundle |
+| `NODE_USE_ENV_PROXY` | 1 |
+<!-- END launchcontract:exec -->
 
 MCP proxy mode (stdio wrapping) and Claude Code hooks do not require TLS
 interception. They scan traffic directly without certificates.

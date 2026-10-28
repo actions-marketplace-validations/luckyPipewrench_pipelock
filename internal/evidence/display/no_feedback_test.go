@@ -4,8 +4,11 @@
 package display
 
 import (
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -21,24 +24,7 @@ func TestDisplayDoesNotFeedVerificationPaths(t *testing.T) {
 		filepath.Join("internal", "cli", "signing", "receipt.go"),
 		filepath.Join("internal", "cli", "signing", "receipt_test.go"),
 	}
-	var paths []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if d.IsDir() {
-			switch d.Name() {
-			case ".git", "vendor":
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.HasSuffix(path, ".go") {
-			return nil
-		}
-		paths = append(paths, filepath.Clean(path))
-		return nil
-	})
+	paths, err := displaySourcePaths(root)
 	if err != nil {
 		t.Fatalf("walk repo: %v", err)
 	}
@@ -69,13 +55,70 @@ func TestDisplayDoesNotFeedVerificationPaths(t *testing.T) {
 	}
 }
 
-func containsDisplaySymbol(data []byte) bool {
-	for _, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "*") {
-			continue
+func displaySourcePaths(root string) ([]string, error) {
+	var paths []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
-		if strings.Contains(trimmed, "display.") {
+		if d.IsDir() {
+			// Go package discovery ignores dot- and underscore-prefixed
+			// directories. Runtime tests create and remove scratch trees here.
+			if path != root && (strings.HasPrefix(d.Name(), ".") || strings.HasPrefix(d.Name(), "_") || d.Name() == "vendor") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") {
+			return nil
+		}
+		paths = append(paths, filepath.Clean(path))
+		return nil
+	})
+	return paths, err
+}
+
+func TestDisplaySourcePathsExcludesScratchDirectories(t *testing.T) {
+	root := t.TempDir()
+	for _, dir := range []string{"internal/verify", ".runtime-conductor-apply-123/audit-queue", "_scratch", "vendor/example"} {
+		path := filepath.Join(root, dir)
+		if err := os.MkdirAll(path, 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "source.go"), []byte("package verify\nimport _ \""+displayImportPath+"\"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	paths, err := displaySourcePaths(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, "internal", "verify", "source.go")
+	if len(paths) != 1 || paths[0] != want {
+		t.Fatalf("source paths = %v, want only %s", paths, want)
+	}
+	data, err := os.ReadFile(filepath.Clean(want))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsDisplaySymbol(data) {
+		t.Fatal("ordinary source directory must still expose forbidden display imports")
+	}
+}
+
+// displayImportPath is how a file reaches this package's symbols. The guard
+// reads the file's parsed import list, so an aliased or dot import is caught
+// and the path appearing in a comment or string literal is not.
+const displayImportPath = "github.com/luckyPipewrench/pipelock/internal/evidence/display"
+
+func containsDisplaySymbol(data []byte) bool {
+	file, err := parser.ParseFile(token.NewFileSet(), "", data, parser.ImportsOnly)
+	if err != nil {
+		// A file the parser cannot read is reported rather than skipped.
+		return true
+	}
+	for _, spec := range file.Imports {
+		if path, err := strconv.Unquote(spec.Path.Value); err == nil && path == displayImportPath {
 			return true
 		}
 	}

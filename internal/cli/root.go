@@ -20,6 +20,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/cli/diag"
 	clienvelope "github.com/luckyPipewrench/pipelock/internal/cli/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/cli/evidence"
+	cliexec "github.com/luckyPipewrench/pipelock/internal/cli/exec"
 	"github.com/luckyPipewrench/pipelock/internal/cli/generate"
 	"github.com/luckyPipewrench/pipelock/internal/cli/git"
 	cliguard "github.com/luckyPipewrench/pipelock/internal/cli/guard"
@@ -37,6 +38,7 @@ import (
 	clisigning "github.com/luckyPipewrench/pipelock/internal/cli/signing"
 	"github.com/luckyPipewrench/pipelock/internal/cli/support"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
 // extraCommands holds commands registered by enterprise packages via init().
@@ -50,6 +52,7 @@ func RegisterCommand(cmd *cobra.Command) {
 
 // Execute runs the root command.
 func Execute() error {
+	selfupdate.CleanupOnStart(os.Stderr)
 	return rootCmd().Execute()
 }
 
@@ -91,10 +94,11 @@ Quick start:
 	// SilenceUsage on this command keeps cobra from ever emitting it.
 	cmd.SetOut(os.Stdout)
 
-	cmd.PersistentFlags().StringVar(&cliutil.PipelockHome, "home", "",
+	cmd.PersistentFlags().StringVar(&signing.PipelockHome, "home", "",
 		"pipelock home directory (default ~/.pipelock, or set PIPELOCK_HOME)")
 
 	cmd.AddCommand(
+		cliexec.Cmd(),
 		// External receipt anchoring
 		anchor.Cmd(),
 		// Assess
@@ -157,6 +161,7 @@ Quick start:
 		session.AdaptiveCmd(),
 		session.BaselineCmd(),
 		session.Cmd(),
+		session.ReloadCmd(),
 		// Setup (IDE integrations)
 		// One registration list, shared with the MCP wrapping-capability
 		// declaration, so a new setup command cannot reach the binary

@@ -122,7 +122,7 @@ func TestNewDurableFileRejectsSymlinkToNonRegularFile(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("/dev/full is a Linux special device")
 	}
-	path := filepath.Join(t.TempDir(), "audit-link")
+	path := filepath.Join(durableAuditTempDir(t), "audit-link")
 	if err := os.Symlink("/dev/full", path); err != nil {
 		t.Fatalf("create audit link: %v", err)
 	}
@@ -139,13 +139,13 @@ func TestNewDurableFileRejectsUnopenablePaths(t *testing.T) {
 		{
 			name: "missing parent",
 			path: func(t *testing.T) string {
-				return filepath.Join(t.TempDir(), "missing", "audit.jsonl")
+				return filepath.Join(durableAuditTempDir(t), "missing", "audit.jsonl")
 			},
 		},
 		{
 			name: "directory instead of file",
 			path: func(t *testing.T) string {
-				return t.TempDir()
+				return durableAuditTempDir(t)
 			},
 		},
 	} {
@@ -161,7 +161,7 @@ func TestNewDurableFileUnsupportedOnNonUnix(t *testing.T) {
 	if DurableAuditFileSupported() {
 		t.Skip("Unix durable audit support boundary")
 	}
-	if _, err := NewDurableFile("json", filepath.Join(t.TempDir(), "audit.jsonl"), false, false); err == nil || !strings.Contains(err.Error(), "unsupported on this platform") {
+	if _, err := NewDurableFile("json", filepath.Join(durableAuditTempDir(t), "audit.jsonl"), false, false); err == nil || !strings.Contains(err.Error(), "unsupported on this platform") {
 		t.Fatalf("NewDurableFile error = %v, want unsupported-platform refusal", err)
 	}
 }
@@ -171,6 +171,17 @@ func requireDurableAuditFile(t *testing.T) {
 	if !DurableAuditFileSupported() {
 		t.Skip("durable lifecycle audit files are unsupported on this platform")
 	}
+}
+
+// durableAuditTempDir gives durable-file fixtures private permissions regardless
+// of the process umask. Tests of unsafe modes set those modes explicitly.
+func durableAuditTempDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil { // #nosec G302 -- owner execute permission is required for directory traversal
+		t.Fatalf("secure durable audit fixture directory: %v", err)
+	}
+	return dir
 }
 
 func TestNewReusesExistingFile(t *testing.T) {
@@ -209,7 +220,7 @@ func TestNewDurableFileRejectsFilesystemSyncFailure(t *testing.T) {
 
 func TestNewDurableFileResyncsParentAfterFailedCreation(t *testing.T) {
 	requireDurableAuditFile(t)
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 	originalSync := syncDurableAuditParent
 	var syncCalls int
 	syncDurableAuditParent = func(string) error {
@@ -288,9 +299,9 @@ func TestNewDurableFileRejectsUnsafeUnixOwnershipAndModes(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 			if tc.inParentDir {
-				path = filepath.Join(t.TempDir(), "audit-parent", "audit.jsonl")
+				path = filepath.Join(durableAuditTempDir(t), "audit-parent", "audit.jsonl")
 			}
 			tc.prepare(t, path)
 			logger, err := NewDurableFile("json", path, false, false)
@@ -306,7 +317,7 @@ func TestNewDurableFileRejectsUnsafeUnixOwnershipAndModes(t *testing.T) {
 
 	if os.Geteuid() == 0 {
 		t.Run("untrusted file owner", func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 			if err := os.WriteFile(path, nil, 0o600); err != nil {
 				t.Fatalf("write audit file: %v", err)
 			}
@@ -370,7 +381,7 @@ func TestLogCommitmentKeyLifecycle(t *testing.T) {
 
 func TestWriteDurableCommitmentKeyLifecycleSyncsJSONRecord(t *testing.T) {
 	requireDurableAuditFile(t)
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 	logger, err := NewDurableFile("json", path, false, false)
 	if err != nil {
 		t.Fatalf("NewDurableFile: %v", err)
@@ -402,7 +413,7 @@ func TestWriteDurableCommitmentKeyLifecycleSyncsJSONRecord(t *testing.T) {
 
 func TestWriteDurableCommitmentKeyLifecycleInterleavesWithOrdinaryJSONLines(t *testing.T) {
 	requireDurableAuditFile(t)
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 	logger, err := NewDurableFile("json", path, false, false)
 	if err != nil {
 		t.Fatalf("NewDurableFile: %v", err)
@@ -471,7 +482,7 @@ func TestWriteDurableCommitmentKeyLifecycleFailurePaths(t *testing.T) {
 	})
 
 	t.Run("closed file handle is refused", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "audit.jsonl")
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 		logger, err := NewDurableFile("json", path, false, false)
 		if err != nil {
 			t.Fatalf("NewDurableFile: %v", err)
@@ -486,7 +497,7 @@ func TestWriteDurableCommitmentKeyLifecycleFailurePaths(t *testing.T) {
 	})
 
 	t.Run("denied record is warn level", func(t *testing.T) {
-		path := filepath.Join(t.TempDir(), "audit.jsonl")
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 		logger, err := NewDurableFile("json", path, false, false)
 		if err != nil {
 			t.Fatalf("NewDurableFile: %v", err)
@@ -530,7 +541,7 @@ func TestRejectDurableFileAliases(t *testing.T) {
 	requireDurableAuditFile(t)
 	newLogger := func(t *testing.T) (*Logger, string) {
 		t.Helper()
-		path := filepath.Join(t.TempDir(), "audit.jsonl")
+		path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 		logger, err := NewDurableFile("json", path, false, false)
 		if err != nil {
 			t.Fatalf("NewDurableFile: %v", err)
@@ -730,7 +741,7 @@ func TestWriteDurableCommitmentKeyLifecycleRejectsDeletedOrRotatedSink(t *testin
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "audit.jsonl")
+			path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 			logger, err := NewDurableFile("json", path, false, false)
 			if err != nil {
 				t.Fatalf("NewDurableFile: %v", err)
@@ -746,7 +757,7 @@ func TestWriteDurableCommitmentKeyLifecycleRejectsDeletedOrRotatedSink(t *testin
 
 func TestWriteDurableCommitmentKeyLifecycleConcurrentAppends(t *testing.T) {
 	requireDurableAuditFile(t)
-	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	path := filepath.Join(durableAuditTempDir(t), "audit.jsonl")
 	const writers = 32
 
 	errs := make(chan error, writers)
@@ -2122,6 +2133,9 @@ func TestLogRedirect_JSONFormat(t *testing.T) {
 	if entry["event"] != "redirect" {
 		t.Errorf("expected event=redirect, got %v", entry["event"])
 	}
+	if entry["message"] != "redirect observed" {
+		t.Errorf("redirect observation must not claim the target was contacted: %v", entry["message"])
+	}
 	if entry["original_url"] != "https://example.com" {
 		t.Errorf("expected original_url, got %v", entry["original_url"])
 	}
@@ -2260,8 +2274,8 @@ func TestLogForwardHTTP_JSONFormat(t *testing.T) {
 	if entry["method"] != testMethodGet {
 		t.Errorf("expected method=GET, got %v", entry["method"])
 	}
-	if entry["url"] != "http://example.com/path" {
-		t.Errorf("expected url=http://example.com/path, got %v", entry["url"])
+	if entry["url"] != "http://example.com" {
+		t.Errorf("expected url=http://example.com, got %v", entry["url"])
 	}
 	statusCode, ok := entry["status_code"].(float64)
 	if !ok || statusCode != 200 {
@@ -2789,7 +2803,7 @@ func TestLogKillSwitchDeny_JSONFormat(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	logger.LogKillSwitchDeny("http", "https://api.example.com/v1/chat", "global", "all traffic halted", "10.0.0.5")
+	logger.LogKillSwitchDeny("http", "https://api.example.com/v1/chat", "global", "all traffic halted", "10.0.0.5", "req-42")
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -2800,6 +2814,7 @@ func TestLogKillSwitchDeny_JSONFormat(t *testing.T) {
 
 	checks := map[string]any{
 		"event":        "kill_switch_deny",
+		"request_id":   "req-42",
 		"transport":    "http",
 		"endpoint":     "https://api.example.com/v1/chat",
 		"source":       "global",
@@ -2833,7 +2848,7 @@ func TestLogKillSwitchDeny_SanitizesFields(t *testing.T) {
 		"global",
 		"bad\x1b[0mmessage",
 		"10.0.0\x1b[2J.1",
-	)
+		"")
 	logger.Close()
 
 	data, _ := os.ReadFile(filepath.Clean(path))
@@ -2887,6 +2902,7 @@ func newLoggerWithEmitter(t *testing.T) (*Logger, *collectingSink) {
 	sink := &collectingSink{}
 	emitter := emit.NewEmitter("test-instance", sink)
 	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
 	t.Cleanup(func() { _ = emitter.Close() })
 	return logger, sink
 }
@@ -3123,6 +3139,7 @@ func TestEmit_WebSocketLifecycleHonorsIncludeAllowedFalse(t *testing.T) {
 	sink := &collectingSink{}
 	emitter := emit.NewEmitter("test", sink)
 	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
 	t.Cleanup(func() { _ = emitter.Close() })
 
 	logger.LogWSOpen("ws://example.com/stream", testClientIP, testReqID, testAgentName)
@@ -3291,6 +3308,7 @@ func TestAuditEmitLookupEventsHaveExplicitSeverity(t *testing.T) {
 		EventTunnelOpen:             emit.EventTunnelOpen,
 		EventTunnelClose:            emit.EventTunnelClose,
 		EventForwardHTTP:            emit.EventForwardHTTP,
+		EventInterceptHTTP:          emit.EventInterceptHTTP,
 		EventRedirect:               emit.EventRedirect,
 		EventToolRedirect:           emit.EventToolRedirect,
 		EventConfigReload:           emit.EventConfigReload,
@@ -3601,6 +3619,7 @@ func TestEmit_LogBlocked_IncludeBlockedFalse(t *testing.T) {
 	sink := &collectingSink{}
 	emitter := emit.NewEmitter("test", sink)
 	logger.SetEmitter(emitter)
+	t.Cleanup(logger.Close)
 	t.Cleanup(func() { _ = emitter.Close() })
 
 	logger.LogBlocked(LogContext{method: testMethodGet, url: "https://evil.com", clientIP: testClientIP, requestID: "req-1"}, ScannerDLP, "secret found")
@@ -3752,7 +3771,7 @@ func TestEmit_RemediationHintSweep(t *testing.T) {
 				logger.LogBodyScan(ctx, EventBodyPromptInjection, actionBlock, 1, []string{"Prompt Injection"})
 			},
 			wantEvent: EventBodyPromptInjection,
-			wantHint:  "response_scanning.exempt_domains",
+			wantHint:  "request_body_scanning.trusted_hosts",
 		},
 		{
 			name: "chain detection",
@@ -3797,7 +3816,7 @@ func TestEmit_RemediationHintSweep(t *testing.T) {
 		{
 			name: "kill switch deny",
 			log: func(logger *Logger) {
-				logger.LogKillSwitchDeny("fetch", "/fetch", "sentinel", "maintenance", testClientIP)
+				logger.LogKillSwitchDeny("fetch", "/fetch", "sentinel", "maintenance", testClientIP, "")
 			},
 			wantEvent: EventKillSwitchDeny,
 			wantHint:  "active kill-switch source",
@@ -4019,8 +4038,8 @@ func TestEmit_LogForwardHTTP(t *testing.T) {
 	if ev.Type != string(EventForwardHTTP) {
 		t.Fatalf("type = %q, want %s", ev.Type, EventForwardHTTP)
 	}
-	if ev.Fields["url"] != "http://example.com/path" {
-		t.Errorf("fields[url] = %v, want http://example.com/path", ev.Fields["url"])
+	if ev.Fields["url"] != "http://example.com" {
+		t.Errorf("fields[url] = %v, want http://example.com", ev.Fields["url"])
 	}
 	if ev.Fields["status_code"] != 200 {
 		t.Errorf("fields[status_code] = %v, want 200", ev.Fields["status_code"])
@@ -4224,7 +4243,7 @@ func TestEmit_LogKillSwitchDeny(t *testing.T) {
 	logger, sink := newLoggerWithEmitter(t)
 	defer logger.Close()
 
-	logger.LogKillSwitchDeny("http", "https://example.com", "global", "halted", testClientIP)
+	logger.LogKillSwitchDeny("http", "https://example.com", "global", "halted", testClientIP, "")
 
 	ev, ok := sink.lastEvent()
 	if !ok {
@@ -4243,7 +4262,7 @@ func TestEmit_DefensiveEvents_NoMITRETechnique(t *testing.T) {
 	defer logger.Close()
 
 	// Kill switch deny is a defensive action, not an attack detection.
-	logger.LogKillSwitchDeny("http", "https://example.com", "api", "testing", testClientIP)
+	logger.LogKillSwitchDeny("http", "https://example.com", "api", "testing", testClientIP, "")
 	ev, ok := sink.lastEvent()
 	if !ok {
 		t.Fatal("expected emitted event for kill_switch_deny")
@@ -4578,6 +4597,39 @@ func TestLogHeaderDLP_JSONFormat(t *testing.T) {
 	}
 	if entry["mitre_technique"] != mitreT1048 {
 		t.Errorf("expected mitre_technique=T1048, got %v", entry["mitre_technique"])
+	}
+}
+
+func TestLogBlockedDetailHeaderDLPMetadata(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.LogBlockedDetail(LogContext{method: "GET", url: "https://app.vendor.example/", requestID: "req-1"},
+		"header_dlp", "request header contains secret", BlockDetail{
+			Header: "Cookie", Patterns: []string{"Session Token"}, Cookies: []string{"sid"},
+		})
+	logger.Close()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["header"] != "Cookie" || entry["scanner"] != "header_dlp" {
+		t.Fatalf("missing header DLP block metadata: %v", entry)
+	}
+	patterns, ok := entry["patterns"].([]any)
+	if !ok || len(patterns) != 1 || patterns[0] != "Session Token" {
+		t.Fatalf("patterns = %v", entry["patterns"])
+	}
+	cookies, ok := entry["cookies"].([]any)
+	if !ok || len(cookies) != 1 || cookies[0] != "sid" {
+		t.Fatalf("cookies = %v", entry["cookies"])
 	}
 }
 
@@ -6106,5 +6158,106 @@ func TestLogAgentIdentityCollision_JSONFormat(t *testing.T) {
 	score, ok := entry["score"].(float64)
 	if !ok || score < 0.69 || score > 0.71 {
 		t.Errorf("expected score ~0.7, got %v", entry["score"])
+	}
+}
+
+func TestJSONInspectionRemediationHints(t *testing.T) {
+	pattern := scannerpkg.UninspectableJSONNumberPattern
+	ctx := LogContext{method: "POST", target: "https://api.vendor.example/submit"}
+	for name, log := range map[string]func(*Logger){
+		"body": func(l *Logger) { l.LogBodyDLP(ctx, "block", 1, []string{pattern}, nil) },
+		"blocked": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.ScannerBodyDLP, "request body contains secret: "+pattern)
+		},
+		"response": func(l *Logger) { l.LogResponseScan(ctx, "block", 1, []string{pattern}, nil) },
+		"header":   func(l *Logger) { l.LogHeaderDLP(ctx, "X-Value", "block", []string{pattern}, nil) },
+		"a2a":      func(l *Logger) { l.LogBodyScan(ctx, EventType(scannerpkg.AuditA2AScan), "block", 1, []string{pattern}) },
+		"websocket-blocked": func(l *Logger) {
+			l.LogWSBlocked(WSBlockedEvent{Scanner: scannerpkg.ScannerDLP, Reason: "DLP match: " + pattern})
+		},
+		"http-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "fragment reassembly DLP match: "+pattern)
+		},
+		"mcp-fragment": func(l *Logger) {
+			l.LogBlocked(ctx, scannerpkg.AuditCrossRequestFragment, "cross-request fragment refused: "+pattern+"; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)")
+		},
+		"websocket": func(l *Logger) {
+			l.LogWSScan(WSScanEvent{Direction: DirectionClientToServer, Action: "block", PatternNames: []string{pattern}, MatchCount: 1})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log(logger)
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			if !strings.Contains(hint, "Reduce nesting or number size") || strings.Contains(strings.ToLower(hint), "suppress") {
+				t.Fatalf("inspection hint = %q", hint)
+			}
+		})
+	}
+}
+
+func TestRemediationNestedJSONInspectionKey(t *testing.T) {
+	for _, label := range []string{scannerpkg.ScannerSSRF, scannerpkg.ScannerDLP} {
+		t.Run(label, func(t *testing.T) {
+			reason := "SSRF blocked: 10.0.0.12 is an internal IP"
+			if label == scannerpkg.ScannerDLP {
+				reason = "DLP match: Test credential (high)"
+			}
+			path := filepath.Join(t.TempDir(), "audit.log")
+			logger, err := New("json", "file", path, true, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.LogBlocked(LogContext{method: "GET", target: "https://api.vendor.example/"}, label, fmt.Sprintf("nested URL in query parameter %q: %s", scannerpkg.UninspectableJSONNumberPattern, reason))
+			logger.Close()
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var entry map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+				t.Fatal(err)
+			}
+			hint, _ := entry["remediation_hint"].(string)
+			baseline := scannerpkg.OperatorHintForResult(label, reason)
+			if baseline == "" || !strings.HasPrefix(hint, baseline) || strings.Contains(hint, "limits are fixed") {
+				t.Fatalf("hint = %q, want %q", hint, baseline)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationPatternIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	logger, err := New("json", "file", path, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pattern := "ordinary, " + scannerpkg.UninspectableJSONNumberPattern
+	logger.LogBodyDLP(LogContext{method: "POST", target: "https://api.vendor.example/"}, "block", 1, []string{pattern}, nil)
+	logger.Close()
+	data, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entry map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(data), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if entry["remediation_hint"] != scannerpkg.OperatorHintFor(scannerpkg.ScannerBodyDLP) {
+		t.Fatalf("display text changed hint: %v", entry["remediation_hint"])
 	}
 }

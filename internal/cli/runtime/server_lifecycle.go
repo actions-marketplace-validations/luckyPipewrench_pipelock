@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"context"
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"io"
@@ -26,8 +27,10 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/identity"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/scanapi"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -393,7 +396,10 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		go func() {
 			defer reloadWG.Done()
 			if err := reloader.Start(ctx); err != nil {
+				s.setReloadWatcherState("failed")
 				s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), err)
+			} else {
+				s.setReloadWatcherState("stopped")
 			}
 		}()
 
@@ -405,6 +411,9 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		// on a watcher-setup failure (the error is logged above).
 		select {
 		case <-reloader.Ready():
+			if reloader.WatchEstablished() {
+				s.setReloadWatcherState("watching")
+			}
 		case <-ctx.Done():
 		}
 
@@ -434,6 +443,9 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		if err == nil {
 			return
 		}
+		if s.receiptShardSet != nil {
+			s.receiptShardSet.MarkUnhealthy(err)
+		}
 		requiredHeartbeatErrMu.Lock()
 		if requiredHeartbeatErr == nil {
 			requiredHeartbeatErr = err
@@ -449,21 +461,18 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		}
 		return fmt.Errorf("flight_recorder.require_receipts is enabled but receipt heartbeat emission failed: %w", requiredHeartbeatErr)
 	}
-	if receiptEmitterReady(s.liveReceiptEmitter()) {
+	if s.receiptShardSet != nil {
+		for _, shard := range s.receiptShardSet.Emitters() {
+			e := shard
+			startReceiptHeartbeat(ctx, &lifecycleWG, cfg.FlightRecorder.HeartbeatIntervalDuration(), func() *receipt.Emitter { return e }, s.opts.Stderr, cfg.FlightRecorder.RequireReceipts, setRequiredHeartbeatErr)
+		}
+	} else if receiptEmitterReady(s.liveReceiptEmitter()) {
 		startReceiptHeartbeat(ctx, &lifecycleWG, cfg.FlightRecorder.HeartbeatIntervalDuration(), s.liveReceiptEmitter, s.opts.Stderr, cfg.FlightRecorder.RequireReceipts, setRequiredHeartbeatErr)
 	}
 	if s.recorder != nil {
 		startFlightRecorderRetention(ctx, &lifecycleWG, s.recorder, s.opts.Stderr, defaultFlightRecorderRetentionInterval, s.opts.expiry())
 	}
-	if cfg.FlightRecorder.EvidenceHealthEnabled() && s.recorder != nil && s.metrics != nil {
-		newEvidenceHealthMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr).start(ctx, &lifecycleWG)
-	}
-	// The loop itself is cheap and inactive without a configured anchor point.
-	// It is started whenever the live recorder/emitter exist so adding an anchor
-	// point on hot reload takes effect without rebuilding recorder state.
-	if receiptEmitterReady(s.liveReceiptEmitter()) && s.recorder != nil && s.metrics != nil {
-		newAutoAnchorMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr).start(ctx, &lifecycleWG)
-	}
+	s.startEvidenceMonitors(ctx, &lifecycleWG, cfg)
 	s.startDashboardRuntimeSnapshot(ctx, &lifecycleWG, cfg)
 	stopFileSentry, fsErr := s.startFileSentry(ctx, cfg, cancel)
 	if fsErr != nil {
@@ -536,7 +545,7 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "  Config: %s (hot-reload enabled%s; rejected security downgrades require restart)\n", s.opts.ConfigFile, ReloadSignalHint())
 	}
 	if s.hasMCPListen {
-		_, _ = fmt.Fprintf(s.opts.Stderr, "  MCP:    http://%s -> %s\n", s.opts.MCPListen, s.opts.MCPUpstream)
+		_, _ = fmt.Fprintf(s.opts.Stderr, "  MCP:    http://%s -> %s\n", s.opts.MCPListen, RedactEndpoint(s.opts.MCPUpstream))
 	}
 	if cfg.ReverseProxy.Enabled {
 		_, _ = fmt.Fprintf(s.opts.Stderr, "  RevPx:  http://%s -> %s (reverse proxy with body scanning)\n",
@@ -709,6 +718,8 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		// configured - in that case we skip registration and the
 		// admin routes simply don't exist on the listener.
 		if sessionAPI := s.proxy.SessionAPI(); sessionAPI != nil {
+			apiMux.HandleFunc("/api/v1/config/status", sessionAPI.HandleConfigStatus)
+			apiMux.HandleFunc("/api/v1/config/reload", sessionAPI.HandleConfigReload)
 			apiMux.HandleFunc("/api/v1/adaptive/status", sessionAPI.HandleAdaptiveStatus)
 			apiMux.HandleFunc("/api/v1/adaptive/flush", sessionAPI.HandleAdaptiveFlush)
 			apiMux.HandleFunc("/api/v1/adaptive/whoami", sessionAPI.HandleAdaptiveWhoami)
@@ -877,6 +888,27 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		// MCP scanning sections auto-enable inside ResolveRuntime above
 		// when the operator did not configure them; the effective cfg
 		// already reflects those defaults.
+		//
+		// Resolve the listener identity before binding. The resolution is
+		// pinned for the listener's life; each request re-resolves against
+		// the live config and the listener stops serving if it differs.
+		mcpTransport := listenerTransport(s.opts.MCPUpstream)
+		if err := requireNoSessionHeader(cfg, mcpTransport); err != nil {
+			return err
+		}
+		mcpResolution, resolveErr := resolveLaunchIdentity(cfg, s.opts.MCPServerName, mcpTransport, s.opts.Stderr)
+		if resolveErr != nil {
+			return resolveErr
+		}
+		mcpBinding := mcpRunListenerBinding(s.opts.MCPUpstream)
+		if mcpResolution.BindingMode == config.MCPAckBindingModeVerifiedLocalSession {
+			sessionBinding, bindErr := identity.SessionBinding(mcpResolution, mcpTransport)
+			if bindErr != nil {
+				return bindErr
+			}
+			mcpBinding = sessionBinding
+		}
+		mcpIdentity := newRunListenerIdentity(s.opts.MCPServerName, mcpResolution, mcpBinding, mcpTransport)
 		mcpToolBaseline := tools.NewToolBaseline()
 		mcpScannerFn := func() *scanner.Scanner { return s.proxy.ScannerPtr().Load() }
 		mcpInputCfgFn := func() *mcp.InputScanConfig { return buildMCPInputCfg(s.proxy.CurrentConfig()) }
@@ -890,6 +922,12 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 			if current != cachedMCPToolSource {
 				cachedMCPToolCfg = buildMCPToolCfg(current, extraPoison, mcpToolBaseline)
 				cachedMCPToolSource = current
+				if cachedMCPToolCfg != nil {
+					s.liveAckSet.Store(&liveCredentialAckSet{cfg: current, set: cachedMCPToolCfg.CredentialAcks})
+				}
+			}
+			if cachedMCPToolCfg != nil && s.ackKeyRevokedFor.Load() == current {
+				cachedMCPToolCfg.CredentialAcks.Revoke()
 			}
 			return cachedMCPToolCfg
 		}
@@ -1013,18 +1051,19 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 			trust := config.ResponseTrustUntrusted
 			c := s.proxy.CurrentConfig()
 			if c != nil {
-				if configuredTrust, ok := c.MCPResponseTrustForServer(s.opts.MCPServerName); ok {
+				if configuredTrust, ok := c.MCPResponseTrustForServer(mcpIdentity.armingName(c)); ok {
 					trust = configuredTrust
 				}
 			}
 			return trust
 		}
 		mcpResponseActionFn := func() string {
-			return s.proxy.CurrentConfig().MCPResponseActionForServer(s.opts.MCPServerName)
+			c := s.proxy.CurrentConfig()
+			return c.MCPResponseActionForServer(mcpIdentity.armingName(c))
 		}
 		mcpTaintTrustedFn := func() bool {
 			c := s.proxy.CurrentConfig()
-			return c != nil && c.TaintTrustsMCPServer(s.opts.MCPServerName)
+			return c != nil && c.TaintTrustsMCPServer(mcpIdentity.armingName(c))
 		}
 
 		mcpErr = make(chan error, 1)
@@ -1050,6 +1089,7 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 					return c.MCPSessionBinding.ListenerRequireStateToken
 				},
 				ScannerFn:                mcpScannerFn,
+				ReloadMu:                 s.proxy.ReloadLock(),
 				Approver:                 mcpApprover,
 				InputCfgFn:               mcpInputCfgFn,
 				RequestBodyFn:            mcpRequestBodyFn,
@@ -1058,6 +1098,7 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 				KillSwitch:               s.killswitch,
 				ChainMatcherFn:           s.currentMCPChainMatcher,
 				AuditLogger:              s.logger,
+				CorrelationHeader:        cfg.Emit.CorrelationHeader,
 				CEEFn:                    s.currentMCPCEE,
 				Store:                    mcpStore,
 				BaselineFn:               s.proxy.SessionBaselineChecker,
@@ -1082,7 +1123,13 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 				CardBaseline:             mcp.NewCardBaseline(1000),
 				A2ACardURL:               s.opts.MCPUpstream,
 				MediaPolicyFn:            mcpMediaPolicyFn,
-				ServerName:               s.opts.MCPServerName,
+				ServerName:               mcpResolution.Name,
+				PolicyServerName:         mcpResolution.ArmingName,
+				ServerBinding:            mcpBinding,
+				ServerBindingMode:        mcpResolution.BindingMode,
+				ServerRevision:           mcpResolution.Revision,
+				ServerIdentityFn:         mcpIdentity.identityFn(s.proxy.CurrentConfig),
+				ServerIdentityHeadersFn:  listenerIdentityHeadersFn(mcpResolution, mcpTransport, mcpIdentity.identityFn(s.proxy.CurrentConfig)),
 				SuppressFn:               mcpResponseSuppressFn,
 				ResponseTrustClassFn:     mcpResponseTrustFn,
 				ResponseActionOverrideFn: mcpResponseActionFn,
@@ -1090,7 +1137,7 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 				FrozenToolStableKey:      s.opts.MCPUpstream,
 				ContractLoaderPtr:        s.proxy.ContractLoaderPtr(),
 				ContractAgent:            edition.ProfileDefault,
-				DialContext:              mcp.NewMetadataSafeDialContext(mcpScannerFn),
+				DialContext:              verifiedDialContext(mcp.NewMetadataSafeDialContext(mcpScannerFn), mcpResolution, s.opts.Stderr),
 			}
 			applyMCPDoWOpts(&listenerOpts, mcpDoWWiring, true)
 			if s.opts.MCPAuthTokenFile != "" {
@@ -1147,8 +1194,8 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 			return err
 		}
 
-		rpSrv := newHTTPServer(rpHandler)
-		rpSrv.WriteTimeout = 30 * time.Second // reverse proxy upstream requests need more time
+		rpSrv := newReverseProxyServer(rpHandler)
+		rpLn = newLimitListener(rpLn, reverseProxyMaxConns)
 		lifecycleWG.Add(1)
 		go func() { //nolint:gosec // G118: graceful shutdown after <-ctx.Done(); using ctx as parent would skip the grace period
 			defer lifecycleWG.Done()
@@ -1218,23 +1265,23 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		}
 	}
 
-	// License expiry watchdog: shut down agent listeners when the
-	// enterprise license expires at runtime. Agent shutdown only matters
-	// when listeners exist, but renewal warnings still emit for long-running
-	// proxy-only processes.
-	if (agentListenerCount > 0 || cfg.Conductor.Enabled) && cfg.LicenseExpiresAt > 0 {
+	// License expiry applies to all paid resolutions, including CIDR profiles
+	// on the main listener without dedicated listeners or Conductor.
+	if cfg.LicenseExpiresAt > 0 {
 		lifecycleWG.Add(1)
 		go func() {
 			defer lifecycleWG.Done()
-			remaining := time.Until(time.Unix(cfg.LicenseExpiresAt, 0))
+			clock := edition.CurrentLicenseClock()
+			remaining := time.Unix(cfg.LicenseExpiresAt, 0).Sub(clock.Now())
 			if remaining <= 0 {
 				s.expireLicensedRuntime()
 				return
 			}
-			timer := time.NewTimer(remaining)
+			fired := make(chan struct{})
+			timer := clock.AfterFunc(remaining, func() { close(fired) })
 			defer timer.Stop()
 			select {
-			case <-timer.C:
+			case <-fired:
 				s.expireLicensedRuntime()
 			case <-ctx.Done():
 			}
@@ -1247,13 +1294,13 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 			s.startLicenseExpiryWatcher(ctx)
 		}()
 	}
-	if (agentListenerCount > 0 || cfg.Conductor.Enabled) && cfg.LicenseCRLFile != "" {
-		lifecycleWG.Add(1)
-		go func() {
-			defer lifecycleWG.Done()
-			s.startLicenseCRLWatcher(ctx)
-		}()
-	}
+	// Keep the watcher alive without dedicated listeners, including when a
+	// license is installed or replaced by a later reload.
+	lifecycleWG.Add(1)
+	go func() {
+		defer lifecycleWG.Done()
+		s.startLicenseCRLWatcher(ctx)
+	}()
 
 	// Start the fetch proxy on the pre-bound listener (blocks until context
 	// cancelled or error). The listener was already bound above, so an error
@@ -1265,7 +1312,16 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 	sdNotifyOrLog(s.opts.Stderr, "READY=1")
 	readyNotified = true
 	s.markStartupNotified()
+	s.reloadMu.Lock()
+	s.notifyReloadStatusLocked()
+	s.reloadMu.Unlock()
 	if err := s.proxy.StartWithListener(ctx, fetchLn); err != nil {
+		if groupErr := s.requiredReceiptGroupError(); groupErr != nil {
+			return groupErr
+		}
+		if s.receiptRotationRequested.Load() {
+			return errReceiptGroupKeyRotation
+		}
 		if heartbeatErr := getRequiredHeartbeatErr(); heartbeatErr != nil {
 			return heartbeatErr
 		}
@@ -1315,8 +1371,14 @@ func (s *Server) Start(ctx context.Context) (startErr error) {
 		return err
 	}
 
+	if groupErr := s.requiredReceiptGroupError(); groupErr != nil {
+		return groupErr
+	}
 	if heartbeatErr := getRequiredHeartbeatErr(); heartbeatErr != nil {
 		return heartbeatErr
+	}
+	if s.receiptRotationRequested.Load() {
+		return errReceiptGroupKeyRotation
 	}
 
 	s.logger.LogShutdown("signal received")
@@ -1365,20 +1427,54 @@ func (s *Server) handleConfigReload(event config.ReloadEvent) {
 	if notifySystemd {
 		sdNotifyReloading(s.opts.Stderr)
 	}
-	err := event.Err
-	if err == nil {
-		err = s.Reload(event.Config)
+	trigger := "fsnotify"
+	if event.Trigger == config.ReloadTriggerSignal {
+		trigger = "signal"
 	}
-	if err != nil {
-		s.logger.LogError(audit.NewResourceLogContext(configReloadAuditMethod, s.opts.ConfigFile), err)
-	}
+	s.reloadMu.Lock()
+	s.reloadEventLocked(event, trigger)
 	if notifySystemd {
-		sdNotifyReloadComplete(s.opts.Stderr, err)
+		// READY ends the notify-reload handshake; it cannot communicate a
+		// rejected transaction. STATUS carries the daemon's actual outcome.
+		sdNotifyConfigComplete(s.opts.Stderr, s.reloadSystemdStatusLocked())
+	} else {
+		s.notifyReloadStatusLocked()
 	}
+	s.reloadMu.Unlock()
+
 	// Signal reload-cycle completion for tests (no-op in production). Fires per
 	// delivered config so reload tests can block on the event instead of polling
 	// stderr on a deadline.
 	fireReloadCompletedHook()
+}
+
+// revokeUnavailableAckKey runs after a reload fails. A failed reload keeps
+// the running configuration, including its pinned acknowledgment key, so a
+// key file that was deleted, truncated, loosened or rotated would otherwise
+// go on validating acknowledgments. The key source is resolved again; unless
+// it still yields the pinned bytes, the key is revoked for this running
+// configuration: the listener's live acknowledgment set is revoked at once,
+// reaching any in-flight response that holds a copy, and an atomic mark makes
+// later configuration reads revoke too. Revocation publishes nothing and
+// cannot fail. Every acknowledgment then
+// refuses until a reload succeeds with a usable key. Nothing else in the
+// running configuration changes.
+func (s *Server) revokeUnavailableAckKey() {
+	cur := s.proxy.CurrentConfig()
+	if cur == nil || len(cur.MCPToolScanning.AcknowledgmentKeyBytes) == 0 {
+		return
+	}
+	key, err := config.ResolveMCPAckKey(cur.MCPToolScanning.AcknowledgmentKey)
+	if err == nil && hmac.Equal(key, cur.MCPToolScanning.AcknowledgmentKeyBytes) {
+		return
+	}
+	s.ackKeyRevokedFor.Store(cur)
+	// Revoke the live set now, not at the next configuration read: a response
+	// already in flight holds a configuration copy that shares this set.
+	if live := s.liveAckSet.Load(); live != nil && live.cfg == cur {
+		live.set.Revoke()
+	}
+	_, _ = fmt.Fprintln(s.opts.Stderr, "pipelock: mcp_tool_scanning.acknowledgment_key is unavailable or changed and the reload failed; every acknowledgment refuses until a reload succeeds")
 }
 
 func preferFileSentryRuntimeError(startErr, fileSentryErr error) error {
@@ -1420,5 +1516,42 @@ func (s *Server) consumeReloads(ctx context.Context, events <-chan config.Reload
 			}
 		}
 		s.handleConfigReload(event)
+	}
+}
+
+// evidenceMonitors builds the evidence self-audit and the auto-anchor loop.
+// With a receipt group every chain is audited against its own session; the
+// group's membership is fixed at opening, so the shard list never changes.
+// A group gets no anchor loop: config validation refuses auto-anchoring with
+// more than one receipt chain. The single-chain anchor loop is cheap and
+// inactive without a configured anchor point, and is built whenever the
+// recorder and emitter exist so that adding an anchor point on hot reload
+// takes effect without rebuilding recorder state.
+func (s *Server) evidenceMonitors(cfg *config.Config) (*evidenceHealthMonitor, *autoAnchorMonitor) {
+	if s.recorder == nil || s.metrics == nil {
+		return nil, nil
+	}
+	var health *evidenceHealthMonitor
+	if cfg.FlightRecorder.EvidenceHealthEnabled() {
+		health = newEvidenceHealthMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr)
+		if s.receiptShardSet != nil {
+			health.withShards(s.receiptShardSet.Emitters)
+		}
+	}
+	var anchor *autoAnchorMonitor
+	if s.receiptShardSet == nil && receiptEmitterReady(s.liveReceiptEmitter()) {
+		anchor = newAutoAnchorMonitor(s.recorder, s.metrics, s.liveReceiptEmitter, s.currentConfig, s.opts.Stderr)
+	}
+	return health, anchor
+}
+
+// startEvidenceMonitors starts the loops evidenceMonitors builds.
+func (s *Server) startEvidenceMonitors(ctx context.Context, wg *sync.WaitGroup, cfg *config.Config) {
+	health, anchor := s.evidenceMonitors(cfg)
+	if health != nil {
+		health.start(ctx, wg)
+	}
+	if anchor != nil {
+		anchor.start(ctx, wg)
 	}
 }

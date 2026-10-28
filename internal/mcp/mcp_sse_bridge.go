@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
 )
 
@@ -31,7 +32,27 @@ type sseMessageWriter struct {
 
 var _ transport.MessageWriter = (*sseMessageWriter)(nil)
 
+// requestDoneReader runs release before reading past the request's own
+// response. ForwardScanned reads the next message only after it has finished
+// the previous one (scan, delivery or denial, and inventory commit), so a
+// stream the upstream keeps open for later events cannot extend a hold that
+// belongs to the request, whether its response was delivered, empty or denied.
+type requestDoneReader struct {
+	transport.MessageReader
+	tracker *RequestTracker
+	release func()
+}
+
+func (r *requestDoneReader) ReadMessage() ([]byte, error) {
+	if !r.tracker.HasPending() {
+		r.release()
+	}
+	return r.MessageReader.ReadMessage()
+}
+
 type listenerStateMessageWriter struct {
+	opts   MCPProxyOpts
+	denied bool
 	state  *mcpListenerClientState
 	writer transport.MessageWriter
 }
@@ -41,6 +62,8 @@ func (w *listenerStateMessageWriter) WriteMessage(msg []byte) error {
 	if !w.state.commitIfActive(func() {
 		writeErr = w.writer.WriteMessage(msg)
 	}) {
+		w.denied = true
+		dropMCPDenial(w.opts, mcpListenerAdmissionDenialAudit(), "response")
 		return context.Canceled
 	}
 	return writeErr
@@ -58,24 +81,33 @@ func (sw *sseMessageWriter) WriteMessage(msg []byte) error {
 	if len(msg) > transport.MaxLineSize {
 		return fmt.Errorf("message too large: %d bytes", len(msg))
 	}
+	// The first write may commit headers even when it fails part way. Wrote
+	// must reflect that attempt so the handler aborts instead of appending a
+	// synthetic 502 response to a partially written event.
+	sw.wrote = true
 	lines := bytes.Split(msg, []byte("\n"))
 	for _, line := range lines {
-		if _, err := sw.w.Write([]byte("data: ")); err != nil {
+		if _, err := (httpstream.Writer{Writer: sw.w}).Write([]byte("data: ")); err != nil {
 			return fmt.Errorf("writing sse data prefix: %w", err)
 		}
-		if _, err := sw.w.Write(line); err != nil {
+		if _, err := (httpstream.Writer{Writer: sw.w}).Write(line); err != nil {
 			return fmt.Errorf("writing sse data: %w", err)
 		}
-		if _, err := sw.w.Write([]byte("\n")); err != nil {
+		if _, err := (httpstream.Writer{Writer: sw.w}).Write([]byte("\n")); err != nil {
 			return fmt.Errorf("writing sse line terminator: %w", err)
 		}
 	}
-	if _, err := sw.w.Write([]byte("\n")); err != nil {
+	if _, err := (httpstream.Writer{Writer: sw.w}).Write([]byte("\n")); err != nil {
 		return fmt.Errorf("writing sse event terminator: %w", err)
 	}
-	sw.wrote = true
 	if sw.flusher != nil {
-		sw.flusher.Flush()
+		if sw.responseWriter != nil {
+			if err := http.NewResponseController(sw.responseWriter).Flush(); err != nil {
+				return fmt.Errorf("flushing sse event: %w", err)
+			}
+		} else {
+			sw.flusher.Flush()
+		}
 	}
 	return nil
 }
@@ -158,6 +190,13 @@ func startGETStream(
 			_, scanErr := ForwardScanned(reader, safeClientOut, safeLogW, tracker, opts)
 			if scanErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: GET stream scan error: %v\n", scanErr)
+				if errors.Is(scanErr, transport.ErrIncompleteResponse) && ctx.Err() == nil {
+					// A subscription has no pending JSON-RPC request identity.
+					// Record its interrupted transport separately from outcomes
+					// for complete messages already delivered on the stream.
+					emitMCPStandaloneStreamReceipt(opts, safeLogW, mcpStreamReceipt(opts, http.MethodGet), "200", httpstream.Incomplete)
+				}
+				logMCPIncompleteResponse(safeLogW, opts, http.MethodGet, scanErr)
 			}
 
 			// Stream ended - reconnect with backoff unless cancelled.
@@ -172,4 +211,13 @@ func startGETStream(
 			}
 		}
 	}()
+}
+
+func (w *listenerStateMessageWriter) writeDeniedMessage(msg []byte) error {
+	w.denied = true
+	var err error
+	if !w.state.commitIfActive(func() { err = deliverMCPDeniedMessage(w.writer, msg) }) {
+		return context.Canceled
+	}
+	return err
 }

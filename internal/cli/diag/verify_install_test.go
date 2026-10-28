@@ -23,6 +23,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -303,6 +304,7 @@ func TestVerifyInstallCmd_Sign(t *testing.T) {
 	if err != nil {
 		t.Fatalf("canonical marshal: %v", err)
 	}
+	canonical = jsonscan.NormalizeReplacementEscapes(canonical)
 
 	// Re-read original to get the signature back.
 	var withSig VerifyReport
@@ -1177,5 +1179,101 @@ func TestPrintVerifyTable_WithFailures(t *testing.T) {
 	}
 	if !strings.Contains(out, "Containment: exposed") {
 		t.Errorf("expected 'Containment: exposed' in output:\n%s", out)
+	}
+}
+
+// TestSignVerifyReport_InvalidUTF8DetailVerifiesAfterParse covers a check
+// detail holding invalid UTF-8, for example an error string built from
+// system output. A verifier rebuilds the signed bytes from the parsed report,
+// so the signature must cover the form that parse produces.
+func TestSignVerifyReport_InvalidUTF8DetailVerifiesAfterParse(t *testing.T) {
+	pub, priv, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("generating signing key: %v", err)
+	}
+	report := VerifyReport{Checks: []VerifyReportCheck{{
+		Name:     "no_direct_http",
+		Category: verifyCatContainment,
+		Status:   verifyStatusUnknown,
+		Detail:   "dial failed: " + string([]byte{0xff}),
+	}}}
+	keyPath := filepath.Join(t.TempDir(), "verify.key")
+	if err := signing.SavePrivateKey(priv, keyPath); err != nil {
+		t.Fatalf("saving signing key: %v", err)
+	}
+	if err := signVerifyReport(&report, keyPath); err != nil {
+		t.Fatalf("signing report: %v", err)
+	}
+	encoded, err := json.Marshal(report)
+	if err != nil {
+		t.Fatalf("marshalling signed report: %v", err)
+	}
+	var decoded VerifyReport
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshalling signed report: %v", err)
+	}
+	sig, err := base64.StdEncoding.DecodeString(decoded.Signature)
+	if err != nil {
+		t.Fatalf("decoding signature: %v", err)
+	}
+	decoded.Signature = ""
+	canonical, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatalf("canonical marshal: %v", err)
+	}
+	if !ed25519.Verify(pub, canonical, sig) {
+		t.Fatal("signature does not verify over the parsed report")
+	}
+}
+
+func TestVerifyReportConfigAndScopeParity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "policy with spaces.yaml")
+	report := BuildVerifyReport(&VerifyEnv{RunCtx: "host"}, nil, path)
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded VerifyReport
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	printVerifyTable(&out, report, false)
+	if decoded.ConfigFile != path || !strings.Contains(out.String(), fmt.Sprintf("Config: %q", decoded.ConfigFile)) {
+		t.Fatalf("config provenance mismatch: %s", &out)
+	}
+	if !strings.Contains(decoded.Scope, "does not verify real client routing") || !strings.Contains(out.String(), decoded.Scope) {
+		t.Fatalf("synthetic scope mismatch: %s", &out)
+	}
+	if strings.Contains(VerifyInstallCmd().Short, "protecting this agent") {
+		t.Fatal("short help claims current-agent protection")
+	}
+}
+
+func TestVerifyReportQuotesConfigPath(t *testing.T) {
+	for _, tc := range []struct{ name, path, want string }{
+		{"spaces", "policy name.yaml", `Config: "policy name.yaml"`},
+		{"quotes", `policy "name".yaml`, `Config: "policy \"name\".yaml"`},
+		{"newline", "policy\nname.yaml", `Config: "policy\nname.yaml"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := BuildVerifyReport(&VerifyEnv{RunCtx: "host"}, nil, tc.path)
+			var out bytes.Buffer
+			printVerifyTable(&out, report, false)
+			if !strings.Contains(out.String(), tc.want+"\nScope:") {
+				t.Fatalf("config path was not quoted on one line: %q", out.String())
+			}
+			data, err := json.Marshal(report)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded VerifyReport
+			if err := json.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			if report.ConfigFile != tc.path || decoded.ConfigFile != tc.path {
+				t.Fatalf("report config path changed: %q, JSON %q", report.ConfigFile, decoded.ConfigFile)
+			}
+		})
 	}
 }

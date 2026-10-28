@@ -4,18 +4,16 @@ Thanks for your interest in making AI agents more secure.
 
 ## Prerequisites
 
-- Go 1.25+ (`go version`)
+- Go 1.26+ (`go version`)
 - [golangci-lint](https://golangci-lint.run/welcome/install/) v2
 - [gofumpt](https://github.com/mvdan/gofumpt) (`go install mvdan.cc/gofumpt@latest`)
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/luckyPipewrench/pipelock.git
+git clone https://github.com/pipelab-org/pipelock.git
 cd pipelock
 make build
-make test
-make lint
 ```
 
 ## Development Workflow
@@ -34,17 +32,30 @@ Branch naming:
 
 ### Pre-Commit Checklist
 
-Run both before opening a pull request. They cover the core local Go checks; CI also runs platform, build, dependency, workflow, and security jobs.
+Before committing, run targeted tests with `-race` for changed packages and affected consumers in both build modes, plus lint for new issues. For example, for a change confined to `internal/gitprotect`:
 
 ```bash
-golangci-lint run ./...          # Full lint (19 linters, see .golangci.yml)
-go test -race -count=1 ./...     # All tests with race detector
+go test -race -count=1 ./internal/gitprotect
+go test -race -count=1 -tags enterprise ./internal/gitprotect
+golangci-lint run --new-from-rev=HEAD ./...
+golangci-lint run --build-tags enterprise --new-from-rev=HEAD ./...
+```
+
+Choose the packages for your change; the example isn't a fixed test list. For workflow, script, or documentation changes, run the relevant policy checks instead of unrelated Go tests. Required CI checks must pass before merge. CI owns the full OSS and enterprise race suites on pushes to `main` and before releases; CI-policy pull requests also run the Go 1.27 race suites before merge.
+
+Full-repository checks are optional locally:
+
+```bash
+make test
+make test-sharded-enterprise
+golangci-lint run ./...
+golangci-lint run --build-tags enterprise ./...
 ```
 
 ## Pull Requests
 
 1. Fill in a clear description of what changed and why
-2. CI requires eight GitHub Actions contexts: **security-scan**, **test (1.25)**, **test (1.26)**, **test-macos**, **lint**, **build**, **govulncheck**, and **codeql**. The advisory **Pipelock CI Summary** rolls them up for readability but isn't a required context. On an ordinary pull request, **test (1.26)** exists as a required check but its Go 1.26 test matrix is skipped and reports success rather than run again; a PR that itself touches `.github/workflows/**`, `go.mod`, `go.sum`, or the guard that checks them runs the full matrix anyway. The full matrix always runs on both Go 1.25 and 1.26 on push to `main`, and both versions are proven again, pinned, in the release workflow before a tag.
+2. CI requires eight GitHub Actions contexts: **security-scan**, **test (1.26)**, **test (1.27)**, **test-macos**, **lint**, **build**, **govulncheck**, and **codeql**. The advisory **Pipelock CI Summary** rolls them up for readability but isn't a required context. On a pull request, **test (1.26)** runs every test package without the race detector under both the OSS and enterprise build tags. A package whose code and test inputs match main's last saved run reports Go's cached result instead of running again. The race detector suite runs after merge, on every push to `main`, as **race (1.26)**, and again in the release workflow before a tag. **test (1.27)** runs the replay harness on every pull request, and its race matrix only when the PR touches `.github/workflows/**`, `go.mod`, `go.sum`, or the guard that checks them; the release workflow proves both Go versions, pinned, before a tag. A pull request that changes only Markdown that no Go code can reach skips the Go build, test, lint, and platform jobs; GitHub counts those skipped required checks as passing, and `main` runs everything after merge.
 3. Address reviewer feedback and bot comments. Automated AI review (e.g. CodeRabbit) is **advisory only** — maintainers make all security decisions, and a bot's passing status or summary does not by itself mean a change was security-reviewed.
 4. PRs are squash-merged
 
@@ -76,7 +87,7 @@ approval.
 
 ### Requirements
 
-- All tests run with `-race -count=1`
+- Local race tests use `-race -count=1`; pull-request CI uses the fast suite, while main and release CI run the race suites.
 - Target **95%+ coverage** on new code (`make test-cover` for local report)
 - Table-driven tests where there are 3+ cases
 
@@ -86,7 +97,7 @@ Disable SSRF in unit tests to avoid DNS lookups:
 
 ```go
 cfg := config.Defaults()
-cfg.Internal = nil // disables SSRF checks
+cfg.Internal = nil // disables configured DNS SSRF checks; the literal-IP core floor stays active
 ```
 
 CLI tests capture output via `SetOut`, never `os.Pipe`:
@@ -124,8 +135,7 @@ See [docs/benchmarks.md](docs/benchmarks.md) for methodology and results.
 
 A small amount of Python lives in the repo: the cross-implementation
 verifier fixture at `testdata/python_verifier_fixture/` and the
-PR review action's runtime deps at
-`.github/actions/pr-review/requirements.txt`.
+script-test dependency at `.github/requirements-scripts-test.txt`.
 
 **Rule: Generated Python lockfiles (`requirements*.txt`) in this repo
 MUST be `==`-pinned with `--hash` lines.** `requirements*.in` is the
@@ -142,7 +152,7 @@ generated from it must be strict. Loose `>=`, `<=`, `~=`, `>`, `<`, and
    inputs at install time, so a tampered wheel can not silently
    substitute.
 
-The lockfile pattern, modeled on `.github/actions/pr-review/requirements.txt`:
+The lockfile pattern, modeled on `.github/requirements-scripts-test.txt`:
 
 ```text
 package==X.Y.Z \
@@ -191,7 +201,7 @@ internal/
   certgen/             ECDSA P-256 CA + leaf certificate generation, cache
   mcp/                 MCP proxy + bidirectional scanning + tool poisoning + chains
   report/              HTML/JSON audit report generation from JSONL event logs
-  killswitch/          Emergency deny-all (6 sources) + port-isolated API
+  killswitch/          Emergency deny-all (7 sources) + port-isolated API
   emit/                Event emission (webhook + syslog + OTLP sinks)
   metrics/             Prometheus metrics + JSON stats endpoint
   normalize/           Unicode normalization (NFKC, confusables, combining marks)
@@ -201,6 +211,8 @@ internal/
   gitprotect/          Git diff scanning for secrets
   projectscan/         Project directory scanner for audit command
   receipt/             Action receipt signing + hash-chained evidence
+  receiptcontent/      Typed receipt content projections and exact clean-text caching
+  recorder/            Durable append tickets, run history and parallel group lifecycle
   addressprotect/      Blockchain address validation and poisoning detection
   seedprotect/         BIP-39 seed phrase detection (dictionary, checksum)
   shield/              Airlock, browser shield, posture capsule
@@ -247,7 +259,7 @@ Pipelock keeps its direct dependency set intentionally small. Any new dependency
 
 ## Security
 
-- **Vulnerabilities**: Report via [GitHub Security Advisories](https://github.com/luckyPipewrench/pipelock/security/advisories), NOT public issues
+- **Vulnerabilities**: Report via [GitHub Security Advisories](https://github.com/pipelab-org/pipelock/security/advisories), NOT public issues
 - **Don't weaken capability separation:** the proxy must never access agent secrets
 - **Don't bypass fail-closed defaults:** if in doubt, block
 - See [SECURITY.md](SECURITY.md) for the full policy

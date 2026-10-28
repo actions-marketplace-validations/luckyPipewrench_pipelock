@@ -1,9 +1,10 @@
 # Browser Shield production readiness
 
-Browser Shield is a defensive response-rewrite layer. It reduces browser-side
-probes and hidden agent traps in HTML, JavaScript, and SVG returned through
-Pipelock. It is not an anti-bot bypass system, and it does not promise access
-to websites that deliberately deny automation or proxy traffic.
+Browser Shield is a defensive response-sanitization layer for HTML and SVG. It
+removes hidden agent traps and active SVG content from responses returned
+through Pipelock. It doesn't edit existing JavaScript. It isn't an anti-bot
+bypass system, and it doesn't promise access to websites that deliberately deny
+automation or proxy traffic.
 
 Browser Shield is opt-in. `browser_shield.enabled` defaults to `false`; the
 strictness, size, oversize, exempt-domain, and rewrite toggles have safe
@@ -15,9 +16,19 @@ Browser Shield runs after Pipelock has fetched a response and before the agent
 or browser receives the body. It only rewrites content that the local pipeline
 can classify as shieldable:
 
-- HTML and XHTML
-- JavaScript
-- SVG active content
+- HTML and XHTML, excluding existing script elements
+- SVG active content, including complete script elements
+
+JavaScript media types still receive normal response scanning, but Browser
+Shield returns their bytes unchanged. This includes historical JavaScript media
+type aliases.
+
+SVG is the one active image format, so it is delivered only after Shield
+validates the complete body and the rewritten body it will send. A document
+with active content is refused rather than partially cleaned, and SVG is
+refused whenever Shield is disabled, exempt for the host, or cannot see the
+complete body (a partial `206`, an oversized body, or an undecodable
+encoding). See `docs/configuration.md`, "SVG active content hardening".
 
 Binary media, PDFs, JSON, and unknown specific content types bypass the shield.
 This avoids treating large legitimate media responses as shield failures.
@@ -31,8 +42,7 @@ This avoids treating large legitimate media responses as shield failures.
   `scan_head` is the default: it rewrites only the configured prefix and records
   the intervention as partial. `block` fails closed. `warn` returns the body
   unchanged and should stay limited to short diagnostics.
-- Common developer documentation and browser IDE hosts are exempt by default to
-  reduce false positives on large rendered reference pages.
+- Common developer documentation and browser IDE hosts skip Shield rewriting by default to reduce false positives on large rendered reference pages. The exemption does not bypass the full-response policy: forward, TLS-intercepted, and reverse traffic still refuses every `206` and `304`.
 - Signed action receipts include a `shield` summary whenever Browser Shield
   rewrites a response and receipt emission is enabled.
 - Rewritten responses carry `X-Pipelock-Shield-Rewrite`, so a client can tell
@@ -53,11 +63,13 @@ This avoids treating large legitimate media responses as shield failures.
 
 The optional `shield` block in ActionReceipt v1 records:
 
-- pipeline: `html`, `javascript`, or `svg`
+- pipeline: `html`, `javascript`, or `svg`; `javascript` identifies partial
+  coverage records and never means that Browser Shield changed script bytes
 - total rewrite count
 - extension probe rewrites
-- tracking beacon rewrites
-- hidden agent-trap rewrites
+- tracking image and prefetch rewrites, reported through the compatibility
+  field `tracking_beacons`
+- hidden agent-trap and whole SVG script removals
 - fingerprint shim injection
 - SVG active-content rewrite counts
 - body size, scanned size, and whether the rewrite was partial
@@ -89,12 +101,14 @@ boundary and create brittle site-specific behavior.
 
 The defensive scope is narrower:
 
-- remove page-side probes that try to enumerate local browser extensions or
-  automation state
-- remove tracking beacons and prefetch-style telemetry that are not required
-  for rendering agent-visible content
+- remove browser-extension URLs outside scripts and optionally inject an HTML
+  shim that blocks extension-scheme requests
+- remove 1x1 tracking images and prefetch links outside scripts
 - remove hidden prompt traps and concealed instructions
 - record when Pipelock changed content so operators can audit the intervention
+
+The optional fingerprint shim can suppress `sendBeacon` at runtime. Browser
+Shield doesn't rewrite static beacon calls in standalone or inline JavaScript.
 
 ## Explicit non-goals
 

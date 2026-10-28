@@ -26,9 +26,8 @@ import (
 // carries it. The adaptive escalation signal itself is recorded by the caller,
 // which owns the EscalationParams.
 func observeCrossAgentEmit(eval *MCPInputEvaluation, opts MCPProxyOpts, boundary session.CrossAgentBoundary) {
-	if decide.ObserveCrossAgentContamination(opts.Rec, opts.taintCfg(), boundary).ShouldEscalate {
-		eval.CrossAgentEscalate = true
-	}
+	eval.CrossAgentObservation = decide.ObserveCrossAgentContamination(opts.Rec, opts.taintCfg(), boundary)
+	eval.CrossAgentEscalate = eval.CrossAgentObservation.ShouldEscalate
 }
 
 // BlockingGate values identifying which inbound gate short-circuited.
@@ -78,7 +77,8 @@ func frameParseErrFailsClosed(err error) bool {
 	// These parser errors can change the callable identity or params view
 	// between policy and upstream parsers. Treat them as non-configurable
 	// parse-error blocks even when content scanning is disabled.
-	return errors.Is(err, ErrInvalidMethodType) || redact.IsDuplicateKeyBlock(err)
+	var block *redact.BlockError
+	return errors.Is(err, ErrInvalidMethodType) || errors.As(err, &block)
 }
 
 // MCPInputEvaluation aggregates the outputs of the configured inbound
@@ -199,10 +199,11 @@ type MCPInputEvaluation struct {
 	// CrossAgentEscalate is true when a contaminated session emitted across
 	// an agent boundary (A2A request or MCP tools/call) at hostile taint
 	// level, or when contamination state was indeterminate (fail-closed). The
-	// caller records SignalCrossAgentContamination on its adaptive path; the
+	// caller scores only an enforced denial or indeterminate state; the
 	// cross_agent taint source (evidence) is already appended in-gate so the
 	// taint snapshot and any receipt carry it.
-	CrossAgentEscalate bool
+	CrossAgentEscalate    bool
+	CrossAgentObservation decide.CrossAgentResult
 }
 
 func applyMCPAirlockGate(opts MCPProxyOpts, eval *MCPInputEvaluation, method string) bool {

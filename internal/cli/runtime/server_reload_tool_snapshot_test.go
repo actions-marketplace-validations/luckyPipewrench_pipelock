@@ -86,14 +86,18 @@ logging:
 				})
 				ctx, cancel := context.WithCancel(context.Background())
 				errCh := make(chan error, 1)
-				go func() { errCh <- s.Start(ctx) }()
+				go func() {
+					defer close(errCh)
+					errCh <- s.Start(ctx)
+				}()
 				defer func() {
 					cancel()
 					shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), testwait.Deadline(5*time.Second))
 					defer shutdownCancel()
 					_ = s.Shutdown(shutdownCtx)
 					select {
-					case <-errCh:
+					case err := <-errCh:
+						t.Logf("goroutine result: %v", err)
 					case <-shutdownCtx.Done():
 						t.Error("listener did not stop after cancellation")
 					}

@@ -5,6 +5,7 @@ package evidencename
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +64,35 @@ func TestParse(t *testing.T) {
 	}
 }
 
+func TestValidateOperatorSessionID(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		id   string
+		want string
+	}{
+		{"empty", "", "must not be empty"},
+		{"run infix", "proxy.run.fake", "reserved run-session infix"},
+		{"slash", "a/b", "path separator"},
+		{"backslash", `a\b`, "path separator"},
+		{"ordinary", "proxy-session", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := ValidateOperatorSessionID(tc.id)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("valid session rejected: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, ErrReservedSessionID) || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("ValidateOperatorSessionID(%q) = %v, want reserved-session error containing %q", tc.id, err, tc.want)
+			}
+		})
+	}
+}
+
 // Every consumer of the shard-directory contract applies this same rule, so the
 // rule itself needs to be right: two distinct names for one sequence are
 // refused, and everything else passes.
@@ -103,5 +133,39 @@ func TestCheckNoDuplicateSeqStart(t *testing.T) {
 				t.Fatalf("error %v does not wrap ErrAmbiguousSeqStart", err)
 			}
 		})
+	}
+}
+
+func TestValidateOperatorSessionIDRefusesInvalidUTF8(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateOperatorSessionID("agent" + string([]byte{0xff}))
+	if err == nil || !strings.Contains(err.Error(), "not valid UTF-8") {
+		t.Fatalf("ValidateOperatorSessionID error = %v, want non-UTF-8 refusal", err)
+	}
+}
+
+func TestIsRunSession(t *testing.T) {
+	hex32 := strings.Repeat("0123456789abcdef", 2)
+	cases := []struct {
+		id   string
+		want bool
+	}{
+		{"proxy" + RunInfix + hex32, true},
+		{"agent-é" + RunInfix + hex32, true},
+		{"proxy", false},
+		{RunInfix + hex32, false},
+		{"proxy" + RunInfix + hex32[:31], false},
+		{"proxy" + RunInfix + hex32 + "0", false},
+		{"proxy" + RunInfix + strings.ToUpper(hex32), false},
+		{"proxy" + RunInfix + strings.Repeat("g", 32), false},
+		{"proxy" + RunInfix + hex32[:16] + RunInfix + hex32[:16], false},
+		{"a/b" + RunInfix + hex32, false},
+		{"proxy%2Erun%2E" + hex32, false},
+	}
+	for _, tc := range cases {
+		if got := IsRunSession(tc.id); got != tc.want {
+			t.Errorf("IsRunSession(%q) = %v, want %v", tc.id, got, tc.want)
+		}
 	}
 }

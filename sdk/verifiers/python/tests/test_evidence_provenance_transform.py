@@ -15,6 +15,9 @@ import pytest
 from pipelock_aarp_verify.provenance import (
     PROFILE_DIGEST,
     PROFILE_DIGEST_V2,
+    PROFILE_DIGEST_V3,
+    PROFILE_DIGEST_V4,
+    PROFILE_DIGEST_V5,
     UNICODE_VERSION,
     ProvenanceError,
     Recipe,
@@ -29,6 +32,52 @@ CORPUS = (
     / "evidence-provenance-v1.json"
 )
 CORPUS_V2 = CORPUS.with_name("evidence-provenance-v2.json")
+CORPUS_V3 = CORPUS.with_name("evidence-provenance-v3.json")
+CORPUS_V4 = CORPUS.with_name("evidence-provenance-v4.json")
+
+
+def test_v5_html5_full_table_parity() -> None:
+    table = json.loads((CORPUS.parent.parent / "html5/parity-v5.json").read_text())
+    assert table["vectors"]
+    recipe = Recipe.from_json(PROFILE_DIGEST_V5, [{"kind": "html_entity_decode"}])
+    divergences = []
+    for vector in table["vectors"]:
+        got = recipe.apply_bytes(vector["input"].encode()).encode()
+        want = vector["output"].encode()
+        if got != want:
+            divergences.append(
+                [
+                    vector["input"],
+                    base64.b64encode(want).decode(),
+                    base64.b64encode(got).decode(),
+                ]
+            )
+    print("HTML5_DIVERGENCES:" + json.dumps(divergences, separators=(",", ":")))
+    assert not divergences, (
+        f"{len(divergences)} HTML5 divergences across {len(table['vectors'])} cases"
+    )
+    print(f"PASS: {len(table['vectors'])} HTML5 cases, zero divergences")
+
+
+def test_evidence_provenance_transform_v3_corpus() -> None:
+    corpus = json.loads(CORPUS_V3.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V3
+    assert corpus["vectors"], "v3 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True)
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
 
 
 def test_evidence_provenance_uses_profile_pinned_unicode_database() -> None:
@@ -250,3 +299,55 @@ def test_liberal_decode_errors_name_the_operation(
     recipe = Recipe.from_json(PROFILE_DIGEST, [operation])
     with pytest.raises(ProvenanceError, match=label):
         recipe.apply(value)
+
+
+def test_evidence_provenance_transform_v4_corpus() -> None:
+    corpus = json.loads(CORPUS_V4.read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V4
+    assert corpus["vectors"], "v4 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True)
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
+
+
+def test_v4_nested_utf8_charges_intermediate_bytes() -> None:
+    charges: list[int] = []
+    recipe = Recipe.from_json(PROFILE_DIGEST_V4, [{"kind": "query_unescape"}])
+    assert recipe.apply("%C3%25A9", charges.append) == "é"
+    assert charges == [8, 8, 4, 2]
+
+
+def test_evidence_provenance_transform_v5_corpus() -> None:
+    corpus = json.loads(CORPUS.with_name("evidence-provenance-v5.json").read_text())
+    assert corpus["profile_digest"] == PROFILE_DIGEST_V5
+    assert corpus["vectors"], "v5 corpus has no vectors"
+    for vector in corpus["vectors"]:
+        recipe = Recipe.from_json(
+            vector.get("transform_profile_digest", corpus["profile_digest"]),
+            vector.get("recipe", []),
+        )
+        if vector.get("want_error"):
+            with pytest.raises(ProvenanceError) as excinfo:
+                recipe.apply_bytes(base64.b64decode(vector["input_b64"], validate=True))
+            assert vector["want_error"] in str(excinfo.value), vector["id"]
+        else:
+            charges: list[int] = []
+            assert recipe.apply_bytes(
+                base64.b64decode(vector["input_b64"], validate=True), charges.append
+            ).encode() == base64.b64decode(vector["output_b64"], validate=True), vector[
+                "id"
+            ]
+            if "processed_bytes" in vector:
+                assert sum(charges) == vector["processed_bytes"], vector["id"]

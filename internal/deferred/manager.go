@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/directorysync"
 )
 
 const (
@@ -49,6 +50,20 @@ const (
 	DefaultMaxPendingBytes        = 1024 * 1024
 	DefaultMaxCascadeDepth        = DefaultMaxPendingSession
 )
+
+// SourceUpstreamContract records a deferred release that the live upstream
+// contract gate denied at the irreversible send boundary.
+const SourceUpstreamContract = "upstream_contract"
+
+// ReasonReceiptNotWritten is the resolution reason for an allow that was closed
+// because its required receipt could not be written.
+const ReasonReceiptNotWritten = "required receipt could not be written"
+
+// ReasonReleaseNotJournaled is the resolution reason for an allow that was
+// closed because the journal could not record the release as final after the
+// allow receipt was written. The call is not sent: restart recovery would close
+// the still-pending release to block, so sending it would contradict that.
+const ReasonReleaseNotJournaled = "release could not be journaled"
 
 // Config controls held-action bounds and timers.
 type Config struct {
@@ -128,6 +143,8 @@ type AuthoritySnapshot struct {
 type HeldAction struct {
 	DeferID       string
 	ActionID      string
+	ShardIndex    int
+	ShardSelected bool
 	Target        string
 	Reason        string
 	Surface       string
@@ -143,15 +160,37 @@ type HeldAction struct {
 	Payload       []byte
 	ArgDigest     string
 	Resolve       func(Resolution)
-	timer         *time.Timer
-	state         string
-	createdAt     time.Time
+	BeforeAllow   func() (release func(), ok bool)
+	// Prepare, when set, runs after BeforeAllow and before the terminal
+	// journal entry. It may downgrade the resolution (for example when a
+	// release-boundary check cancels an allow) so the journal records the
+	// outcome that actually happens. The returned finish func runs, via
+	// defer, after Resolve returns or panics.
+	Prepare func(Resolution) (Resolution, func())
+	// AfterJournal, when set, normally runs for an allow, after the journal has
+	// recorded the release as pending and before it records the allow as final.
+	// It is where evidence that must not exist for a call that is never sent
+	// (the allow resolution receipt) belongs: Prepare runs ahead of the journal
+	// write and cannot know it will succeed. Because the journal still shows
+	// the release as pending while this runs, a process that dies here leaves a
+	// hold that restart recovery closes to block with its own receipt. A
+	// non-nil error closes the allow. Whenever a release closes to block, it
+	// is called again with the block resolution before the terminal journal
+	// entry, so that block's receipt is written first. Prepare's
+	// finish func is still pending, so the release claim and sink lock cover
+	// this call.
+	AfterJournal func(Resolution) error
+	timer        *time.Timer
+	state        string
+	createdAt    time.Time
 }
 
 // Resolution is delivered exactly once for a held action.
 type Resolution struct {
 	DeferID          string
 	ParentActionID   string
+	ShardIndex       int
+	ShardSelected    bool
 	FinalDecision    string
 	ResolutionSource string
 	Authority        AuthoritySnapshot
@@ -174,6 +213,16 @@ type Manager struct {
 	sessionHolds   map[string][]string
 	totalBytes     int
 	pendingJournal map[string]journalEntry
+	// fileSync replaces File.Sync for journal writes in tests; nil uses it.
+	fileSync func(*os.File) error
+	// dirSync replaces directorysync.Sync in tests; nil uses it.
+	dirSync func(string) error
+	// journalDirSynced records that this manager has synced the journal's
+	// directory since it started. It is set only after a sync succeeds, so a
+	// failed attempt is retried on the next write, and it starts false so a
+	// file created by an earlier process that died before its directory sync
+	// is covered too. Guarded by journalMu.
+	journalDirSynced bool
 }
 
 var (
@@ -364,8 +413,18 @@ func (m *Manager) journalRejectedHold(action HeldAction, source string) {
 
 // Resolve atomically transitions a held action and invokes its callback once.
 func (m *Manager) Resolve(deferID, finalDecision, source string) error {
+	_, err := m.resolveApplied(deferID, finalDecision, source)
+	return err
+}
+
+// resolveApplied is Resolve that also reports the terminal decision actually
+// applied. The requested decision is only a request: the release-time
+// kill-switch precheck, a Prepare hook (upstream contract gate, send claim) and
+// a journal failure can each close an allow, and callers that surface the
+// outcome to an operator must report that one, not the request.
+func (m *Manager) resolveApplied(deferID, finalDecision, source string) (string, error) {
 	if m == nil {
-		return ErrDisabled
+		return "", ErrDisabled
 	}
 	if finalDecision == "" {
 		finalDecision = "block"
@@ -378,7 +437,7 @@ func (m *Manager) Resolve(deferID, finalDecision, source string) error {
 	held := m.holds[deferID]
 	if held == nil || held.state != StateHeld {
 		m.mu.Unlock()
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	held.state = StateResolving
 	delete(m.holds, deferID)
@@ -388,20 +447,21 @@ func (m *Manager) Resolve(deferID, finalDecision, source string) error {
 		held.timer.Stop()
 	}
 	m.mu.Unlock()
+	if finalDecision == config.ActionAllow && held.BeforeAllow != nil {
+		release, ok := held.BeforeAllow()
+		if !ok || release == nil {
+			finalDecision = config.ActionBlock
+			source = SourceKillSwitch
+		} else {
+			defer release()
+		}
+	}
 
-	state := resolvedState(finalDecision)
-	if err := m.appendJournal(journalEntryFromHeld(*held, state, source)); err != nil {
-		finalDecision = "block"
-		source = SourceCancel
-		state = resolvedState(finalDecision)
-		_ = m.appendJournal(journalEntryFromHeld(*held, state, source))
-	}
-	if finalDecision != config.ActionAllow && source != SourceCascade {
-		m.cascadeBlockDescendants([]string{held.DeferID})
-	}
-	held.Resolve(Resolution{
+	res := Resolution{
 		DeferID:          held.DeferID,
 		ParentActionID:   held.ActionID,
+		ShardIndex:       held.ShardIndex,
+		ShardSelected:    held.ShardSelected,
 		FinalDecision:    finalDecision,
 		ResolutionSource: source,
 		Authority:        held.Authority,
@@ -412,8 +472,87 @@ func (m *Manager) Resolve(deferID, finalDecision, source string) error {
 		Target:           held.Target,
 		Method:           held.Method,
 		Reason:           held.Reason,
-	})
-	return nil
+	}
+	if held.Prepare != nil {
+		prepared, finish := held.Prepare(res)
+		if finish != nil {
+			defer finish()
+		}
+		// Prepare may only keep or close the decision; it can never open one.
+		if prepared.FinalDecision == config.ActionAllow && res.FinalDecision != config.ActionAllow {
+			prepared.FinalDecision = config.ActionBlock
+		}
+		res = prepared
+	}
+
+	if res.FinalDecision == config.ActionAllow {
+		res = m.journalRelease(held, res)
+	} else if err := m.appendJournal(journalEntryFromHeld(*held, resolvedState(res.FinalDecision), res.ResolutionSource)); err != nil {
+		res.FinalDecision = config.ActionBlock
+		res.ResolutionSource = SourceCancel
+		_ = m.appendJournal(journalEntryFromHeld(*held, resolvedState(res.FinalDecision), res.ResolutionSource))
+	}
+	if res.FinalDecision != config.ActionAllow && res.ResolutionSource != SourceCascade {
+		m.cascadeBlockDescendants([]string{held.DeferID})
+	}
+	held.Resolve(res)
+	return res.FinalDecision, nil
+}
+
+// journalRelease records an allow in three durable steps so that no point in
+// it can leave a hold without a resolution receipt:
+//
+//  1. a release-pending entry, which keeps the hold pending for recovery;
+//  2. AfterJournal, which writes the allow resolution receipt;
+//  3. the terminal resolved_allow entry.
+//
+// The call is sent only after step 3, from Resolve. A process that dies after
+// step 1 leaves a pending hold that restart recovery closes to block with its
+// own receipt, and the payload was never journaled, so it cannot be re-sent.
+// Any step that fails closes the allow to block. The block's own receipt is
+// written through AfterJournal before its terminal entry, so a process that
+// dies in between leaves a pending hold, never a closed hold with no block
+// receipt. If that corrective receipt fails, no terminal entry is written at
+// all and the hold stays pending, so restart recovery closes it with its own
+// receipt. A failed allow write can still have reached the file (a write whose
+// sync reports failure), and a terminal entry without its receipt would leave
+// a closed hold whose evidence nothing will revisit. A recorder that keeps
+// failing therefore surfaces at the next start, when recovery cannot write its
+// receipts, instead of as a hold closed with missing or contradicting evidence.
+func (m *Manager) journalRelease(held *HeldAction, res Resolution) Resolution {
+	closeAllow := func(reason string) {
+		res.FinalDecision = config.ActionBlock
+		res.ResolutionSource = SourceCancel
+		res.Reason = reason
+		// Resolve writes the final receipt, but only after the journal. Write
+		// it here first so the terminal entry never precedes its receipt;
+		// Resolve then reuses it.
+		if held.AfterJournal != nil {
+			if err := held.AfterJournal(res); err != nil {
+				m.warnf("pipelock: warning event=deferred_resolution_receipt_failed audit_gap=true source=%s defer_id=%s: %v\n",
+					res.ResolutionSource, held.DeferID, err)
+				return
+			}
+		}
+		if err := m.appendJournal(journalEntryFromHeld(*held, StateResolvedBlock, res.ResolutionSource)); err != nil {
+			m.warnf("pipelock: warning event=deferred_journal_write_failed audit_gap=true source=%s defer_id=%s: %v\n",
+				res.ResolutionSource, held.DeferID, err)
+		}
+	}
+	if err := m.appendJournal(releasePendingEntry(*held, res.ResolutionSource)); err != nil {
+		closeAllow(res.Reason)
+		return res
+	}
+	if held.AfterJournal != nil {
+		if err := held.AfterJournal(res); err != nil {
+			closeAllow(ReasonReceiptNotWritten)
+			return res
+		}
+	}
+	if err := m.appendJournal(journalEntryFromHeld(*held, StateResolvedAllow, res.ResolutionSource)); err != nil {
+		closeAllow(ReasonReleaseNotJournaled)
+	}
+	return res
 }
 
 // ResolveAll resolves every currently held action with the same final decision.
@@ -464,6 +603,16 @@ func (m *Manager) Snapshot() []HeldAction {
 	return out
 }
 
+// HeldCount reports how many actions are currently held, without copying them.
+func (m *Manager) HeldCount() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.holds)
+}
+
 func (m *Manager) Held(deferID string) (HeldAction, bool) {
 	held, err := m.snapshotOne(deferID)
 	if err != nil {
@@ -510,10 +659,9 @@ func (m *Manager) ResolveApprovalResult(deferID, finalDecision, source string) (
 		return "", err
 	}
 	decision := approvalDecision(held.RulePolicy, finalDecision)
-	if err := m.Resolve(deferID, decision, source); err != nil {
-		return "", err
-	}
-	return decision, nil
+	// Report what was applied, not what was asked: a kill switch that activated
+	// before release, or a release gate that refused, closes an approved hold.
+	return m.resolveApplied(deferID, decision, source)
 }
 
 // approvalDecision maps an approval input onto the terminal decision, enforcing
@@ -634,29 +782,39 @@ func resolvedState(finalDecision string) string {
 }
 
 type journalEntry struct {
-	DeferID       string                       `json:"defer_id"`
-	ActionID      string                       `json:"action_id"`
-	State         string                       `json:"state"`
-	Source        string                       `json:"source,omitempty"`
-	Target        string                       `json:"target,omitempty"`
-	Surface       string                       `json:"surface,omitempty"`
-	Method        string                       `json:"method,omitempty"`
-	Reason        string                       `json:"reason,omitempty"`
-	Authority     AuthoritySnapshot            `json:"authority"`
-	Policy        ResolutionPolicy             `json:"policy"`
-	RulePolicy    config.DeferResolutionPolicy `json:"rule_policy"`
-	ParentDeferID string                       `json:"parent_defer_id,omitempty"`
-	CascadeDepth  int                          `json:"cascade_depth,omitempty"`
-	Linkage       string                       `json:"linkage,omitempty"`
-	Deadline      time.Time                    `json:"deadline,omitempty"`
-	Timestamp     time.Time                    `json:"timestamp"`
-	SizeBytes     int                          `json:"size_bytes,omitempty"`
+	DeferID       string `json:"defer_id"`
+	ActionID      string `json:"action_id"`
+	ShardIndex    int    `json:"shard_index,omitempty"`
+	ShardSelected bool   `json:"shard_selected,omitempty"`
+	State         string `json:"state"`
+	// ReleasePending marks a deferred_held entry written when an allow began
+	// releasing the hold. It is a flag on the held state rather than a state
+	// of its own so that a binary that predates it, whose journal reader
+	// rejects unknown states, still reads the hold as pending and recovers it
+	// to block. Only deferred_held entries may carry it.
+	ReleasePending bool                         `json:"release_pending,omitempty"`
+	Source         string                       `json:"source,omitempty"`
+	Target         string                       `json:"target,omitempty"`
+	Surface        string                       `json:"surface,omitempty"`
+	Method         string                       `json:"method,omitempty"`
+	Reason         string                       `json:"reason,omitempty"`
+	Authority      AuthoritySnapshot            `json:"authority"`
+	Policy         ResolutionPolicy             `json:"policy"`
+	RulePolicy     config.DeferResolutionPolicy `json:"rule_policy"`
+	ParentDeferID  string                       `json:"parent_defer_id,omitempty"`
+	CascadeDepth   int                          `json:"cascade_depth,omitempty"`
+	Linkage        string                       `json:"linkage,omitempty"`
+	Deadline       time.Time                    `json:"deadline,omitempty"`
+	Timestamp      time.Time                    `json:"timestamp"`
+	SizeBytes      int                          `json:"size_bytes,omitempty"`
 }
 
 func journalEntryFromHeld(held HeldAction, state, source string) journalEntry {
 	return journalEntry{
 		DeferID:       held.DeferID,
 		ActionID:      held.ActionID,
+		ShardIndex:    held.ShardIndex,
+		ShardSelected: held.ShardSelected,
 		State:         state,
 		Source:        source,
 		Target:        held.Target,
@@ -675,6 +833,18 @@ func journalEntryFromHeld(held HeldAction, state, source string) journalEntry {
 	}
 }
 
+// releasePendingEntry is the journal entry for a hold whose allow has begun
+// releasing but is not yet final. See journalEntry.ReleasePending.
+func releasePendingEntry(held HeldAction, source string) journalEntry {
+	entry := journalEntryFromHeld(held, StateHeld, source)
+	entry.ReleasePending = true
+	return entry
+}
+
+// appendJournal writes one entry and returns only after it is on stable
+// storage. Recovery trusts the journal's ordering against the receipt chain,
+// whose own writes for these resolutions are fsync-confirmed, so an entry
+// still in the page cache could be lost while a later receipt survives.
 func (m *Manager) appendJournal(entry journalEntry) error {
 	if m == nil || m.cfg.JournalPath == "" {
 		return nil
@@ -684,7 +854,8 @@ func (m *Manager) appendJournal(entry journalEntry) error {
 
 	write := func() error {
 		path := filepath.Clean(m.cfg.JournalPath)
-		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		dir := filepath.Dir(path)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
 			return err
 		}
 		f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
@@ -699,12 +870,37 @@ func (m *Manager) appendJournal(entry journalEntry) error {
 		if _, err := f.Write(append(data, '\n')); err != nil {
 			return err
 		}
+		if err := m.syncFile(f); err != nil {
+			return fmt.Errorf("sync defer journal: %w", err)
+		}
+		if !m.journalDirSynced {
+			if err := m.syncDir(dir); err != nil {
+				return fmt.Errorf("sync defer journal directory: %w", err)
+			}
+			m.journalDirSynced = true
+		}
 		return nil
 	}
 	if m.cfg.JournalWriteGuard != nil {
 		return m.cfg.JournalWriteGuard(write)
 	}
 	return write()
+}
+
+// syncDir makes the journal's directory entry durable.
+func (m *Manager) syncDir(dir string) error {
+	if m.dirSync != nil {
+		return m.dirSync(dir)
+	}
+	return directorysync.Sync(dir)
+}
+
+// syncFile makes a journal write durable.
+func (m *Manager) syncFile(f *os.File) error {
+	if m.fileSync != nil {
+		return m.fileSync(f)
+	}
+	return f.Sync()
 }
 
 // PendingJournal returns held actions from a prior process that lack a terminal
@@ -730,11 +926,20 @@ func PendingJournal(path string) ([]HeldAction, error) {
 		if err := json.Unmarshal(scanner.Bytes(), &entry); err != nil {
 			return nil, fmt.Errorf("parse defer journal: %w", err)
 		}
+		if entry.ReleasePending && entry.State != StateHeld {
+			return nil, fmt.Errorf("defer journal integrity: release_pending on state %q for defer_id %q", entry.State, entry.DeferID)
+		}
 		switch entry.State {
 		case StateHeld:
 			if _, seen := terminal[entry.DeferID]; seen {
 				return nil, fmt.Errorf("defer journal integrity: held entry after terminal state for defer_id %q", entry.DeferID)
 			}
+			if _, seen := pending[entry.DeferID]; entry.ReleasePending && !seen {
+				return nil, fmt.Errorf("defer journal integrity: release_pending without a prior hold for defer_id %q", entry.DeferID)
+			}
+			// A release-pending entry stays pending: its allow never reached
+			// the journal as final, so the call was not sent and recovery
+			// closes it to block.
 			pending[entry.DeferID] = entry
 		case StateResolvedAllow, StateResolvedBlock, StateResolvedStepUp:
 			delete(pending, entry.DeferID)
@@ -756,6 +961,8 @@ func PendingJournal(path string) ([]HeldAction, error) {
 		out = append(out, HeldAction{
 			DeferID:       entry.DeferID,
 			ActionID:      entry.ActionID,
+			ShardIndex:    entry.ShardIndex,
+			ShardSelected: entry.ShardSelected,
 			Target:        entry.Target,
 			Reason:        entry.Reason,
 			Surface:       entry.Surface,

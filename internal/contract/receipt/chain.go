@@ -10,11 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
+	"io"
 	"path/filepath"
-	"sort"
 
-	"github.com/luckyPipewrench/pipelock/internal/contract"
 	"github.com/luckyPipewrench/pipelock/internal/evidencename"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
@@ -150,90 +148,136 @@ func brokenChain(seq uint64, format string, args ...any) ChainResult {
 // of the prior receipt), and — when ChainVerifyOptions.PinnedKey is set —
 // the Ed25519 signature against the pinned key.
 func VerifyChain(receipts []EvidenceReceipt, opts ChainVerifyOptions) ChainResult {
-	if len(receipts) == 0 {
+	walk := NewChainWalker(opts)
+	for _, r := range receipts {
+		if !walk.Add(r) {
+			break
+		}
+	}
+	return walk.Result()
+}
+
+// ChainWalker is VerifyChain applied one receipt at a time. It keeps the
+// previous receipt's hash and the chain signer, never the receipts, and
+// Result returns exactly what VerifyChain returns for the receipts added so
+// far. Once a receipt breaks the chain the walker stays broken.
+type ChainWalker struct {
+	opts              ChainVerifyOptions
+	pinnedSignerKeyID string
+	signerID          string
+	prevHash          string
+	tipHash           string
+	count             uint64
+	finalSeq          uint64
+	fail              *ChainResult
+}
+
+// NewChainWalker starts an empty chain under opts.
+func NewChainWalker(opts ChainVerifyOptions) *ChainWalker {
+	return &ChainWalker{opts: opts, pinnedSignerKeyID: SignerKeyID(opts.PinnedKey), prevHash: GenesisHash}
+}
+
+// Add checks the next receipt. It returns false once the chain is broken.
+func (w *ChainWalker) Add(r EvidenceReceipt) bool {
+	if w.fail != nil {
+		return false
+	}
+	if res, ok := w.add(r); !ok {
+		w.fail = &res
+		return false
+	}
+	return true
+}
+
+func (w *ChainWalker) add(r EvidenceReceipt) (ChainResult, bool) {
+	opts := w.opts
+	seq := w.count
+	if seq == 0 {
+		w.signerID = r.Signature.SignerKeyID
+	}
+
+	// Structural validity. VerifyWithKey re-runs Validate internally,
+	// so when a key is pinned the explicit call is folded into the
+	// signature check below to avoid double validation.
+	if opts.PinnedKey == nil {
+		if err := r.Validate(); err != nil {
+			return brokenChain(seq, "receipt %d invalid: %v", seq, err), false
+		}
+	}
+
+	if opts.ExpectSignerKeyID != "" && r.Signature.SignerKeyID != opts.ExpectSignerKeyID {
+		return brokenChain(seq, "receipt %d signer_key_id %q does not match pinned %q",
+			seq, r.Signature.SignerKeyID, opts.ExpectSignerKeyID), false
+	}
+	if opts.ExpectPayloadKind != "" && r.PayloadKind != opts.ExpectPayloadKind {
+		return brokenChain(seq, "receipt %d payload_kind %q does not match expected %q",
+			seq, r.PayloadKind, opts.ExpectPayloadKind), false
+	}
+	if opts.ExpectContractHash != "" && r.ContractHash != opts.ExpectContractHash {
+		return brokenChain(seq, "receipt %d contract_hash does not match expected", seq), false
+	}
+	if opts.ExpectManifestHash != "" && r.ActiveManifestHash != opts.ExpectManifestHash {
+		return brokenChain(seq, "receipt %d active_manifest_hash does not match expected", seq), false
+	}
+
+	// Signer consistency: a forged chain that splices receipts from a
+	// different signer is rejected even without a pinned key.
+	if r.Signature.SignerKeyID != w.signerID {
+		return brokenChain(seq, "receipt %d signer_key_id %q breaks chain signer %q",
+			seq, r.Signature.SignerKeyID, w.signerID), false
+	}
+
+	if r.ChainSeq != seq {
+		return brokenChain(seq, "receipt %d declares chain_seq %d", seq, r.ChainSeq), false
+	}
+	if r.ChainPrevHash != w.prevHash {
+		return brokenChain(seq, "receipt %d chain_prev_hash mismatch", seq), false
+	}
+
+	if opts.PinnedKey != nil {
+		if err := VerifyWithKey(r, opts.PinnedKey, w.pinnedSignerKeyID); err != nil {
+			return brokenChain(seq, "receipt %d signature: %v", seq, err), false
+		}
+	}
+
+	h, err := ReceiptHash(r)
+	if err != nil {
+		return brokenChain(seq, "receipt %d hash: %v", seq, err), false
+	}
+	w.prevHash = h
+	w.tipHash = h
+	w.finalSeq = r.ChainSeq
+	w.count++
+	return ChainResult{}, true
+}
+
+// Result returns VerifyChain's result for the receipts added so far.
+func (w *ChainWalker) Result() ChainResult {
+	if w.fail != nil {
+		return *w.fail
+	}
+	if w.count == 0 {
 		return ChainResult{Valid: false, Error: "empty chain"}
 	}
-
-	signerID := receipts[0].Signature.SignerKeyID
-	pinnedSignerKeyID := SignerKeyID(opts.PinnedKey)
-	prevHash := GenesisHash
-	var tipHash string
-
-	for i, r := range receipts {
-		seq := uint64(i)
-
-		// Structural validity. VerifyWithKey re-runs Validate internally,
-		// so when a key is pinned the explicit call is folded into the
-		// signature check below to avoid double validation.
-		if opts.PinnedKey == nil {
-			if err := r.Validate(); err != nil {
-				return brokenChain(seq, "receipt %d invalid: %v", seq, err)
-			}
-		}
-
-		if opts.ExpectSignerKeyID != "" && r.Signature.SignerKeyID != opts.ExpectSignerKeyID {
-			return brokenChain(seq, "receipt %d signer_key_id %q does not match pinned %q",
-				seq, r.Signature.SignerKeyID, opts.ExpectSignerKeyID)
-		}
-		if opts.ExpectPayloadKind != "" && r.PayloadKind != opts.ExpectPayloadKind {
-			return brokenChain(seq, "receipt %d payload_kind %q does not match expected %q",
-				seq, r.PayloadKind, opts.ExpectPayloadKind)
-		}
-		if opts.ExpectContractHash != "" && r.ContractHash != opts.ExpectContractHash {
-			return brokenChain(seq, "receipt %d contract_hash does not match expected", seq)
-		}
-		if opts.ExpectManifestHash != "" && r.ActiveManifestHash != opts.ExpectManifestHash {
-			return brokenChain(seq, "receipt %d active_manifest_hash does not match expected", seq)
-		}
-
-		// Signer consistency: a forged chain that splices receipts from a
-		// different signer is rejected even without a pinned key.
-		if r.Signature.SignerKeyID != signerID {
-			return brokenChain(seq, "receipt %d signer_key_id %q breaks chain signer %q",
-				seq, r.Signature.SignerKeyID, signerID)
-		}
-
-		if r.ChainSeq != seq {
-			return brokenChain(seq, "receipt %d declares chain_seq %d", seq, r.ChainSeq)
-		}
-		if r.ChainPrevHash != prevHash {
-			return brokenChain(seq, "receipt %d chain_prev_hash mismatch", seq)
-		}
-
-		if opts.PinnedKey != nil {
-			if err := VerifyWithKey(r, opts.PinnedKey, pinnedSignerKeyID); err != nil {
-				return brokenChain(seq, "receipt %d signature: %v", seq, err)
-			}
-		}
-
-		h, err := ReceiptHash(r)
-		if err != nil {
-			return brokenChain(seq, "receipt %d hash: %v", seq, err)
-		}
-		prevHash = h
-		tipHash = h
-	}
-
-	finalSeq := receipts[len(receipts)-1].ChainSeq
 
 	// Completeness, and the only check here that a valid prefix cannot pass.
 	// Deliberately last: a chain that is internally broken should report the
 	// broken link at its sequence rather than a head mismatch, which is the
 	// downstream symptom rather than the cause.
-	if opts.ExpectHeadHash != "" && tipHash != opts.ExpectHeadHash {
-		return brokenChain(finalSeq,
+	if w.opts.ExpectHeadHash != "" && w.tipHash != w.opts.ExpectHeadHash {
+		return brokenChain(w.finalSeq,
 			"chain head %s does not match expected %s: the chain is truncated, forked, or from a different session",
-			tipHash, opts.ExpectHeadHash)
+			w.tipHash, w.opts.ExpectHeadHash)
 	}
 
 	return ChainResult{
 		Valid:              true,
-		ReceiptCount:       uint64(len(receipts)),
-		FinalSeq:           finalSeq,
-		RootHash:           tipHash,
-		SignaturesVerified: opts.PinnedKey != nil,
-		HeadVerified:       opts.ExpectHeadHash != "",
-		SignerKeyID:        signerID,
+		ReceiptCount:       w.count,
+		FinalSeq:           w.finalSeq,
+		RootHash:           w.tipHash,
+		SignaturesVerified: w.opts.PinnedKey != nil,
+		HeadVerified:       w.opts.ExpectHeadHash != "",
+		SignerKeyID:        w.signerID,
 	}
 }
 
@@ -262,11 +306,11 @@ func (v *StreamingVerifier) AddRaw(raw []byte) error {
 	if v.fail != nil {
 		return fmt.Errorf("%s", v.fail.Error)
 	}
-	var r EvidenceReceipt
 	if err := jsonscan.RejectDuplicateKeys(raw); err != nil {
 		return v.latch(brokenChain(v.count, "receipt %d duplicate keys: %v", v.count, err))
 	}
-	if err := contract.DecodeStrictJSON(raw, &r); err != nil {
+	r, err := ParseEvidenceReceipt(raw)
+	if err != nil {
 		return v.latch(brokenChain(v.count, "receipt %d decode: %v", v.count, err))
 	}
 	seq := v.count
@@ -318,11 +362,35 @@ type recorderLine struct {
 // while unknown types fail closed so junk cannot ride beside a valid receipt
 // subsequence.
 func ExtractEvidenceReceipts(path string) ([]EvidenceReceipt, error) {
-	data, err := os.ReadFile(filepath.Clean(path))
+	var receipts []EvidenceReceipt
+	err := recorder.WalkEvidenceFileReader(filepath.Clean(path), func(input io.ReadSeeker) error {
+		var parseErr error
+		receipts, parseErr = extractEvidenceReceiptsFromReader(input, path)
+		return parseErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("read evidence file: %w", err)
 	}
-	return extractEvidenceReceiptsFromBytes(data, filepath.Clean(path))
+	return receipts, nil
+}
+
+// ExtractEvidenceReceiptsFromReader streams complete recorder JSONL and retains
+// only its signed evidence receipts. The caller establishes a stable snapshot.
+func ExtractEvidenceReceiptsFromReader(input io.Reader) ([]EvidenceReceipt, error) {
+	return extractEvidenceReceiptsFromReader(input, "evidence reader")
+}
+
+func extractEvidenceReceiptsFromReader(input io.Reader, source string) ([]EvidenceReceipt, error) {
+	var receipts []EvidenceReceipt
+	if err := walkEvidenceReceiptLines(input, source, func(r EvidenceReceipt) { receipts = append(receipts, r) }); err != nil {
+		return nil, err
+	}
+	return receipts, nil
+}
+
+// ExtractEvidenceReceiptsBytes parses an already-read evidence snapshot.
+func ExtractEvidenceReceiptsBytes(data []byte) ([]EvidenceReceipt, error) {
+	return extractEvidenceReceiptsFromBytes(data, "evidence bytes")
 }
 
 // ExtractEvidenceReceiptsFromSessionDir reads all recorder JSONL files for a
@@ -337,76 +405,23 @@ func ExtractEvidenceReceiptsFromSessionDir(dir, sessionID string) ([]EvidenceRec
 }
 
 // ExtractEvidenceReceiptsFromResolvedSessionDir reads one already-resolved evidence location.
+//
+// The shards come from the recorder's authoritative session walk: membership
+// is parsed session equality, never an "evidence-<session>-" prefix; order is
+// (sequence start, name); two shards starting the same sequence are refused;
+// and no directory, file-size or entry-count budget can refuse or truncate the
+// chain. Each shard streams one line at a time, so only receipts are retained.
 func ExtractEvidenceReceiptsFromResolvedSessionDir(location recorder.EvidenceLocation, sessionID string) ([]EvidenceReceipt, error) {
 	clean := filepath.Clean(location.Dir)
-	entries, err := recorder.ReadEvidenceLocationEntries(location)
-	if err != nil {
-		return nil, fmt.Errorf("read evidence directory: %w", err)
-	}
-	// Session membership is parsed equality, not an "evidence-<session>-"
-	// prefix. For session "s", the name "evidence-s-evil-999.jsonl" satisfies
-	// the prefix but belongs to session "s-evil", so prefix matching folded
-	// another session's receipts into this one's chain order.
 	wantSession := filepath.Base(sessionID)
-	// Parse once per file rather than on every comparator call. A session's
-	// shard count is unbounded over time now that resume no longer caps the
-	// directory, and the two sibling scanners in this change already
-	// precompute the same way.
-	type shard struct {
-		name     string
-		seqStart uint64
-	}
-	shards := make([]shard, 0)
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		parsedSession, seqStart, ok := parseEvidenceName(name)
-		if !ok || parsedSession != wantSession {
-			continue
-		}
-		shards = append(shards, shard{
-			name:     name,
-			seqStart: seqStart,
+	out := make([]EvidenceReceipt, 0)
+	err := recorder.WalkSessionHistoryFiles(location, wantSession, func(shard recorder.SessionHistoryShard, r io.Reader) error {
+		return walkEvidenceReceiptLines(r, filepath.Join(clean, shard.Name), func(receipt EvidenceReceipt) {
+			out = append(out, receipt)
 		})
-	}
-	// Total order. sort.Slice is not stable, and a non-numeric trailing segment
-	// parses to sequence 0, so several distinct names can tie. Without a
-	// tie-break the resulting chain order would depend on directory order.
-	sort.Slice(shards, func(i, j int) bool {
-		if shards[i].seqStart != shards[j].seqStart {
-			return shards[i].seqStart < shards[j].seqStart
-		}
-		return shards[i].name < shards[j].name
 	})
-	files := make([]string, 0, len(shards))
-	for _, s := range shards {
-		files = append(files, s.name)
-	}
-
-	// Refuse an ambiguous shard set rather than concatenating receipts in an
-	// order that depended on which of two indistinguishable names sorted
-	// first. A verifier presenting that as a chain is the same hazard as a
-	// truncated read presented as complete.
-	if err := evidencename.CheckNoDuplicateSeqStart(files); err != nil {
+	if err != nil {
 		return nil, fmt.Errorf("evidence session %s in %s: %w", wantSession, clean, err)
-	}
-
-	var out []EvidenceReceipt
-	for _, file := range files {
-		data, readErr := recorder.ReadEvidenceLocationFileBounded(location, file, recorder.MaxEvidenceReadFileBytes)
-		if readErr == nil {
-			receipts, parseErr := extractEvidenceReceiptsFromBytes(data, filepath.Join(clean, file))
-			if parseErr != nil {
-				readErr = parseErr
-			} else {
-				out = append(out, receipts...)
-			}
-		}
-		if readErr != nil {
-			return nil, fmt.Errorf("read %s: %w", filepath.Base(file), readErr)
-		}
 	}
 	return out, nil
 }
@@ -414,36 +429,67 @@ func ExtractEvidenceReceiptsFromResolvedSessionDir(location recorder.EvidenceLoc
 // ExtractEvidenceReceiptsFromEntries extracts signed receipts from recorder
 // entries that have already passed recorder parsing. It uses RawDetail when
 // present so receipt verification consumes the immutable wire bytes rather
-// than a re-marshaled approximation.
+// than a re-marshaled approximation. The secret-egress kind requires original
+// RawDetail; re-marshaling a parsed map cannot recover its source wire profile.
+// Other kinds retain their legacy typed/programmatic Detail fallback.
 func ExtractEvidenceReceiptsFromEntries(entries []recorder.Entry) ([]EvidenceReceipt, error) {
 	out := make([]EvidenceReceipt, 0)
 	for i, entry := range entries {
-		if entry.Type != EvidenceEntryType {
-			if knownRecorderEntryType(entry.Type) {
-				continue
-			}
-			return nil, fmt.Errorf("parsed recorder entry %d: unexpected recorder entry type %q", i+1, entry.Type)
-		}
-		detail := entry.RawDetail
-		if len(detail) == 0 {
-			var err error
-			detail, err = json.Marshal(entry.Detail)
-			if err != nil {
-				return nil, fmt.Errorf("parsed recorder entry %d: marshal evidence detail: %w", i+1, err)
-			}
-		}
-		receipt, err := decodeEvidenceReceiptDetail(detail)
+		receipt, ok, err := EvidenceReceiptFromEntry(i, entry)
 		if err != nil {
-			return nil, fmt.Errorf("parsed recorder entry %d: %w", i+1, err)
+			return nil, err
 		}
-		out = append(out, receipt)
+		if ok {
+			out = append(out, receipt)
+		}
 	}
 	return out, nil
 }
 
+// EvidenceReceiptFromEntry is one step of ExtractEvidenceReceiptsFromEntries:
+// index is the entry's zero-based position among all recorder entries, which
+// errors name. ok is false for a known entry type that is not an evidence
+// receipt. A caller that extracts while reading gets the same receipts and
+// the same first error without holding the entries.
+func EvidenceReceiptFromEntry(index int, entry recorder.Entry) (EvidenceReceipt, bool, error) {
+	if entry.Type != EvidenceEntryType {
+		if knownRecorderEntryType(entry.Type) {
+			return EvidenceReceipt{}, false, nil
+		}
+		return EvidenceReceipt{}, false, fmt.Errorf("parsed recorder entry %d: unexpected recorder entry type %q", index+1, entry.Type)
+	}
+	detail := entry.RawDetail
+	if len(detail) == 0 {
+		var err error
+		detail, err = json.Marshal(entry.Detail)
+		if err != nil {
+			return EvidenceReceipt{}, false, fmt.Errorf("parsed recorder entry %d: marshal evidence detail: %w", index+1, err)
+		}
+		if isSecretEgressWire(detail) {
+			return EvidenceReceipt{}, false, fmt.Errorf("parsed recorder entry %d: secret egress receipt requires original RawDetail", index+1)
+		}
+	}
+	receipt, err := decodeEvidenceReceiptDetail(detail)
+	if err != nil {
+		return EvidenceReceipt{}, false, fmt.Errorf("parsed recorder entry %d: %w", index+1, err)
+	}
+	return receipt, true, nil
+}
+
 func extractEvidenceReceiptsFromBytes(data []byte, label string) ([]EvidenceReceipt, error) {
 	var out []EvidenceReceipt
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	if err := walkEvidenceReceiptLines(bytes.NewReader(data), label, func(r EvidenceReceipt) {
+		out = append(out, r)
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// walkEvidenceReceiptLines parses recorder JSONL one line at a time and
+// delivers each v2 evidence receipt, so a caller retains only receipts.
+func walkEvidenceReceiptLines(input io.Reader, label string, deliver func(EvidenceReceipt)) error {
+	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64<<10), maxChainLineBytes)
 	line := 0
 	for scanner.Scan() {
@@ -453,28 +499,28 @@ func extractEvidenceReceiptsFromBytes(data []byte, label string) ([]EvidenceRece
 			continue
 		}
 		if err := jsonscan.RejectDuplicateKeys(raw); err != nil {
-			return nil, fmt.Errorf("%s line %d: decode recorder entry: %w", label, line, err)
+			return fmt.Errorf("%s line %d: decode recorder entry: %w", label, line, err)
 		}
 		var entry recorderLine
 		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, fmt.Errorf("%s line %d: decode recorder entry: %w", label, line, err)
+			return fmt.Errorf("%s line %d: decode recorder entry: %w", label, line, err)
 		}
 		if entry.Type != EvidenceEntryType {
 			if knownRecorderEntryType(entry.Type) {
 				continue
 			}
-			return nil, fmt.Errorf("%s line %d: unexpected recorder entry type %q", label, line, entry.Type)
+			return fmt.Errorf("%s line %d: unexpected recorder entry type %q", label, line, entry.Type)
 		}
 		r, err := decodeEvidenceReceiptDetail(entry.Detail)
 		if err != nil {
-			return nil, fmt.Errorf("%s line %d: %w", label, line, err)
+			return fmt.Errorf("%s line %d: %w", label, line, err)
 		}
-		out = append(out, r)
+		deliver(r)
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan evidence file %s: %w", label, err)
+		return fmt.Errorf("scan evidence file %s: %w", label, err)
 	}
-	return out, nil
+	return nil
 }
 
 // decodeEvidenceReceiptDetail decodes the hash-bound detail value used by
@@ -484,11 +530,11 @@ func decodeEvidenceReceiptDetail(detail []byte) (EvidenceReceipt, error) {
 	if len(detail) == 0 || string(bytes.TrimSpace(detail)) == "null" {
 		return EvidenceReceipt{}, errors.New("evidence entry has empty detail")
 	}
-	var receipt EvidenceReceipt
-	if err := contract.DecodeStrictJSON(detail, &receipt); err != nil {
+	r, err := ParseEvidenceReceipt(detail)
+	if err != nil {
 		return EvidenceReceipt{}, fmt.Errorf("decode evidence receipt: %w", err)
 	}
-	return receipt, nil
+	return r, nil
 }
 
 // parseEvidenceName splits an evidence shard filename into its session ID and

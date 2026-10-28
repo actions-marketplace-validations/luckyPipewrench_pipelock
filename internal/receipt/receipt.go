@@ -151,9 +151,16 @@ func VerifyInternalConsistencyOnly(r Receipt) error {
 	return VerifyWithKey(r, r.SignerKey)
 }
 
-// Marshal returns the JSON encoding of a receipt.
+// Marshal returns the JSON encoding of a receipt. Invalid UTF-8 in a string
+// is written as a raw U+FFFD on every Go release, matching the signing
+// preimage and what a verifier re-encodes after parsing; see
+// jsonscan.NormalizeReplacementEscapes.
 func Marshal(r Receipt) ([]byte, error) {
-	return json.Marshal(r)
+	b, err := json.Marshal(r)
+	if err != nil {
+		return nil, err
+	}
+	return jsonscan.NormalizeReplacementEscapes(b), nil
 }
 
 // ErrUnknownField is returned when a v1 receipt (or any of its signed nested
@@ -200,6 +207,9 @@ func Unmarshal(data []byte) (Receipt, error) {
 			if strings.Contains(err.Error(), `"detected_patterns"`) {
 				legacy, legacyErr := unmarshalLegacyDetectedPatterns(data)
 				if legacyErr == nil {
+					if err := rejectReceiptAliases(data); err != nil {
+						return Receipt{}, fmt.Errorf("unmarshal receipt: %w", err)
+					}
 					return legacy, nil
 				}
 			}
@@ -212,6 +222,9 @@ func Unmarshal(data []byte) (Receipt, error) {
 			return Receipt{}, fmt.Errorf("unmarshal receipt: %w: %w", ErrTrailingTokens, err)
 		}
 		return Receipt{}, fmt.Errorf("unmarshal receipt: %w", ErrTrailingTokens)
+	}
+	if err := rejectReceiptAliases(data); err != nil {
+		return Receipt{}, fmt.Errorf("unmarshal receipt: %w", err)
 	}
 	return r, nil
 }

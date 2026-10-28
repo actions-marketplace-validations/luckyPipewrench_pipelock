@@ -297,6 +297,7 @@ func mcpCEEFragmentSessionKey(sessionKey, path string) string {
 }
 
 type ceeRecordMCPOptions struct {
+	denialAudit      *mcpDenialAudit
 	sessionKey       string
 	entropyPayload   []byte
 	fragmentPayloads map[string][]byte
@@ -395,8 +396,8 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				if opts.blockKind != nil {
 					*opts.blockKind = ceeBlockKindEntropyBudget
 				}
-				if opts.logger != nil {
-					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_entropy", reason)
+				if opts.denialAudit != nil {
+					*opts.denialAudit = mcpCeeEntropyDenialAudit()
 				}
 				return ceeEntropyBlockClientReason
 			}
@@ -460,8 +461,8 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				// identities' fragments.
 				reason := "cross-request fragment stream belongs to another identity; request cannot be safely inspected"
 				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
-				if opts.logger != nil {
-					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_owner_mismatch", reason)
+				if opts.denialAudit != nil {
+					*opts.denialAudit = mcpCeeOwnerDenialAudit()
 				}
 				if opts.blockKind != nil {
 					*opts.blockKind = ceeBlockKindOwnerMismatch
@@ -474,8 +475,8 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 				}
 				reason := "cross-request fragment session capacity exhausted; request cannot be safely inspected; increase cross_request_detection.fragment_reassembly.max_sessions or reduce active sessions"
 				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", reason, opts.sessionKey)
-				if opts.logger != nil {
-					opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment_capacity", reason)
+				if opts.denialAudit != nil {
+					*opts.denialAudit = mcpCeeCapacityDenialAudit()
 				}
 				if opts.blockKind != nil {
 					*opts.blockKind = ceeBlockKindSessionCapacity
@@ -484,24 +485,40 @@ func ceeRecordMCP(opts ceeRecordMCPOptions) string {
 			}
 			matches := streamMatches[i]
 			if len(matches) > 0 {
-				findingKey, kind := mcpCEEFragmentFindingKey(path, payload, matches[0].PatternName)
-				if mcpCEEFragmentFindingAlreadyRecorded(kind, findingKey, seenSingletonFindings, seenArgumentFindings) {
+				primary := matches[0]
+				inspectionLimit := scanner.HasFragmentInspectionLimit(matches)
+				if inspectionLimit {
+					for _, match := range matches {
+						if match.IsInspectionLimit() {
+							primary = match
+							break
+						}
+					}
+				}
+				findingKey, kind := mcpCEEFragmentFindingKey(path, payload, primary.PatternName)
+				if !inspectionLimit && mcpCEEFragmentFindingAlreadyRecorded(kind, findingKey, seenSingletonFindings, seenArgumentFindings) {
 					continue
 				}
 				if m != nil {
 					m.RecordCrossRequestDLPMatch()
 				}
-				operatorReason := fmt.Sprintf("cross-request fragment DLP match: %s; remove the secret from tool arguments, or lower cross_request_detection.fragment_reassembly.max_buffer_bytes for a narrower window (reduces protection against long chunk sequences)", matches[0].PatternName)
+				operatorReason := fmt.Sprintf("cross-request fragment DLP match: %s; remove the secret from tool arguments, or lower cross_request_detection.fragment_reassembly.max_buffer_bytes for a narrower window (reduces protection against long chunk sequences)", primary.PatternName)
+				if inspectionLimit {
+					operatorReason = fmt.Sprintf("cross-request fragment refused: %s; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)", primary.PatternName)
+				}
 				_, _ = fmt.Fprintf(opts.logW, "pipelock: CEE: %s (session=%s)\n", operatorReason, opts.sessionKey)
-				if ceeCfg.Action == config.ActionBlock {
+				if ceeCfg.Action == config.ActionBlock || inspectionLimit {
 					if opts.matchedPattern != nil {
-						*opts.matchedPattern = matches[0].PatternName
+						*opts.matchedPattern = primary.PatternName
 					}
 					if opts.contributors != nil {
-						*opts.contributors = captureCEEContributors(matches[0].Contributors)
+						*opts.contributors = captureCEEContributors(primary.Contributors)
 					}
-					if opts.logger != nil {
-						opts.logger.LogBlocked(mustMCPAuditContext(opts.logger, "CEE", "mcp-input"), "cross_request_fragment", operatorReason)
+					if opts.denialAudit != nil {
+						*opts.denialAudit = mcpCEEFragmentDenialAudit(operatorReason)
+						if inspectionLimit {
+							*opts.denialAudit = mcpCeeFragmentLimitDenialAudit()
+						}
 					}
 					return ceeFragmentBlockClientReason
 				}

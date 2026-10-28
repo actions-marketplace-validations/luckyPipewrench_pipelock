@@ -5,10 +5,16 @@ package transport
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 )
+
+// ErrIncompleteResponse prevents a broken upstream response from being treated as
+// an expected socket teardown by the message forwarding layer.
+var ErrIncompleteResponse = errors.New("incomplete upstream response")
 
 // SSEReader reads Server-Sent Events from an io.Reader and implements
 // MessageReader. Each ReadMessage call returns the data payload of the
@@ -34,6 +40,13 @@ func NewSSEReader(r io.Reader) *SSEReader {
 // This can be used for reconnection with the Last-Event-ID header.
 func (sr *SSEReader) LastEventID() string {
 	return sr.lastEventID
+}
+
+// ClearInvalidLastEventID prevents a rejected ID from affecting later events.
+func (sr *SSEReader) ClearInvalidLastEventID() {
+	if !utf8.ValidString(sr.lastEventID) {
+		sr.lastEventID = ""
+	}
 }
 
 // LastEventType returns the event: field from the most recently read SSE event.
@@ -116,7 +129,7 @@ func (sr *SSEReader) ReadMessage() ([]byte, error) {
 	// A partial event (data accumulated without a blank-line boundary) during
 	// a scanner error means the event was interrupted mid-stream.
 	if err := sr.scanner.Err(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrIncompleteResponse, err)
 	}
 	if hasData {
 		joined := strings.Join(data, "\n")

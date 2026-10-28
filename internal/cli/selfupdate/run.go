@@ -5,6 +5,7 @@ package selfupdate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -108,9 +109,9 @@ func (o *Options) Check(ctx context.Context) (*Status, error) {
 
 // Run performs the full verified update: resolve release -> verify the native
 // Ed25519 release manifest -> optionally verify legacy cosign material ->
-// download archive -> checksum match -> extract -> back up -> atomic replace.
-// FAIL-CLOSED at every step: any error aborts and leaves the installed binary
-// untouched.
+// download archive -> checksum match -> extract -> back up -> platform replace.
+// Verification failures leave the installed binary untouched. Replacement errors
+// report whether the original is intact, restored, or needs manual recovery.
 //
 // The cobra layer is responsible for any interactive confirmation before
 // calling Run; Run itself always proceeds (it is the "yes" path).
@@ -178,6 +179,11 @@ func (o *Options) Run(ctx context.Context) (*Status, error) {
 	}
 	verification, err := releasetrust.VerifyManifest(manifestData, manifestSig, o.ReleaseKeyringHex)
 	if err != nil {
+		if errors.Is(err, releasetrust.ErrNoReleaseKey) {
+			err = fmt.Errorf("%w: this binary has no embedded release verification keys; "+
+				"install an official release, or update manually after verifying the release archive "+
+				"(https://github.com/pipelab-org/pipelock#quick-start)", err)
+		}
 		return st, fmt.Errorf("%w: native release manifest: %w", ErrSignatureVerify, err)
 	}
 	if verification.Manifest.Tag != rel.TagName {
@@ -226,9 +232,9 @@ func (o *Options) Run(ctx context.Context) (*Status, error) {
 	if err != nil {
 		return st, err
 	}
-	// From here, any failure must delete tmpPath and leave target untouched.
+	// The replacement helper owns restoration if installation fails.
 
-	// --- 6. back up current + atomic replace ---
+	// --- 6. back up current + platform replacement ---
 	backup, err := installBinary(o.TargetPath, tmpPath)
 	if err != nil {
 		_ = removeQuiet(tmpPath)

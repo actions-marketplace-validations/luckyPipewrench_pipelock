@@ -16,9 +16,11 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 
+	"github.com/luckyPipewrench/pipelock/internal/launchcontract"
 	"github.com/luckyPipewrench/pipelock/internal/processexec"
 )
 
@@ -104,7 +106,7 @@ func RunInit() {
 		exitSandboxProcess(1)
 	}
 	policy = resolvedPolicy
-	llStatus, llErr := ApplyLandlock(policy)
+	llStatus, llErr := ApplyLandlock(policy, socketPath)
 	reportLayer(os.Stderr, llStatus, llErr)
 
 	// Set no_new_privs (MUST come before seccomp).
@@ -156,7 +158,7 @@ func RunInit() {
 		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] launch outcome: REFUSED: %v\n", outcomeErr)
 		exitSandboxProcess(1)
 	}
-	reportAppliedLaunchOutcome(os.Stderr, outcome)
+	reportAppliedLaunchOutcome(os.Stderr, outcome, llStatus.Version)
 
 	// Mapped launches remain here until the parent has made itself
 	// non-dumpable. This gate covers both the direct exec below and bridge-mode
@@ -167,7 +169,7 @@ func RunInit() {
 	}
 
 	if socketPath != "" {
-		runInitWithBridge(command, env, workspace, socketPath, bridgeSignals)
+		runInitWithBridge(command, env, workspace, socketPath, bridgeSignals, llStatus)
 		return
 	}
 
@@ -175,7 +177,7 @@ func RunInit() {
 	for _, key := range []string{
 		initEnvKey, "__PIPELOCK_SANDBOX_WORKSPACE", "__PIPELOCK_SANDBOX_COMMAND",
 		"__PIPELOCK_SANDBOX_EXTRA_ENV", "__PIPELOCK_SANDBOX_POLICY",
-		sandboxSocketEnv, noNetNSEnvKey,
+		sandboxSocketEnv, noNetNSEnvKey, bridgeIdleTimeoutEnv,
 	} {
 		env = removeEnvKey(env, key)
 	}
@@ -193,6 +195,13 @@ func RunInit() {
 	}
 
 	reportSubprocessCoverageError(flushSubprocessCoverage())
+	if !llStatus.Active || llStatus.Version < 9 {
+		runtime.LockOSThread()
+		if err := restrictTargetUnixSockets(); err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "[sandbox] FATAL: %v\n", err)
+			exitSandboxProcess(1)
+		}
+	}
 	err = processexec.Replace(binary, command, env)
 	_, _ = fmt.Fprintf(os.Stderr, "[sandbox] exec failed: %v\n", err)
 	exitSandboxProcess(1)
@@ -208,7 +217,7 @@ func applyRlimitsOrExit() {
 	_, _ = fmt.Fprintf(os.Stderr, "[sandbox] rlimits: ACTIVE\n")
 }
 
-func runInitWithBridge(command, env []string, workspace, socketPath string, sigCh <-chan os.Signal) {
+func runInitWithBridge(command, env []string, workspace, socketPath string, sigCh <-chan os.Signal, filesystem LayerStatus) {
 	noNetNS := IsNoNetNS()
 	bridgeAddr := ""
 	if noNetNS {
@@ -219,6 +228,7 @@ func runInitWithBridge(command, env []string, workspace, socketPath string, sigC
 		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] bridge proxy: %v\n", err)
 		exitSandboxProcess(1)
 	}
+	bridge.SetIdleTimeout(parseBridgeIdleTimeout(os.Getenv(bridgeIdleTimeoutEnv)))
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -234,7 +244,7 @@ func runInitWithBridge(command, env []string, workspace, socketPath string, sigC
 	for _, key := range []string{
 		initEnvKey, "__PIPELOCK_SANDBOX_WORKSPACE", "__PIPELOCK_SANDBOX_COMMAND",
 		"__PIPELOCK_SANDBOX_EXTRA_ENV", "__PIPELOCK_SANDBOX_POLICY",
-		sandboxSocketEnv, noNetNSEnvKey,
+		sandboxSocketEnv, noNetNSEnvKey, bridgeIdleTimeoutEnv,
 	} {
 		env = removeEnvKey(env, key)
 	}
@@ -254,7 +264,7 @@ func runInitWithBridge(command, env []string, workspace, socketPath string, sigC
 	childCmd.Env = env
 	childCmd.Dir = workspace
 
-	if err := childCmd.Start(); err != nil {
+	if err := startSandboxTarget(childCmd, filesystem); err != nil {
 		cancel()
 		bridge.Close()
 		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] command error: %v\n", err)
@@ -309,15 +319,7 @@ func appendBridgeProxyEnv(env []string, addr string) []string {
 // single source so the two cannot drift and reintroduce a proxy bypass. addr
 // comes from BridgeProxy.Addr(), a listener-backed host:port.
 func bridgeProxyEnv(addr string) []string {
-	proxyURL := "http://" + addr
-	return []string{
-		"HTTP_PROXY=" + proxyURL,
-		"HTTPS_PROXY=" + proxyURL,
-		"http_proxy=" + proxyURL,
-		"https_proxy=" + proxyURL,
-		"NO_PROXY=",
-		"no_proxy=",
-	}
+	return launchcontract.Entries(launchcontract.Vars(launchcontract.Sandbox, "http://"+addr, "", "", ""))
 }
 
 func removeProxyEnvKeys(env []string) []string {

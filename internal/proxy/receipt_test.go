@@ -394,13 +394,15 @@ func TestReceiptEmissionError_OmitsRawTargetAndAgent(t *testing.T) {
 		Agent:     "private-agent",
 	}, errors.New("disk full"))
 
+	// The error carries fixed labels only: no request text, caller identity,
+	// action ID or raw cause, whatever the caller supplied.
 	msg := err.Error()
-	for _, forbidden := range []string{"https://example.test", "raw-target-marker", "private-agent"} {
+	for _, forbidden := range []string{"https://example.test", "raw-target-marker", "private-agent", "act-123", "disk full", "receipt_emission", "required"} {
 		if strings.Contains(msg, forbidden) {
 			t.Fatalf("receipt emission error leaked %q in %q", forbidden, msg)
 		}
 	}
-	for _, want := range []string{"act-123", string(config.ActionAllow), TransportReverse, http.MethodGet, "disk full"} {
+	for _, want := range []string{"verdict=" + string(config.ActionAllow), "phase=", "layer=other", "failure=other"} {
 		if !strings.Contains(msg, want) {
 			t.Fatalf("receipt emission error %q missing %q", msg, want)
 		}
@@ -722,6 +724,7 @@ func TestProxy_ReloadReceiptEmitter_BadKeyPathPreservesLiveEmitter(t *testing.T)
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	startCfgPath := filepath.Join(keyDir, "start.yaml")
 	startYAML := fmt.Sprintf(`mode: balanced
@@ -876,6 +879,7 @@ func TestProxy_ReloadSessionOpenEmitFailurePreservesLiveEmitter(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	startCfgPath := filepath.Join(keyDir, "start.yaml")
 	startYAML := fmt.Sprintf(`mode: balanced
@@ -895,6 +899,10 @@ fetch_proxy:
 	}
 	cfg.Internal = nil
 	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.SessionProfiling.Enabled = true
+	cfg.BehavioralBaseline.Enabled = true
+	cfg.BehavioralBaseline.ProfileDir = t.TempDir()
+	cfg.BehavioralBaseline.DeviationAction = config.ActionBlock
 
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   rec,
@@ -944,6 +952,10 @@ fetch_proxy:
 	}
 	reloadCfg.Internal = nil
 	reloadCfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	reloadCfg.SessionProfiling.Enabled = true
+	reloadCfg.BehavioralBaseline.Enabled = true
+	reloadCfg.BehavioralBaseline.ProfileDir = cfg.BehavioralBaseline.ProfileDir
+	reloadCfg.BehavioralBaseline.DeviationAction = config.ActionWarn
 	if cfg.CanonicalPolicyHash() == reloadCfg.CanonicalPolicyHash() {
 		t.Fatal("expected distinct canonical policy hashes for failed reload")
 	}
@@ -965,6 +977,9 @@ fetch_proxy:
 	}
 	if p.CurrentConfig() != cfg {
 		t.Fatal("session_open emit failure should preserve the old config")
+	}
+	if got := p.sessionMgrPtr.Load().baselinePtr.Load().action; got != config.ActionBlock {
+		t.Fatalf("failed reload weakened baseline action to %q", got)
 	}
 	if afterEmitter := p.receiptEmitterPtr.Load(); afterEmitter != beforeEmitter {
 		t.Fatal("receipt emitter changed even though reload session_open emission failed")
@@ -1190,6 +1205,7 @@ func TestProxy_ReloadSameSigningKeyReusesEmitterSoStaleHeartbeatCannotFork(t *te
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   rec,
@@ -1814,6 +1830,7 @@ func TestProxy_ReceiptEmission_ForwardResponseSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   rec,
@@ -1932,6 +1949,7 @@ func TestProxy_ReceiptEmission_ForwardSizeExemptResponseScanBlock(t *testing.T) 
 	if err != nil {
 		t.Fatalf("recorder.New: %v", err)
 	}
+	t.Cleanup(func() { _ = rec.Close() })
 
 	emitter := receipt.NewEmitter(receipt.EmitterConfig{
 		Recorder:   rec,

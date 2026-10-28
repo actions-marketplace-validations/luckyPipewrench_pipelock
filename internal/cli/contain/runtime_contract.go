@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/luckyPipewrench/pipelock/internal/launchcontract"
 	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
 )
 
@@ -23,7 +24,8 @@ import (
 // HTTPS_PROXY (notably node/undici) or read its own config file looked
 // "broken" with a generic network error.
 //
-// This file is the single source of truth for the contract. plk-launch, the
+// The proxy/CA names come from internal/launchcontract. This file adds the
+// containment-specific policy and identity assignments. plk-launch, the
 // /etc/profile.d login-shell script, the pipelock-* utility wrappers, and the
 // `contain doctor` self-test all derive from runtimeContractVars so the
 // surfaces never drift.
@@ -125,37 +127,21 @@ func profileScriptPathOrDefault(env *installEnv) string {
 func runtimeContractVars(env *installEnv) []contractVar {
 	proxy := proxyURLFor(env.proxyPort)
 	caBundle := env.caBundlePath
-	nodeCA := env.caExportPath
 	shim := undiciShimPathOrDefault(env)
 
-	return []contractVar{
-		// Proxy (upper + lower; clients disagree on which they read).
-		{"HTTP_PROXY", proxy},
-		{"http_proxy", proxy},
-		{"HTTPS_PROXY", proxy},
-		{"https_proxy", proxy},
-		{"ALL_PROXY", proxy},
-		{"all_proxy", proxy},
-		{"NO_PROXY", contractNoProxy},
-		{"no_proxy", contractNoProxy},
-		// CA trust for the Pipelock MITM CA across tool ecosystems.
-		{"SSL_CERT_FILE", caBundle},
-		{"REQUESTS_CA_BUNDLE", caBundle},
-		{"CURL_CA_BUNDLE", caBundle},
-		{"GIT_SSL_CAINFO", caBundle},
-		{"CARGO_HTTP_CAINFO", caBundle},
-		{"PIP_CERT", caBundle},
-		// Environment config outranks an untrusted project .npmrc. A deliberate
-		// command-line --ignore-scripts=false still provides the operator escape hatch.
-		{"npm_config_ignore_scripts", "1"},
-		// node trusts an APPENDED CA file (not a replacement bundle).
-		{"NODE_EXTRA_CA_CERTS", nodeCA},
-		// Older node fetch()/undici ignores *_PROXY unless a global dispatcher
-		// is installed; the shim does that at startup when undici is available.
-		{"NODE_OPTIONS", "--require " + shim},
-		// Newer node fetch()/undici honors *_PROXY natively when this flag exists.
-		{"NODE_USE_ENV_PROXY", "1"},
+	vars := launchcontract.Vars(launchcontract.Contain, proxy, contractNoProxy, caBundle, "")
+	result := make([]contractVar, 0, len(vars)+3)
+	for _, v := range vars {
+		switch v.Name {
+		case "NODE_EXTRA_CA_CERTS":
+			// Preserve containment's npm policy and the original assignment order.
+			result = append(result, contractVar{"npm_config_ignore_scripts", "1"})
+		case "NODE_USE_ENV_PROXY":
+			result = append(result, contractVar{"NODE_OPTIONS", "--require " + shim})
+		}
+		result = append(result, contractVar{v.Name, v.Value})
 	}
+	return append(result, contractVar{"XAUTHORITY", displayAuthorityPath(env)})
 }
 
 // containedLaunchIdentityVars returns the identity block that LEADS the
@@ -185,7 +171,7 @@ func containedLaunchIdentityVars(agentUserName, homeDir string) []contractVar {
 // silently falling back to the default path (and grading containment UNKNOWN)
 // when --posture-output points elsewhere. An empty value falls back to the
 // default proof path.
-func containLaunchEnv(agentUserName, homeDir string, proxyPort int, postureProofPath string) []string {
+func containLaunchEnv(agentUserName, homeDir string, proxyPort int, postureProofPath, display string) []string {
 	var env []string
 	for _, v := range containedLaunchIdentityVars(agentUserName, homeDir) {
 		env = append(env, v.name+"="+v.value)
@@ -198,6 +184,7 @@ func containLaunchEnv(agentUserName, homeDir string, proxyPort int, postureProof
 		env = append(env, v.name+"="+v.value)
 	}
 	env = append(env, posturebinding.RuntimeProofEnv+"="+resolvedPostureProofPath(postureProofPath))
+	env = append(env, "DISPLAY="+display)
 	env = append(env, "PATH="+agentExecPath(agentUserName))
 	return env
 }
@@ -275,10 +262,23 @@ func launchExecEnvLines(env *installEnv) []string {
 	}
 	lines = append(lines,
 		"    "+posturebinding.RuntimeProofEnv+`="${`+posturebinding.RuntimeProofEnv+":-"+posturebinding.DefaultContainRunProofPath+`}" \`,
+		`    DISPLAY="${DISPLAY:-`+managedDisplayFallback(env)+`}" \`,
 		`    PATH="$AGENT_PATH" \`,
 		`    "$TARGET" "$@"`,
 	)
 	return lines
+}
+
+// managedDisplayFallback names the managed display used when the operator's
+// own DISPLAY is unset. plk-launch runs under `env -i`, so DISPLAY is unset
+// on every invocation regardless of what a login shell exported; the
+// operator's value is recovered by contain run / the contained-launch
+// wrapper passing DISPLAY through explicitly before this script execs.
+func managedDisplayFallback(env *installEnv) string {
+	if env.displayEnabled {
+		return displayName(env.displayNumber)
+	}
+	return ""
 }
 
 // renderProfileScript renders /etc/profile.d/pipelock-contain.sh. Sourced by
@@ -531,8 +531,10 @@ func stepWriteProfileScript() step {
 			if err := backupAndWrite(env, path, []byte(body), modeProfileScript); err != nil {
 				return false, err
 			}
+			// The new script is on disk; report it applied so rollback
+			// restores the previous one instead of leaving it half-owned.
 			if err := env.chown(path, 0, gid); err != nil {
-				return false, fmt.Errorf("chown %s: %w", path, err)
+				return true, fmt.Errorf("chown %s: %w", path, err)
 			}
 			return true, nil
 		},
@@ -559,13 +561,7 @@ func stepWriteUtilityWrappers() step {
 				path := filepath.Join(env.wrapperDir, name)
 				body := renderUtilityWrapper(env, tool)
 				restoreTouched := func(cause error) (bool, error) {
-					errs := []error{cause}
-					for i := len(touched) - 1; i >= 0; i-- {
-						if rerr := restoreBackup(env, touched[i]); rerr != nil {
-							errs = append(errs, rerr)
-						}
-					}
-					return false, errors.Join(errs...)
+					return restoreTouchedInline(env, touched, cause)
 				}
 				if existing, err := env.readFile(path); err == nil && string(existing) == body {
 					// Re-assert the executable bit on rerun so a drifted wrapper
@@ -610,14 +606,10 @@ func stepWriteAgentToolConfigs() step {
 				return false, fmt.Errorf("resolve %s uid: %w", env.agentUserName, err)
 			}
 			home := agentHomeDir(env)
+			// touched includes a config whose chown just failed, so the
+			// inline restore puts that one back too.
 			restore := func(cause error) (bool, error) {
-				errs := []error{cause}
-				for i := len(touched) - 1; i >= 0; i-- {
-					if rerr := restoreBackup(env, touched[i]); rerr != nil {
-						errs = append(errs, rerr)
-					}
-				}
-				return false, errors.Join(errs...)
+				return restoreTouchedInline(env, touched, cause)
 			}
 			for _, cfg := range agentToolConfigs() {
 				path := filepath.Join(home, cfg.rel)
@@ -636,10 +628,10 @@ func stepWriteAgentToolConfigs() step {
 				if err := backupAndWrite(env, path, []byte(body), modeAgentConfig); err != nil {
 					return restore(fmt.Errorf("write %s: %w", path, err))
 				}
+				touched = append(touched, path)
 				if err := chownAgentConfigFile(env, path, uid, gid); err != nil {
 					return restore(fmt.Errorf("chown %s: %w", path, err))
 				}
-				touched = append(touched, path)
 			}
 			return len(touched) > 0, nil
 		},

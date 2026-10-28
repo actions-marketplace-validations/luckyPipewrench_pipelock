@@ -14,6 +14,17 @@ import (
 )
 
 func TestCredentialGuardFilesystemFailuresAbortActivation(t *testing.T) {
+	prepareGuardParent := func(t *testing.T, env *installEnv) {
+		t.Helper()
+		dir := filepath.Dir(env.guardScriptPath)
+		if err := os.MkdirAll(dir, modeDirReadable); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dir, modeDirReadable); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	t.Run("operator lookup", func(t *testing.T) {
 		env, _, _ := newFakeEnv(t)
 		env.lookupUser = func(name string) (*user.User, error) {
@@ -36,6 +47,7 @@ func TestCredentialGuardFilesystemFailuresAbortActivation(t *testing.T) {
 
 	t.Run("parent chmod", func(t *testing.T) {
 		env, _, _ := newFakeEnv(t)
+		prepareGuardParent(t, env)
 		env.chmod = func(string, os.FileMode) error { return os.ErrPermission }
 		applied, err := stepWriteCredentialGuard().apply(context.Background(), env)
 		if err == nil || applied || !strings.Contains(err.Error(), "chmod") {
@@ -59,17 +71,63 @@ func TestCredentialGuardFilesystemFailuresAbortActivation(t *testing.T) {
 			return originalChmod(path, mode)
 		}
 		applied, err := stepWriteCredentialGuard().apply(context.Background(), env)
-		if err == nil || applied || !strings.Contains(err.Error(), "chmod") {
+		if err == nil || !applied || !strings.Contains(err.Error(), "chmod") {
 			t.Fatalf("applied = %v, error = %v", applied, err)
 		}
 	})
 
 	t.Run("file write", func(t *testing.T) {
 		env, _, _ := newFakeEnv(t)
+		prepareGuardParent(t, env)
 		env.writeFile = func(string, []byte, os.FileMode) error { return os.ErrPermission }
 		applied, err := stepWriteCredentialGuard().apply(context.Background(), env)
 		if err == nil || applied || !strings.Contains(err.Error(), "write") {
 			t.Fatalf("applied = %v, error = %v", applied, err)
+		}
+	})
+}
+
+func TestCredentialGuardStateProbeFailureStopsBeforeMutation(t *testing.T) {
+	for _, probe := range []string{"is-active", "is-enabled"} {
+		t.Run(probe, func(t *testing.T) {
+			env, runner, _ := newFakeEnv(t)
+			if probe == "is-enabled" {
+				mustWriteFile(t, env.guardPathUnit, "prior guard unit")
+			}
+			runCmd := env.runCmd
+			env.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+				if name == "systemctl" && len(args) > 0 && args[0] == probe {
+					return "", -1, os.ErrPermission
+				}
+				return runCmd(ctx, name, args...)
+			}
+			applied, err := stepWriteCredentialGuard().apply(context.Background(), env)
+			if err == nil || applied || !strings.Contains(err.Error(), probe) {
+				t.Fatalf("apply = (%t, %v), want an unapplied %s probe failure", applied, err, probe)
+			}
+			if runnerCalled(runner, "enable --now "+filepath.Base(env.guardPathUnit)) {
+				t.Fatalf("guard activation attempted after failed %s probe: %+v", probe, runner.calls)
+			}
+			if _, err := os.Stat(env.guardScriptPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("guard script changed after failed %s probe: %v", probe, err)
+			}
+		})
+	}
+	t.Run("guard unit stat", func(t *testing.T) {
+		env, runner, _ := newFakeEnv(t)
+		lstat := env.lstat
+		env.lstat = func(path string) (os.FileInfo, error) {
+			if path == env.guardPathUnit {
+				return nil, os.ErrPermission
+			}
+			return lstat(path)
+		}
+		applied, err := stepWriteCredentialGuard().apply(context.Background(), env)
+		if err == nil || applied || !strings.Contains(err.Error(), "stat credential guard unit") {
+			t.Fatalf("apply = (%t, %v), want unapplied guard stat failure", applied, err)
+		}
+		if runnerCalled(runner, "enable --now "+filepath.Base(env.guardPathUnit)) {
+			t.Fatalf("guard activation attempted after failed stat: %+v", runner.calls)
 		}
 	})
 }
@@ -150,9 +208,18 @@ func TestCreateDirectoryFailuresDoNotReportSuccess(t *testing.T) {
 		env, _, _ := newFakeEnv(t)
 		path := filepath.Join(t.TempDir(), "new")
 		env.chmod = func(string, os.FileMode) error { return os.ErrPermission }
-		applied, err := stepCreateDir("test", func(*installEnv) string { return path }, modeDirPrivate).apply(context.Background(), env)
-		if err == nil || applied || !strings.Contains(err.Error(), "chmod") {
+		step := stepCreateDir("test", func(*installEnv) string { return path }, modeDirPrivate)
+		applied, err := step.apply(context.Background(), env)
+		// The directory now exists, so the step reports applied and its undo
+		// removes it.
+		if err == nil || !applied || !strings.Contains(err.Error(), "chmod") {
 			t.Fatalf("applied = %v, error = %v", applied, err)
+		}
+		if err := step.undo(context.Background(), env); err != nil {
+			t.Fatalf("undo: %v", err)
+		}
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("undo left the directory this attempt created: %v", statErr)
 		}
 	})
 }
@@ -180,8 +247,42 @@ func TestToolsListWriteFailuresPreservePolicyBoundary(t *testing.T) {
 		env, _, _ := newFakeEnv(t)
 		env.stat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
 		applied, err := stepWriteToolsList().apply(context.Background(), env)
-		if err == nil || applied || !strings.Contains(err.Error(), "no default agent tools") {
+		if err == nil || applied || !strings.Contains(err.Error(), "no agent tools found") {
 			t.Fatalf("applied = %v, error = %v", applied, err)
+		}
+		if strings.Contains(err.Error(), "add-tool") {
+			t.Fatalf("error names add-tool, which cannot run after a refused install: %v", err)
+		}
+	})
+
+	t.Run("step keeps an existing allow-list without defaults", func(t *testing.T) {
+		env, _, _ := newFakeEnv(t)
+		if err := os.MkdirAll(filepath.Dir(env.toolsListPath), 0o750); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		agentIsCurrentUser(t, env)
+		target := runnableFixtureTarget(t)
+		custom := "custom\t" + target + "\n"
+		if err := os.WriteFile(env.toolsListPath, []byte(custom), 0o600); err != nil {
+			t.Fatalf("write tools.list: %v", err)
+		}
+		realStat := env.stat
+		env.stat = func(p string) (os.FileInfo, error) {
+			if p == env.toolsListPath || p == filepath.Dir(env.toolsListPath) || p == target || strings.HasPrefix(target, p+string(filepath.Separator)) || p == "/" {
+				return realStat(p)
+			}
+			return nil, os.ErrNotExist
+		}
+		applied, err := stepWriteToolsList().apply(context.Background(), env)
+		if err != nil {
+			t.Fatalf("existing add-tool allow-list must survive reinstall without defaults: applied=%v err=%v", applied, err)
+		}
+		got, err := os.ReadFile(env.toolsListPath)
+		if err != nil {
+			t.Fatalf("read tools.list: %v", err)
+		}
+		if !strings.Contains(string(got), strings.TrimSuffix(custom, "\n")) {
+			t.Fatalf("tools.list lost its add-tool entry: %q", got)
 		}
 	})
 }

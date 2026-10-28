@@ -6,7 +6,94 @@ package scanner
 import (
 	"strings"
 	"testing"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
+
+func TestMCPHeaderGuidanceNamesActualScanControls(t *testing.T) {
+	dlp, ok := guidanceForResult(AuditMCPHeaderDLP, "test credential")
+	if !ok {
+		t.Fatal("MCP header DLP guidance missing")
+	}
+	for _, want := range []string{
+		"listener request header", "text DLP", "Authorization", "Last-Event-ID", "Mcp-Param-*", "Mcp-Session-Id",
+		"request_body_scanning.scan_headers", "header_mode", "sensitive_headers", "ignore_headers",
+	} {
+		if !strings.Contains(dlp.OperatorKnob, want) {
+			t.Errorf("MCP header DLP guidance omitted %q: %s", want, dlp.OperatorKnob)
+		}
+	}
+	injection, ok := guidanceForResult(AuditMCPHeaderInjection, "test instruction")
+	if !ok || !strings.Contains(injection.OperatorKnob, "decoded Mcp-Param-*") ||
+		!strings.Contains(injection.OperatorKnob, "response injection scanning") {
+		t.Fatalf("MCP header injection guidance describes the wrong scan: %+v", injection)
+	}
+}
+
+func TestGuidanceForResultPatternNameEndingInValidityNote(t *testing.T) {
+	for _, note := range []string{githubDownloadGrantValidityNote, githubDownloadSASValidityNote, githubAttestationValidityNote, githubActionsValidityNote} {
+		t.Run(note, func(t *testing.T) {
+			cfg := config.Defaults()
+			cfg.Internal = nil
+			cfg.DLP.Patterns = []config.DLPPattern{{
+				Name: "Provider Key; " + note, Regex: `testcredential[a-z]{12}`, Severity: config.SeverityHigh,
+				CredentialAudienceHosts: []string{"audience.example"},
+			}}
+			sc := MustNew(cfg)
+			t.Cleanup(sc.Close)
+			result := sc.Scan(t.Context(), "https://api.vendor.example/?key=testcredential"+strings.Repeat("a", 12))
+			if result.Allowed || result.Scanner != ScannerDLP || !strings.Contains(result.Reason, note) {
+				t.Fatalf("expected the named DLP block, got %+v", result)
+			}
+			got, ok := GuidanceForResult(result.Scanner, result.Reason)
+			if !ok || strings.Contains(got.OperatorKnob, "host clock") || strings.Contains(result.Hint, "validity window") {
+				t.Fatalf("pattern name selected validity guidance: result=%+v guidance=%+v", result, got)
+			}
+		})
+	}
+}
+
+func TestGuidanceForResultAudienceMetadataIsNotGrantValidity(t *testing.T) {
+	for _, name := range []string{
+		"Provider Key; GitHub grant outside its validity window",
+		"Provider Key; GitHub download grant outside its validity window; check the host clock or obtain a current download URL",
+	} {
+		mismatches := []CredentialAudienceMismatch{{
+			PatternName: name,
+			Surface:     "url",
+			Destination: "api.vendor.example",
+		}}
+		reason := "DLP match: " + name + " (high); " + CredentialAudienceMismatchExplanation(mismatches)
+		for _, reason := range []string{reason, "DLP match: " + name + " (high)", "DLP: " + name} {
+			got, ok := GuidanceForResult(ScannerDLP, reason)
+			want, wantOK := GuidanceFor(ScannerDLP)
+			if !ok || !wantOK || got != want {
+				t.Fatalf("metadata changed guidance: got=%+v want=%+v", got, want)
+			}
+		}
+	}
+}
+
+func TestGuidanceForResultGrantValidityAnnotation(t *testing.T) {
+	for _, note := range []string{
+		"GitHub download grant outside its validity window; check the host clock or obtain a current download URL",
+		"GitHub download SAS outside its validity window; check the host clock or obtain a current download URL",
+		"GitHub attestation SAS outside its validity window; check the host clock or obtain a current bundle URL",
+		"GitHub Actions results SAS outside its validity window; check the host clock or obtain a current log or artifact URL",
+	} {
+		reason := "DLP match: JWT Token (high); credential audience mismatch (pattern JWT Token, surface url, canonical destination api.vendor.example); " + note
+		got, ok := GuidanceForResult(ScannerDLP, reason)
+		if !ok || !got.Immutable || !strings.Contains(got.OperatorKnob, "host clock") {
+			t.Fatalf("validity annotation lost guidance: reason=%q got=%+v", reason, got)
+		}
+		for _, invalid := range []string{"DLP: " + note, reason + ")", reason + " trailing metadata"} {
+			got, ok := GuidanceForResult(ScannerDLP, invalid)
+			if !ok || strings.Contains(got.OperatorKnob, "host clock") {
+				t.Fatalf("non-annotation changed guidance: reason=%q got=%+v", invalid, got)
+			}
+		}
+	}
+}
 
 func TestRemediationGuidanceCoversAllLabels(t *testing.T) {
 	// The canonical set of block labels a scanner emits. Every one must have
@@ -36,6 +123,7 @@ func TestRemediationGuidanceCoversAllLabels(t *testing.T) {
 		ScannerDenialOfWallet,
 		AuditResponseScan,
 		AuditHeaderDLP,
+		AuditReverseURLDLP,
 		AuditBodyPromptInjection,
 		AuditAddressProtection,
 		AuditChainDetection,
@@ -47,12 +135,29 @@ func TestRemediationGuidanceCoversAllLabels(t *testing.T) {
 		AuditSessionAnomaly,
 		AuditAdaptiveEnforcement,
 		AuditMCPSessionBinding,
+		AuditMCPToolPolicy,
+		ScannerMCPToolScanning,
+		AuditToolScanning,
+		AuditMCPInputDLP,
+		AuditMCPInputInjection,
+		AuditMCPInputInspection,
+		AuditMCPHeaderDLP,
+		AuditMCPHeaderInjection,
+		AuditMCPHeaderInspection,
+		AuditMCPResponseInspection,
+		AuditMCPProtocol,
+		AuditMCPRedirect,
+		AuditMCPRedirectOutputDLP,
+		AuditMCPRedirectOutputInjection,
+		AuditMCPDefer,
 		AuditFrozenTool,
 		AuditSNIMismatch,
 		AuditKillSwitch,
 		AuditAirlock,
 		AuditCrossRequestEntropy,
 		AuditCrossRequestFragment,
+		AuditCrossRequestFragmentOwnerMismatch,
+		AuditCrossRequestFragmentCapacity,
 		AuditGitProtection,
 		AuditAgentBudget,
 		AuditResponseSize,
@@ -111,7 +216,7 @@ func TestRemediationGuidanceCoversAllLabels(t *testing.T) {
 		{"a2a", AuditA2AScan, "invalid JSON", "no exemption knob", false},
 		{"agent budget", AuditAgentBudget, "request budget exceeded", "request count is expected", false},
 		{"session anomaly", AuditSessionAnomaly, "baseline_deviation", "baseline show", false},
-		{"query entropy", ScannerEntropy, "high entropy query value", "query_entropy_param_exclusions", false},
+		{"query entropy", ScannerEntropy, `high entropy query param "sig"`, "query_entropy_param_exclusions", false},
 		{"denial of wallet", ScannerDenialOfWallet, "tool call limit exceeded", "max_tool_calls_per_session", false},
 		{"ssrf metadata", ScannerSSRF, "metadata endpoint blocked", "non-overridable SSRF deny", true},
 		{"ssrf metadata label", ScannerSSRFMetadata, "metadata endpoint blocked", "non-overridable SSRF deny", true},
@@ -249,8 +354,31 @@ func TestGuidanceForResultDisambiguatesEntropy(t *testing.T) {
 		if !strings.Contains(g.OperatorKnob, "query_entropy_param_exclusions") {
 			t.Fatalf("query-entropy knob = %q, want query_entropy_param_exclusions first", g.OperatorKnob)
 		}
-		if OperatorHintForResult(ScannerEntropy, "query x") != queryEntropyOperatorKnob {
-			t.Fatal("OperatorHintForResult should return the query knob for a query reason")
+		if OperatorHintForResult(ScannerEntropy, `high entropy query param "sig"`) != queryEntropyOperatorKnob {
+			t.Fatal("OperatorHintForResult should return the query knob for a query value reason")
+		}
+		if OperatorHintForResult(ScannerEntropy, `high entropy query key "sig"`) != queryEntropyKeyOperatorKnob {
+			t.Fatal("OperatorHintForResult should return the key knob for a query key reason")
+		}
+	})
+
+	t.Run("classifier is exact and strips nested prefix", func(t *testing.T) {
+		cases := []struct {
+			reason string
+			want   bool
+		}{
+			{`high entropy query param "sig" (4.50 > 4.00 threshold)`, true},
+			{`high entropy query key "opaque" (4.50 > 4.00 threshold)`, true},
+			{`high entropy path segment (4.50 > 4.00 threshold)`, false},
+			{`nested URL in query parameter "redirect": high entropy query param "sig"`, true},
+			{`nested URL in query parameter "query trap": high entropy path segment`, false},
+			{`future query entropy prose`, false},
+		}
+		for _, tc := range cases {
+			got := IsQueryEntropyResult(Result{Scanner: ScannerEntropy, Reason: tc.reason})
+			if got != tc.want {
+				t.Errorf("IsQueryEntropyResult(%q) = %v, want %v", tc.reason, got, tc.want)
+			}
 		}
 	})
 
@@ -367,6 +495,8 @@ func TestOperatorHintForResultResolvesAuditReasons(t *testing.T) {
 		{"baseline deviation", AuditSessionAnomaly, "baseline_deviation", "pipelock baseline show"},
 		{"domain burst", AuditSessionAnomaly, "ip_domain_burst", "session_profiling.domain_burst"},
 		{"frozen tool is airlock", AuditFrozenTool, "tool not in frozen inventory", "airlock.timers"},
+		{"released tool scanning inspection", AuditToolScanning, "tools/list cannot be safely inspected: tool_inventory_capacity", "does not override this refusal"},
+		{"URL tool scanning inspection", ScannerMCPToolScanning, "tools/list cannot be safely inspected: tool_inventory_capacity", "does not override this refusal"},
 		{"session deny alias", AuditSessionDeny, "critical", "affected identity session"},
 		{"A2A header alias", AuditA2AHeader, "a2a: A2A-Extensions header contains blocked URI", "a2a_scanning.action"},
 		{"redaction non JSON route", AuditRedaction, "redaction blocked request: non_json_body", "redaction.allowlist_unparseable_routes"},
@@ -392,6 +522,19 @@ func TestOperatorHintForResultResolvesAuditReasons(t *testing.T) {
 }
 
 func TestRemediationHintsDoNotRecommendInertKnobs(t *testing.T) {
+	t.Run("request body prompt injection omits response exemptions", func(t *testing.T) {
+		hint := OperatorHintForResult(AuditBodyPromptInjection, "request body contains prompt injection")
+		if !strings.Contains(hint, "request_body_scanning.trusted_hosts") {
+			t.Fatalf("request-body prompt-injection hint = %q, want trusted-host control", hint)
+		}
+		if strings.Contains(hint, "response_scanning.exempt_domains") {
+			t.Fatalf("request-body prompt-injection hint = %q, recommends an unconsulted response exemption", hint)
+		}
+		if !strings.Contains(hint, "configured action") || !strings.Contains(hint, "`block` action") {
+			t.Fatalf("request-body prompt-injection hint = %q, must preserve the configured action", hint)
+		}
+	})
+
 	t.Run("core response rejects inert suppression advice", func(t *testing.T) {
 		hint := OperatorHintForResult(ScannerCoreResponse, "core response pattern: role_override")
 		if strings.Contains(hint, "top-level `suppress:`") {
@@ -483,8 +626,18 @@ func TestRemediationHintsDoNotRecommendInertKnobs(t *testing.T) {
 
 	t.Run("kill switch distinguishes transport exemptions", func(t *testing.T) {
 		hint := OperatorHintForResult(AuditKillSwitch, "sentinel")
-		if !strings.Contains(hint, "kill_switch.allowlist_ips") || !strings.Contains(hint, "Raw/MCP") {
+		if !strings.Contains(hint, "kill_switch.allowlist_ips") || !strings.Contains(hint, "Raw/MCP") || !strings.Contains(hint, "except during unresolved") {
 			t.Fatalf("kill-switch hint = %q, want exact HTTP carve-out scope", hint)
+		}
+	})
+
+	t.Run("uncertain policy requires recovery instead of an IP exemption", func(t *testing.T) {
+		hint := OperatorHintForResult(AuditKillSwitch, "conductor_apply_failure")
+		// Pin the complete advice so an added contradictory exemption cannot
+		// pass merely because the recovery and non-exemption fragments remain.
+		const want = "Restore the failed policy-application prerequisite and retry a valid Conductor policy, or restart to re-verify cached policy. `kill_switch.allowlist_ips` doesn't exempt unresolved policy application."
+		if hint != want {
+			t.Fatalf("uncertain-policy hint = %q, want only policy recovery and the explicit exemption limit", hint)
 		}
 	})
 
@@ -643,7 +796,7 @@ func TestDecideLabelGuidanceNamesOperatorKnobsOnlyToOperator(t *testing.T) {
 		forbidAgent string
 	}{
 		{DecideInjectionLabel, "response_scanning", "response_scanning"},
-		{DecidePolicyLabel, "mcp_tool_policy", "mcp_tool_policy"},
+		{DecidePolicyLabel, "mcp_tool_policy.on_incomplete_check", "mcp_tool_policy"},
 		{DecideStructuralLabel, "could not be evaluated safely", "correct the action shape"},
 	}
 
@@ -658,6 +811,244 @@ func TestDecideLabelGuidanceNamesOperatorKnobsOnlyToOperator(t *testing.T) {
 			}
 			if strings.Contains(g.AgentReason, tt.forbidAgent) {
 				t.Fatalf("AgentReason %q contains operator knob substring %q", g.AgentReason, tt.forbidAgent)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationHint(t *testing.T) {
+	for label := range remediationGuidance {
+		t.Run(label, func(t *testing.T) {
+			for _, reason := range []string{
+				UninspectableJSONNumberPattern,
+				"request body contains secret: " + UninspectableJSONNumberPattern,
+				"other pattern, " + UninspectableJSONNumberPattern,
+			} {
+				g, ok := GuidanceForResultWithPatterns(label, reason, []string{"other pattern", UninspectableJSONNumberPattern})
+				if !ok || !g.Immutable || g.OperatorBroader != "" {
+					t.Fatalf("inspection guidance = %+v, mapped = %v", g, ok)
+				}
+				hint := OperatorHintForPatterns(label, []string{"other pattern", UninspectableJSONNumberPattern})
+				for _, want := range []string{"Reduce nesting or number size", "payload at its source", "limits are fixed"} {
+					if !strings.Contains(hint, want) {
+						t.Errorf("hint = %q, want %q", hint, want)
+					}
+				}
+				if strings.Contains(strings.ToLower(hint), "suppress") {
+					t.Fatalf("inspection hint offers suppression: %q", hint)
+				}
+			}
+			ordinary, ok := GuidanceForResult(label, "ordinary finding")
+			if baseline, mapped := GuidanceFor(label); mapped && ok && ordinary.OperatorKnob != baseline.OperatorKnob {
+				// Reason-specific families have their own existing regression tests.
+				if label == ScannerBodyDLP || label == ScannerDLP || label == AuditResponseScan {
+					t.Fatalf("ordinary guidance changed: %+v, want %+v", ordinary, baseline)
+				}
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationReasonFormats(t *testing.T) {
+	for _, tt := range []struct{ label, reason string }{
+		{ScannerBodyDLP, "request body contains secret: " + UninspectableJSONNumberPattern},
+		{ScannerBodyDLP, "request body contains secret: ordinary, " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerCoreDLP, "core DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerDLP, "DLP match: ordinary, " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (escalated)"},
+		{ScannerDLP, "DLP: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "cross-request fragment inspection limit exceeded"},
+		{AuditCrossRequestFragment, "cross-request fragment refused: " + UninspectableJSONNumberPattern + "; reduce nesting or number size in the JSON tool arguments at their source (typed JSON number and depth limits are fixed)"},
+		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
+		{AuditA2AResponse, "a2a: 2 URL/SSRF finding(s); injection: ordinary; DLP: " + UninspectableJSONNumberPattern},
+		{AuditA2AScan, "a2a: injection: ordinary; DLP: ordinary, " + UninspectableJSONNumberPattern + "; payload exceeded node budget"},
+	} {
+		t.Run(tt.reason, func(t *testing.T) {
+			got, ok := GuidanceForResult(tt.label, tt.reason)
+			if !ok || !got.Immutable || !strings.Contains(got.OperatorKnob, "limits are fixed") {
+				t.Fatalf("genuine refusal lost: %+v, %v", got, ok)
+			}
+		})
+	}
+}
+
+func TestJSONInspectionRemediationRequiresPatternIdentity(t *testing.T) {
+	for _, pattern := range []string{"prefix " + UninspectableJSONNumberPattern, UninspectableJSONNumberPattern + " suffix", "ordinary, " + UninspectableJSONNumberPattern, "request body contains secret: " + UninspectableJSONNumberPattern, " " + UninspectableJSONNumberPattern + " "} {
+		got, ok := GuidanceForResultWithPatterns(ScannerBodyDLP, pattern, []string{pattern})
+		baseline, _ := GuidanceFor(ScannerBodyDLP)
+		if !ok || got != baseline {
+			t.Fatalf("display text %q changed guidance: %+v", pattern, got)
+		}
+	}
+	for _, label := range []string{ScannerSSRF, ScannerDLP, AuditResponseScan, ScannerBodyDLP, AuditCrossRequestFragment, AuditA2AScan, AuditA2AResponse} {
+		for _, patterns := range [][]string{nil, {""}, {"", " \t\r\n", "\u00a0"}} {
+			got, ok := GuidanceForResultWithPatterns(label, "client text mentions "+UninspectableJSONNumberPattern, patterns)
+			baseline, _ := GuidanceFor(label)
+			if !ok || got != baseline {
+				t.Fatalf("free text changed %q guidance with patterns %q: %+v", label, patterns, got)
+			}
+		}
+	}
+}
+
+func TestJSONInspectionRemediationIgnoresBlankPatterns(t *testing.T) {
+	for _, tt := range []struct{ label, reason string }{
+		{ScannerBodyDLP, "request body contains secret: " + UninspectableJSONNumberPattern},
+		{ScannerDLP, "DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{ScannerCoreDLP, "core DLP match: " + UninspectableJSONNumberPattern + " (high)"},
+		{AuditA2AResponse, "a2a: DLP: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "fragment reassembly DLP match: " + UninspectableJSONNumberPattern},
+		{AuditCrossRequestFragment, "cross-request fragment inspection limit exceeded"},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			// Positive control: this genuine reason must be recognized on its own.
+			want, ok := GuidanceForResult(tt.label, tt.reason)
+			if !ok || !want.Immutable || !strings.Contains(want.OperatorKnob, "limits are fixed") {
+				t.Fatalf("invalid genuine-refusal fixture: %+v, %v", want, ok)
+			}
+			for _, patterns := range [][]string{nil, {}, {""}, {" \t\r\n"}, {"", "\u00a0", "\t"}} {
+				got, mapped := GuidanceForResultWithPatterns(tt.label, tt.reason, patterns)
+				if !mapped || got != want {
+					t.Errorf("blank patterns %q lost fixed-limit guidance: %+v, %v", patterns, got, mapped)
+				}
+			}
+			// Blank entries must not hide a real identity or mutate the caller's slice.
+			patterns := []string{"", "ordinary pattern", " \t"}
+			got, mapped := GuidanceForResultWithPatterns(tt.label, tt.reason, patterns)
+			ordinary, ordinaryMapped := GuidanceForResultWithPatterns(tt.label, tt.reason, []string{"ordinary pattern"})
+			if !mapped || !ordinaryMapped || got != ordinary || got == want {
+				t.Fatalf("structured identity lost precedence: %+v, %v", got, mapped)
+			}
+			if patterns[0] != "" || patterns[1] != "ordinary pattern" || patterns[2] != " \t" {
+				t.Fatalf("caller patterns changed: %q", patterns)
+			}
+			got, mapped = GuidanceForResultWithPatterns(tt.label, "ordinary finding", []string{"", " \t", UninspectableJSONNumberPattern})
+			if !mapped || got != want {
+				t.Fatalf("exact identity lost among blanks: %+v, %v", got, mapped)
+			}
+		})
+	}
+}
+
+func TestA2AJSONInspectionRemediationRejectsForgedParts(t *testing.T) {
+	for _, prefix := range []string{
+		"duplicate JSON object key: ", "invalid JSON: ", "response scan incomplete: ",
+		"request body uses Content-Encoding ", "error reading request body: ",
+		"opaque hex request body content ", "0 URL/SSRF finding(s)",
+		"ordinary URL/SSRF finding(s)", "99999999999999999999999999999 URL/SSRF finding(s)",
+	} {
+		reason := "a2a: " + prefix + "; DLP: " + UninspectableJSONNumberPattern + "; tail"
+		for _, label := range []string{AuditA2AScan, AuditA2AHeader, AuditA2AResponse} {
+			for _, patterns := range [][]string{nil, {""}, {"", " \t\r\n", "\u00a0"}} {
+				g, ok := GuidanceForResultWithPatterns(label, reason, patterns)
+				if !ok || g == jsonInspectionLimitGuidance() {
+					t.Errorf("forged reason %q selected inspection-limit guidance under %s with patterns %q", reason, label, patterns)
+				}
+			}
+		}
+	}
+}
+
+// The mcp_protocol label covers listener admission, protocol and capacity
+// refusals as well as batches. Only a batch request is repaired by sending one
+// request at a time, so no other reason may carry that hint.
+func TestMCPProtocolHintOnlyForBatchRequests(t *testing.T) {
+	const batchKnob = "Send one JSON-RPC request at a time."
+	if hint := OperatorHintForResult(AuditMCPProtocol, "MCP batch requests are unsupported"); !strings.Contains(hint, batchKnob) {
+		t.Fatalf("batch request hint = %q", hint)
+	}
+	for _, reason := range []string{
+		"MCP batch responses are unsupported",
+		"MCP listener admission refused",
+		"MCP listener protocol refused",
+		"MCP listener state capacity exhausted",
+		"MCP listener client-registry capacity exhausted (4096 clients); wait for listener idle expiry (24h) or session end",
+		"session capacity exhausted; wait for session recovery or increase max_sessions",
+	} {
+		if hint := OperatorHintForResult(AuditMCPProtocol, reason); hint == "" || strings.Contains(hint, batchKnob) {
+			t.Errorf("reason %q has hint %q, want its own non-empty hint", reason, hint)
+		}
+	}
+}
+
+// Operational refusals must identify the failed prerequisite, rather than
+// recommending the generic content-policy controls for the same label.
+func TestMCPRemediationReasonPrerequisites(t *testing.T) {
+	cases := []struct {
+		label, reason, want string
+		immutable           bool
+	}{
+		{AuditContract, "MCP contract evaluation failed", "Restore the active contract loader", false},
+		{AuditA2AScan, "A2A input could not be inspected", "does not override a failed inspection", false},
+		{AuditA2AScan, "A2A input URL check refused", "cloud metadata and core-critical destination blocks remain enforced", false},
+		{AuditA2AScan, "A2A input inspection budget exceeded", "budget-only refusal after fallback scanning", false},
+		{AuditA2AScan, "A2A input configuration mismatch", "does not repair a configuration mismatch", false},
+		{AuditMCPProtocol, "MCP batch responses are unsupported", "correct the upstream server", true},
+		{AuditMCPProtocol, "MCP listener admission refused", "listener_require_state_token", true},
+		{AuditMCPProtocol, "MCP listener protocol refused", "no scanner or policy setting relaxes protocol validation", true},
+		{AuditMCPProtocol, "MCP listener state capacity exhausted", "Retry after an existing state expires", true},
+		{AuditMCPProtocol, "MCP listener client-registry capacity exhausted (4096 clients); wait for listener idle expiry (24h) or session end", "does not raise this registry limit", true},
+		{AuditMCPProtocol, "session capacity exhausted; wait for session recovery or increase max_sessions", "session_profiling.max_sessions", true},
+		{ScannerMCPToolScanning, "tools/list cannot be safely inspected: oversized inventory", "does not override this refusal", false},
+		{AuditToolScanning, "tools/list cannot be safely inspected: malformed inventory", "does not override this refusal", false},
+		{AuditResponseScan, "response scan parse error in MCP parameter header", "cannot make the header scannable", false},
+		{AuditResponseScan, "response scan cannot be scanned: response scanner unavailable", "policy suppression cannot provide the missing scan", false},
+		{AuditResponseScan, "response scan returned an incomplete verdict", "a pattern suppression has no identified match to change", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.label+"/"+tc.reason, func(t *testing.T) {
+			guidance, ok := GuidanceForResult(tc.label, tc.reason)
+			if !ok || !strings.Contains(guidance.OperatorKnob, tc.want) || guidance.Immutable != tc.immutable || guidance.AgentReason != auditRuntimeAgentReason {
+				t.Fatalf("guidance = %+v, ok=%v; want prerequisite %q, immutable=%v and runtime refusal", guidance, ok, tc.want, tc.immutable)
+			}
+			if hint := OperatorHintForResult(tc.label, tc.reason); !strings.Contains(hint, tc.want) {
+				t.Fatalf("operator hint lost prerequisite: %q", hint)
+			}
+		})
+	}
+}
+
+func TestQueryEntropyHintChangingPaths(t *testing.T) {
+	for _, reason := range []string{
+		`high entropy query param "_state" (5.58 > 4.50 threshold)`,
+		`nested URL in query parameter "next": high entropy query param "_state"`,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			hint := OperatorHintForResult(ScannerEntropy, reason)
+			for _, want := range []string{
+				"For a blocked query value at a stable endpoint path",
+				"query_entropy_param_exclusions",
+				"not future paths with new upload UUIDs or other changing segments",
+				"query_entropy_exclusions",
+				"broader host-wide fallback",
+			} {
+				if !strings.Contains(hint, want) {
+					t.Errorf("hint %q missing %q", hint, want)
+				}
+			}
+		})
+	}
+}
+
+// A parameter exclusion skips only query-value entropy, so a query-key block
+// must point at the host-wide exclusion and never suggest the inert tuple.
+func TestQueryEntropyKeyHint(t *testing.T) {
+	for _, reason := range []string{
+		`high entropy query key "opaque" (4.50 > 4.00 threshold)`,
+		`nested URL in query parameter "next": high entropy query key "opaque"`,
+	} {
+		t.Run(reason, func(t *testing.T) {
+			hint := OperatorHintForResult(ScannerEntropy, reason)
+			if !strings.HasPrefix(hint, queryEntropyKeyOperatorKnob) {
+				t.Fatalf("hint = %q, want key knob", hint)
+			}
+			if !strings.Contains(hint, "`fetch_proxy.monitoring.query_entropy_exclusions`") {
+				t.Errorf("hint %q missing host-wide exclusion", hint)
+			}
+			if strings.Contains(hint, "add the exact scheme+host+path+param tuple") {
+				t.Errorf("hint %q recommends a parameter exclusion that cannot lift a key block", hint)
 			}
 		})
 	}

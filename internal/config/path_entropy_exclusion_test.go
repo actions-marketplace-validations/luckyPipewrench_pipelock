@@ -54,6 +54,11 @@ func TestValidatePathEntropyExclusions(t *testing.T) {
 			wantErr: "host is required",
 		},
 		{
+			name:    "doubled trailing slash is not a canonical prefix",
+			entry:   PathEntropyExclusion{Host: "docs.vendor.example", PathPrefix: "/assets//"},
+			wantErr: "not a canonical path",
+		},
+		{
 			name:    "missing path prefix would exempt every path on the host",
 			entry:   PathEntropyExclusion{Host: "docs.vendor.example"},
 			wantErr: "path_prefix is required",
@@ -74,9 +79,9 @@ func TestValidatePathEntropyExclusions(t *testing.T) {
 			wantErr: "must start with /",
 		},
 		{
-			name:    "http is refused so an entry cannot silently cover cleartext",
-			entry:   PathEntropyExclusion{Scheme: "http", Host: "docs.vendor.example", PathPrefix: "/document/d/"},
-			wantErr: "must be https",
+			name:    "a scheme other than http or https is refused",
+			entry:   PathEntropyExclusion{Scheme: "ftp", Host: "docs.vendor.example", PathPrefix: "/document/d/"},
+			wantErr: "must be http or https",
 		},
 		{
 			name:    "an over-broad wildcard is refused",
@@ -180,6 +185,32 @@ func TestValidatePathEntropyExclusions(t *testing.T) {
 		}
 	})
 
+	t.Run("an explicit http entry is accepted and normalized", func(t *testing.T) {
+		t.Parallel()
+		entries := []PathEntropyExclusion{{
+			Scheme:     " HTTP ",
+			Host:       "files.vendor.example",
+			PathPrefix: "/artifacts/",
+		}}
+		if err := validatePathEntropyExclusions(entries); err != nil {
+			t.Fatalf("validatePathEntropyExclusions(http) = %v, want nil", err)
+		}
+		if entries[0].Scheme != "http" {
+			t.Errorf("scheme = %q, want http", entries[0].Scheme)
+		}
+	})
+
+	t.Run("http and https of the same route are different exemptions", func(t *testing.T) {
+		t.Parallel()
+		err := validatePathEntropyExclusions([]PathEntropyExclusion{
+			{Scheme: "http", Host: "files.vendor.example", PathPrefix: "/artifacts/"},
+			{Scheme: "https", Host: "files.vendor.example", PathPrefix: "/artifacts/"},
+		})
+		if err != nil {
+			t.Fatalf("validatePathEntropyExclusions(http and https) = %v, want nil", err)
+		}
+	})
+
 	t.Run("a wildcard host is accepted", func(t *testing.T) {
 		t.Parallel()
 		entries := []PathEntropyExclusion{{Host: "*.vendor.example", PathPrefix: "/document/d/"}}
@@ -212,6 +243,7 @@ func TestPathEntropyExclusionDefaults(t *testing.T) {
 		{Host: "docs.google.com", PathPrefix: "/presentation/d/"},
 		{Host: "docs.google.com", PathPrefix: "/forms/d/e/"},
 		{Host: "drive.google.com", PathPrefix: "/file/d/"},
+		{Host: "challenges.cloudflare.com", PathPrefix: "/cdn-cgi/challenge-platform/"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("default path_entropy_exclusions has %d entries, want %d: %+v", len(got), len(want), got)

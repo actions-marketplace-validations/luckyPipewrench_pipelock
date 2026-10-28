@@ -118,6 +118,7 @@ func rollbackActions(opts rollbackOpts) []step {
 		actionPreserve("preflight (no-op for rollback)"),
 		actionMaybeDeleteUser(opts, true),  // proxy
 		actionMaybeDeleteUser(opts, false), // agent
+		actionMaybeDeleteViewerUser(opts),
 		actionMaybeRemoveDir(opts, "config", func(e *installEnv) string { return e.configDir }),
 		actionMaybeRemoveDir(opts, "data", func(e *installEnv) string { return e.dataDir }),
 		// Revoke MUST execute (in reverse walk: first) before the agent
@@ -137,19 +138,128 @@ func rollbackActions(opts rollbackOpts) []step {
 		actionPreserve("user-mode pipelock (operator decides whether to re-enable)"),
 		actionRemoveSystemUnit(),
 		actionDisablePipelockService(),
-		actionRemovePath("pipelock CA export", func(e *installEnv) string { return e.caExportPath }),
-		actionRemovePath("combined CA bundle", func(e *installEnv) string { return e.caBundlePath }),
+		// main restores these rather than removing them (#1624): a rollback must
+		// not destroy operator trust state it did not create.
+		actionRestorePath("pipelock CA export", func(e *installEnv) string { return e.caExportPath }),
+		actionRestorePath("combined CA bundle", func(e *installEnv) string { return e.caBundlePath }),
+		// Browser-trust removal recomputes the CA fingerprint from the export,
+		// so it must execute BEFORE the restores put the pre-install bytes
+		// back. runUndo walks this slice in reverse, so executing first means
+		// sitting at a HIGHER index: below the restores, not above them.
+		actionRemoveBrowserCATrust(),
+		actionRemoveNetworkNamespace(),
 		actionRemoveNFTRules(),
+		actionRemoveAgentDisplay(),
+		actionRemoveViewer(),
 		actionRemovePath("plk-launch tools.list", func(e *installEnv) string { return e.toolsListPath }),
 		actionRemovePath("node undici shim", undiciShimPathOrDefault),
 		actionRemoveWrapper("plk-launch", "plk-launch"),
+		actionRemoveWrapper("plk-contained-launch", "plk-contained-launch"),
 		actionRemoveWrapper("plk meta-wrapper", "plk"),
 		actionRemoveToolWrappers(),
 		actionRemoveUtilityWrappers(),
 		actionRemovePath("login-shell runtime contract", profileScriptPathOrDefault),
 		actionRemoveAgentToolConfigs(),
+		actionRemoveAgentBrowserDefaults(),
 		actionRemovePath("wrapper inventory", func(e *installEnv) string { return e.wrapperInvPath }),
 		actionRemoveSudoers(),
+	}
+}
+
+func actionMaybeDeleteViewerUser(opts rollbackOpts) step {
+	return step{name: "delete-viewer-user", desc: "delete dedicated display viewer user", undo: func(ctx context.Context, env *installEnv) error {
+		if opts.keepUsers && !opts.purgeUsers {
+			return nil
+		}
+		createdUID, err := env.readFile(viewerCreationMarkerPath(env))
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("viewer creation record: %w", err)
+		}
+		account, err := env.lookupUser(viewerUserName)
+		if err != nil {
+			if errors.As(err, new(user.UnknownUserError)) {
+				return env.removeFile(viewerCreationMarkerPath(env))
+			}
+			return fmt.Errorf("viewer user lookup: %w", err)
+		}
+		if strings.TrimSpace(string(createdUID)) != account.Uid {
+			return fmt.Errorf("viewer account UID differs from its creation record; preserving account")
+		}
+		if err := removeEmptyDisplayRuntime(ctx, env); err != nil {
+			return fmt.Errorf("preserving viewer account: %w; stop the display, inspect and repair or move aside the runtime directory, then retry account removal", err)
+		}
+		if err := runOrErr(ctx, env, "userdel", "-r", viewerUserName); err != nil {
+			return err
+		}
+		return env.removeFile(viewerCreationMarkerPath(env))
+	}}
+}
+
+func actionRemoveNetworkNamespace() step {
+	return step{
+		name: "remove-agent-network-namespace",
+		desc: "remove the contained-agent network namespace and proxy forwarder units",
+		undo: func(ctx context.Context, env *installEnv) error {
+			var errs []error
+			// Close published endpoints first: their relays join the namespace
+			// removed below.
+			if err := removePublishedServices(ctx, env); err != nil {
+				errs = append(errs, err)
+			}
+			if inv, err := readLoopbackForwarderInventory(env); err != nil {
+				errs = append(errs, err)
+			} else {
+				unitDir := filepath.Dir(env.proxyForwarderSocketPath)
+				for _, record := range inv.Services {
+					socket := record.Unit + ".socket"
+					if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", socket); err != nil {
+						errs = append(errs, err)
+					}
+					for _, suffix := range []string{".socket", ".service"} {
+						path := filepath.Join(unitDir, record.Unit+suffix)
+						if err := restoreBackup(env, path); err != nil {
+							errs = append(errs, fmt.Errorf("restore %s: %w", path, err))
+						}
+					}
+				}
+			}
+			for _, path := range []string{env.proxyForwarderSocketPath, env.proxyForwarderServicePath, env.networkNamespaceUnitPath} {
+				if path == "" {
+					continue
+				}
+				unit := filepath.Base(path)
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+					errs = append(errs, fmt.Errorf("disable %s: %w", unit, err))
+				}
+				if err := restoreBackup(env, path); err != nil {
+					errs = append(errs, fmt.Errorf("restore %s: %w", path, err))
+				}
+			}
+			// Remove the prior release's cgroup anchor too. It is no longer a
+			// containment mechanism and must not survive as a second apparent
+			// source of truth after rollback or upgrade.
+			if path := env.ownedLoopbackAnchorUnitPath; path != "" {
+				unit := filepath.Base(path)
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+					errs = append(errs, fmt.Errorf("disable legacy %s: %w", unit, err))
+				}
+				if err := restoreBackup(env, path); err != nil {
+					errs = append(errs, fmt.Errorf("restore legacy %s: %w", path, err))
+				}
+			}
+			if env.loopbackForwarderInvPath != "" {
+				if err := restoreBackup(env, env.loopbackForwarderInvPath); err != nil {
+					errs = append(errs, fmt.Errorf("restore %s: %w", env.loopbackForwarderInvPath, err))
+				}
+			}
+			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
+				errs = append(errs, err)
+			}
+			return errors.Join(errs...)
+		},
 	}
 }
 
@@ -228,6 +338,22 @@ func actionRemovePath(desc string, pathFn func(*installEnv) string) step {
 			}
 			// Also drop the .bak if present.
 			_ = env.removeFile(path + ".bak")
+			return nil
+		},
+	}
+}
+
+// actionRestorePath reverses a backup-aware install write. It restores a
+// pre-install file when one exists and otherwise removes only the artifact the
+// installer created.
+func actionRestorePath(desc string, pathFn func(*installEnv) string) step {
+	return step{
+		name: "restore-" + desc,
+		desc: "restore or remove " + desc,
+		undo: func(_ context.Context, env *installEnv) error {
+			if err := restoreBackup(env, pathFn(env)); err != nil {
+				return fmt.Errorf("restore %s: %w", desc, err)
+			}
 			return nil
 		},
 	}

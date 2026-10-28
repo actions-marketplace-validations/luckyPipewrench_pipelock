@@ -8,12 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strconv"
 	"unicode/utf8"
 
 	"golang.org/x/text/unicode/norm"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
 // ErrFloatNotAllowed indicates a float appeared in a signable preimage.
@@ -55,7 +56,9 @@ func canonicalizeInto(buf *bytes.Buffer, v any) error {
 		if err != nil {
 			return fmt.Errorf("marshal string: %w", err)
 		}
-		buf.Write(b)
+		// Invalid UTF-8 must encode the same way on every Go release and in
+		// every verifier; see jsonscan.NormalizeReplacementEscapes.
+		buf.Write(jsonscan.NormalizeReplacementEscapes(b))
 		return nil
 	case int:
 		buf.WriteString(strconv.FormatInt(int64(x), 10))
@@ -137,81 +140,15 @@ func canonicalizeInto(buf *bytes.Buffer, v any) error {
 // ErrTrailingTokens is returned if any non-whitespace tokens follow the value.
 // Trailing whitespace (spaces, newlines) is permitted by the JSON spec and is not an error.
 func ParseJSONStrict(data []byte) (any, error) {
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.UseNumber()
-	val, err := parseStrictValue(dec)
-	if err != nil {
-		return nil, err
-	}
-	// Trailing whitespace is not a token and dec.Token returns io.EOF for it.
-	// Any other token, including a stray delimiter, is rejected.
-	if tok, err := dec.Token(); err != io.EOF {
-		if err != nil {
+	var value any
+	if err := jsonscan.DecodeStrict(data, &value); err != nil {
+		if errors.Is(err, jsonscan.ErrDuplicateKey) {
+			return nil, fmt.Errorf("%w: %w", ErrDuplicateKey, err)
+		}
+		if errors.Is(err, jsonscan.ErrTrailingTokens) {
 			return nil, fmt.Errorf("%w: %w", ErrTrailingTokens, err)
 		}
-		return nil, fmt.Errorf("%w: %v", ErrTrailingTokens, tok)
-	}
-	return val, nil
-}
-
-// parseStrictValue walks a json.Decoder rejecting duplicate keys.
-func parseStrictValue(dec *json.Decoder) (any, error) {
-	tok, err := dec.Token()
-	if err != nil {
 		return nil, err
 	}
-	return parseStrictFrom(dec, tok)
-}
-
-func parseStrictFrom(dec *json.Decoder, tok json.Token) (any, error) {
-	switch t := tok.(type) {
-	case json.Delim:
-		switch t {
-		case '{':
-			obj := map[string]any{}
-			for dec.More() {
-				ktok, err := dec.Token()
-				if err != nil {
-					return nil, err
-				}
-				key, ok := ktok.(string)
-				if !ok {
-					return nil, fmt.Errorf("expected string key, got %T", ktok)
-				}
-				if _, exists := obj[key]; exists {
-					return nil, fmt.Errorf("%w: %q", ErrDuplicateKey, key)
-				}
-				val, err := parseStrictValue(dec)
-				if err != nil {
-					return nil, err
-				}
-				obj[key] = val
-			}
-			if _, err := dec.Token(); err != nil {
-				return nil, err
-			}
-			return obj, nil
-		case '[':
-			arr := []any{}
-			for dec.More() {
-				val, err := parseStrictValue(dec)
-				if err != nil {
-					return nil, err
-				}
-				arr = append(arr, val)
-			}
-			if _, err := dec.Token(); err != nil {
-				return nil, err
-			}
-			return arr, nil
-		default:
-			return nil, fmt.Errorf("unexpected delimiter %v", t)
-		}
-	case json.Number:
-		return t, nil
-	case string, bool, nil:
-		return t, nil
-	default:
-		return nil, fmt.Errorf("unexpected token %T", tok)
-	}
+	return value, nil
 }

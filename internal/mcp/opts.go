@@ -5,10 +5,13 @@ package mcp
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/authority"
@@ -66,6 +69,45 @@ const (
 	mcpServerResponse = "server_response"
 )
 
+// ServerIdentity is the per-request identity of a long-lived listener's
+// upstream. A non-empty Refusal refuses the request outright.
+type ServerIdentity struct {
+	Name        string
+	PolicyName  string
+	Binding     string
+	BindingMode string
+	Revision    string
+	Refusal     string
+}
+
+// withServerIdentity stamps a per-request identity over the static fields.
+func (o MCPProxyOpts) withServerIdentity(id ServerIdentity) MCPProxyOpts {
+	o.ServerName = id.Name
+	o.PolicyServerName = id.PolicyName
+	o.ServerBinding = id.Binding
+	o.ServerBindingMode = id.BindingMode
+	o.ServerRevision = id.Revision
+	return o
+}
+
+// checkServerIdentity refuses an in-flight response after its registration
+// changes. The response keeps its admission identity; it cannot switch to a
+// new identity midway through scanning or while awaiting operator approval.
+func (o MCPProxyOpts) checkServerIdentity() error {
+	if o.ServerIdentityFn == nil {
+		return nil
+	}
+	id := o.ServerIdentityFn()
+	if id.Refusal != "" {
+		return fmt.Errorf("MCP upstream identity refused: %s", id.Refusal)
+	}
+	if id.Name != o.ServerName || id.PolicyName != o.PolicyServerName ||
+		id.Binding != o.ServerBinding || id.BindingMode != o.ServerBindingMode || id.Revision != o.ServerRevision {
+		return fmt.Errorf("MCP upstream identity changed during response; restart the listener")
+	}
+	return nil
+}
+
 // MCPRedactionConfig snapshots the request-side redaction settings used for a
 // single MCP message or HTTP request.
 type MCPRedactionConfig struct {
@@ -91,6 +133,22 @@ func (o MCPProxyOpts) minSubjectTrust() config.DoWSubjectTrust {
 // Required: Scanner (dereferenced unconditionally in all scan paths).
 // Optional (nil-safe): all other fields - functions check before use.
 type MCPProxyOpts struct {
+	denialTerminal *mcpDeferredTerminal
+	// Modern HTTP lists enforce structural contracts independently of drift trust.
+	validateToolHeaders bool
+	// Internal discovery inspects definitions without claiming client delivery.
+	toolContractDiscovery bool
+	// JSON listener scanning writes to a buffer. Defer inventory admission until
+	// the real downstream write succeeds; streaming transports commit directly.
+	toolInventoryDelivery func(commit, release func())
+	// A bridge queues held-action decisions until its inventory lock is released.
+	// A release can itself acquire a header contract; resolving under the writer
+	// hold would deadlock. Private discovery never invokes this callback.
+	toolInventoryResolution func(string)
+	// OnResponseKeysValidated admits transport metadata only after message keys
+	// pass the shared guard. It must be set before response scanning starts.
+	OnResponseKeysValidated func()
+
 	// ListenerBearerToken authenticates inbound HTTP-listener clients through
 	// Proxy-Authorization. It is never forwarded to the MCP upstream, whose
 	// independent credential continues to use Authorization.
@@ -130,8 +188,11 @@ type MCPProxyOpts struct {
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Scanning
-	Scanner        *scanner.Scanner
-	ScannerFn      func() *scanner.Scanner
+	Scanner   *scanner.Scanner
+	ScannerFn func() *scanner.Scanner
+	// ReloadMu is the publisher's lock, shared with config/scanner reloads.
+	// Request snapshots hold it only while resolving the scanner and policy hash.
+	ReloadMu       *sync.RWMutex
 	Approver       *hitl.Approver
 	InputCfg       *InputScanConfig
 	InputCfgFn     func() *InputScanConfig
@@ -144,6 +205,12 @@ type MCPProxyOpts struct {
 	KillSwitch     *killswitch.Controller
 	ChainMatcher   *chains.Matcher
 	ChainMatcherFn func() *chains.Matcher
+
+	beforeDeferredSendClaim func()
+	// beforeDeferredSinkClaim is a test seam that runs after Manager.Resolve
+	// has claimed a hold and immediately before the release-boundary
+	// kill-switch claim.
+	beforeDeferredSinkClaim func()
 
 	// stdioInputScanDisabled is set only by stdio proxy entry points after
 	// they resolve the live input configuration. Low-level callers retain the
@@ -167,7 +234,8 @@ type MCPProxyOpts struct {
 	TaintExternalSource bool
 	// TaintTrustedSource marks this MCP server's responses as operator-trusted
 	// for taint classification. Prompt-injection hits can still raise hostile
-	// taint; this only changes clean response-source classification.
+	// taint unless prompt_injection_detection is off or warn-only; this only
+	// changes clean response-source classification.
 	TaintTrustedSource bool
 	// TaintTrustedSourceFn returns the current MCP taint trust decision for
 	// hot-reload-aware proxy surfaces. Nil falls back to TaintTrustedSource.
@@ -179,7 +247,12 @@ type MCPProxyOpts struct {
 
 	// Observability
 	AuditLogger *audit.Logger
-	Metrics     *metrics.Metrics
+	// CorrelationHeader is emit.correlation_header, captured at startup like
+	// the emit sinks it feeds. The HTTP listener copies the vetted value of
+	// this inbound request header into every event the request emits.
+	// Transports without inbound request headers (stdio) ignore it.
+	CorrelationHeader string
+	Metrics           *metrics.Metrics
 
 	// AuthorityVerifier validates external grants immediately before an MCP
 	// request is forwarded. AuthorityActor and AuthorityDestination are
@@ -310,6 +383,32 @@ type MCPProxyOpts struct {
 	// match against. Empty disables target-scoped response suppression. Set
 	// from `pipelock mcp proxy --server-name`.
 	ServerName string
+	// PolicyServerName is the name that arms name-keyed trust and suppression:
+	// the suppress target "mcp://<name>/response" and core-observe. It is set
+	// only for a legacy explicit name or a verified registered identity, so a
+	// ServerName that is merely a label never arms any of them. Empty keeps the
+	// unnamed behavior.
+	PolicyServerName string
+	// ServerBinding is the binding digest of the configured server
+	// (tools.ServerBindingDigest). Credential-request acknowledgments must
+	// name it, so a server name reused for another destination cannot carry
+	// an acknowledgment over.
+	ServerBinding string
+	// ServerBindingMode is the acknowledgment binding mode ServerBinding was
+	// built for: empty or transport-v2, or verified-local-session.
+	ServerBindingMode string
+	// ServerRevision is the registered identity revision of a verified local
+	// service, empty for a legacy launch. It versions the adaptive session key.
+	ServerRevision string
+	// ServerIdentityFn re-resolves the server identity for each request of a
+	// long-lived listener, so a hot reload that changes or removes the
+	// registration is seen. Its result replaces the five static identity fields
+	// above for that request. Nil keeps the static fields.
+	ServerIdentityFn func() ServerIdentity
+	// ServerIdentityHeadersFn binds a listener request's effective upstream
+	// headers. It takes precedence over ServerIdentityFn when present, including
+	// at the in-flight response gates. Legacy listeners leave it nil.
+	ServerIdentityHeadersFn func(http.Header) ServerIdentity
 
 	// ResponseTrustClass is the effective trust class for this server's MCP
 	// responses. Empty is treated as "untrusted" and fails closed. Set from
@@ -358,8 +457,12 @@ type MCPProxyOpts struct {
 	// parity with ReceiptEmitter. Nil-safe (no-op when nil).
 	V2ReceiptEmitter   *proxydecision.Emitter
 	V2ReceiptEmitterFn func() *proxydecision.Emitter
-	PolicyHash         string
-	PolicyHashFn       func() string
+	// ReceiptGroup routes N>1 decisions to paired v1/v2 shard writers.
+	// Per-action callers select a shard before emission and retain it for
+	// asynchronous outcomes. Nil preserves the legacy single-chain path.
+	ReceiptGroup *MCPReceiptGroup
+	PolicyHash   string
+	PolicyHashFn func() string
 
 	DeferManager   *deferred.Manager
 	DeferManagerFn func() *deferred.Manager
@@ -429,10 +532,35 @@ type MCPProxyOpts struct {
 // responses ("mcp://<ServerName>/response"), or "" when no stable server
 // name is set (which disables target-scoped response suppression).
 func (o MCPProxyOpts) responseTarget() string {
+	if o.PolicyServerName == "" {
+		return ""
+	}
+	return "mcp://" + o.PolicyServerName + "/response"
+}
+
+// auditTarget returns the audit resource and receipt target for the server's
+// responses. It follows ServerName, which labels the stream whether or not the
+// name arms any policy.
+func (o MCPProxyOpts) auditTarget() string {
 	if o.ServerName == "" {
 		return ""
 	}
 	return "mcp://" + o.ServerName + "/response"
+}
+
+// adaptiveSessionKey is the per-server adaptive-enforcement session key.
+// A registered identity is keyed by name and revision, so a changed policy
+// never inherits another revision's score; a legacy name is used unchanged.
+func (o MCPProxyOpts) adaptiveSessionKey() string {
+	name := firstNonEmpty(o.ServerName, "default")
+	if o.ServerRevision == "" {
+		return name
+	}
+	rev := o.ServerRevision
+	if len(rev) > 12 {
+		rev = rev[:12]
+	}
+	return name + "@" + rev
 }
 
 // responseScanOptions builds the per-server suppression context passed into
@@ -442,11 +570,12 @@ func (o MCPProxyOpts) responseScanOptions() ResponseScanOptions {
 	// configured (the HTTP listener path), so building the context never logs
 	// a spurious "resource required" error and the record still names a
 	// surface an operator can search for.
-	auditResource := o.responseTarget()
+	auditResource := o.auditTarget()
 	if auditResource == "" {
 		auditResource = "mcp://response"
 	}
 	return ResponseScanOptions{
+		Context:        o.warnContext(),
 		Target:         o.responseTarget(),
 		Suppress:       o.responseSuppress(),
 		ActionOverride: o.responseActionOverride(),
@@ -467,8 +596,26 @@ func (o MCPProxyOpts) responseScanOptions() ResponseScanOptions {
 				o.Metrics.RecordResponseSuppressedMatch(match.PatternName, "mcp_stdio", "suppressed")
 			}
 		},
+		OnObservedCoreResponse: func(observed scanner.ObservedCoreMatch) {
+			if o.AuditLogger != nil {
+				o.AuditLogger.LogCoreResponseObserved(mustMCPAuditContext(o.AuditLogger, "MCP", auditResource), observed.Match.PatternName, "mcp_stdio", audit.CoreObserveAuthorization{
+					Host:    observed.Host,
+					Reason:  observed.Reason,
+					Owner:   observed.Owner,
+					Expires: observed.Expires,
+				})
+			}
+			if o.Metrics != nil {
+				o.Metrics.RecordResponseSuppressedMatch(observed.Match.PatternName, "mcp_stdio", coreObservedEvidenceReason)
+			}
+		},
 	}
 }
+
+// coreObservedEvidenceReason labels MCP evidence for a declared core-floor
+// observation. It matches the proxy's ExemptReasonCoreObserved so one query
+// finds every observed floor finding across transports.
+const coreObservedEvidenceReason = "core_observed"
 
 func (o MCPProxyOpts) responseSuppress() []config.SuppressEntry {
 	if o.SuppressFn != nil {
@@ -532,10 +679,49 @@ func (o MCPProxyOpts) addressProtectionAgent() string {
 }
 
 func (o MCPProxyOpts) warnContext() context.Context {
-	if o.WarnContext != nil {
-		return o.WarnContext
+	ctx := o.WarnContext
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	return context.Background()
+	wc := scanner.DLPWarnContextFromCtx(ctx)
+	wc.PromptInjectionMode = o.scanner().PromptInjectionMode()
+	if hash := o.receiptPolicyHash(); hash != "" {
+		wc.PolicyHash = hash
+	}
+	if wc.Transport == "" {
+		wc.Transport = o.Transport
+	}
+	if wc.Agent == "" {
+		wc.Agent = o.addressProtectionAgent()
+	}
+	if wc.ServerName == "" {
+		wc.ServerName = o.ServerName
+	}
+	if wc.Resource == "" {
+		wc.Resource = o.auditTarget()
+	}
+	if wc.Method == "" {
+		wc.Method = mcpWarnMethod
+	}
+	return scanner.WithDLPWarnContext(ctx, wc)
+}
+
+// snapshotScanPolicy pins the scanner and its receipt policy to the same
+// reload revision. Copies retain the snapshot through input, response and
+// asynchronous receipt emission; other live resolvers keep their own semantics.
+func (o MCPProxyOpts) snapshotScanPolicy() MCPProxyOpts {
+	if o.ReloadMu != nil {
+		o.ReloadMu.RLock()
+		defer o.ReloadMu.RUnlock()
+	}
+	o.Scanner = o.scanner()
+	o.PolicyHash = o.receiptPolicyHash()
+	o.ScannerFn = nil
+	o.PolicyHashFn = nil
+	o.ConfigHash = o.captureConfigHash()
+	o.ConfigHashFn = nil
+	o.ReloadMu = nil
+	return o
 }
 
 func (o MCPProxyOpts) scanner() *scanner.Scanner {
@@ -652,8 +838,19 @@ func (o MCPProxyOpts) a2aResponseOpts(scanOpts ResponseScanOptions) *A2AResponse
 			cardURL:         o.A2ACardURL,
 			authFingerprint: o.A2ACardAuthFingerprint,
 		},
-		ScanOpts: scanOpts,
+		ScanOpts:    scanOpts,
+		ScanTimeout: o.a2aResponseScanTimeout(),
 	}
+}
+
+// a2aResponseScanTimeout bounds the A2A response scan by the configured
+// upstream response timeout, so a response is never scanned for longer than
+// the proxy would wait for it.
+func (o MCPProxyOpts) a2aResponseScanTimeout() time.Duration {
+	if inputCfg := o.inputCfg(); inputCfg != nil && inputCfg.ResponseTimeoutSeconds > 0 {
+		return time.Duration(inputCfg.ResponseTimeoutSeconds) * time.Second
+	}
+	return 0
 }
 
 func (o MCPProxyOpts) mediaPolicy() *config.MediaPolicy {
@@ -695,6 +892,31 @@ func (o MCPProxyOpts) v2ReceiptEmitter() *proxydecision.Emitter {
 	return o.V2ReceiptEmitter
 }
 
+func (o MCPProxyOpts) emitReceiptDecision(d MCPDecision) ([]byte, error) {
+	return o.emitMCPReceiptDecision(d, true)
+}
+
+// emitAdmittedReceiptDecision preserves the tool pipeline's admission choice.
+// A missing choice must fail rather than assigning a new shard at emission.
+func (o MCPProxyOpts) emitAdmittedReceiptDecision(d MCPDecision) ([]byte, error) {
+	return o.emitMCPReceiptDecision(d, false)
+}
+
+func (o MCPProxyOpts) emitMCPReceiptDecision(d MCPDecision, admit bool) ([]byte, error) {
+	d.Receipt = o.withReceiptPolicyHash(d.Receipt)
+	if o.ReceiptGroup != nil {
+		if admit && o.ReceiptGroup.Shards != nil && d.Receipt.ActionID != "" && !d.Receipt.ShardSelected {
+			d.Receipt = o.ReceiptGroup.Shards.Admit(d.Receipt)
+		}
+		if o.requireReceipts() && d.Receipt.ActionID != "" {
+			d.RequireReceipt = true
+		}
+		d.RequiredMode = o.requireReceipts()
+		return EmitMCPGroupDecision(*o.ReceiptGroup, nil, d)
+	}
+	return EmitMCPDecision(o.receiptEmitter(), o.v2ReceiptEmitter(), nil, d)
+}
+
 func (o MCPProxyOpts) receiptPolicyHash() string {
 	if o.PolicyHashFn != nil {
 		if v := o.PolicyHashFn(); v != "" {
@@ -708,13 +930,17 @@ func (o MCPProxyOpts) receiptPolicyHash() string {
 }
 
 func (o MCPProxyOpts) withReceiptPolicyHash(opts receipt.EmitOpts) receipt.EmitOpts {
+	o = o.snapshotScanPolicy()
 	if opts.PolicyHash == "" {
 		opts.PolicyHash = o.receiptPolicyHash()
 	}
-	return opts
+	return receipt.WithPromptInjectionMode(opts, o.scanner().PromptInjectionMode())
 }
 
 func (o MCPProxyOpts) deferManager() *deferred.Manager {
+	if o.toolContractDiscovery {
+		return nil
+	}
 	if o.DeferManagerFn != nil {
 		return o.DeferManagerFn()
 	}

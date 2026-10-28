@@ -131,7 +131,7 @@ canonicalization, the current order is:
 7. SigV4 presigned-URL credential carve-out
 8. Core DLP floor
 9. Configured DLP
-10. Path entropy
+10. Path and query entropy
 11. Subdomain entropy
 12. Nested URL destinations named inside query components
 13. DNS-based SSRF, private-address, metadata, and rebinding checks
@@ -180,10 +180,7 @@ Pipelock ships several evidence surfaces with different proof boundaries:
   linkage.
 - **EvidenceReceipt v2:** RFC 8785/JCS-canonicalized typed evidence for contract
   lifecycle, shadow, drift, and contract-aware proxy decisions.
-- **Flight recorder:** configured evidence storage with chain continuity and
-  signed checkpoints. It records blocks; allow receipts require the configured
-  receipt mode, and clean stream frames may be summarized rather than emitted
-  one by one.
+- **Flight recorder:** configured evidence storage with chain continuity and signed checkpoints. When signing is configured, allow receipts are emitted in best-effort mode too; `require_receipts` makes successful allow-path emission mandatory. Clean stream frames may be summarized rather than emitted one by one.
 - **Audit Packet v0:** posture-bundled receipts plus verifier output. Its relying
   party must pin the expected trust inputs described in the
   [Audit Packet threat model](security/audit-packet-threat-model.md).

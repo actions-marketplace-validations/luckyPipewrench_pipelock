@@ -14,6 +14,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/termsafe"
 )
 
 // Cmd returns the top-level "update" command (alias "upgrade").
@@ -43,7 +44,9 @@ OIDC) for ecosystem auditors. Cosign absence is allowed after native Ed25519
 verification succeeds; checksum-only updates are never allowed.
 
 The previous binary is saved to <binary>.bak so "pipelock update --rollback"
-can restore it. When downgrading to a release that predates the update command
+can restore it. On Windows, a temporary recovery directory beside the executable
+holds the running image until a later start can remove it. The .bak copy stays
+available for rollback. When downgrading to a release that predates the update command
 (before v2.8.0), the updater warns that --rollback will not be available from
 the downgraded binary and prints the manual recovery command.
 
@@ -97,7 +100,7 @@ func runCommand(ctx context.Context, cmd *cobra.Command, opts *Options, doRollba
 		if err != nil {
 			return emitErr(cmd, opts, st, err)
 		}
-		msg := fmt.Sprintf("Current: %s\nLatest:  %s", display(st.CurrentVersion), st.LatestVersion)
+		msg := fmt.Sprintf("Current: %s\nLatest:  %s", display(st.CurrentVersion), display(st.LatestVersion))
 		if st.UpdateAvailable {
 			msg += "\nAn update is available. Run `pipelock update` to install it."
 		} else {
@@ -116,7 +119,7 @@ func runCommand(ctx context.Context, cmd *cobra.Command, opts *Options, doRollba
 				return emit(cmd, opts, pre, "You are running the latest release. Nothing to do.")
 			}
 			if !confirm(cmd, fmt.Sprintf("Update Pipelock from %s to %s? [y/N]: ",
-				display(pre.CurrentVersion), pre.LatestVersion)) {
+				display(pre.CurrentVersion), display(pre.LatestVersion))) {
 				return emit(cmd, opts, pre, "Update cancelled.")
 			}
 		}
@@ -127,17 +130,19 @@ func runCommand(ctx context.Context, cmd *cobra.Command, opts *Options, doRollba
 			}
 			return emitErr(cmd, opts, st, err)
 		}
-		msg := fmt.Sprintf("Updated to %s. Previous binary saved at %s.", st.LatestVersion, st.BackupPath)
+		msg := fmt.Sprintf("Updated to %s. Previous binary saved at %s.", display(st.LatestVersion), st.BackupPath)
 		return emit(cmd, opts, st, msg)
 	}
 }
 
-// display normalizes a possibly-empty/dev version for human output.
+// display normalizes a possibly-empty/dev version for human output. The
+// latest version comes from remote release metadata, so it is escaped before
+// it reaches the terminal or the confirmation prompt.
 func display(v string) string {
 	if v == "" {
 		return "unknown"
 	}
-	return v
+	return termsafe.Escape(v)
 }
 
 // confirm reads a y/N answer from stdin.

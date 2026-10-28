@@ -17,8 +17,8 @@ OpenCode runs long sessions across multiple repos, calls many MCP tools, and fre
 ## Quick Start
 
 ```bash
-# 1. Install pipelock (requires Go 1.25+)
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
@@ -35,6 +35,11 @@ pipelock opencode install --config "$PWD/pipelock.yaml"
 server to launch through `pipelock mcp proxy`, and is idempotent. Pass
 `--path` to target another config. After adding or removing an MCP server in
 OpenCode's configuration, re-run the installer to wrap new entries.
+Re-running after upgrading Pipelock also recovers and re-wraps an older
+Pipelock-authored entry using the current binary's invocation shape; an entry
+it cannot safely normalize (for example one still carrying a `headers` field
+outside the wrapped command) is refused with a message identifying the file
+and entry, and nothing is changed.
 
 After restarting OpenCode, use `opencode mcp list` and a harmless tool action
 to confirm the server connects. A rewritten config does not by itself prove an
@@ -77,7 +82,7 @@ Start in `balanced` to surface false positives in audit mode. Promote to a block
 
 ## Containment for Local Multi-User Hosts
 
-If you run OpenCode on a shared host, layer the [`pipelock contain`](../contain-cli.md) lifecycle on top of MCP wrapping. `pipelock contain install` splits the host into `operator` / `pipelock-proxy` / `pipelock-agent` users and uses nftables owner-match to force the contained agent user through Pipelock on loopback, including tools that try raw sockets. The two layers compose: MCP wrapping covers JSON-RPC scanning; containment covers the underlying egress path.
+If you run OpenCode on a shared host, layer the [`pipelock contain`](../contain-cli.md) lifecycle on top of MCP wrapping. `pipelock contain install` splits the host into `operator`, `pipelock-proxy`, and `pipelock-agent` users. OpenCode runs in a private network namespace with only a socket-forwarded path to Pipelock, while nftables owner-match keeps the agent UID denied outside that launch path. MCP wrapping scans JSON-RPC messages, and containment controls the network path underneath them.
 
 ## Troubleshooting
 

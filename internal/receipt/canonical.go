@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/session"
 )
 
@@ -24,7 +25,9 @@ func canonicalActionRecord(version int, ar ActionRecord) ([]byte, error) {
 // 1. Do not add future ActionRecord fields here. If the signed surface changes,
 // create a new projection and select it from canonicalActionRecord.
 func canonicalActionRecordV1(ar ActionRecord) ([]byte, error) {
-	return json.Marshal(actionRecordCanonicalV1{
+	// NormalizeReplacementEscapes makes the preimage independent of the Go
+	// release for strings holding invalid UTF-8; see its doc comment.
+	b, err := json.Marshal(actionRecordCanonicalV1{
 		Version:               ar.Version,
 		ActionID:              ar.ActionID,
 		ParentActionID:        ar.ParentActionID,
@@ -84,6 +87,10 @@ func canonicalActionRecordV1(ar ActionRecord) ([]byte, error) {
 		ContestationWindow:    ar.ContestationWindow,
 		PrecedentRefs:         ar.PrecedentRefs,
 	})
+	if err != nil {
+		return nil, err
+	}
+	return jsonscan.NormalizeReplacementEscapes(b), nil
 }
 
 type actionRecordCanonicalV1 struct {
@@ -226,10 +233,11 @@ type sessionOpenCanonicalV1 struct {
 	GenesisAnchorHead string `json:"genesis_anchor_head,omitempty"`
 	GenesisAnchorLog  string `json:"genesis_anchor_log,omitempty"`
 
-	PostureCapsuleSHA256 string `json:"posture_capsule_sha256,omitempty"`
-	PostureSignerKeyID   string `json:"posture_signer_key_id,omitempty"`
-	ContainmentNonce     string `json:"containment_nonce,omitempty"`
-	ContainedUID         string `json:"contained_uid,omitempty"`
+	PostureCapsuleSHA256 string               `json:"posture_capsule_sha256,omitempty"`
+	PostureSignerKeyID   string               `json:"posture_signer_key_id,omitempty"`
+	ContainmentNonce     string               `json:"containment_nonce,omitempty"`
+	ContainedUID         string               `json:"contained_uid,omitempty"`
+	GroupBinding         *ReceiptGroupBinding `json:"group_binding,omitempty"`
 }
 
 type sessionHeartbeatCanonicalV1 struct {
@@ -289,6 +297,7 @@ func canonicalSessionOpenV1(in *SessionOpen) *sessionOpenCanonicalV1 {
 		PostureSignerKeyID:   in.PostureSignerKeyID,
 		ContainmentNonce:     in.ContainmentNonce,
 		ContainedUID:         in.ContainedUID,
+		GroupBinding:         in.GroupBinding,
 	}
 }
 

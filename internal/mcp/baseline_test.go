@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/deferred"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
@@ -25,7 +26,31 @@ const baselineDeferToolCall = `{"jsonrpc":"2.0","id":1,"method":"tools/call","pa
 
 type baselineTestRecorder struct {
 	toolCalls int
+	activity  int
 	tools     map[string]struct{}
+}
+
+func (r *baselineTestRecorder) RecordToolActivity() { r.activity++ }
+
+func TestMCPRequestBaselineRefreshesSharedActivityOnlyOnCommit(t *testing.T) {
+	shared := &baselineTestRecorder{}
+	local := newMCPRequestBaselineRecorder()
+	local.activityRecorder = shared
+	_ = local.ProvisionalToolCallMetrics("read_file")
+	if shared.activity != 0 || shared.toolCalls != 0 || local.BaselineMetrics().ToolCalls != 0 {
+		t.Fatal("provisional call mutated shared or local activity")
+	}
+	commitMCPToolCall(local, "read_file")
+	if shared.activity != 1 || shared.toolCalls != 0 || local.BaselineMetrics().ToolCalls != 1 {
+		t.Fatal("committed call did not update shared and local activity once")
+	}
+	// A second request starts its own baseline while keeping shared activity.
+	next := newMCPRequestBaselineRecorder()
+	next.activityRecorder = shared
+	commitMCPToolCall(next, "write_file")
+	if shared.activity != 2 || shared.toolCalls != 0 || next.BaselineMetrics().ToolCalls != 1 {
+		t.Fatal("shared activity contaminated the request-local baseline")
+	}
 }
 
 func (r *baselineTestRecorder) BaselineMetrics() session.BaselineMetrics {
@@ -186,6 +211,12 @@ func TestScanHTTPInputDecision_A2ABehavioralBaselineDeviationBlocks(t *testing.T
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			var events bytes.Buffer
+			logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(logger.Close)
 			cfg := config.Defaults()
 			cfg.Internal = nil
 			sc := scanner.MustNew(cfg)
@@ -201,6 +232,7 @@ func TestScanHTTPInputDecision_A2ABehavioralBaselineDeviationBlocks(t *testing.T
 			msg := []byte(`{"jsonrpc":"2.0","id":1,"method":"SendMessage","params":{"message":{"parts":[{"text":"hello peer"}]}}}`)
 			decision := scanHTTPInputDecision(msg, io.Discard, "mcp-http-42", "mcp-http-42", MCPProxyOpts{
 				Scanner:                sc,
+				AuditLogger:            logger,
 				Rec:                    rec,
 				Baseline:               checker,
 				AddressProtectionAgent: "identity-k",
@@ -210,6 +242,11 @@ func TestScanHTTPInputDecision_A2ABehavioralBaselineDeviationBlocks(t *testing.T
 
 			if decision.Blocked == nil {
 				t.Fatal("A2A behavioral baseline deviation was allowed; want JSON-RPC block")
+			}
+			if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+				!strings.Contains(got, `"scanner":"`+scanner.AuditSessionAnomaly+`"`) ||
+				!strings.Contains(got, "pipelock baseline show") {
+				t.Fatalf("baseline denial audit event = %s", got)
 			}
 		})
 	}

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"mime/multipart"
 	"mime/quotedprintable"
@@ -18,6 +19,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,6 +30,8 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contententropy"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/media"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
@@ -36,7 +40,8 @@ import (
 const (
 	// contentTypeJSON is the canonical JSON media type. Used in multiple
 	// redaction and body-text extraction gates; extracted to satisfy goconst.
-	contentTypeJSON = "application/json"
+	contentTypeJSON     = "application/json"
+	dnsMessageMediaType = "application/dns-message"
 
 	// maxMultipartParts caps the number of multipart form parts parsed.
 	// 100 is well above typical form submissions (usually <20 fields) while
@@ -188,10 +193,16 @@ type sizeExemptScanRelease func()
 
 func noopSizeExemptScanRelease() {}
 
-func (b *sizeExemptScanBudget) readBoundedSizeExemptResponse(host string, prefix []byte, body io.Reader, scanMaxBytes, inflightMaxBytes int) ([]byte, sizeExemptScanRelease, *sizeExemptResponseReadError) {
+func (b *sizeExemptScanBudget) readBoundedSizeExemptResponse(host string, prefix []byte, body io.Reader, scanMaxBytes, inflightMaxBytes int, rem sizeRemedies) ([]byte, sizeExemptScanRelease, *sizeExemptResponseReadError) {
 	ceiling := int64(scanMaxBytes)
 	if ceiling <= 0 {
 		ceiling = int64(config.DefaultSizeExemptScanMaxBytes)
+	}
+	if ceiling == math.MaxInt64 {
+		return nil, noopSizeExemptScanRelease, &sizeExemptResponseReadError{
+			Kind:   sizeExemptReadFailureReadError,
+			Reason: "size-exempt response scan ceiling must leave room for one probe byte",
+		}
 	}
 	inflightLimit := int64(inflightMaxBytes)
 	if inflightLimit <= 0 {
@@ -220,7 +231,7 @@ func (b *sizeExemptScanBudget) readBoundedSizeExemptResponse(host string, prefix
 		release()
 		return nil, noopSizeExemptScanRelease, &sizeExemptResponseReadError{
 			Kind:   sizeExemptReadFailureOversize,
-			Reason: responseSizeExemptObservedScanBlockReason(host, int64(len(fullBody)), ceiling, false),
+			Reason: responseSizeExemptObservedScanBlockReason(host, int64(len(fullBody)), ceiling, false, rem),
 		}
 	}
 	return fullBody, release, nil
@@ -282,6 +293,9 @@ func matchUnscannablePassthrough(req unscannablePassthroughRequest, entries []co
 		return unscannablePassthroughMatch{}, false
 	}
 	mediaType := responseMediaType(req.ContentType)
+	if len(req.Header.Values("Content-Type")) > 0 && !responseMIMEEssencesAgree(req.Header) {
+		return unscannablePassthroughMatch{}, false
+	}
 	if mediaType == "" || configTextualPassthroughType(mediaType) {
 		return unscannablePassthroughMatch{}, false
 	}
@@ -309,6 +323,11 @@ func matchUnscannablePassthrough(req unscannablePassthroughRequest, entries []co
 		return unscannablePassthroughMatch{Entry: entry, ContentType: mediaType}, true
 	}
 	return unscannablePassthroughMatch{}, false
+}
+
+func isDNSMessageMediaType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(strings.ToLower(strings.TrimSpace(contentType)))
+	return err == nil && mediaType == dnsMessageMediaType
 }
 
 func responseMediaType(contentType string) string {
@@ -394,19 +413,22 @@ func contentTypeMatchesAny(mediaType string, allowed []string) bool {
 	return false
 }
 
-// shouldHardBlockBodyPromptInjection returns true when a prompt-injection
-// match appears in an outbound request body to a non-provider destination.
-// Prompts sent to the configured response-scan exemption set can naturally
-// discuss injection attempts; non-exempt publish/API destinations should not
-// receive those instructions in warn/balanced mode.
-// This path has no response body stream, so the over-cap response exemption
-// observability signal is not applicable here.
+// shouldHardBlockBodyPromptInjection forces a block for an outbound injection
+// finding unless its destination is in request_body_scanning.trusted_hosts.
+// Trusted destinations retain request scanning and the configured action.
+// Response-scanning exemptions do not affect this request-side decision.
+// Like the critical-DLP floor, it applies only in enforcement mode: with
+// enforce: false the finding follows the configured action, so an audit-only
+// deployment observes injection instead of dropping the request.
 func shouldHardBlockBodyPromptInjection(result BodyScanResult, hostname string, cfg *config.Config) bool {
 	if len(result.InjectionMatches) == 0 {
 		return false
 	}
 	if cfg == nil {
 		return true
+	}
+	if !cfg.EnforceEnabled() {
+		return false
 	}
 	// Request-side trust is its own list. The response_scanning exemptions
 	// describe inbound trust and are documented as never loosening outbound
@@ -420,10 +442,14 @@ func shouldHardBlockBodyPromptInjection(result BodyScanResult, hostname string, 
 // shouldHardBlockCriticalDLP returns true for enforced critical credential
 // detections while the proxy is in enforcement mode. These are high-confidence
 // core exfiltration findings and must fail closed even when request-body
-// scanning is otherwise in warn mode. Explicit audit mode still observes only.
+// scanning is otherwise in warn mode. Audit mode observes every other finding
+// but still refuses incomplete inspection and blocks the core credential floor.
 func shouldHardBlockCriticalDLP(matches []scanner.TextDLPMatch, enforceEnabled bool) bool {
+	if scanner.HasInspectionLimit(matches) {
+		return true
+	}
 	if !enforceEnabled {
-		return false
+		return containsCoreFloorMatch(matches)
 	}
 	for _, match := range matches {
 		if match.Warn {
@@ -437,8 +463,14 @@ func shouldHardBlockCriticalDLP(matches []scanner.TextDLPMatch, enforceEnabled b
 }
 
 func shouldHardBlockRequestDLP(matches []scanner.TextDLPMatch, cfg *config.Config) bool {
-	if cfg == nil || !cfg.EnforceEnabled() {
+	if scanner.HasInspectionLimit(matches) {
+		return true
+	}
+	if cfg == nil {
 		return false
+	}
+	if !cfg.EnforceEnabled() {
+		return enforcedBlock(cfg, config.ActionWarn, containsCoreFloorMatch(matches))
 	}
 	for _, match := range matches {
 		if match.Warn {
@@ -454,6 +486,80 @@ func shouldHardBlockRequestDLP(matches []scanner.TextDLPMatch, cfg *config.Confi
 		return true
 	}
 	return false
+}
+
+// headerDLPDecision resolves request-header enforcement after scanning. Every
+// header finding, including an unencoded JWT in Cookie, follows the configured
+// header action. The one automatic exception for browser session cookies is the
+// issuer-bound omission applied during scanning: a cookie an intercepted HTTPS
+// origin issued to this identity and that returns to that origin never reaches
+// this function as a finding. There is deliberately no fallback that downgrades
+// a JWT cookie to a warning when issuance evidence is missing, because TLS
+// interception ships off and that fallback would reopen the hole for every
+// preset.
+func headerDLPDecision(result *BodyScanResult, cfg *config.Config) (string, bool) {
+	if result == nil {
+		return "", false
+	}
+	action := result.Action
+	if action == "" && cfg != nil {
+		action = cfg.RequestBodyScanning.Action
+	}
+	hardBlock := shouldHardBlockRequestDLP(result.DLPMatches, cfg)
+	if hardBlock {
+		action = config.ActionBlock
+	}
+	return action, hardBlock
+}
+
+// bodyBlockCause names the body finding that blocks the request on its own.
+type bodyBlockCause int
+
+const (
+	// bodyBlockCauseUnknown means no single finding blocks by itself, for
+	// example when adaptive escalation upgraded a warning. Callers keep their
+	// existing naming order.
+	bodyBlockCauseUnknown bodyBlockCause = iota
+	bodyBlockCauseInjection
+	bodyBlockCauseDLP
+	bodyBlockCauseEntropy
+)
+
+// blockingBodyFinding reports which finding stops the request. Any finding can
+// ride along at warn level: a secret match under request_body_scanning.action
+// or a pattern_actions override, a prompt-injection match to a request-body
+// trusted host, or an entropy finding under content_entropy_action. The block
+// reason, label, and receipt must name the finding that actually blocked, in
+// the same precedence the enforcement paths apply.
+func blockingBodyFinding(result BodyScanResult, hostname string, cfg *config.Config) bodyBlockCause {
+	if cfg == nil {
+		return bodyBlockCauseUnknown
+	}
+	switch {
+	case shouldHardBlockBodyPromptInjection(result, hostname, cfg):
+		return bodyBlockCauseInjection
+	case len(result.DLPMatches) > 0 &&
+		(requestBodyDLPAction(result.DLPMatches, cfg.RequestBodyScanning.Action, cfg.RequestBodyScanning.PatternActions) == config.ActionBlock ||
+			shouldHardBlockBodyCriticalDLP(result, hostname, cfg)):
+		return bodyBlockCauseDLP
+	case result.EntropyFinding != nil && result.EntropyAction == config.ActionBlock:
+		return bodyBlockCauseEntropy
+	}
+	return bodyBlockCauseUnknown
+}
+
+// bodyBlockCauseLabel returns the scanner label for a blocking finding, or
+// current when no single finding blocks.
+func bodyBlockCauseLabel(cause bodyBlockCause, current string) string {
+	switch cause {
+	case bodyBlockCauseInjection:
+		return scannerLabelBodyPromptInjection
+	case bodyBlockCauseDLP:
+		return scannerLabelBodyDLP
+	case bodyBlockCauseEntropy:
+		return scannerLabelBodyEntropy
+	}
+	return current
 }
 
 func shouldHardBlockBodyCriticalDLP(result BodyScanResult, hostname string, cfg *config.Config) bool {
@@ -472,11 +578,22 @@ func shouldHardBlockBodyCriticalDLP(result BodyScanResult, hostname string, cfg 
 }
 
 func isBodyAdaptiveExempt(scannerLabel string, result BodyScanResult, hostname string, cfg *config.Config) bool {
-	if scannerLabel == scannerLabelBodyEntropy && result.EntropyWarnRoute != nil {
+	if result.IsEntropyOnly() || result.IsInformationalCardRuns() {
 		return true
 	}
 	return scannerLabel == scannerLabelBodyDLP && len(result.DLPMatches) > 0 && cfg != nil &&
 		isAdaptiveExempt(hostname, cfg.AdaptiveEnforcement.ExemptDomains)
+}
+
+// IsInformationalCardRuns excludes other evidence and incomplete inspection.
+func (r BodyScanResult) IsInformationalCardRuns() bool {
+	return scanner.OnlyInformational(r.DLPMatches) && len(r.InjectionMatches) == 0 && len(r.AddressFindings) == 0 && r.EntropyFinding == nil && r.Reason == "" && r.RedactionBlockReason == "" && r.CredentialAudienceReceiptErr == nil
+}
+
+// IsEntropyOnly requires an actual entropy finding and no other body evidence.
+func (r BodyScanResult) IsEntropyOnly() bool {
+	return r.EntropyFinding != nil && len(r.DLPMatches) == 0 && len(r.InjectionMatches) == 0 &&
+		len(r.AddressFindings) == 0 && !r.RedactedDLPOnly && r.RedactionBlockReason == "" && r.HeaderName == ""
 }
 
 // BodyScanResult describes the outcome of scanning a request body or headers.
@@ -503,6 +620,28 @@ type BodyScanResult struct {
 	// RedactionBlockReason carries a redact.BlockReason value when the
 	// fail-closed redaction path triggered a block. Empty otherwise.
 	RedactionBlockReason redact.BlockReason
+	// CredentialAudienceReceiptErr is set when a credential-audience-allow
+	// receipt could not be durably confirmed and
+	// flight_recorder.require_receipts is on. The body/header may otherwise
+	// be Clean; callers MUST check this field before forwarding and block
+	// the request (never send upstream bytes) when it is non-nil.
+	CredentialAudienceReceiptErr error
+	// CredentialAudienceMismatches explains only the surviving DLP findings.
+	CredentialAudienceMismatches []scanner.CredentialAudienceMismatch
+}
+
+func (r BodyScanResult) withAudienceExplanation(reason string) string {
+	if explanation := scanner.CredentialAudienceMismatchExplanation(r.CredentialAudienceMismatches); explanation != "" {
+		return reason + "; " + explanation
+	}
+	return reason
+}
+
+func (r BodyScanRequest) audienceSurface() string {
+	if r.AudienceSurface != "" {
+		return r.AudienceSurface
+	}
+	return "body"
 }
 
 // ContentEntropyFinding describes an opaque high-entropy body/frame value.
@@ -512,11 +651,12 @@ type ContentEntropyFinding = contententropy.Finding
 // an entropy finding from block to warn. It is kept on the result so audit and
 // receipt surfaces can show why the warning was allowed through.
 type BodyEntropyWarnRouteMatch struct {
-	Host    string
-	Path    string
-	Reason  string
-	Owner   string
-	Expires string
+	Host       string
+	Path       string
+	PathPrefix string
+	Reason     string
+	Owner      string
+	Expires    string
 }
 
 // BodyScanRequest groups the parameters for scanRequestBody, keeping the
@@ -587,8 +727,13 @@ type BodyScanRequest struct {
 	// AudienceSurface identifies this body-like carrier to the bounded audience
 	// allow metric. Empty means an HTTP request body. The callback is invoked
 	// once per distinct compiled credential audience allow after scanning.
-	AudienceSurface           string
-	OnCredentialAudienceAllow func(scanner.CredentialAudienceAllow)
+	AudienceSurface string
+	// OnCredentialAudienceAllow is invoked once per distinct compiled
+	// credential audience allow after scanning completes cleanly. A non-nil
+	// return means the allow's receipt could not be durably confirmed;
+	// scanRequestBody surfaces it on BodyScanResult.CredentialAudienceReceiptErr
+	// so the caller blocks before forwarding instead of losing the signal.
+	OnCredentialAudienceAllow func(scanner.CredentialAudienceAllow) error
 	// Content entropy checks catch opaque non-credential-shaped exfiltration.
 	// Destination trust/exclusions are supplied from the parsed upstream
 	// authority, not from user-controlled Host headers.
@@ -606,14 +751,21 @@ type BodyScanRequest struct {
 // credential exfiltration and prompt injection.
 // Returns the buffered body bytes (for re-wrapping) and the scan result.
 // Fail-closed: oversized bodies and compressed bodies are always blocked.
-func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScanResult) {
+func scanRequestBody(ctx context.Context, req BodyScanRequest) (_ []byte, final BodyScanResult) {
 	var audienceAllows []scanner.CredentialAudienceAllow
 	defer func() {
-		if req.OnCredentialAudienceAllow == nil {
+		final.CredentialAudienceMismatches = scanner.TextDLPCredentialAudienceMismatches(final.DLPMatches, req.suppressTarget(), req.audienceSurface())
+		// An audience allow is evidence that a credential was delivered. A
+		// pre-redaction DLP pass can collect one before redaction, content
+		// entropy, or injection scanning blocks the body, so emit only for a
+		// body whose final result is clean.
+		if req.OnCredentialAudienceAllow == nil || !final.Clean {
 			return
 		}
 		for _, allow := range uniqueCredentialAudienceAllows(audienceAllows) {
-			req.OnCredentialAudienceAllow(allow)
+			if err := req.OnCredentialAudienceAllow(allow); err != nil && final.CredentialAudienceReceiptErr == nil {
+				final.CredentialAudienceReceiptErr = err
+			}
 		}
 	}()
 	audienceSurface := req.AudienceSurface
@@ -669,7 +821,26 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 		return buf, BodyScanResult{Clean: true}
 	}
 
+	// RFC 8484 DNS-over-HTTPS POST. A strict DNS message is read as its
+	// names, record payloads and fixed-width fields. Those pieces join the
+	// ordinary body DLP pipeline below, so suppressions, disabled patterns,
+	// credential-audience allows and pattern actions apply as for any body,
+	// and a critical match hard-blocks the same way. Entropy is measured on
+	// the pieces, all in one ScanTexts call so its joined check still sees
+	// data split across many short fields; the wire bytes themselves are not
+	// scored as text. A body that is not a strict DNS message keeps the
+	// opaque-body checks.
+	var dnsInspection scanner.DNSPayloadInspection
+	if isDNSMessageMediaType(req.ContentType) {
+		dnsInspection = req.Scanner.InspectDNSPayload(buf)
+	}
+
 	allowEmbeddedSigV4 := matchBodySigV4CredentialRoute(req, time.Now().UTC())
+	// One dropped finding can be seen by the pre-redaction pass, the
+	// post-redaction pass, and both the plain and provider-opaque text sets.
+	// Record it once per request so the dropped-match metric and dlp_warn
+	// evidence count findings, not scan passes.
+	onDropped := onceBodyDLPDrops(req.OnDroppedDLP)
 	var preRedactionDLP []scanner.TextDLPMatch
 	if req.RedactMatcher != nil {
 		extracted := extractBodyTextForDLP(buf, req)
@@ -678,8 +849,11 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 		// this body cannot be parsed.
 		if extracted.Err == "" {
 			disabled := bodyDLPDisabledSet(req.DisablePatterns)
-			preRedactionDLP = scanBodyTextsForDLPWithAudience(ctx, req.Scanner, extracted.Texts, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, req.OnDroppedDLP, audienceSurface, collectAudienceAllow)
-			preRedactionDLP = append(preRedactionDLP, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, extracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, req.OnDroppedDLP, audienceSurface, collectAudienceAllow)...)
+			// No allow is collected here: redaction may rewrite the credential
+			// before forwarding, and a credential that survives redaction is
+			// collected again by the post-redaction scan below.
+			preRedactionDLP = scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, bodyDLPViews{texts: extracted.Texts, cards: extracted.CardTexts, atoms: extracted.Atoms, rawJSON: bodyJSONCardView(buf, extracted.Atoms)}, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, nil)
+			preRedactionDLP = append(preRedactionDLP, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, extracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, nil)...)
 		}
 	}
 
@@ -739,6 +913,9 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 		}
 	}
 	texts := dlpExtracted.GenericTexts
+	if dnsInspection.Parsed {
+		dlpExtracted.Texts = append(dlpExtracted.Texts, dnsInspection.DLPTexts...)
+	}
 
 	if len(texts) == 0 {
 		if len(preRedactionDLP) > 0 {
@@ -758,8 +935,8 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 
 	// Scan each extracted string individually (catches per-field encoded secrets).
 	disabledDLP := bodyDLPDisabledSet(req.DisablePatterns)
-	matches := scanBodyTextsForDLPWithAudience(ctx, req.Scanner, dlpExtracted.Texts, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, req.OnDroppedDLP, audienceSurface, collectAudienceAllow)
-	matches = append(matches, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, dlpExtracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, req.OnDroppedDLP, audienceSurface, collectAudienceAllow)...)
+	matches := scanBodyTextViewsForDLPWithAudience(ctx, req.Scanner, bodyDLPViews{texts: dlpExtracted.Texts, cards: dlpExtracted.CardTexts, atoms: dlpExtracted.Atoms, rawJSON: bodyJSONCardView(buf, dlpExtracted.Atoms)}, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, onDropped, audienceSurface, collectAudienceAllow)
+	matches = append(matches, scanProviderOpaqueTextsForDLPWithAudience(ctx, req.Scanner, dlpExtracted.ProviderOpaqueTexts, req.suppressTarget(), req.Suppress, disabledDLP, allowEmbeddedSigV4, onDropped, audienceSurface, collectAudienceAllow)...)
 	matches = uniqueBodyDLPMatches(matches)
 	if len(matches) > 0 {
 		result.DLPMatches = matches
@@ -772,7 +949,12 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 			action = config.StrongestAction(action, requestBodyDLPAction(preRedactionDLP, req.Action, req.PatternActions))
 		}
 	}
-	if finding := scanBodyTextsForContentEntropy(texts, req); finding != nil {
+	entropyTexts := texts
+	if dnsInspection.Parsed {
+		entropyTexts = dnsInspection.EntropyTexts
+	}
+	finding := scanBodyTextsForContentEntropy(entropyTexts, req)
+	if finding != nil {
 		result.EntropyFinding = finding
 		result.EntropyAction = req.ContentEntropyAction
 		if matched := matchBodyEntropyWarnRoute(req, time.Now().UTC()); matched != nil {
@@ -796,12 +978,13 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 	// first because phrase order matters; DLP still uses a sorted join below
 	// for deterministic split-secret detection.
 	joinedInOrder := strings.Join(texts, "\n")
+	var inOrderInjection, sortedInjection []scanner.ResponseMatch
 	injectionResult := req.Scanner.ScanResponse(ctx, joinedInOrder)
 	if injectionResult.Failed() {
 		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
 	}
 	if !injectionResult.Clean {
-		result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
+		inOrderInjection = injectionResult.Matches
 	}
 
 	// Sort to ensure deterministic ordering for DLP (Go map iteration in
@@ -813,8 +996,13 @@ func scanRequestBody(ctx context.Context, req BodyScanRequest) ([]byte, BodyScan
 		return nil, BodyScanResult{Action: config.ActionBlock, Reason: "request body scan failed: " + injectionResult.ScanError}
 	}
 	if !injectionResult.Clean {
-		result.InjectionMatches = append(result.InjectionMatches, injectionResult.Matches...)
+		sortedInjection = injectionResult.Matches
 	}
+	// The joined views re-read every field, so they repeat what the per-field
+	// scan already found. Keep every per-field match and add only the
+	// occurrences a joined view alone detected, such as a phrase split across
+	// fields.
+	result.InjectionMatches = mergeJoinedInjectionMatches(result.InjectionMatches, inOrderInjection, sortedInjection)
 
 	// Address poisoning detection alongside DLP.
 	// Note: body address findings are currently emitted/counted as body_dlp
@@ -888,6 +1076,8 @@ type jsonBodyDLPFrame struct {
 }
 
 type bodyDLPTextExtraction struct {
+	CardTexts           []string
+	Atoms               []extract.DLPAtom
 	GenericTexts        []string
 	Texts               []string
 	ProviderOpaqueTexts []string
@@ -900,21 +1090,27 @@ func extractBodyTextForDLP(body []byte, req BodyScanRequest) bodyDLPTextExtracti
 		texts, errText := extractBodyText(body, req)
 		return bodyDLPTextExtraction{GenericTexts: texts, Texts: texts, Err: errText}
 	}
-	textStrings, providerOpaqueTexts, genericTexts, truncated, err := extractJSONBodyDLPStrings(body, req)
+	textStrings, cardStrings, atoms, providerOpaqueTexts, genericTexts, truncated, err := extractJSONBodyDLPStrings(body, req)
 	if err != nil {
 		return bodyDLPTextExtraction{Err: err.Error()}
 	}
 	if truncated {
 		return bodyDLPTextExtraction{Err: "JSON body exceeds maximum inspectable nesting depth"}
 	}
-	return bodyDLPTextExtraction{GenericTexts: genericTexts, Texts: textStrings, ProviderOpaqueTexts: providerOpaqueTexts}
+	return bodyDLPTextExtraction{GenericTexts: genericTexts, Texts: textStrings, CardTexts: cardStrings, Atoms: atoms, ProviderOpaqueTexts: providerOpaqueTexts}
 }
 
-func extractJSONBodyDLPStrings(body []byte, req BodyScanRequest) ([]string, []string, []string, bool, error) {
+func extractJSONBodyDLPStrings(body []byte, req BodyScanRequest) ([]string, []string, []extract.DLPAtom, []string, []string, bool, error) {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 
-	var result []string
+	var result, cards []string
+	var atoms []extract.DLPAtom
+	appendAtom := func(text, card string, number bool) {
+		result = append(result, text)
+		cards = append(cards, card)
+		atoms = append(atoms, extract.DLPAtom{Text: text, Card: card, Number: number})
+	}
 	var providerOpaque []string
 	var generic []string
 	var stack []jsonBodyDLPFrame
@@ -927,18 +1123,18 @@ func extractJSONBodyDLPStrings(body []byte, req BodyScanRequest) ([]string, []st
 		tok, err := dec.Token()
 		if err == io.EOF {
 			if !rootStarted {
-				return nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: empty JSON body")
+				return nil, nil, nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: empty JSON body")
 			}
 			if depth > 0 || len(stack) > 0 || !rootComplete {
-				return nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: %w", io.ErrUnexpectedEOF)
+				return nil, nil, nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: %w", io.ErrUnexpectedEOF)
 			}
 			break
 		}
 		if err != nil {
-			return nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: %w", err)
+			return nil, nil, nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: %w", err)
 		}
 		if rootComplete {
-			return nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: multiple JSON values")
+			return nil, nil, nil, nil, nil, false, fmt.Errorf("decoding JSON body for DLP: multiple JSON values")
 		}
 		rootStarted = true
 
@@ -967,7 +1163,8 @@ func extractJSONBodyDLPStrings(body []byte, req BodyScanRequest) ([]string, []st
 		case string:
 			if len(stack) > 0 && stack[len(stack)-1].kind == '{' && stack[len(stack)-1].expectKey {
 				if depth <= extractJSONMaxDepth {
-					result = append(result, v)
+					appendAtom(v, v, false)
+					atoms[len(atoms)-1].Key = true
 					generic = append(generic, v)
 				}
 				stack[len(stack)-1].currentKey = v
@@ -979,35 +1176,38 @@ func extractJSONBodyDLPStrings(body []byte, req BodyScanRequest) ([]string, []st
 				if isTrustedProviderOpaqueDLPField(req, currentJSONBodyDLPPath(stack), v) {
 					providerOpaque = append(providerOpaque, v)
 				} else {
-					result = append(result, v)
+					appendAtom(v, v, false)
 				}
 			}
 			markJSONBodyDLPValueConsumed(stack)
 		case json.Number:
 			if depth <= extractJSONMaxDepth {
 				text := v.String()
-				result = append(result, text)
+				appendAtom(text, jsonnumber.IntegralView(v), true)
 				generic = append(generic, text)
 			}
 			markJSONBodyDLPValueConsumed(stack)
 		case bool:
 			if depth <= extractJSONMaxDepth {
 				text := strconv.FormatBool(v)
-				result = append(result, text)
+				appendAtom(text, text, false)
 				generic = append(generic, text)
 			}
 			markJSONBodyDLPValueConsumed(stack)
 		case nil:
+			if depth <= extractJSONMaxDepth {
+				atoms = append(atoms, extract.DLPAtom{Card: "null"})
+			}
 			markJSONBodyDLPValueConsumed(stack)
 		}
 		if depth == 0 {
 			rootComplete = true
 		}
 	}
-	return result, providerOpaque, generic, truncated, nil
+	return result, cards, atoms, providerOpaque, generic, truncated, nil
 }
 
-const extractJSONMaxDepth = 64
+const extractJSONMaxDepth = extract.MaxExtractDepth
 
 func currentJSONBodyDLPPath(stack []jsonBodyDLPFrame) []string {
 	if len(stack) == 0 {
@@ -1148,15 +1348,29 @@ func matchBodyEntropyWarnRoute(req BodyScanRequest, now time.Time) *BodyEntropyW
 	host := strings.ToLower(strings.TrimSuffix(req.Host, "."))
 	today := now.UTC().Format("2006-01-02")
 	for _, entry := range req.ContentEntropyWarnRoutes {
-		if entry.Host != host || entry.Path != path || entry.Expires < today || !stringListContains(entry.ContentTypes, mediaType) {
+		if entry.Host != host || entry.Expires < today || !entropyWarnRouteCoversPath(entry, path) || !stringListContains(entry.ContentTypes, mediaType) {
 			continue
 		}
 		if len(entry.Methods) > 0 && !stringListContains(entry.Methods, method) {
 			continue
 		}
-		return &BodyEntropyWarnRouteMatch{Host: entry.Host, Path: entry.Path, Reason: entry.Reason, Owner: entry.Owner, Expires: entry.Expires}
+		return &BodyEntropyWarnRouteMatch{Host: entry.Host, Path: entry.Path, PathPrefix: entry.PathPrefix, Reason: entry.Reason, Owner: entry.Owner, Expires: entry.Expires}
 	}
 	return nil
+}
+
+// entropyWarnRouteCoversPath reports whether a route covers the canonical
+// request path. A route that sets both path and path_prefix, or neither, covers
+// nothing: validation refuses it, and a config that skipped validation fails
+// toward enforcement.
+func entropyWarnRouteCoversPath(entry config.RequestBodyEntropyWarnRoute, path string) bool {
+	switch {
+	case entry.Path != "" && entry.PathPrefix == "":
+		return entry.Path == path
+	case entry.PathPrefix != "" && entry.Path == "":
+		return config.RequestPathHasSegmentPrefix(path, entry.PathPrefix)
+	}
+	return false
 }
 
 func matchBodySigV4CredentialRoute(req BodyScanRequest, now time.Time) bool {
@@ -1202,7 +1416,9 @@ func applyContentEntropyConfig(req *BodyScanRequest, cfg *config.Config, extraEx
 	req.ContentEntropyThreshold = cfg.RequestBodyScanning.ContentEntropyThreshold
 	req.ContentEntropyMinLength = cfg.RequestBodyScanning.ContentEntropyMinLength
 	req.ContentEntropyTrusted = cfg.TrustedDomains
-	req.ContentEntropyExclusions = append([]string(nil), cfg.RequestBodyScanning.ContentEntropyExclusions...)
+	// Expiring host exclusions stop applying after their date even in a process
+	// that has not reloaded, as the warn routes do.
+	req.ContentEntropyExclusions = append(config.ActiveEntropyExclusionHosts(cfg.RequestBodyScanning.ContentEntropyExclusions, time.Now()), config.ShippedChallengeProviderHosts()...)
 	req.ContentEntropyWarnRoutes = cfg.RequestBodyScanning.ContentEntropyWarnRoutes
 	for _, exclusions := range extraExclusions {
 		req.ContentEntropyExclusions = append(req.ContentEntropyExclusions, exclusions...)
@@ -1224,41 +1440,111 @@ func scanBodyTextsForDLP(ctx context.Context, sc *scanner.Scanner, texts []strin
 // rule before operator-owned suppressions. A malformed or absent target leaves
 // every match intact, so text-only and destination-free callers fail closed.
 func scanBodyTextsForDLPWithAudience(ctx context.Context, sc *scanner.Scanner, texts []string, target string, suppress []config.SuppressEntry, disabled map[string]struct{}, allowEmbeddedSigV4 bool, onDropped func(scanner.TextDLPMatch, string), audienceSurface string, onAudienceAllow func(scanner.CredentialAudienceAllow)) []scanner.TextDLPMatch {
+	return scanBodyTextViewsForDLPWithAudience(ctx, sc, bodyDLPViews{texts: texts, cards: texts}, target, suppress, disabled, allowEmbeddedSigV4, onDropped, audienceSurface, onAudienceAllow)
+}
+
+type bodyDLPViews struct {
+	texts, cards []string
+	atoms        []extract.DLPAtom
+	rawJSON      string
+}
+
+func bodyJSONCardView(body []byte, atoms []extract.DLPAtom) string {
+	if len(atoms) == 0 {
+		return ""
+	}
+	return string(body)
+}
+
+func scanBodyTextViewsForDLPWithAudience(ctx context.Context, sc *scanner.Scanner, views bodyDLPViews, target string, suppress []config.SuppressEntry, disabled map[string]struct{}, allowEmbeddedSigV4 bool, onDropped func(scanner.TextDLPMatch, string), audienceSurface string, onAudienceAllow func(scanner.CredentialAudienceAllow)) []scanner.TextDLPMatch {
+	texts := views.texts
+	cards := views.cards
+	if len(cards) != len(texts) {
+		cards = texts
+	}
+	atoms := views.atoms
+	if len(atoms) < len(texts) {
+		atoms = make([]extract.DLPAtom, len(texts))
+		for i := range texts {
+			atoms[i] = extract.DLPAtom{Text: texts[i], Card: cards[i]}
+		}
+	}
+
 	var allMatches []scanner.TextDLPMatch
 	var dropped []droppedBodyDLPMatch
 	collectDropped := func(match scanner.TextDLPMatch, reason string) {
 		dropped = append(dropped, droppedBodyDLPMatch{match: match, reason: reason})
 	}
+	var audienceAllows []scanner.CredentialAudienceAllow
 	filterMatches := func(matches []scanner.TextDLPMatch) []scanner.TextDLPMatch {
 		matches, allows := sc.FilterTextDLPMatchesForDestination(matches, target, audienceSurface)
-		if onAudienceAllow != nil {
-			for _, allow := range allows {
-				onAudienceAllow(allow)
-			}
-		}
+		audienceAllows = append(audienceAllows, allows...)
 		return filterBodyDLPMatches(matches, target, suppress, disabled, collectDropped)
 	}
-	for _, text := range texts {
-		result := scanBodyTextForDLP(ctx, sc, text, allowEmbeddedSigV4)
-		if !result.Clean {
+	if views.rawJSON != "" {
+		allMatches = append(allMatches, filterMatches(sc.ScanJSONCardRuns(ctx, views.rawJSON))...)
+	}
+	for i, text := range texts {
+		var result scanner.TextDLPResult
+		if allowEmbeddedSigV4 {
+			result = sc.ScanRequestBodyTextPartsWithCardViews(ctx, []string{text}, []string{cards[i]}, "")
+		} else {
+			result = sc.ScanTextForDLPWithCardView(ctx, text, cards[i])
+		}
+		if len(result.Matches) > 0 {
 			if matches := filterMatches(result.Matches); len(matches) > 0 {
 				allMatches = append(allMatches, matches...)
 			}
 		}
 	}
-	sorted := sortedBodyTexts(texts)
+	// The sorted text join catches order-independent cross-field secrets.
+	// Cards retain source value order, skipping keys and retaining null barriers.
+	if len(atoms) > 1 {
+		var hasNumber bool
+		for _, atom := range atoms {
+			hasNumber = hasNumber || atom.Number
+		}
+		if hasNumber {
+			var ordered scanner.TextDLPResult
+			if allowEmbeddedSigV4 {
+				ordered = sc.ScanRequestBodyTextPartsWithCardAtoms(ctx, texts, atoms, bodyDLPJoinSeparator)
+			} else {
+				ordered = sc.ScanTextForDLPWithTypedCardView(ctx, strings.Join(texts, bodyDLPJoinSeparator), extract.JoinCardAtoms(atoms, bodyDLPJoinSeparator))
+			}
+			if len(ordered.Matches) > 0 {
+				allMatches = append(allMatches, filterMatches(ordered.Matches)...)
+			}
+		}
+	}
+	indices := make([]int, len(texts))
+	for i := range indices {
+		indices[i] = i
+	}
+	slices.SortStableFunc(indices, func(a, b int) int { return strings.Compare(texts[a], texts[b]) })
+	var sorted []string
+	for _, i := range indices {
+		sorted = append(sorted, texts[i])
+	}
 	var result scanner.TextDLPResult
 	if allowEmbeddedSigV4 {
-		result = sc.ScanRequestBodyTextPartsForDLP(ctx, sorted, bodyDLPJoinSeparator)
+		// The scanner scrubs Text and Card independently, so keep the sorted
+		// non-card text alongside the original card sequence and provenance.
+		result = sc.ScanRequestBodyTextPartsWithCardAtoms(ctx, sorted, atoms, bodyDLPJoinSeparator)
 	} else {
-		result = sc.ScanTextForDLP(ctx, strings.Join(sorted, bodyDLPJoinSeparator))
+		result = sc.ScanTextForDLPWithTypedCardView(ctx, strings.Join(sorted, bodyDLPJoinSeparator), extract.JoinCardAtoms(atoms, bodyDLPJoinSeparator))
 	}
-	if !result.Clean {
+	if len(result.Matches) > 0 {
 		if matches := filterMatches(result.Matches); len(matches) > 0 {
 			allMatches = append(allMatches, matches...)
 		}
 	}
 	recordUniqueBodyDLPDrops(dropped, onDropped)
+	// Emit audience allows only for a clean result, matching the header path.
+	if onAudienceAllow != nil && len(allMatches) == 0 {
+		for _, allow := range uniqueCredentialAudienceAllows(audienceAllows) {
+			onAudienceAllow(allow)
+		}
+	}
 	return uniqueBodyDLPMatches(allMatches)
 }
 
@@ -1267,13 +1553,42 @@ type droppedBodyDLPMatch struct {
 	reason string
 }
 
+func bodyDLPDropKey(m scanner.TextDLPMatch) string {
+	if identity, ok := m.ValueIdentity(); ok {
+		return m.PatternName + "\x00" + string(identity[:])
+	}
+	// Matches without a located value retain their existing representation key.
+	return bodyDLPMatchKey(m)
+}
+
+// onceBodyDLPDrops wraps a dropped-match callback so each distinct dropped
+// value reaches it once per request, however many scan passes or fields report
+// it. Fields are not part of the identity: the joined-body pass reports matches
+// that no single field owns, so counting per field would reintroduce the
+// overcount this collapses. The key matches
+// recordUniqueBodyDLPDrops, which collapses repeats within a single pass.
+func onceBodyDLPDrops(onDropped func(scanner.TextDLPMatch, string)) func(scanner.TextDLPMatch, string) {
+	if onDropped == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	return func(m scanner.TextDLPMatch, reason string) {
+		key := bodyDLPDropKey(m) + "\x00" + m.Bundle + "\x00" + m.BundleVersion + "\x00" + reason
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		onDropped(m, reason)
+	}
+}
+
 func recordUniqueBodyDLPDrops(dropped []droppedBodyDLPMatch, onDropped func(scanner.TextDLPMatch, string)) {
 	if onDropped == nil {
 		return
 	}
 	seen := make(map[string]struct{}, len(dropped))
 	for _, drop := range dropped {
-		key := bodyDLPMatchKey(drop.match) + "\x00" + drop.match.Bundle + "\x00" + drop.match.BundleVersion + "\x00" + drop.reason
+		key := bodyDLPDropKey(drop.match) + "\x00" + drop.match.Bundle + "\x00" + drop.match.BundleVersion + "\x00" + drop.reason
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -1301,13 +1616,6 @@ func recordUniqueHeaderDLPDrops(dropped []droppedBodyDLPMatch, onDropped func(sc
 		seen[key] = struct{}{}
 		onDropped(drop.match, drop.reason)
 	}
-}
-
-func scanBodyTextForDLP(ctx context.Context, sc *scanner.Scanner, text string, allowEmbeddedSigV4 bool) scanner.TextDLPResult {
-	if allowEmbeddedSigV4 {
-		return sc.ScanRequestBodyTextForDLP(ctx, text)
-	}
-	return sc.ScanTextForDLP(ctx, text)
 }
 
 func scanProviderOpaqueTextsForDLPWithAudience(ctx context.Context, sc *scanner.Scanner, texts []string, target string, suppress []config.SuppressEntry, disabled map[string]struct{}, allowEmbeddedSigV4 bool, onDropped func(scanner.TextDLPMatch, string), audienceSurface string, onAudienceAllow func(scanner.CredentialAudienceAllow)) []scanner.TextDLPMatch {
@@ -1356,6 +1664,10 @@ func filterBodyDLPMatches(matches []scanner.TextDLPMatch, target string, suppres
 	}
 	filtered := matches[:0]
 	for _, match := range matches {
+		if match.IsInspectionLimit() {
+			filtered = append(filtered, match)
+			continue
+		}
 		if _, skip := disabled[match.PatternName]; skip &&
 			!config.IsCoreDLPPatternName(match.PatternName) {
 			if onDropped != nil {
@@ -1417,13 +1729,52 @@ func uniqueBodyDLPMatches(matches []scanner.TextDLPMatch) []scanner.TextDLPMatch
 	return unique
 }
 
+// mergeJoinedInjectionMatches folds overlapping scan views into one list. Each
+// view is a complete reading of the body, so the number of occurrences of a
+// pattern and text is the largest count any single view reports. Every
+// per-field match is kept, and a joined view contributes only occurrences
+// beyond that count, so repeats across views collapse while separate
+// occurrences inside one view survive. Position is not part of the key because
+// it is relative to whichever view produced the match.
+func mergeJoinedInjectionMatches(perField []scanner.ResponseMatch, joinedViews ...[]scanner.ResponseMatch) []scanner.ResponseMatch {
+	kept := make(map[string]int, len(perField))
+	for _, match := range perField {
+		kept[bodyInjectionMatchKey(match)]++
+	}
+	merged := perField
+	for _, view := range joinedViews {
+		inView := make(map[string]int, len(view))
+		for _, match := range view {
+			key := bodyInjectionMatchKey(match)
+			inView[key]++
+			if inView[key] <= kept[key] {
+				continue
+			}
+			kept[key] = inView[key]
+			merged = append(merged, match)
+		}
+	}
+	return merged
+}
+
+func bodyInjectionMatchKey(match scanner.ResponseMatch) string {
+	return match.PatternName + "\x00" + match.MatchText
+}
+
 func bodyDLPMatchKey(match scanner.TextDLPMatch) string {
 	return match.PatternName + "\x00" + match.Encoded + "\x00" + strconv.FormatBool(match.Warn) + "\x00" + strconv.FormatBool(match.ProviderOpaque)
 }
 
 func requestBodyDLPAction(matches []scanner.TextDLPMatch, defaultAction string, patternActions map[string]string) string {
+	if scanner.HasInspectionLimit(matches) {
+		return config.ActionBlock
+	}
 	action := ""
 	for _, match := range matches {
+		if match.IsInformational() {
+			action = config.ActionWarn
+			continue
+		}
 		matchAction := defaultAction
 		if override := patternActions[match.PatternName]; override != "" &&
 			!config.IsCoreDLPPatternName(match.PatternName) {
@@ -1578,7 +1929,7 @@ func unparseableRouteMatches(req BodyScanRequest, route redact.UnparseableRouteS
 // request would violate the scanner's safety invariant, such as a consumed body
 // that cannot be replayed or a redaction gate that explicitly failed closed.
 func isFailClosedBodyResult(result BodyScanResult, bodyBytes []byte) bool {
-	return bodyBytes == nil || result.RedactionBlockReason != ""
+	return bodyBytes == nil || result.RedactionBlockReason != "" || scanner.HasInspectionLimit(result.DLPMatches)
 }
 
 // isJSONContentType reports whether ct is a recognised JSON media type,
@@ -1907,6 +2258,24 @@ func headerValueForDLP(name, value, target string, valueCount int) string {
 	return scanner.ScrubSigV4AuthorizationForTarget(value, target)
 }
 
+type joinedHeaderValue struct {
+	original string
+	scrubbed string
+}
+
+// joinHeaderValuesInOriginalOrder keeps each scrubbed value beside its original
+// while sorting, so the two DLP scans see the same header boundaries.
+func joinHeaderValuesInOriginalOrder(values []joinedHeaderValue) (string, string) {
+	sort.SliceStable(values, func(i, j int) bool { return values[i].original < values[j].original })
+	original := make([]string, len(values))
+	scrubbed := make([]string, len(values))
+	for i, value := range values {
+		original[i] = value.original
+		scrubbed[i] = value.scrubbed
+	}
+	return strings.Join(original, "\n"), strings.Join(scrubbed, "\n")
+}
+
 // scanRequestHeaders scans HTTP request headers for DLP patterns.
 // Two modes: "sensitive" scans only listed headers; "all" scans everything
 // except the ignore list. Headers are scanned regardless of destination
@@ -1924,7 +2293,7 @@ func scanRequestHeadersForTargetWithDropped(ctx context.Context, headers http.He
 	return scanRequestHeadersForTargetWithAudience(ctx, headers, cfg, sc, target, onDropped, nil)
 }
 
-func scanRequestHeadersForTargetWithAudience(ctx context.Context, headers http.Header, cfg *config.Config, sc *scanner.Scanner, target string, onDropped func(scanner.TextDLPMatch, string), onAudienceAllow func(scanner.CredentialAudienceAllow)) *BodyScanResult {
+func scanRequestHeadersForTargetWithAudience(ctx context.Context, headers http.Header, cfg *config.Config, sc *scanner.Scanner, target string, onDropped func(scanner.TextDLPMatch, string), onAudienceAllow func(scanner.CredentialAudienceAllow) error) *BodyScanResult {
 	return scanRequestHeadersWithAudience(ctx, headers, cfg, sc, target, cfg.Suppress, onDropped, onAudienceAllow)
 }
 
@@ -1935,26 +2304,42 @@ func scanRequestHeadersWithSuppress(ctx context.Context, headers http.Header, cf
 // scanRequestHeadersWithAudience applies the same destination-aware compiled
 // credential exception as URL and body DLP. An empty or invalid target keeps
 // the match, preserving the original fail-closed header behavior.
-func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cfg *config.Config, sc *scanner.Scanner, target string, suppress []config.SuppressEntry, onDropped func(scanner.TextDLPMatch, string), onAudienceAllow func(scanner.CredentialAudienceAllow)) *BodyScanResult {
+func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cfg *config.Config, sc *scanner.Scanner, target string, suppress []config.SuppressEntry, onDropped func(scanner.TextDLPMatch, string), onAudienceAllow func(scanner.CredentialAudienceAllow) error) (result *BodyScanResult) {
 	bodyCfg := cfg.RequestBodyScanning
 	disabled := bodyDLPDisabledSet(bodyCfg.DisablePatterns)
 	var allMatches []scanner.TextDLPMatch
 	var dropped []droppedBodyDLPMatch
 	var audienceAllows []scanner.CredentialAudienceAllow
 	defer func() {
-		if onAudienceAllow == nil {
+		// An audience allow is evidence that a credential was delivered. It is
+		// emitted only when the whole header scan is clean, never for a request
+		// another header, decoded view, or joined match goes on to block.
+		if onAudienceAllow == nil || len(allMatches) > 0 {
 			return
 		}
+		var audienceErr error
 		for _, allow := range uniqueCredentialAudienceAllows(audienceAllows) {
-			onAudienceAllow(allow)
+			if err := onAudienceAllow(allow); err != nil && audienceErr == nil {
+				audienceErr = err
+			}
 		}
+		if audienceErr == nil {
+			return
+		}
+		// A required-receipt failure must reach the caller even though the
+		// header scan itself found nothing to block; scanRequestHeadersWithAudience
+		// otherwise returns nil for a clean scan.
+		if result == nil {
+			result = &BodyScanResult{Clean: true}
+		}
+		result.CredentialAudienceReceiptErr = audienceErr
 	}()
 	collectDropped := func(match scanner.TextDLPMatch, reason string) {
 		dropped = append(dropped, droppedBodyDLPMatch{match: match, reason: reason})
 	}
 	matchedHeaders := map[string]struct{}{}
-	addMatches := func(headerName string, matches []scanner.TextDLPMatch) {
-		matches, allows := sc.FilterTextDLPMatchesForDestination(matches, target, "header")
+	addMatches := func(headerName, value string, matches []scanner.TextDLPMatch) {
+		matches, allows := sc.FilterHeaderDLPMatches(matches, target, headerName, value)
 		audienceAllows = append(audienceAllows, allows...)
 		filtered := filterBodyDLPMatches(matches, target, suppress, disabled, collectDropped)
 		if len(filtered) == 0 {
@@ -2004,7 +2389,8 @@ func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cf
 	}
 	sort.Strings(headerNames)
 
-	var allValues []string
+	var joinedValues []joinedHeaderValue
+	scrubbed := false
 	for _, name := range headerNames {
 		values := headersToScan[name]
 		// In "all" mode, scan header names too (catches exfil via custom
@@ -2013,19 +2399,24 @@ func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cf
 		if bodyCfg.HeaderMode == config.HeaderModeAll {
 			result := sc.ScanTextForDLP(ctx, name)
 			if !result.Clean {
-				addMatches(name, result.Matches)
+				addMatches(name, name, result.Matches)
 			}
 			// Include header name in joined scan to catch secrets split
 			// across the name:value boundary (e.g., X-AKIA1234: EXAMPLE).
-			allValues = append(allValues, name)
+			joinedValues = append(joinedValues, joinedHeaderValue{name, name})
 		}
 
 		for _, v := range values {
 			scanVal := headerValueForDLP(name, v, target, len(values))
-			allValues = append(allValues, scanVal)
+			joinedVal := scanVal
+			if scanner.CredentialAudienceHeaderSurface(name, scanVal) != "header" {
+				joinedVal = sc.ScrubAuthorizedCredentialFromJoinedHeaders(name, scanVal, target)
+			}
+			joinedValues = append(joinedValues, joinedHeaderValue{scanVal, joinedVal})
+			scrubbed = scrubbed || joinedVal != scanVal
 			result := sc.ScanTextForDLP(ctx, scanVal)
 			if !result.Clean {
-				addMatches(name, result.Matches)
+				addMatches(name, scanVal, result.Matches)
 			}
 			// In "all" mode, scan name+value concatenation to catch secrets
 			// split across the header name:value boundary.
@@ -2033,7 +2424,7 @@ func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cf
 				combined := name + scanVal
 				combinedResult := sc.ScanTextForDLP(ctx, combined)
 				if !combinedResult.Clean {
-					addMatches(name, combinedResult.Matches)
+					addMatches(name, scanVal, combinedResult.Matches)
 				}
 			}
 		}
@@ -2042,12 +2433,15 @@ func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cf
 	// Joined scan: catches split-secret attacks across multiple headers
 	// or repeated values of the same header.
 	// Sort to ensure deterministic ordering (Go map iteration is random).
-	if len(allValues) > 1 {
-		sort.Strings(allValues)
-		joined := strings.Join(allValues, "\n")
-		result := sc.ScanTextForDLP(ctx, joined)
-		if !result.Clean {
-			addMatches("(joined)", result.Matches)
+	if len(joinedValues) > 1 {
+		joined, scrubbedJoined := joinHeaderValuesInOriginalOrder(joinedValues)
+		matches := sc.ScanTextForDLP(ctx, joined).Matches
+		if scrubbed {
+			scrubbedMatches := sc.ScanTextForDLP(ctx, scrubbedJoined).Matches
+			matches = scanner.MergeJoinedHeaderMatches(matches, scrubbedMatches)
+		}
+		if len(matches) > 0 {
+			addMatches("(joined)", joined, matches)
 		}
 	}
 
@@ -2057,10 +2451,11 @@ func scanRequestHeadersWithAudience(ctx context.Context, headers http.Header, cf
 		return nil
 	}
 	return &BodyScanResult{
-		Clean:      false,
-		Action:     requestBodyDLPAction(allMatches, bodyCfg.Action, bodyCfg.PatternActions),
-		DLPMatches: allMatches,
-		HeaderName: headerDLPMatchSource(matchedHeaders),
+		Clean:                        false,
+		Action:                       requestBodyDLPAction(allMatches, bodyCfg.Action, bodyCfg.PatternActions),
+		DLPMatches:                   allMatches,
+		HeaderName:                   headerDLPMatchSource(matchedHeaders),
+		CredentialAudienceMismatches: scanner.TextDLPCredentialAudienceMismatches(allMatches, target, "header"),
 	}
 }
 
@@ -2086,20 +2481,26 @@ func headerDLPMatchSource(headers map[string]struct{}) string {
 // count within convention now that a bounded metric-label agent is threaded
 // through the header DLP path.
 type headerDLPParams struct {
-	headers     http.Header
-	cfg         *config.Config
-	sc          *scanner.Scanner
-	logger      *audit.Logger
-	actx        audit.LogContext
-	hostname    string
-	target      string
-	metricAgent string
-	start       time.Time
+	headers      http.Header
+	cfg          *config.Config
+	sc           *scanner.Scanner
+	logger       *audit.Logger
+	actx         audit.LogContext
+	hostname     string
+	target       string
+	metricAgent  string
+	start        time.Time
+	reasonPrefix string
 }
 
-func (p *Proxy) evalHeaderDLP(ctx context.Context, e headerDLPParams) (blocked bool, hadFinding bool) {
+// evalHeaderDLP's last return value is the require_receipts credential
+// audience receipt confirmation failure, if any. It takes priority over the
+// DLP block decision: the caller must block on it before evaluating
+// blocked/hadFinding, since a non-nil receiptErr means the allow could not be
+// durably confirmed and the request must never be forwarded.
+func (p *Proxy) evalHeaderDLP(ctx context.Context, e headerDLPParams) (blocked bool, hadFinding bool, reason string, receiptErr error) {
 	if !e.cfg.RequestBodyScanning.Enabled || !e.cfg.RequestBodyScanning.ScanHeaders {
-		return false, false
+		return false, false, "", nil
 	}
 	metricAgent := e.metricAgent
 	if metricAgent == "" {
@@ -2110,29 +2511,33 @@ func (p *Proxy) evalHeaderDLP(ctx context.Context, e headerDLPParams) (blocked b
 			e.logger.LogDLPDropped(e.actx, match.PatternName, match.Severity, "header", reason)
 		}
 		p.metrics.RecordDLPDroppedMatch(match.PatternName, "header", reason)
-	}, func(allow scanner.CredentialAudienceAllow) {
-		p.recordCredentialAudienceAllow(e.actx, allow, TransportForward, e.actx.Method(), e.target, e.actx.RequestID(), e.actx.Agent())
+	}, func(allow scanner.CredentialAudienceAllow) error {
+		return p.recordCredentialAudienceAllow(e.cfg, e.actx, allow, TransportForward, e.actx.Method(), e.target, e.actx.RequestID(), e.actx.Agent(), receiptShardFromContext(ctx))
 	})
 	if headerResult == nil {
-		return false, false
+		return false, false, "", nil
 	}
-	action := headerResult.Action
-	if action == "" {
-		action = e.cfg.RequestBodyScanning.Action
+	if headerResult.CredentialAudienceReceiptErr != nil {
+		return false, false, "", headerResult.CredentialAudienceReceiptErr
 	}
-	headerHardBlock := shouldHardBlockRequestDLP(headerResult.DLPMatches, e.cfg)
-	if headerHardBlock {
-		action = config.ActionBlock
+	if headerResult.Clean {
+		return false, false, "", nil
 	}
+	action, headerHardBlock := headerDLPDecision(headerResult, e.cfg)
 	patternNames := dlpMatchNames(headerResult.DLPMatches)
 	bundleRules := dlpBundleRules(headerResult.DLPMatches)
 
-	e.logger.LogHeaderDLP(e.actx, headerResult.HeaderName, action, patternNames, bundleRules)
+	e.logger.LogHeaderDLP(e.actx, headerResult.HeaderName, action, patternNames, bundleRules, headerResult.CredentialAudienceMismatches...)
 	p.metrics.RecordHeaderDLP(action, metricAgent)
 
+	reason = e.reasonPrefix
+	if reason == "" {
+		reason = "request header contains secret"
+	}
+	reason = headerResult.withAudienceExplanation(reason)
 	if headerHardBlock || (action == config.ActionBlock && e.cfg.EnforceEnabled()) {
 		p.metrics.RecordBlocked(e.hostname, "header_dlp", time.Since(e.start), metricAgent)
-		return true, true
+		return true, true, reason, nil
 	}
-	return false, true
+	return false, true, reason, nil
 }

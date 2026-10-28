@@ -21,8 +21,8 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
-	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
 	decide "github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/envcontrol"
 	"github.com/luckyPipewrench/pipelock/internal/hitl"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
@@ -105,7 +105,7 @@ func emitPendingTimeoutResponses(writer transport.MessageWriter, logW io.Writer,
 		if wErr := writer.WriteMessage(resp); wErr != nil {
 			_, _ = fmt.Fprintf(logW, "pipelock: failed to send timeout response: %v\n", wErr)
 		}
-		emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), logW, pending.Outcome.Receipt, "error", int64(len(resp)), "response_timeout")
+		emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, pending.Outcome.Receipt, "error", int64(len(resp)), "response_timeout", opts.requireReceipts())
 	}
 }
 
@@ -114,7 +114,7 @@ func emitPendingIncompleteOutcomes(logW io.Writer, tracker *RequestTracker, opts
 		return
 	}
 	for _, pending := range tracker.DrainPendingOutcomes() {
-		emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), logW, pending.Outcome.Receipt, "incomplete", -1, reason)
+		emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, pending.Outcome.Receipt, "incomplete", -1, reason, opts.requireReceipts())
 	}
 }
 
@@ -163,9 +163,19 @@ func isRequest(msg []byte) bool {
 // mid-stream terminates already-open sessions immediately.
 // Returns true if any response security finding was detected.
 func ForwardScanned(reader transport.MessageReader, writer transport.MessageWriter, logW io.Writer, tracker *RequestTracker, opts MCPProxyOpts) (bool, error) {
+	opts = opts.snapshotScanPolicy()
+	if opts.ServerIdentityFn != nil {
+		writer = &serverIdentityMessageWriter{writer: writer, opts: opts}
+	}
 	sc := opts.scanner()
 	approver := opts.Approver
 	toolCfg := opts.toolCfg()
+	if toolCfg != nil && (opts.validateToolHeaders || opts.toolContractDiscovery) {
+		copyCfg := *toolCfg
+		copyCfg.RequireHeaderContracts = true
+		copyCfg.ContractDiscovery = opts.toolContractDiscovery
+		toolCfg = &copyCfg
+	}
 	ks := opts.KillSwitch
 	rec := opts.Rec
 	adaptiveCfg := opts.adaptiveCfg()
@@ -204,7 +214,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			// connection"), and a peer drop surfaces as reset/broken-pipe,
 			// from a blocked transport read. All mean "no more traffic to
 			// scan", not a fatal error. IsExpectedCloseErr covers io.EOF too.
-			if wsutil.IsExpectedCloseErr(err) {
+			if wsutil.IsExpectedCloseErr(err) && !errors.Is(err, transport.ErrIncompleteResponse) {
 				break
 			}
 			if opts.sessionExit.inProgress() && isSessionExitCloseErr(err) {
@@ -223,18 +233,40 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			return foundInjection, fmt.Errorf("reading input: %w", err)
 		}
 		lineNum++
+		var denialAudit mcpDenialAudit
+		if err := opts.checkServerIdentity(); err != nil {
+			dropMCPDenial(opts, mcpIdentityMcpResponseDenialAudit(), "response")
+			return foundInjection, &mcpFinalizedDenialError{err: err}
+		}
 
 		// Parse the inbound frame once per message; every gate below reads
 		// ID / Method / tool fields from this frame instead of re-parsing.
 		frame := ParseMCPFrame(line)
+		// Key rejection must precede tracker consumption, adaptive recovery,
+		// tool drift promotion, inventory reservations and taint observations.
+		if frame.KeyValidationErr != nil {
+			detected, outbound, err := rejectResponseKeys(frame, lineNum, sc, writer, logW, opts)
+			foundInjection = foundInjection || detected
+			if err != nil {
+				return foundInjection, err
+			}
+			emitRejectedResponseOutcome(frame.Raw, outbound, logW, tracker, opts)
+			continue
+		}
+
+		if opts.OnResponseKeysValidated != nil {
+			opts.OnResponseKeysValidated()
+		}
 
 		// Kill switch: deny all responses when activated mid-stream.
 		// Checked per message so activation after session start takes effect
 		// immediately on already-open MCP sessions.
 		if ks != nil {
 			if d := ks.IsActiveMCP(line); d.Active {
+				denialAudit = mcpKillMcpResponseDenialAudit()
 				rpcID := frame.ID
 				if rpcID == nil {
+					dropMCPDenial(opts, denialAudit, "response")
 					// Notification: drop silently (no response possible).
 					_, _ = fmt.Fprintf(logW, "pipelock: response line %d: kill switch dropped notification (source=%s)\n",
 						lineNum, d.Source)
@@ -243,20 +275,23 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				_, _ = fmt.Fprintf(logW, "pipelock: response line %d: kill switch denied (source=%s)\n",
 					lineNum, d.Source)
 				resp := killswitch.ErrorResponse(rpcID, d.Message)
-				if wErr := writer.WriteMessage(resp); wErr != nil {
+				if wErr := writeMCPDenial(opts, denialAudit, writer, resp); wErr != nil {
 					return foundInjection, fmt.Errorf("writing kill switch response: %w", wErr)
 				}
 				continue
 			}
 		}
 
-		// On-entry de-escalation for long-lived response streams.
-		tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
-			sessionKey: firstNonEmpty(opts.ServerName, "default"),
-			reason:     adaptiveRecoveryTimer,
-			logger:     opts.AuditLogger,
-			metrics:    m,
-		}, opts.warnContext()))
+		// Private inventory inspection cannot lower the caller's security state.
+		// Ordinary response streams retain their on-entry recovery policy.
+		if !opts.toolContractDiscovery {
+			tryRecoverSession(rec, adaptiveCfg, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
+				sessionKey: opts.adaptiveSessionKey(),
+				reason:     adaptiveRecoveryTimer,
+				logger:     opts.AuditLogger,
+				metrics:    m,
+			}, opts.warnContext()))
+		}
 
 		// A signed operator delegation is the only path that clears a stdio
 		// airlock. A malformed, expired, replayed, or absent authority leaves
@@ -289,14 +324,16 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 		}
 		if blockAll {
+			denialAudit = mcpAdaptiveResponseDenialAudit()
 			rpcID := frame.ID
 			// Notifications (no ID) must not receive a response per JSON-RPC spec.
 			// Drop them silently instead of writing an error.
 			if rpcID == nil {
+				dropMCPDenial(opts, denialAudit, "response")
 				continue
 			}
-			resp := blockSessionDenyResponse(rpcID, session.EscalationLabel(rec.EscalationLevel()))
-			if wErr := writer.WriteMessage(resp); wErr != nil {
+			resp := blockSessionDenyResponse(rpcID, mcpAdaptiveBlockMessage(rec, adaptiveCfg, "session_deny", logW))
+			if wErr := writeMCPDenial(opts, denialAudit, writer, resp); wErr != nil {
 				return foundInjection, fmt.Errorf("writing session deny: %w", wErr)
 			}
 			continue
@@ -308,6 +345,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// frame: WebSocket and SSE can preserve leading whitespace that
 		// a raw first-byte check would miss.
 		if frame.IsBatch {
+			dropMCPDenial(opts, mcpBatchResponseDenialAudit(), "response")
 			_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocked batch JSON-RPC message (not supported by MCP)\n", lineNum)
 			continue
 		}
@@ -331,8 +369,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			// parse error before the first client request is recorded.
 			if canonicalID(rpcID) == "" {
 				_, _ = fmt.Fprintf(logW, "pipelock: line %d: confused deputy: response has no correlatable ID\n", lineNum)
+				denialAudit = mcpCorrelationResponseDenialAudit()
 				resp := blockResponseReason(nil, "response has no correlatable ID (confused deputy)")
-				if err := writer.WriteMessage(resp); err != nil {
+				if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 					return foundInjection, fmt.Errorf("writing confused deputy block: %w", err)
 				}
 				continue
@@ -350,8 +389,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					if tracker.Strict() {
 						blockID = nil
 					}
+					denialAudit = mcpCorrelationResponseDenialAudit()
 					resp := blockResponseReason(blockID, "unsolicited response ID (confused deputy)")
-					if err := writer.WriteMessage(resp); err != nil {
+					if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 						return foundInjection, fmt.Errorf("writing confused deputy block: %w", err)
 					}
 					continue
@@ -364,16 +404,18 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			if !hasTrackedOutcome {
 				return
 			}
-			emitMCPOutcomeReceipt(receiptEmitter, v2ReceiptEmitter, logW, trackedOutcome.Receipt, status, int64(len(outbound)), reason)
+			emitMCPOutcomeReceipt(receiptEmitter, v2ReceiptEmitter, opts.ReceiptGroup, logW, trackedOutcome.Receipt, status, int64(len(outbound)), reason, opts.requireReceipts())
 		}
 
 		blockScanError := func(scanError string) error {
 			_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, scanError)
+			denialAudit = mcpResponseInspectionBlockAudit("MCP response scan failed")
 			if frame.ID == nil && frame.Method != "" {
+				dropMCPDenial(opts, denialAudit, "response")
 				return nil // Notifications have no request awaiting a response.
 			}
 			resp := blockResponseReason(frame.ID, "upstream response scan failed")
-			if err := writer.WriteMessage(resp); err != nil {
+			if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 				return fmt.Errorf("writing scan-error block response: %w", err)
 			}
 			emitTrackedOutcome("error", "response_scan_error", resp)
@@ -407,14 +449,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 			_, _ = fmt.Fprintf(logW, "pipelock: line %d: media policy blocked MCP response (%s)\n",
 				lineNum, mediaResult.BlockReason)
-			if opts.AuditLogger != nil {
-				opts.AuditLogger.LogBlocked(mustMCPAuditContext(opts.AuditLogger, mcpWarnMethod, target), "media_policy", mediaResult.BlockReason)
-			}
+			denialAudit = mcpMediaDenialAudit(mediaResult)
 			if m != nil {
 				m.RecordBlocked("mcp", "media_policy", 0, "")
 			}
-			if receiptEmitter != nil {
-				if _, emitErr := EmitMCPDecision(receiptEmitter, v2ReceiptEmitter, nil, MCPDecision{
+			if receiptEmitter != nil || opts.ReceiptGroup != nil {
+				if _, emitErr := opts.emitReceiptDecision(MCPDecision{
 					Receipt: opts.withReceiptPolicyHash(receipt.EmitOpts{
 						ActionID:  receipt.NewActionID(),
 						Verdict:   config.ActionBlock,
@@ -435,35 +475,32 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					Logger:        opts.AuditLogger,
 					Metrics:       m,
 					ConsoleWriter: logW,
-					Session:       firstNonEmpty(opts.ServerName, "default"),
+					Session:       opts.adaptiveSessionKey(),
 					DenialScanner: "media_policy",
 					DenialReason:  mediaResult.BlockReason,
 					PolicyHash:    opts.receiptPolicyHash(),
 				})
 			}
 			resp := blockMediaPolicyResponse(rpcID, mediaResult.BlockReason)
-			if err := writer.WriteMessage(resp); err != nil {
+			if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 				return foundInjection, fmt.Errorf("writing media policy block: %w", err)
 			}
 			emitTrackedOutcome("error", "media_policy", resp)
 			continue
 		}
-		line = mediaResult.Line
 
-		// Reject ambiguous/malformed JSON before any provenance, tool-baseline,
-		// capture, or adaptive side effect. The later response scanner also
-		// rejects duplicates, but tool scanning intentionally runs first; without
-		// this preflight an ultimately-blocked tools/list document could still
-		// seed the session binding baseline before the parser error was observed.
-		if err := jsonscan.RejectDuplicateKeys(line); err != nil {
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: invalid or ambiguous JSON before tool processing: %v\n", lineNum, err)
-			resp := blockResponseReason(recoverTopLevelJSONRPCID(line), "upstream response is not unambiguous JSON")
-			if err := writer.WriteMessage(resp); err != nil {
-				return foundInjection, fmt.Errorf("writing preflight JSON block: %w", err)
+		if mediaResult.Changed {
+			if emitErr := confirmMCPResponseEffect(logW, opts, trackedOutcome.Receipt, receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: config.ActionStrip, Layer: "media_policy", Pattern: "image media rewritten", Transport: opts.Transport, Target: "mcp://response", RequestID: canonicalID(frame.ID)}); emitErr != nil {
+				denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_response", mcpReceiptEmissionReason)
+				resp := blockResponseReason(frame.ID, "receipt emission failed")
+				if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+					return foundInjection, fmt.Errorf("writing media receipt-failure block: %w", err)
+				}
+				emitTrackedOutcome("error", "receipt_emission_failed", resp)
+				continue
 			}
-			emitTrackedOutcome("error", "parse_error", resp)
-			continue
 		}
+		line = mediaResult.Line
 
 		// Tool scanning runs first. tools/list responses contain instructional
 		// text ("you must call this tool") that the general injection scanner
@@ -477,7 +514,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			if decision == "" {
 				return
 			}
-			if manager := opts.deferManager(); manager != nil {
+			if opts.toolInventoryResolution != nil && !opts.toolContractDiscovery {
+				opts.toolInventoryResolution(decision)
+			} else if manager := opts.deferManager(); manager != nil {
 				manager.ResolveToolInventory(captureSessionID(opts.Transport), decision)
 			}
 			toolInventoryResolved = true
@@ -488,14 +527,24 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// response scanner.
 		var toolInventoryReservation *tools.ToolInventoryReservation
 		reserveToolInventory := func() error {
-			if !isToolsList || toolCfg == nil || toolCfg.Baseline == nil || len(toolResult.ToolNames) == 0 {
+			if opts.toolContractDiscovery || !isToolsList || toolCfg == nil || toolCfg.Baseline == nil || len(toolResult.ToolNames) == 0 && len(toolResult.ToolDefs) == 0 {
 				return nil
 			}
+			// x-mcp-header contracts belong to the 2026-07-28 tools/list. A
+			// server answering an older revision follows that revision (MCP
+			// 2026-07-28 Streamable HTTP, "Earlier Streamable HTTP Revisions"),
+			// so its inventory records delivery but never the current contract.
+			// Otherwise an unannotated legacy definition would read as a known
+			// contract and let modern calls skip discovery and mirror checks.
+			defs := toolResult.ToolDefs
+			if !opts.validateToolHeaders {
+				defs = nil
+			}
 			var err error
-			toolInventoryReservation, err = toolCfg.Baseline.ReserveToolInventory(toolResult.ToolNames, toolResult.ToolDefs)
+			toolInventoryReservation, err = toolCfg.Baseline.ReserveToolInventory(toolResult.ToolNames, defs)
 			return err
 		}
-		commitToolInventory := func() {
+		applyToolInventory := func() {
 			if toolInventoryReservation == nil {
 				return
 			}
@@ -506,11 +555,23 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 			if len(added) > 0 {
 				decision = config.ActionBlock
-			} else if toolCfg.Baseline.HasBaseline() {
+			} else if toolCfg.Baseline.HasBaseline() && !toolCfg.HeaderContractsOnly {
+				// Structural collection never scanned these definitions, so it
+				// cannot be the affirmative inventory signal that releases a hold.
 				decision = config.ActionAllow
 			}
 			if !toolInventoryResolved {
 				resolveToolInventory(decision)
+			}
+		}
+		commitToolInventory := func() {
+			if toolInventoryReservation == nil {
+				return
+			}
+			if opts.toolInventoryDelivery != nil {
+				opts.toolInventoryDelivery(applyToolInventory, toolInventoryReservation.Release)
+			} else {
+				applyToolInventory()
 			}
 		}
 		releaseToolInventory := func() {
@@ -523,8 +584,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		// tool-poison near-miss signal must not also apply RecordClean: the
 		// same message cannot both raise and decay the session threat score.
 		toolPoisonDetected := false
+		// toolAcknowledged marks a tools/list whose Credential Request
+		// Directive finding a configured acknowledgment lifted. It is not
+		// evidence of clean behavior, so it earns no clean credit either.
+		toolAcknowledged := false
 		if toolCfg != nil {
-			toolResult = tools.ScanTools(line, sc, toolCfg)
+			toolResult = tools.ScanToolsForMethodContext(opts.warnContext(), line, sc, toolCfg.WithServerMode(opts.ServerName, opts.ServerBinding, opts.ServerBindingMode, opts.ServerRevision), trackedMethod)
 			if err := opts.warnContext().Err(); err != nil {
 				if writeErr := blockScanError("response scan failed: " + err.Error()); writeErr != nil {
 					return foundInjection, writeErr
@@ -532,23 +597,20 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				continue
 			}
 			isToolsList = toolResult.IsToolsList
+			toolAcknowledged = toolResult.IsToolsList && toolResult.CredentialAckApplied()
 			// Provenance: verify tool signatures BEFORE updating session binding
 			// baseline. A blocked tools/list must not seed known tools.
 			if toolResult.IsToolsList && provenanceCfg != nil && provenanceCfg.Enabled {
 				pv := VerifyToolsListProvenance(line, provenanceCfg)
 				if pv.Block {
-					if manager := opts.deferManager(); manager != nil {
-						manager.ResolveToolInventory(captureSessionID(opts.Transport), config.ActionBlock)
-					}
+					resolveToolInventory(config.ActionBlock)
 					_, _ = fmt.Fprintf(logW, "pipelock: line %d: tools/list provenance verification failed: %s\n", lineNum, pv.Error)
-					if opts.AuditLogger != nil {
-						opts.AuditLogger.LogBlocked(mustMCPAuditContext(opts.AuditLogger, "MCP", "tools/list"), "provenance", pv.Error)
-					}
+					denialAudit = mcpProvenanceDenialAudit()
 					if m != nil {
 						m.RecordBlocked("mcp", "provenance", 0, "")
 					}
 					resp := blockResponseReason(toolResult.RPCID, "tool provenance verification failed")
-					if err := writer.WriteMessage(resp); err != nil {
+					if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 						return foundInjection, fmt.Errorf("writing provenance block: %w", err)
 					}
 					emitTrackedOutcome("error", "provenance", resp)
@@ -568,17 +630,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				}
 			}
 			// Capture: record tools/list scan verdict.
-			if toolResult.IsToolsList {
-				toolCaptureAction := config.ActionAllow
-				if !toolResult.Clean {
-					if toolResult.ResourceLimit != "" {
-						toolCaptureAction = config.ActionBlock
-					} else if toolCfg.Action != "" {
-						toolCaptureAction = toolCfg.Action
-					} else {
-						toolCaptureAction = config.ActionBlock
-					}
-				}
+			captureToolScan := func(toolCaptureAction string) {
 				obs.ObserveToolScanVerdict(context.Background(), &capture.ToolScanRecord{
 					Subsurface:        "mcp_tools_list",
 					Transport:         opts.Transport,
@@ -588,10 +640,27 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					Profile:           opts.captureProfile(),
 					ActionClass:       captureMCPActionClass("", "tools/list"),
 					Request:           capture.CaptureRequest{RPCID: captureRPCID(toolResult.RPCID)},
-					RawFindings:       toolScanMatchesToFindings(toolResult.Matches),
+					RawFindings:       toolScanResultFindings(toolResult),
 					EffectiveAction:   toolCaptureAction,
-					Outcome:           captureOutcome(toolCaptureAction, toolResult.Clean),
+					Outcome:           captureOutcome(toolCaptureAction, toolResult.Clean && !toolAcknowledged),
 				})
+			}
+			// An acknowledged list is captured after its receipt decision below,
+			// so the tool-scan record reflects that receipt decision.
+			// Later gates record their own refusals.
+			if toolResult.IsToolsList && (!toolAcknowledged || !toolResult.Clean) {
+				toolCaptureAction := config.ActionAllow
+				if !toolResult.Clean {
+					if toolResult.ResourceLimit != "" || toolResult.CredentialAckRefused() {
+						// Both refuse under every action, so record the block.
+						toolCaptureAction = config.ActionBlock
+					} else if toolCfg.Action != "" {
+						toolCaptureAction = toolCfg.Action
+					} else {
+						toolCaptureAction = config.ActionBlock
+					}
+				}
+				captureToolScan(toolCaptureAction)
 			}
 			// Accepted definition drift is not a finding and does not affect the
 			// verdict, so it is reported here rather than on the block path. An
@@ -608,102 +677,179 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				toolPoisonDetected = true
 				tools.LogToolFindings(logW, lineNum, toolResult)
 
-				originalToolAction := toolCfg.Action
-				toolAction := originalToolAction
+				toolAction := toolCfg.Action
 				if toolResult.ResourceLimit != "" {
 					// A capacity result means the response cannot become a complete
 					// security baseline. Policy warn/strip would forward an
 					// uninspectable definition, so this outcome is always a block.
 					toolAction = config.ActionBlock
 				}
-				// Escalation upgrade for tool poison detection.
+				if toolResult.CredentialAckRefused() {
+					// A configured acknowledgment that no longer matches its
+					// tool is a reviewed exception gone stale. It refuses under
+					// every action rather than quietly becoming a warning.
+					toolAction = config.ActionBlock
+				}
+				// Escalation upgrade for tool poison detection. Hard floors above
+				// keep their own reason even when the configured action is warn.
+				preAdaptiveToolAction := toolAction
 				if rec != nil {
 					toolAction = decide.UpgradeAction(toolAction, rec.EscalationLevel(), adaptiveCfg)
-					if toolAction != originalToolAction {
+					if toolAction != preAdaptiveToolAction {
 						// Emit adaptive-upgrade telemetry when escalation changed the action.
 						_, _ = fmt.Fprintf(logW, "pipelock: line %d: adaptive upgrade tool-poison %s->%s (level=%s)\n",
-							lineNum, originalToolAction, toolAction, session.EscalationLabel(rec.EscalationLevel()))
+							lineNum, preAdaptiveToolAction, toolAction, session.EscalationLabel(rec.EscalationLevel()))
 						if m != nil {
-							m.RecordAdaptiveUpgrade(originalToolAction, toolAction, session.EscalationLabel(rec.EscalationLevel()))
+							m.RecordAdaptiveUpgrade(preAdaptiveToolAction, toolAction, session.EscalationLabel(rec.EscalationLevel()))
 						}
 					}
 				}
 
 				if toolAction == config.ActionBlock {
-					_ = emitMCPToolScanReceipt(receiptEmitter, v2ReceiptEmitter, logW, opts, toolResult, config.ActionBlock)
+					_ = emitMCPToolScanReceipt(logW, opts, toolResult, config.ActionBlock, trackedOutcome.Receipt)
 					blockReason := "tool poisoning detected in tools/list"
 					if toolResult.ResourceLimit != "" {
 						blockReason = "tools/list cannot be safely inspected: " + toolResult.ResourceLimit
 						if m != nil {
 							m.RecordBlocked("mcp", toolResult.ResourceLimit, 0, "")
 						}
+					} else if toolResult.CredentialAckRefused() {
+						blockReason = "tools/list refused: a credential-request acknowledgment no longer matches its tool"
 					} else if toolScanHasDrift(toolResult) && toolCfg.DriftRemediation != "" {
 						blockReason = "tool definition drift detected; " + toolCfg.DriftRemediation
 					}
-					if opts.AuditLogger != nil {
-						opts.AuditLogger.LogBlocked(
-							mustMCPAuditContext(opts.AuditLogger, "MCP", "tools/list"),
-							"tool_scanning",
-							blockReason,
-						)
-					}
+					// Preserve the resolved enforcement cause before adaptive caller
+					// wording can replace the reply's explanation.
+					denialAudit = mcpToolResultDenialAudit(toolResult.ResourceLimit, blockReason)
+
 					// Signal: tool poisoning blocked.
 					if adaptiveCfg != nil && adaptiveCfg.Enabled {
-						recordMCPAdaptiveSignal(opts, rec, session.SignalBlock, decide.EscalationParams{
+						recordMCPAdaptiveSignal(opts, rec, decide.UpgradedWarningSignal(preAdaptiveToolAction, session.SignalBlock), decide.EscalationParams{
 							Threshold:     adaptiveCfg.EscalationThreshold,
 							Logger:        opts.AuditLogger,
 							Metrics:       m,
 							ConsoleWriter: logW,
-							Session:       firstNonEmpty(opts.ServerName, "default"),
+							Session:       opts.adaptiveSessionKey(),
 							DenialScanner: "tool_scanning",
 							DenialReason:  blockReason,
 							PolicyHash:    opts.receiptPolicyHash(),
 						})
 					}
+					if toolAction != preAdaptiveToolAction {
+						blockReason = strings.TrimPrefix(mcpAdaptiveBlockMessage(rec, adaptiveCfg, "tool_scanning", logW), "pipelock: ")
+					}
 					resp := blockResponseReason(toolResult.RPCID, blockReason)
-					if err := writer.WriteMessage(resp); err != nil {
+					if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 						return foundInjection, fmt.Errorf("writing tool block: %w", err)
 					}
 					emitTrackedOutcome("error", "tool_poisoning", resp)
 					continue
 				}
-				if emitErr := emitMCPToolScanReceipt(receiptEmitter, v2ReceiptEmitter, logW, opts, toolResult, config.ActionWarn); emitErr != nil && opts.requireReceipts() {
+				if emitErr := emitMCPToolScanReceipt(logW, opts, toolResult, config.ActionWarn, trackedOutcome.Receipt); emitErr != nil && opts.requireReceipts() {
+					denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_response", mcpReceiptEmissionReason)
 					resp := blockResponseReason(toolResult.RPCID, "receipt emission failed")
-					if err := writer.WriteMessage(resp); err != nil {
+					if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 						return foundInjection, fmt.Errorf("writing receipt-failure block: %w", err)
 					}
+					emitTrackedOutcome("error", "receipt_emission_failed", resp)
 					continue
 				}
-				// warn: logged above, record near-miss and fall through to general handling.
+				// Warn: preserve the observation without enforcement points.
 				if adaptiveCfg != nil && adaptiveCfg.Enabled {
-					recordMCPAdaptiveSignal(opts, rec, session.SignalNearMiss, decide.EscalationParams{
+					recordMCPAdaptiveSignal(opts, rec, session.SignalWarning, decide.EscalationParams{
 						Threshold:     adaptiveCfg.EscalationThreshold,
 						Logger:        opts.AuditLogger,
 						Metrics:       m,
 						ConsoleWriter: logW,
-						Session:       firstNonEmpty(opts.ServerName, "default"),
+						Session:       opts.adaptiveSessionKey(),
 						DenialScanner: "tool_scanning",
 						DenialReason:  "tool poisoning detected in tools/list",
 						PolicyHash:    opts.receiptPolicyHash(),
 					})
 				}
 			}
+			if toolAcknowledged && toolResult.Clean {
+				// The tool scanner allowed this list under a reviewed
+				// acknowledgment. The receipt and capture record that scanner
+				// decision with an allow verdict; it is not a near miss and not
+				// a clean event. Later gates (general response scanning,
+				// inventory reservation) can still refuse delivery, and record
+				// that themselves.
+				if emitErr := emitMCPToolScanReceipt(logW, opts, toolResult, config.ActionAllow, trackedOutcome.Receipt); emitErr != nil && opts.requireReceipts() {
+					denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_response", mcpReceiptEmissionReason)
+					captureToolScan(config.ActionBlock)
+					resolveToolInventory(config.ActionBlock)
+					resp := blockResponseReason(toolResult.RPCID, "receipt emission failed")
+					if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+						return foundInjection, fmt.Errorf("writing receipt-failure block: %w", err)
+					}
+					emitTrackedOutcome("error", "receipt_emission_failed", resp)
+					continue
+				}
+				// The tool scanner passed it with a finding present: warned,
+				// never clean.
+				captureToolScan(config.ActionWarn)
+			}
+		}
+
+		if isToolsList && opts.validateToolHeaders && !opts.toolContractDiscovery {
+			filtered, names, rejected, err := tools.FilterInvalidHeaderTools(line, toolResult.ToolDefs)
+			if err != nil {
+				if writeErr := blockScanError("invalid tool header contract response"); writeErr != nil {
+					return foundInjection, writeErr
+				}
+				continue
+			}
+			if len(rejected) > 0 {
+				// A filtered inventory is not affirmative approval evidence for held
+				// actions, even when the remaining definitions scanned cleanly.
+				resolveToolInventory(config.ActionBlock)
+			}
+			for name, reason := range rejected {
+				_, _ = fmt.Fprintf(logW, "pipelock: tool %q excluded: %q\n", name, reason)
+			}
+			line = filtered
+			toolResult.ToolNames = names
 		}
 
 		// For tools/list responses, skip general scanning of the result field
 		// (tool descriptions contain instructional text that triggers FPs).
 		// Still scan the error field: injection could hide in non-tool fields.
 		var verdict jsonrpc.ScanVerdict
-		if isToolsList {
+		var baselineReceiptErr error
+		// Structural collection is not a dedicated content scan. Preserve the
+		// nil-tool-config full-response scanning contract (ScanResponseDispatch)
+		// rather than exempting tool descriptions that nobody has inspected.
+		if isToolsList && !toolCfg.HeaderContractsOnly {
 			verdict = scanToolsListNonToolFieldsContext(opts.warnContext(), line, sc, respScanOpts)
 		} else {
 			a2aOpts := opts.a2aResponseOpts(respScanOpts)
 			a2aOpts.Method = trackedMethod
+			if opts.requireReceipts() {
+				a2aOpts.ConfirmCardAcceptance = func(candidate AgentCardScanResult) error {
+					selected := trackedOutcome.Receipt
+					if !selected.ShardSelected && opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+						selected = opts.ReceiptGroup.Shards.Admit(selected)
+					}
+					if candidate.SignatureVerified {
+						baselineReceiptErr = confirmMCPResponseEffect(logW, opts, selected, receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: config.ActionAllow, Layer: "a2a_card_signature", Pattern: "verified key_id=" + candidate.SignatureKeyID, Transport: opts.Transport, Target: "mcp://response", RequestID: canonicalID(frame.ID)})
+						if baselineReceiptErr != nil {
+							return baselineReceiptErr
+						}
+					}
+					if !candidate.FirstSeen && !candidate.DriftAdopted {
+						return nil
+					}
+					baselineReceiptErr = confirmMCPResponseEffect(logW, opts, selected, receipt.EmitOpts{ActionID: receipt.NewActionID(), Verdict: config.ActionAllow, Layer: "a2a_card_drift", Pattern: "Agent Card baseline accepted", Transport: opts.Transport, Target: "mcp://response", RequestID: canonicalID(frame.ID)})
+					return baselineReceiptErr
+				}
+			}
+
 			a2aOpts.OnCardDriftAdopted = func() {
 				const detail = "a2a: Agent Card descriptive drift adopted"
 				_, _ = fmt.Fprintf(logW, "pipelock: a2a response: %s\n", detail)
 				if opts.AuditLogger != nil {
-					resource := opts.responseTarget()
+					resource := opts.auditTarget()
 					if resource == "" {
 						resource = "mcp://response"
 					}
@@ -716,6 +862,16 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				}
 			}
 			verdict = ScanResponseA2A(line, sc, a2aOpts)
+		}
+
+		if baselineReceiptErr != nil {
+			denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_response", mcpReceiptEmissionReason)
+			resp := blockResponseReason(frame.ID, "receipt emission failed")
+			if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+				return foundInjection, fmt.Errorf("writing card receipt-failure block: %w", err)
+			}
+			emitTrackedOutcome("error", "receipt_emission_failed", resp)
+			continue
 		}
 
 		// The transport context owns cancellation even for legacy scanners that
@@ -734,9 +890,9 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			// Clean message: decay threat score. Skip decay when tool-poisoning
 			// was detected for this message - a near-miss signal and a clean
 			// decay on the same message would incorrectly counteract each other.
-			if !toolPoisonDetected {
+			if !opts.toolContractDiscovery && !toolPoisonDetected && !toolAcknowledged {
 				recordCleanSession(rec, adaptiveCfg, true, adaptiveRecoveryContextWithWarnContext(adaptiveRecoveryContext{
-					sessionKey: firstNonEmpty(opts.ServerName, "default"),
+					sessionKey: opts.adaptiveSessionKey(),
 					reason:     adaptiveRecoveryClean,
 					requestID:  canonicalID(verdict.ID),
 					logger:     opts.AuditLogger,
@@ -757,27 +913,19 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			}
 			commitToolInventory()
 			emitTrackedOutcome(mcpResponseStatus(line), "complete", line)
-			observeMCPResponseTaint(taintOpts, toolPoisonDetected)
+			observeMCPResponseFindings(taintOpts, toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged))
 			continue
 		}
 
 		// Parse error: always fail-closed regardless of action setting.
 		// Unparseable responses could hide injection in malformed content.
 		if verdict.Error != "" {
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, verdict.Error)
-			// Scan raw text for injection even when not valid JSON-RPC.
-			rawResult := sc.ScanResponse(context.Background(), string(line))
-			if !rawResult.Clean {
-				foundInjection = true
-				names := matchNames(rawResult.Matches)
-				_, _ = fmt.Fprintf(logW, "pipelock: line %d: injection in non-JSON content (%s)\n",
-					lineNum, strings.Join(names, ", "))
+			detected, resp, err := writeUnparseableResponse(unparseableResponseOptions{frame: frame, detail: verdict.Error, lineNum: lineNum, sc: sc, writer: writer, logW: logW, opts: opts})
+			foundInjection = foundInjection || detected
+			if err != nil {
+				return foundInjection, err
 			}
-			_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocking unparseable response\n", lineNum)
-			resp := blockResponseReason(nil, "upstream response is not parseable JSON-RPC")
-			if err := writer.WriteMessage(resp); err != nil {
-				return foundInjection, fmt.Errorf("writing block response: %w", err)
-			}
+
 			emitTrackedOutcome("error", "parse_error", resp)
 			continue
 		}
@@ -803,7 +951,8 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 		}
 
 		// Escalation upgrade: may promote warn/ask to block for elevated sessions.
-		if rec != nil {
+		numberOnlyDecision := len(verdict.Matches) == 0 && scanner.OnlyInformational(verdict.DLPMatches)
+		if rec != nil && !numberOnlyDecision {
 			action = decide.UpgradeAction(action, rec.EscalationLevel(), adaptiveCfg)
 		}
 		escalationDriven := action != originalAction
@@ -820,7 +969,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			// Escalation-driven blocks use -32001 (session deny code) to
 			// distinguish them from direct injection blocks (-32000).
 			if escalationDriven {
-				outbound = blockSessionDenyResponse(verdict.ID, session.EscalationLabel(rec.EscalationLevel()))
+				outbound = blockSessionDenyResponse(verdict.ID, mcpAdaptiveBlockMessage(rec, adaptiveCfg, "mcp_response_scan", logW))
 			} else {
 				outbound = blockResponseReason(verdict.ID, responseFindingBlockReason(verdict, serverName, firstNonEmptyPattern(names), trustClass))
 			}
@@ -847,22 +996,22 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					effectiveAction = config.ActionAllow
 					outbound = line
 					writeContext = "writing line"
-					observeMCPResponseTaint(taintOpts, true)
+					observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 				case hitl.DecisionStrip:
 					_, _ = fmt.Fprintf(logW, "pipelock: line %d: operator chose strip\n", lineNum)
-					if len(verdict.DLPMatches) > 0 {
+					if len(verdict.DLPMatches) > 0 && !scanner.OnlyInformational(verdict.DLPMatches) {
 						// The injection stripper has no lossless DLP rewrite for arbitrary
 						// JSON-RPC result shapes. Never forward an unredacted credential.
 						effectiveAction = config.ActionBlock
 						outbound = blockResponseReason(verdict.ID, "inbound DLP finding cannot be safely stripped")
 						writeContext = "writing block response"
 					} else {
-						actualAction, msg := stripOrBlockMessage(line, sc, logW, verdict.ID)
+						actualAction, msg := stripOrBlockMessageWithOptions(line, sc, logW, verdict.ID, opts.warnContext(), respScanOpts)
 						effectiveAction = actualAction
 						outbound = msg
 						writeContext = "writing strip/block response"
 						if actualAction == config.ActionStrip {
-							observeMCPResponseTaint(taintOpts, true)
+							observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 						}
 					}
 				default: // DecisionBlock
@@ -873,25 +1022,25 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				}
 			}
 		case config.ActionStrip:
-			if len(verdict.DLPMatches) > 0 {
+			if len(verdict.DLPMatches) > 0 && !scanner.OnlyInformational(verdict.DLPMatches) {
 				// The injection stripper has no lossless DLP rewrite for arbitrary
 				// JSON-RPC result shapes. Never forward an unredacted credential.
 				effectiveAction = config.ActionBlock
 				outbound = blockResponseReason(verdict.ID, "inbound DLP finding cannot be safely stripped")
 				writeContext = "writing block response"
 			} else {
-				actualAction, msg := stripOrBlockMessage(line, sc, logW, verdict.ID)
+				actualAction, msg := stripOrBlockMessageWithOptions(line, sc, logW, verdict.ID, opts.warnContext(), respScanOpts)
 				effectiveAction = actualAction
 				outbound = msg
 				writeContext = "writing strip/block response"
 				if actualAction == config.ActionStrip {
-					observeMCPResponseTaint(taintOpts, true)
+					observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 				}
 			}
 		default: // warn
 			outbound = line
 			writeContext = "writing line"
-			observeMCPResponseTaint(taintOpts, true)
+			observeMCPResponseFindings(taintOpts, session.MergeFindingKinds(ResponseTaintFindingKinds(verdict), toolTaintFindingKinds(toolResult, toolPoisonDetected, toolAcknowledged)))
 		}
 
 		requestID := canonicalID(verdict.ID)
@@ -904,19 +1053,25 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 			pattern = names[0]
 		}
 		originalActionID := receipt.NewActionID()
-		_, emitErr := EmitMCPDecision(receiptEmitter, v2ReceiptEmitter, nil, MCPDecision{
-			Receipt: opts.withReceiptPolicyHash(receipt.EmitOpts{
-				ActionID:  originalActionID,
-				Verdict:   effectiveAction,
-				Transport: opts.Transport,
-				Target:    target,
-				RequestID: requestID,
-				Layer:     "mcp_response_scan",
-				Pattern:   pattern,
-				Severity:  config.SeverityHigh,
-			}),
+		originalReceiptOpts := opts.withReceiptPolicyHash(receipt.EmitOpts{
+			ActionID:  originalActionID,
+			Verdict:   effectiveAction,
+			Transport: opts.Transport,
+			Target:    target,
+			RequestID: requestID,
+			Layer:     "mcp_response_scan",
+			Pattern:   pattern,
+			Severity:  config.SeverityHigh,
+		})
+		originalReceiptOpts = withMCPResponseShard(trackedOutcome.Receipt, originalReceiptOpts)
+		if !originalReceiptOpts.ShardSelected && opts.ReceiptGroup != nil && opts.ReceiptGroup.Shards != nil {
+			originalReceiptOpts = opts.ReceiptGroup.Shards.Admit(originalReceiptOpts)
+		}
+		_, emitErr := opts.emitReceiptDecision(MCPDecision{
+			Receipt:        originalReceiptOpts,
 			RequireReceipt: opts.requireReceipts() && effectiveAction != config.ActionBlock,
 		})
+		receiptFailureBlock := false
 		originalReceiptPersisted := emitErr != nil && errors.Is(emitErr, errMCPV2ReceiptEmit)
 		if emitErr != nil {
 			logReceiptEmitFailure(logW, emitErr, opts.requireReceipts(), effectiveAction)
@@ -924,6 +1079,7 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				if effectiveAction != config.ActionBlock {
 					outbound = blockResponseReason(verdict.ID, "receipt emission failed")
 					effectiveAction = config.ActionBlock
+					receiptFailureBlock = true
 					writeContext = "writing block response"
 				}
 				replacementOpts := opts.withReceiptPolicyHash(receipt.EmitOpts{
@@ -936,10 +1092,12 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 					Pattern:   "mcp_response_scan receipt emission failed",
 					Severity:  config.SeverityHigh,
 				})
+				replacementOpts.ShardIndex = originalReceiptOpts.ShardIndex
+				replacementOpts.ShardSelected = originalReceiptOpts.ShardSelected
 				if originalReceiptPersisted {
 					replacementOpts.ParentActionID = originalActionID
 				}
-				if _, blockEmitErr := EmitMCPDecision(receiptEmitter, v2ReceiptEmitter, nil, MCPDecision{
+				if _, blockEmitErr := opts.emitReceiptDecision(MCPDecision{
 					Receipt:        replacementOpts,
 					RequireReceipt: true,
 				}); blockEmitErr != nil {
@@ -959,35 +1117,49 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 				continue
 			}
 		}
-		if err := writer.WriteMessage(outbound); err != nil {
+		if effectiveAction == config.ActionBlock || opts.AuditLogger != nil {
+			ctx := mustMCPAuditContext(opts.AuditLogger, "MCP", "server_response")
+			switch effectiveAction {
+			case config.ActionBlock:
+				if receiptFailureBlock {
+					denialAudit = mcpOperationalBlockAudit(scanner.AuditReceiptEmission, "mcp_response", mcpReceiptEmissionReason)
+				} else {
+					denialAudit = mcpResponseContentDenialAudit(pattern)
+				}
+			case config.ActionStrip, config.ActionWarn:
+				opts.AuditLogger.LogResponseScan(ctx, effectiveAction, len(names), names, nil)
+			}
+		}
+		if err := writeMCPResponseDisposition(opts, denialAudit, writer, outbound, effectiveAction == config.ActionBlock); err != nil {
 			releaseToolInventory()
 			return foundInjection, fmt.Errorf("%s: %w", writeContext, err)
 		}
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: response action=%s\n", lineNum, effectiveAction)
 		if effectiveAction == config.ActionWarn || effectiveAction == config.ActionAllow {
 			commitToolInventory()
 		}
 		emitTrackedOutcome(mcpResponseStatus(outbound), "mcp_response_scan", outbound)
 
-		// Signal recording: record after action is taken.
-		if adaptiveCfg != nil && adaptiveCfg.Enabled {
+		// Signal recording: informational card warnings do not affect the score.
+		if adaptiveCfg != nil && adaptiveCfg.Enabled && !numberOnlyDecision {
 			ep := decide.EscalationParams{
 				Threshold:     adaptiveCfg.EscalationThreshold,
 				Logger:        opts.AuditLogger,
 				Metrics:       m,
 				ConsoleWriter: logW,
-				Session:       firstNonEmpty(opts.ServerName, "default"),
+				Session:       opts.adaptiveSessionKey(),
 				DenialScanner: "mcp_response_scan",
 				DenialReason:  firstNonEmpty(pattern, "mcp_response_scan"),
 				PolicyHash:    opts.receiptPolicyHash(),
 			}
 			switch effectiveAction {
 			case config.ActionBlock:
-				recordMCPAdaptiveSignal(opts, rec, session.SignalBlock, ep)
+				recordMCPAdaptiveSignal(opts, rec, decide.UpgradedWarningSignal(originalAction, session.SignalBlock), ep)
 			case config.ActionStrip:
 				recordMCPAdaptiveSignal(opts, rec, session.SignalStrip, ep)
 			default:
-				// Warn/ask: near-miss signal (injection detected but not blocked).
-				recordMCPAdaptiveSignal(opts, rec, session.SignalNearMiss, ep)
+				// Warn/ask: observation only (injection detected but not blocked).
+				recordMCPAdaptiveSignal(opts, rec, session.SignalWarning, ep)
 			}
 		}
 
@@ -1012,6 +1184,102 @@ func ForwardScanned(reader transport.MessageReader, writer transport.MessageWrit
 	return foundInjection, nil
 }
 
+// writeUnparseableResponse preserves parse diagnostics without admitting any
+// response-derived state. The caller owns request correlation and receipts.
+type unparseableResponseOptions struct {
+	frame   MCPFrame
+	detail  string
+	lineNum int
+	sc      *scanner.Scanner
+	writer  transport.MessageWriter
+	logW    io.Writer
+	opts    MCPProxyOpts
+}
+
+func writeUnparseableResponse(o unparseableResponseOptions) (bool, []byte, error) {
+	frame, detail, lineNum, sc, writer, logW, opts := o.frame, o.detail, o.lineNum, o.sc, o.writer, o.logW, o.opts
+	denialAudit := mcpResponseInspectionBlockAudit("MCP response is unparseable")
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, detail)
+	rawResult := sc.ScanResponse(opts.warnContext(), string(frame.Raw))
+	if !rawResult.Clean {
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: injection in non-JSON content (%s)\n", lineNum, strings.Join(matchNames(rawResult.Matches), ", "))
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: blocking unparseable response\n", lineNum)
+	// Key preflight previously preserved a recoverable request ID even when
+	// the remaining JSON was malformed. Keep that correlation without
+	// consuming the tracker or admitting any response-derived state.
+	var id json.RawMessage
+	if frame.KeyValidationErr != nil {
+		id = frame.ID
+	}
+	resp := blockResponseReason(id, "upstream response is not parseable JSON-RPC")
+	if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+		return !rawResult.Clean, resp, fmt.Errorf("writing block response: %w", err)
+	}
+	return !rawResult.Clean, resp, nil
+}
+
+// rejectResponseKeys writes diagnostics without consuming correlation or running
+// any response-derived state updates. Cancellation remains a scan error; valid
+// but ambiguous messages remain security findings, unlike ordinary malformed JSON.
+func rejectResponseKeys(frame MCPFrame, lineNum int, sc *scanner.Scanner, writer transport.MessageWriter, logW io.Writer, opts MCPProxyOpts) (bool, []byte, error) {
+	var denialAudit mcpDenialAudit
+	if err := opts.warnContext().Err(); err != nil {
+		denialAudit = mcpResponseInspectionBlockAudit("MCP response scan failed")
+		_, _ = fmt.Fprintf(logW, "pipelock: line %d: response scan failed: %v\n", lineNum, err)
+		resp := blockResponseReason(frame.ID, "upstream response scan failed")
+		if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+			return false, resp, fmt.Errorf("writing scan-error block response: %w", err)
+		}
+		return false, resp, nil
+	}
+	if !json.Valid(frame.Raw) {
+		verdict := responseKeyErrorVerdict(frame.Raw, frame.KeyValidationErr)
+		return writeUnparseableResponse(unparseableResponseOptions{frame: frame, detail: verdict.Error, lineNum: lineNum, sc: sc, writer: writer, logW: logW, opts: opts})
+	}
+	_, _ = fmt.Fprintf(logW, "pipelock: line %d: invalid or ambiguous JSON before tool processing: %v\n", lineNum, frame.KeyValidationErr)
+	denialAudit = mcpResponseInspectionBlockAudit("MCP response has ambiguous protocol keys")
+	id := recoverTopLevelJSONRPCID(frame.Raw)
+	reason := "upstream response is not unambiguous JSON"
+	if shape, _ := toolsListShape(frame.Raw); shape == toolsListUninspectable || (shape == toolsListScannable && jsonscan.RejectDuplicateKeys(frame.Raw) == nil) {
+		reason = "tools/list cannot be safely inspected: tool_definition_uninspectable"
+	}
+	resp := blockResponseReason(id, reason)
+	if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
+		return true, resp, fmt.Errorf("writing preflight JSON block: %w", err)
+	}
+	return true, resp, nil
+}
+
+// emitRejectedResponseOutcome preserves receipt evidence using only metadata
+// from an admitted request. Ambiguous IDs cannot attribute an outcome, and the
+// rejected response never consumes the outstanding request or admits its state.
+// A tracker reservation bounds rejection receipts to one per pending request.
+func emitRejectedResponseOutcome(raw, outbound []byte, logW io.Writer, tracker *RequestTracker, opts MCPProxyOpts) {
+	if !isResponse(raw) {
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return
+	}
+	if _, duplicate := jsonscan.TopLevelDuplicateKeys(raw)["id"]; duplicate || jsonscan.HasKeyAlias(fields, "id") {
+		return
+	}
+	if _, request := fields["method"]; request || jsonscan.HasKeyAlias(fields, "method") {
+		return
+	}
+	outcome, ok := tracker.claimRejectedOutcome(fields["id"])
+	if !ok {
+		return
+	}
+	reason := "response_key_validation"
+	if opts.warnContext().Err() != nil {
+		reason = "response_scan_error"
+	}
+	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, outcome.Receipt, "error", int64(len(outbound)), reason, opts.requireReceipts())
+}
+
 func toolScanHasDrift(result tools.ToolScanResult) bool {
 	for _, match := range result.Matches {
 		if match.DriftDetected {
@@ -1022,12 +1290,11 @@ func toolScanHasDrift(result tools.ToolScanResult) bool {
 }
 
 func emitMCPToolScanReceipt(
-	emitter *receipt.Emitter,
-	v2Emitter *proxydecision.Emitter,
 	logW io.Writer,
 	opts MCPProxyOpts,
 	result tools.ToolScanResult,
 	verdict string,
+	selected receipt.EmitOpts,
 ) error {
 	serverName := strings.TrimSpace(opts.ServerName)
 	if serverName == "" {
@@ -1038,6 +1305,11 @@ func emitMCPToolScanReceipt(
 	if result.ResourceLimit != "" {
 		pattern = result.ResourceLimit
 	} else {
+		for _, o := range result.Observations {
+			if o.CredentialAck == tools.CredentialAckAcknowledged && len(o.ToolPoison) > 0 {
+				pattern = o.ToolPoison[0]
+			}
+		}
 		for _, match := range result.Matches {
 			if len(match.ToolPoison) > 0 {
 				pattern = match.ToolPoison[0]
@@ -1053,8 +1325,8 @@ func emitMCPToolScanReceipt(
 			}
 		}
 	}
-	_, err := EmitMCPDecision(emitter, v2Emitter, nil, MCPDecision{
-		Receipt: opts.withReceiptPolicyHash(receipt.EmitOpts{
+	_, err := opts.emitReceiptDecision(MCPDecision{
+		Receipt: opts.withReceiptPolicyHash(withMCPResponseShard(selected, receipt.EmitOpts{
 			ActionID:  receipt.NewActionID(),
 			Verdict:   verdict,
 			Transport: opts.Transport,
@@ -1064,7 +1336,7 @@ func emitMCPToolScanReceipt(
 			Layer:     "mcp_tool_scan",
 			Pattern:   pattern,
 			Severity:  config.SeverityHigh,
-		}),
+		})),
 		RequireReceipt: opts.requireReceipts() && verdict != config.ActionBlock,
 	})
 	if err != nil {
@@ -1078,11 +1350,20 @@ func emitMCPToolScanReceipt(
 // ("strip" or "block") plus any writer error.
 func stripOrBlock(line []byte, sc *scanner.Scanner, writer transport.MessageWriter, logW io.Writer, rpcID json.RawMessage) (string, error) {
 	actualAction, msg := stripOrBlockMessage(line, sc, logW, rpcID)
-	return actualAction, writer.WriteMessage(msg)
+	return actualAction, writeMCPResponseDisposition(MCPProxyOpts{}, mcpResponseContentDenialAudit(""), writer, msg, actualAction == config.ActionBlock)
 }
 
 func stripOrBlockMessage(line []byte, sc *scanner.Scanner, logW io.Writer, rpcID json.RawMessage) (string, []byte) {
-	stripped, sErr := stripResponse(line, sc)
+	return stripOrBlockMessageWithOptions(line, sc, logW, rpcID, context.Background(), ResponseScanOptions{})
+}
+
+func stripOrBlockMessageWithOptions(line []byte, sc *scanner.Scanner, logW io.Writer, rpcID json.RawMessage, ctx context.Context, opts ResponseScanOptions) (string, []byte) {
+	stripped, sErr := stripResponseWithOptions(line, sc, ctx, opts)
+	if sErr == nil && bytes.Equal(stripped, line) {
+		// Callers strip only a message whose scan reported a finding. When no
+		// supported field changed, the finding is outside what strip rewrites.
+		sErr = fmt.Errorf("no strippable field carried the finding")
+	}
 	if sErr != nil {
 		_, _ = fmt.Fprintf(logW, "pipelock: strip failed (%v), blocking instead\n", sErr)
 		return config.ActionBlock, blockResponse(rpcID)
@@ -1222,18 +1503,13 @@ func blockToolInventoryCapacity(
 	const reason = "tool_inventory_capacity"
 	blockReason := "tools/list cannot be safely inspected: " + reason
 	_, _ = fmt.Fprintf(logW, "pipelock: line %d: %s\n", lineNum, blockReason)
-	if opts.AuditLogger != nil {
-		opts.AuditLogger.LogBlocked(
-			mustMCPAuditContext(opts.AuditLogger, "MCP", "tools/list"),
-			"tool_scanning",
-			blockReason,
-		)
-	}
+	denialAudit := mcpToolCapacityDenialAudit()
+
 	if opts.Metrics != nil {
 		opts.Metrics.RecordBlocked("mcp", reason, 0, "")
 	}
 	resp := blockResponseReason(rpcID, blockReason)
-	if err := writer.WriteMessage(resp); err != nil {
+	if err := writeMCPDenial(opts, denialAudit, writer, resp); err != nil {
 		return fmt.Errorf("writing inventory-capacity block: %w", err)
 	}
 	emitTrackedOutcome("error", reason, resp)
@@ -1261,133 +1537,175 @@ func blockMediaPolicyResponse(id json.RawMessage, reason string) []byte {
 // denial. Uses error code -32001 (implementation-defined) with a session-deny
 // message. Distinct from blockResponse to distinguish session-level blocks
 // from per-message injection blocks in logs and client error handling.
-func blockSessionDenyResponse(id json.RawMessage, _ string) []byte {
+func blockSessionDenyResponse(id json.RawMessage, detail string) []byte {
 	resp := rpcError{
 		JSONRPC: jsonrpc.Version,
 		ID:      id,
 		Error: rpcErrorDetail{
 			Code:    -32001,
-			Message: adaptiveBlockedReason,
+			Message: detail,
 		},
 	}
 	data, _ := json.Marshal(resp) //nolint:errcheck // marshaling known-good struct
 	return data
 }
 
-// stripRPCResponse is used only by stripResponse for typed result manipulation.
-// The main jsonrpc.RPCResponse uses json.RawMessage for flexible scanning.
-type stripRPCResponse struct {
-	JSONRPC string              `json:"jsonrpc"`
-	ID      json.RawMessage     `json:"id"`
-	Result  *jsonrpc.ToolResult `json:"result,omitempty"`
-	Error   json.RawMessage     `json:"error,omitempty"`
-}
-
 // maxStripDepth limits recursion between stripResponseDepth and stripBatchDepth
 // to prevent stack overflow from maliciously nested JSON arrays.
 const maxStripDepth = 4
 
-// stripResponse re-parses a JSON-RPC response, redacts matched injection
-// patterns in content blocks and error fields, and returns the re-marshaled JSON.
+type stripResponseScanner func(string) scanner.ResponseScanResult
+
+// stripResponse rewrites supported fields without discarding the envelope and
+// returns content only after a whole-message rescan finds no enforcing finding.
 func stripResponse(line []byte, sc *scanner.Scanner) ([]byte, error) {
-	return stripResponseDepth(line, sc, 0)
+	return stripResponseWithOptions(line, sc, context.Background(), ResponseScanOptions{})
 }
 
-func stripResponseDepth(line []byte, sc *scanner.Scanner, depth int) ([]byte, error) {
+func stripResponseWithOptions(line []byte, sc *scanner.Scanner, ctx context.Context, opts ResponseScanOptions) ([]byte, error) {
+	scan := stripResponseScanner(func(text string) scanner.ResponseScanResult {
+		return sc.ScanResponseWithSuppress(ctx, text, opts.Target, opts.Suppress)
+	})
+	out, err := stripResponseDepth(line, scan, 0)
+	if err != nil {
+		return nil, err
+	}
+	// Rescan the outgoing message with the response scan that decided it, so
+	// every view that produced a finding (typed fields, decoded media text,
+	// envelope strings and keys) must have no enforcing finding. The raw view also covers
+	// findings that span fields. Observation callbacks already fired for the
+	// original message and must not fire again for the candidate.
+	checkOpts := opts
+	checkOpts.OnSuppressedResponse = nil
+	checkOpts.OnObservedCoreResponse = nil
+	checkOpts.OnDroppedDLP = nil
+	if verdict := ScanResponseOpts(out, sc, checkOpts); verdict.Error != "" || (!verdict.Clean && (len(verdict.Matches) > 0 || !scanner.OnlyInformational(verdict.DLPMatches))) {
+		return nil, fmt.Errorf("stripped response is not clean")
+	}
+	if checked := scan(string(out)); !checked.Clean || checked.Failed() {
+		return nil, fmt.Errorf("stripped response is not clean")
+	}
+	return out, nil
+}
+
+// stripResponseString rewrites only supported string fields. Object-valued
+// fields remain intact and are inspected by the whole-message rescan.
+func stripResponseString(object map[string]json.RawMessage, key string, scan stripResponseScanner) (bool, error) {
+	var text string
+	if raw, ok := object[key]; !ok || json.Unmarshal(raw, &text) != nil {
+		return false, nil
+	}
+	result := scan(text)
+	if result.Clean {
+		return false, nil
+	}
+	if result.Failed() || result.TransformedContent == "" {
+		return false, fmt.Errorf("injection detected but not redactable in response string")
+	}
+	rewritten, err := json.Marshal(result.TransformedContent)
+	if err != nil {
+		return false, fmt.Errorf("encoding stripped string: %w", err)
+	}
+	object[key] = rewritten
+	return true, nil
+}
+
+func stripResponseDepth(line []byte, scan stripResponseScanner, depth int) ([]byte, error) {
 	// Handle batch responses (JSON array). Trim so a leading-whitespace
 	// array is classified the same way ParseMCPFrame sets IsBatch.
 	if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 && trimmed[0] == '[' {
 		if depth >= maxStripDepth {
 			return nil, fmt.Errorf("batch nesting too deep (max %d)", maxStripDepth)
 		}
-		return stripBatchDepth(trimmed, sc, depth+1)
+		return stripBatchDepth(trimmed, scan, depth+1)
 	}
 
-	var rpc stripRPCResponse
+	if err := jsonscan.RejectDuplicateKeys(line); err != nil {
+		return nil, fmt.Errorf("parsing response for strip: %w", err)
+	}
+	var rpc map[string]json.RawMessage
 	if err := json.Unmarshal(line, &rpc); err != nil {
 		return nil, fmt.Errorf("parsing response for strip: %w", err)
 	}
-
-	if rpc.Result != nil {
-		for i, block := range rpc.Result.Content {
-			if block.Text == "" {
-				continue
+	if rpc == nil {
+		return nil, fmt.Errorf("strip requires a response object")
+	}
+	changed := false
+	if raw, ok := rpc["result"]; ok && len(raw) > 0 && string(raw) != "null" {
+		var result map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &result); err != nil || result == nil {
+			return nil, fmt.Errorf("strip requires a result object")
+		}
+		if rawContent, ok := result["content"]; ok {
+			var content []map[string]json.RawMessage
+			if err := json.Unmarshal(rawContent, &content); err != nil {
+				return nil, fmt.Errorf("parsing content for strip: %w", err)
 			}
-			result := sc.ScanResponse(context.Background(), block.Text)
-			if !result.Clean {
-				if result.TransformedContent != "" {
-					rpc.Result.Content[i].Text = result.TransformedContent
-				} else {
-					// Detection from non-redactable pass (vowel-fold/decoded).
-					// Can't strip, fail-closed to block.
-					return nil, fmt.Errorf("injection detected but not redactable in content block %d", i)
+			contentChanged := false
+			for _, block := range content {
+				c, err := stripResponseString(block, "text", scan)
+				if err != nil {
+					return nil, err
 				}
+				contentChanged = contentChanged || c
+			}
+			if contentChanged {
+				rewritten, err := json.Marshal(content)
+				if err != nil {
+					return nil, fmt.Errorf("encoding stripped content: %w", err)
+				}
+				result["content"] = rewritten
+				rewritten, err = json.Marshal(result)
+				if err != nil {
+					return nil, fmt.Errorf("encoding stripped result: %w", err)
+				}
+				rpc["result"] = rewritten
+				changed = true
 			}
 		}
 	}
-
-	// Scan error.message and error.data for injection content.
-	if len(rpc.Error) > 0 {
-		var errObj struct {
-			Code    int             `json:"code"`
-			Message string          `json:"message"`
-			Data    json.RawMessage `json:"data,omitempty"`
+	if raw, ok := rpc["error"]; ok && len(raw) > 0 && string(raw) != "null" {
+		var errorObject map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &errorObject); err != nil || errorObject == nil {
+			return nil, fmt.Errorf("strip requires an error object")
 		}
-		if json.Unmarshal(rpc.Error, &errObj) == nil {
-			changed := false
-			if errObj.Message != "" {
-				result := sc.ScanResponse(context.Background(), errObj.Message)
-				if !result.Clean {
-					if result.TransformedContent != "" {
-						errObj.Message = result.TransformedContent
-						changed = true
-					} else {
-						return nil, fmt.Errorf("injection detected but not redactable in error message")
-					}
-				}
+		errorChanged := false
+		for _, key := range []string{"message", "data"} {
+			c, err := stripResponseString(errorObject, key, scan)
+			if err != nil {
+				return nil, err
 			}
-			if len(errObj.Data) > 0 {
-				var dataStr string
-				if json.Unmarshal(errObj.Data, &dataStr) == nil && dataStr != "" {
-					result := sc.ScanResponse(context.Background(), dataStr)
-					if !result.Clean {
-						if result.TransformedContent != "" {
-							if newData, mErr := json.Marshal(result.TransformedContent); mErr == nil {
-								errObj.Data = newData
-								changed = true
-							}
-						} else {
-							return nil, fmt.Errorf("injection detected but not redactable in error data")
-						}
-					}
-				}
+			errorChanged = errorChanged || c
+		}
+		if errorChanged {
+			rewritten, err := json.Marshal(errorObject)
+			if err != nil {
+				return nil, fmt.Errorf("encoding stripped error: %w", err)
 			}
-			if changed {
-				if newErr, mErr := json.Marshal(errObj); mErr == nil {
-					rpc.Error = newErr
-				}
-			}
+			rpc["error"] = rewritten
+			changed = true
 		}
 	}
-
+	if !changed {
+		return line, nil
+	}
 	return json.Marshal(rpc)
 }
 
 // stripBatchDepth handles stripping injection from batch (array) JSON-RPC responses.
-func stripBatchDepth(line []byte, sc *scanner.Scanner, depth int) ([]byte, error) {
+func stripBatchDepth(line []byte, scan stripResponseScanner, depth int) ([]byte, error) {
 	var batch []json.RawMessage
 	if err := json.Unmarshal(line, &batch); err != nil {
 		return nil, fmt.Errorf("parsing batch for strip: %w", err)
 	}
 	result := make([]json.RawMessage, len(batch))
 	for i, elem := range batch {
-		stripped, err := stripResponseDepth(elem, sc, depth)
+		stripped, err := stripResponseDepth(elem, scan, depth)
 		if err != nil {
-			// Never forward unstripped injection - block the element instead.
-			result[i] = json.RawMessage(blockResponse(nil))
-		} else {
-			result[i] = json.RawMessage(stripped)
+			// A blocked element is not a successful strip of the batch.
+			return nil, fmt.Errorf("stripping batch element %d: %w", i, err)
 		}
+		result[i] = json.RawMessage(stripped)
 	}
 	return json.Marshal(result)
 }
@@ -1493,10 +1811,13 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 	// (adaptive enforcement disabled), so all downstream callers are nil-safe.
 	var rec session.Recorder
 	if opts.Store != nil {
-		rec = opts.Store.GetOrCreate(session.NextInvocationKey("mcp-stdio"))
+		invocationKey := session.NextInvocationKey("mcp-stdio")
+		rec = opts.Store.GetOrCreate(invocationKey)
 		if rec == nil {
+			dropMCPDenial(opts, mcpStartupDenialAudit(mcpListenerCapacityDenialAudit()), "startup")
 			return session.ErrCapacity
 		}
+		defer opts.Store.Delete(invocationKey)
 	}
 	defer recordMCPBaselineSample(opts, rec)
 
@@ -1771,6 +2092,8 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 			BindingUnknownAction:    toolCfg.BindingUnknownAction,
 			BindingNoBaselineAction: toolCfg.BindingNoBaselineAction,
 			ExtraPoison:             toolCfg.ExtraPoison,
+			CredentialAcks:          toolCfg.CredentialAcks,
+			Now:                     toolCfg.Now,
 		}
 	}
 
@@ -1844,13 +2167,7 @@ func RunProxy(ctx context.Context, clientIn io.Reader, clientOut io.Writer, logW
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: blocked notification (no response sent): %s\n", blocked.LogMessage)
 				continue
 			}
-			var resp []byte
-			if blocked.SyntheticResponse != nil {
-				resp = blocked.SyntheticResponse
-			} else {
-				resp = blockRequestResponse(blocked)
-			}
-			if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
+			if wErr := deliverMCPInputResult(opts, blocked, safeClientOut); wErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send block response: %v\n", wErr)
 			}
 		}
@@ -2013,6 +2330,8 @@ var safeEnvKeySet = func() map[string]bool {
 
 // dangerousEnvKeys are environment variable names that can inject code or libraries
 // into child processes. These are blocked even when explicitly requested via --env.
+// IsDangerousEnvKey also refuses every envcontrol.CodeLoadingNames entry; this
+// map adds the git, proxy and macOS loader variables that list does not hold.
 var dangerousEnvKeys = map[string]bool{
 	// Dynamic linker injection (Linux/macOS).
 	"LD_PRELOAD":            true,
@@ -2072,11 +2391,12 @@ func IsSafeEnvKey(key string) bool {
 
 // IsDangerousEnvKey reports whether the given environment variable name is
 // blocked from passthrough because it can inject code or redirect traffic.
-// Proxy-related vars are checked case-insensitively since different runtimes
-// (Go, Node.js, Python, curl) honor different casings.
+// Every name is matched case-insensitively: Windows environment names ignore
+// case, so a child started with pythonpath=... reads it as PYTHONPATH, and
+// different runtimes (Go, Node.js, Python, curl) honor different proxy casings.
 func IsDangerousEnvKey(key string) bool {
 	upper := strings.ToUpper(key)
-	if dangerousEnvKeys[upper] {
+	if dangerousEnvKeys[upper] || envcontrol.IsCodeLoading(upper) {
 		return true
 	}
 	// Case-insensitive catch-all for proxy vars. Covers mixed-case forms
@@ -2130,6 +2450,40 @@ func mergeChildEnvForOS(base, overrides []string, goos string) []string {
 		result = append(result, values[key])
 	}
 	return result
+}
+
+// ChildEnvOverrideIdentity is the effective result of applying overrides to a
+// child environment, independent of what the child inherits: for each
+// variable, in mergeChildEnv's last-wins order and key rules, either
+// "set:KEY=VALUE" or "unset:KEY". It is what a server's transport binding
+// covers; inherited variables the operator did not name are not included.
+func ChildEnvOverrideIdentity(overrides []string) []string {
+	return childEnvOverrideIdentityForOS(overrides, runtime.GOOS)
+}
+
+func childEnvOverrideIdentityForOS(overrides []string, goos string) []string {
+	final := make(map[string]string, len(overrides))
+	for _, entry := range overrides {
+		key, value, ok := splitChildEnvEntry(entry, goos)
+		if !ok {
+			key = entry
+		}
+		identity := key
+		if goos == windowsOS {
+			identity = strings.ToUpper(key)
+		}
+		if ok {
+			final[identity] = "set:" + identity + "=" + value
+		} else {
+			final[identity] = "unset:" + identity
+		}
+	}
+	out := make([]string, 0, len(final))
+	for _, v := range final {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func splitChildEnvEntry(entry, goos string) (string, string, bool) {

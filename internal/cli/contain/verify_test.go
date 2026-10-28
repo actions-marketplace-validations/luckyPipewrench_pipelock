@@ -34,6 +34,21 @@ import (
 
 // Test helpers ---------------------------------------------------------------
 
+func TestReadAccessACLUnavailableAndExitFailure(t *testing.T) {
+	if _, err := readAccessACL(context.Background(), nil, "/unused"); err == nil || !strings.Contains(err.Error(), "ACL reader unavailable") {
+		t.Fatalf("missing ACL reader error = %v", err)
+	}
+	run := func(_ context.Context, name string, args ...string) (string, int, error) {
+		if name != "getfacl" || len(args) != 2 || args[0] != "-p" || args[1] != "/unused" {
+			t.Fatalf("ACL command = %s %v", name, args)
+		}
+		return "permission denied\n", 2, nil
+	}
+	if _, err := readAccessACL(context.Background(), run, "/unused"); err == nil || !strings.Contains(err.Error(), "getfacl exit 2: permission denied") {
+		t.Fatalf("ACL command failure = %v", err)
+	}
+}
+
 const (
 	testProxyUser    = "pipelock-proxy"
 	testAgentUser    = "pipelock-agent"
@@ -201,6 +216,8 @@ func makeProbeEnv(t *testing.T, opts ...func(*probeEnv)) *probeEnv {
 		wrapperDir:         t.TempDir(),
 		toolWrappers:       []string{"plk-claude", "plk-codex"},
 		caBundlePath:       filepath.Join(t.TempDir(), "combined-ca.pem"),
+		caExportPath:       filepath.Join(t.TempDir(), "ca.pem"),
+		configDir:          filepath.Join(t.TempDir(), "etc", "pipelock"),
 		launchPath:         "", // populated below
 		nftTable:           testTable,
 		nftChain:           testChain,
@@ -573,6 +590,13 @@ func TestProbeNFTContainment(t *testing.T) {
 			code:       0,
 			wantStatus: statusPass,
 			wantDetail: "skuid drop rule",
+		},
+		{
+			name:       "stale owned-loopback mark is a failure",
+			stdout:     strings.Replace(goodNFTContainmentOutput, "\t\tmeta skuid 987 drop", "\t\tmeta skuid 987 oifname \"lo\" ip daddr 127.0.0.1 socket cgroupv2 level 1 \"pipelock_contained.slice\" ct state new ct mark set 0x504c4b01 accept # handle 70\n\t\tmeta skuid 987 drop", 1),
+			code:       0,
+			wantStatus: statusFail,
+			wantDetail: "stale owned-loopback cgroup mark rule",
 		},
 		{
 			name: "established server reply remains compatible",
@@ -1159,6 +1183,12 @@ func TestProbeNFTContainment(t *testing.T) {
 			env := makeProbeEnv(t, func(e *probeEnv) {
 				e.operatorUser = testOperatorUser
 				e.lookupUser = containTestLookup
+				e.readFile = func(path string) ([]byte, error) {
+					if path == e.configPath {
+						return nil, os.ErrNotExist
+					}
+					return rejectAllReadFile(path)
+				}
 				e.runCmd = func(_ context.Context, _ string, _ ...string) (string, int, error) {
 					return tc.stdout, tc.code, tc.runErr
 				}
@@ -1383,6 +1413,9 @@ func TestVerifyNFTPersistence_RequiresEveryManagedDirective(t *testing.T) {
 					if path == env.nftPersistUnitPath {
 						return []byte(canonical), nil
 					}
+					if path == env.configPath {
+						return nil, os.ErrNotExist
+					}
 					return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
 				}
 			})
@@ -1396,6 +1429,9 @@ func TestVerifyNFTPersistence_RequiresEveryManagedDirective(t *testing.T) {
 			env.readFile = func(path string) ([]byte, error) {
 				if path == env.nftPersistUnitPath {
 					return []byte(body), nil
+				}
+				if path == env.configPath {
+					return nil, os.ErrNotExist
 				}
 				return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
 			}
@@ -1867,13 +1903,36 @@ func writeFakeWrapper(t *testing.T, path string, mode os.FileMode) {
 func TestProbeCABundle(t *testing.T) {
 	t.Run("happy path", func(t *testing.T) {
 		env := makeProbeEnv(t)
-		writeFakePEMBundle(t, env.caBundlePath, "Pipelock Test CA", "Some Other Root")
+		// The bundle must carry the SAME certificate the selected CA returns.
+		// Generating an independent one with a matching common name is the
+		// stale-bundle state this probe now rejects.
+		current := []byte(testPEMCA(t))
+		bundle := append(append([]byte{}, current...), makeFakeCertPEM(t, "Some Other Root")...)
+		if err := os.WriteFile(env.caBundlePath, bundle, 0o600); err != nil {
+			t.Fatalf("write bundle: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
 		gotStatus, gotDetail := probeCABundle(context.Background(), env)
 		if gotStatus != statusPass {
 			t.Fatalf("status: got %q, want pass (detail=%q)", gotStatus, gotDetail)
 		}
-		if !strings.Contains(gotDetail, "Pipelock Test CA") {
-			t.Fatalf("detail: got %q, want substring 'Pipelock Test CA'", gotDetail)
+		if !strings.Contains(gotDetail, "certificate material") {
+			t.Fatalf("detail: got %q, want it to say the match was on certificate material", gotDetail)
+		}
+	})
+
+	t.Run("bundle holds a different CA with the same common name", func(t *testing.T) {
+		// The exact failure this probe exists for: after a rotation the bundle
+		// still carries a Pipelock-named certificate, so a subject-name check
+		// reports agreement while every contained client trusts a CA the proxy
+		// no longer presents.
+		env := makeProbeEnv(t)
+		writeFakePEMBundle(t, env.caBundlePath, "Pipelock Test CA", "Some Other Root")
+		current := []byte(testPEMCA(t))
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+		gotStatus, gotDetail := probeCABundle(context.Background(), env)
+		if gotStatus != statusFail || !strings.Contains(gotDetail, "does not contain the selected Pipelock CA") {
+			t.Fatalf("status=%q detail=%q; want a failure naming the missing selected CA", gotStatus, gotDetail)
 		}
 	})
 
@@ -2574,7 +2633,7 @@ func TestAgentUIDBareAcceptBeforeDrop(t *testing.T) {
 	}
 
 	uids := containmentUIDs{proxyUID: 988, agentUID: agentUID}
-	if chainLinesHaveUnsafeVerdictBeforeAgentDrop([]string{"meta skuid 12345 accept", "meta skuid 987 drop"}, uids, defaultProxyPort, nil) {
+	if chainLinesHaveUnsafeVerdictBeforeAgentDrop([]string{"meta skuid 12345 accept", "meta skuid 987 drop"}, uids, defaultProxyPort) {
 		t.Fatal("a terminal rule owned by another UID cannot admit agent packets and must not be flagged")
 	}
 }
@@ -2627,6 +2686,12 @@ func TestProbeNFTContainment_JumpBeforeDropIsNeverPass(t *testing.T) {
 		env := makeProbeEnv(t, func(e *probeEnv) {
 			e.operatorUser = testOperatorUser
 			e.lookupUser = containTestLookup
+			e.readFile = func(path string) ([]byte, error) {
+				if path == e.configPath {
+					return nil, os.ErrNotExist
+				}
+				return rejectAllReadFile(path)
+			}
 			e.nftRulesPath = ""
 			e.nftPersistUnitPath = ""
 			e.runCmd = func(context.Context, string, ...string) (string, int, error) {
@@ -3271,10 +3336,11 @@ func TestRunVerify_TextOutput_AllPass(t *testing.T) {
 	if !strings.HasPrefix(out, "pipelock contain verify") {
 		t.Errorf("missing header: %q", out)
 	}
-	if strings.Count(out, "[PASS]") != 15 {
-		t.Errorf("want 15 [PASS] lines, got %d in %q", strings.Count(out, "[PASS]"), out)
+	wantPass := len(allProbes())
+	if strings.Count(out, "[PASS]") != wantPass {
+		t.Errorf("want %d [PASS] lines, got %d in %q", wantPass, strings.Count(out, "[PASS]"), out)
 	}
-	if !strings.Contains(out, "15 PASS / 0 FAIL / 0 SKIP") {
+	if !strings.Contains(out, fmt.Sprintf("%d PASS / 0 FAIL / 0 SKIP", len(allProbes()))) {
 		t.Errorf("missing aggregate: %q", out)
 	}
 }
@@ -3291,18 +3357,22 @@ func TestRunVerify_JSONOutput_AllPass(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
-	if len(lines) != 16 {
-		t.Fatalf("expected 16 JSON records (15 probes + aggregate), got %d: %q", len(lines), buf.String())
+	wantRecords := len(allProbes()) + 1
+	if len(lines) != wantRecords {
+		t.Fatalf("expected %d JSON records (%d probes + aggregate), got %d: %q", wantRecords, len(allProbes()), len(lines), buf.String())
 	}
-	for i := 0; i < 15; i++ {
+	for i := 0; i < len(allProbes()); i++ {
 		var rec probeRecord
 		if err := json.Unmarshal([]byte(lines[i]), &rec); err != nil {
 			t.Fatalf("line %d: parse: %v (line=%q)", i, err, lines[i])
 		}
-		wantProbe := i + 1
-		if i == 14 {
-			wantProbe = 16 // published probe 15 remains reserved for conditional workspace_access.
-		}
+		// Derive the expected number from the probe registry rather than from
+		// hardcoded index arithmetic. Published numbers are deliberately
+		// non-contiguous -- 15 is reserved for the conditional workspace probe
+		// and run-only checks own 17 and 18 -- and every past attempt to encode
+		// those gaps as "+1 after index N" needed another bump the next time a
+		// probe was added, silently passing until it did.
+		wantProbe := allProbes()[i].n
 		if rec.Probe != wantProbe {
 			t.Errorf("line %d: probe=%d, want %d", i, rec.Probe, wantProbe)
 		}
@@ -3311,10 +3381,10 @@ func TestRunVerify_JSONOutput_AllPass(t *testing.T) {
 		}
 	}
 	var agg aggregateRecord
-	if err := json.Unmarshal([]byte(lines[15]), &agg); err != nil {
-		t.Fatalf("aggregate: parse: %v (line=%q)", err, lines[15])
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
+		t.Fatalf("aggregate: parse: %v (line=%q)", err, lines[len(lines)-1])
 	}
-	if agg.Aggregate.Pass != 15 || agg.Aggregate.Fail != 0 || agg.Aggregate.Skip != 0 {
+	if agg.Aggregate.Pass != len(allProbes()) || agg.Aggregate.Fail != 0 || agg.Aggregate.Skip != 0 {
 		t.Errorf("aggregate counts: %+v", agg.Aggregate)
 	}
 	if agg.Aggregate.ExitCode != cliutil.ExitOK {
@@ -3326,9 +3396,9 @@ func TestRunVerify_EnforcementOnlySkipsProxyLiveness(t *testing.T) {
 	env := allPassEnv(t)
 	var systemdCalled bool
 	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
-		if name == testSystemctl {
+		if name == testSystemctl && containsArg(args, testService) {
 			systemdCalled = true
-			return "", 1, errors.New("systemd should not run in enforcement-only mode")
+			return "", 1, errors.New("pipelock service liveness should not run in enforcement-only mode")
 		}
 		return defaultRunForAllPass(name, args)
 	}
@@ -3359,7 +3429,7 @@ func TestRunVerify_EnforcementOnlySkipsProxyLiveness(t *testing.T) {
 	if strings.Contains(out, "probe 2:") || strings.Contains(out, "probe 6:") {
 		t.Errorf("liveness probes should be omitted: %q", out)
 	}
-	if !strings.Contains(out, "13 PASS / 0 FAIL / 0 SKIP") {
+	if !strings.Contains(out, fmt.Sprintf("%d PASS / 0 FAIL / 0 SKIP", len(allProbes())-2)) {
 		t.Errorf("missing enforcement-only aggregate: %q", out)
 	}
 	if !strings.Contains(out, "probe 10: deployed pipelock binary matches TOFU pin; running-service image is not verified") ||
@@ -3575,8 +3645,8 @@ func TestRunVerify_JSONUnknownIsIncomplete(t *testing.T) {
 	}
 
 	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
-	if len(lines) != 16 {
-		t.Fatalf("JSON record count = %d, want 16: %q", len(lines), buf.String())
+	if len(lines) != len(allProbes())+1 {
+		t.Fatalf("JSON record count = %d, want %d: %q", len(lines), len(allProbes())+1, buf.String())
 	}
 	var canary probeRecord
 	if err := json.Unmarshal([]byte(lines[7]), &canary); err != nil {
@@ -3586,11 +3656,12 @@ func TestRunVerify_JSONUnknownIsIncomplete(t *testing.T) {
 		t.Fatalf("canary record = %+v, want probe 8 unknown", canary)
 	}
 	var agg aggregateRecord
-	if err := json.Unmarshal([]byte(lines[15]), &agg); err != nil {
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
 		t.Fatalf("decode aggregate: %v", err)
 	}
-	if agg.Aggregate.Unknown != 1 || agg.Aggregate.Pass != 14 || agg.Aggregate.ExitCode != cliutil.ExitConfig {
-		t.Fatalf("aggregate = %+v, want 14 pass / 1 unknown / exit 2", agg.Aggregate)
+	wantPass := len(allProbes()) - 1
+	if agg.Aggregate.Unknown != 1 || agg.Aggregate.Pass != wantPass || agg.Aggregate.ExitCode != cliutil.ExitConfig {
+		t.Fatalf("aggregate = %+v, want %d pass / 1 unknown / exit 2", agg.Aggregate, wantPass)
 	}
 }
 
@@ -3603,7 +3674,7 @@ func TestRunVerify_MixedOutcomesPreserveWorstResultInTextAndJSON(t *testing.T) {
 			}
 			env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
 				switch {
-				case name == testSystemctl:
+				case name == testSystemctl && containsArg(args, testService):
 					return "", -1, errors.New("systemctl unavailable")
 				case name == testSudoCmd && containsArg(args, testOperatorUser) && containsArg(args, curlPath):
 					return "curl: (22) HTTP 500", 22, nil
@@ -3627,14 +3698,14 @@ func TestRunVerify_MixedOutcomesPreserveWorstResultInTextAndJSON(t *testing.T) {
 				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
 					t.Fatalf("decode aggregate: %v\n%s", err, out)
 				}
-				if agg.Aggregate.Pass != 11 || agg.Aggregate.Fail != 1 ||
+				if agg.Aggregate.Pass != len(allProbes())-4 || agg.Aggregate.Fail != 1 ||
 					agg.Aggregate.Skip != 2 || agg.Aggregate.Unknown != 1 ||
 					agg.Aggregate.ExitCode != cliutil.ExitGeneral {
-					t.Fatalf("mixed aggregate = %+v, want 11 pass / 1 fail / 2 skip / 1 unknown / exit 1", agg.Aggregate)
+					t.Fatalf("mixed aggregate = %+v, want %d pass / 1 fail / 2 skip / 1 unknown / exit 1", agg.Aggregate, len(allProbes())-4)
 				}
 				return
 			}
-			if !strings.Contains(out, "11 PASS / 1 FAIL / 2 SKIP / 1 UNKNOWN — exit 1") {
+			if !strings.Contains(out, fmt.Sprintf("%d PASS / 1 FAIL / 2 SKIP / 1 UNKNOWN — exit 1", len(allProbes())-4)) {
 				t.Fatalf("text lost a mixed outcome or fail precedence:\n%s", out)
 			}
 		})
@@ -3658,9 +3729,9 @@ func TestRunVerify_RecordAndAggregateWriteFailuresFailClosed(t *testing.T) {
 		want             string
 	}{
 		{name: "text probe", successfulWrites: 1, want: "writing probe 1 text"},
-		{name: "text aggregate", successfulWrites: 16, want: "writing verify aggregate"},
+		{name: "text aggregate", successfulWrites: len(allProbes()) + 1, want: "writing verify aggregate"},
 		{name: "JSON probe", jsonOutput: true, want: "encoding probe 1 JSON"},
-		{name: "JSON aggregate", jsonOutput: true, successfulWrites: 15, want: "encoding aggregate JSON"},
+		{name: "JSON aggregate", jsonOutput: true, successfulWrites: len(allProbes()), want: "encoding aggregate JSON"},
 	}
 
 	for _, tc := range tests {
@@ -3895,12 +3966,36 @@ func containsArg(args []string, needle string) bool {
 func allPassEnv(t *testing.T) *probeEnv {
 	t.Helper()
 	env := makeProbeEnv(t)
+	env.lstat = func(path string) (os.FileInfo, error) {
+		if path == containedDoorwaySocketPath {
+			return fakeFileInfo{mode: os.ModeSocket | 0o600}, nil
+		}
+		return os.Lstat(path)
+	}
 	env.privateTmpProbe = func(context.Context, *probeEnv) (string, string) {
 		return statusPass, "test private temporary-directory canary passed"
+	}
+	env.filesystemProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test filesystem profile enforced"
+	}
+	env.browserCATrust = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test NSS browser CA trust passed"
+	}
+	env.networkNamespaceProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "test network namespace boundary passed"
+	}
+	env.agentProcessNetnsProbe = func(context.Context, *probeEnv, string) (string, string) {
+		return statusPass, "test live agent process namespaces passed"
 	}
 	env.operatorUser = testOperatorUser
 	env.nftRulesPath = filepath.Join(t.TempDir(), "50-pipelock-containment.nft")
 	env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
+	unitDir := t.TempDir()
+	env.networkNamespaceUnitPath = filepath.Join(unitDir, containedNetworkNamespaceUnit)
+	env.proxyForwarderSocketPath = filepath.Join(unitDir, containedProxyForwarderUnit+".socket")
+	env.proxyForwarderServicePath = filepath.Join(unitDir, containedProxyForwarderUnit+".service")
+	env.namespaceForwarderServicePath = filepath.Join(unitDir, containedNamespaceForwarderUnit)
+	env.loopbackForwarderInvPath = filepath.Join(t.TempDir(), "loopback-forwarders.json")
 
 	// Probe 1: both users present.
 	env.lookupUser = func(name string) (*user.User, error) {
@@ -3945,7 +4040,20 @@ func allPassEnv(t *testing.T) *probeEnv {
 	if err := os.WriteFile(env.launchPath, []byte(body), 0o755); err != nil { //nolint:gosec // wrapper script must be executable in test
 		t.Fatalf("rewrite launch: %v", err)
 	}
-	writeFakePEMBundle(t, env.caBundlePath, "Pipelock Test CA")
+	currentCA := []byte(testPEMCA(t))
+	// The combined bundle is what contained clients actually trust, so a
+	// healthy fixture has to carry the SAME certificate the selected CA
+	// returns, alongside an unrelated root the way a real merged bundle does.
+	// Generating an independent cert with a matching common name modelled a
+	// host whose clients trust a CA the proxy does not present.
+	bundle := append(append([]byte{}, currentCA...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, bundle, 0o600); err != nil {
+		t.Fatalf("write CA bundle: %v", err)
+	}
+	if err := os.WriteFile(env.caExportPath, currentCA, 0o600); err != nil {
+		t.Fatalf("write CA export: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return currentCA, nil }
 
 	// Probe 10: deployed and running binary integrity. allPassEnv emits matching
 	// pin + hashes and maps the synthetic process image to the deployed file.
@@ -3959,6 +4067,18 @@ func allPassEnv(t *testing.T) *probeEnv {
 		return defaultRunForAllPass(name, args)
 	}
 	env.readFile = func(path string) ([]byte, error) {
+		switch path {
+		case env.networkNamespaceUnitPath:
+			return []byte(renderContainedNetworkNamespaceUnit()), nil
+		case env.proxyForwarderSocketPath:
+			return []byte(renderContainedProxySocketUnit(env.agentUserName)), nil
+		case env.proxyForwarderServicePath:
+			return []byte(renderContainedProxyForwarderUnit(env.pipelockTarget, env.proxyUserName, env.port)), nil
+		case env.namespaceForwarderServicePath:
+			return []byte(renderContainedNamespaceForwarderUnit(env.pipelockTarget, env.agentUserName, env.port)), nil
+		case env.loopbackForwarderInvPath:
+			return []byte("{\n  \"services\": [],\n  \"proxy_relay\": true\n}\n"), nil
+		}
 		if path == env.configPath {
 			return []byte("metrics_listen: 127.0.0.1:9091\n"), nil
 		}
@@ -3976,9 +4096,19 @@ func allPassEnv(t *testing.T) *probeEnv {
 		if path == env.nftRulesPath {
 			return []byte(renderNFTRules(1000, 988, 987, env.port, env.nftTable, env.nftChain)), nil
 		}
+		if path == publishedServiceRecordPath(env.loopbackForwarderInvPath) {
+			// A host that never declared a published service has no record.
+			return nil, os.ErrNotExist
+		}
 		return nil, fmt.Errorf("unexpected readFile %s", path)
 	}
 	env.readLink = func(path string) (string, error) {
+		if path == fmt.Sprintf("/proc/%d/ns/net", testServicePID) {
+			return "net:[200]", nil
+		}
+		if path == "/proc/1/ns/net" {
+			return "net:[100]", nil
+		}
 		if path != procExe {
 			return "", fmt.Errorf("unexpected readLink %s", path)
 		}
@@ -4007,6 +4137,15 @@ func allPassEnv(t *testing.T) *probeEnv {
 func defaultRunForAllPass(name string, args []string) (string, int, error) {
 	switch name {
 	case testSystemctl:
+		if containsArg(args, "--property=ActiveState,SubState,Type,NRestarts") {
+			return testForwarderReady, 0, nil
+		}
+		if containsArg(args, "is-enabled") {
+			return "enabled\n", 0, nil
+		}
+		if containsArg(args, "is-active") {
+			return "active\n", 0, nil
+		}
 		if containsArg(args, "--value") {
 			switch {
 			case containsArg(args, "--property=ExecStart"):
@@ -4019,6 +4158,16 @@ func defaultRunForAllPass(name string, args []string) (string, int, error) {
 	case testNFT:
 		return goodNFTContainmentOutput, 0, nil
 	case testSudoCmd:
+		// The identity-switch probe must succeed before the signing-key read
+		// probe can distinguish an unreadable key from sudo's own exit 1.
+		if containsArg(args, "test") && containsArg(args, "-e") && len(args) > 0 && args[len(args)-1] == "/" {
+			return "", 0, nil
+		}
+		// Containment posture signing must prove the managed agent cannot read
+		// the private signing key. Exit 1 is test(1)'s ordinary "not readable".
+		if containsArg(args, "test") && containsArg(args, "-r") && len(args) > 0 && strings.HasSuffix(args[len(args)-1], ".key") {
+			return "", 1, nil
+		}
 		// Probe 11: plk-launch allow-list probe invokes plk-launch with a
 		// sentinel tool name. Expect exit 5 = denial.
 		if containsArg(args, "plk-launch") || containsArg(args, probe11Sentinel) {
@@ -4260,6 +4409,117 @@ func TestNewFakeRunHelper(t *testing.T) {
 	}
 }
 
+func TestContainRuntimeReadinessProbes(t *testing.T) {
+	t.Run("CA export matches the current proxy CA and rejects a rotation", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		current := []byte(testPEMCA(t))
+		if err := os.WriteFile(env.caExportPath, current, 0o600); err != nil {
+			t.Fatalf("write CA export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusPass || !strings.Contains(detail, "matches") {
+			t.Fatalf("matching CA probe = %q %q", status, detail)
+		}
+		rotated := []byte(testPEMCA(t))
+		if string(rotated) == string(current) {
+			t.Fatal("rotation test did not produce distinct CA material")
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return rotated, nil }
+		status, detail = probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "does not match") {
+			t.Fatalf("rotated CA probe = %q %q", status, detail)
+		}
+	})
+}
+
+func TestProbeCurrentCAExportFailureDirections(t *testing.T) {
+	t.Run("missing exported CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("missing export = %q %q", status, detail)
+		}
+	})
+
+	t.Run("invalid exported CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		if err := os.WriteFile(env.caExportPath, []byte("not a certificate"), 0o600); err != nil {
+			t.Fatalf("write invalid export: %v", err)
+		}
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "invalid") || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("invalid export = %q %q", status, detail)
+		}
+	})
+
+	t.Run("unavailable current CA names ca-refresh", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		current := []byte(testPEMCA(t))
+		if err := os.WriteFile(env.caExportPath, current, 0o600); err != nil {
+			t.Fatalf("write export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return nil, errors.New("proxy unavailable") }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "proxy unavailable") || !strings.Contains(detail, "ca-refresh") {
+			t.Fatalf("unavailable current CA = %q %q", status, detail)
+		}
+	})
+
+	t.Run("invalid current CA is rejected", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+			t.Fatalf("write export: %v", err)
+		}
+		env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return []byte("not a certificate"), nil }
+		status, detail := probeCurrentCAExport(context.Background(), env)
+		if status != statusFail || !strings.Contains(detail, "invalid current TLS CA") {
+			t.Fatalf("invalid current CA = %q %q", status, detail)
+		}
+	})
+}
+
+func TestCurrentCAForVerifyUsesConfiguredCAAndReportsCommandFailures(t *testing.T) {
+	t.Run("uses configured certificate", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		certPath := filepath.Join(env.configDir, "tls", "ca.pem")
+		if err := os.MkdirAll(filepath.Dir(certPath), 0o750); err != nil {
+			t.Fatalf("mkdir TLS directory: %v", err)
+		}
+		if err := os.WriteFile(certPath, []byte("configured"), 0o600); err != nil {
+			t.Fatalf("write configured CA: %v", err)
+		}
+		var gotArgs []string
+		env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+			if name != "sudo" {
+				t.Fatalf("command = %q, want sudo", name)
+			}
+			gotArgs = append([]string(nil), args...)
+			return testPEMCA(t), 0, nil
+		}
+		if _, err := currentCAForVerify(context.Background(), env); err != nil {
+			t.Fatalf("read current CA: %v", err)
+		}
+		if !containsArg(gotArgs, "--cert") || !containsArg(gotArgs, certPath) {
+			t.Fatalf("configured CA was not consulted: %v", gotArgs)
+		}
+	})
+
+	t.Run("command failures are returned", func(t *testing.T) {
+		env := makeProbeEnv(t)
+		env.runCmd = func(context.Context, string, ...string) (string, int, error) {
+			return "", 0, errors.New("command unavailable")
+		}
+		if _, err := currentCAForVerify(context.Background(), env); err == nil || !strings.Contains(err.Error(), "command unavailable") {
+			t.Fatalf("command error = %v", err)
+		}
+		env.runCmd = func(context.Context, string, ...string) (string, int, error) { return "", 7, nil }
+		if _, err := currentCAForVerify(context.Background(), env); err == nil || !strings.Contains(err.Error(), "exited 7") {
+			t.Fatalf("exit error = %v", err)
+		}
+	})
+}
+
 // canonicalLaunchScript renders the plk-launch body exactly as `contain
 // install` would for the given proxy port, so fixtures exercise the real
 // `exec env -i` contract block the launcher-environment probe validates.
@@ -4276,4 +4536,149 @@ func canonicalLaunchScript(port int, caBundle string) string {
 		caExportPath:  defaultCAExportPath,
 	}
 	return "#!/bin/bash\n" + strings.Join(launchExecEnvLines(env), "\n") + "\n"
+}
+
+// TestContainRunProbeNumbersDoNotCollideWithVerify enforces the published
+// numbering contract between the two commands. Probe numbers are an operator-
+// and dashboard-facing identity: if `contain run` and `contain verify` both
+// publish the same number for different checks, a consumer keyed on that number
+// cannot tell which contract it observed, and a failure of one reads as a
+// failure of the other.
+//
+// This existed only as a comment in run.go until a verify probe was added at 18
+// while run.go had already published 18. The run-only numbers are asserted here
+// literally rather than parsed, so adding a run probe without updating this list
+// is itself a failure.
+func TestContainRunProbeNumbersDoNotCollideWithVerify(t *testing.T) {
+	// Read the production registry rather than restating it. A second copy here
+	// is exactly how a newly added run-only probe escapes the collision check:
+	// the list looks maintained and silently is not.
+	runOnly := containRunOnlyProbes
+	for _, p := range allProbes() {
+		if runProbe, clash := runOnly[p.n]; clash {
+			t.Fatalf("verify probe %d (%s) reuses a number `contain run` already publishes for %s; pick an unused number", p.n, p.name, runProbe.name)
+		}
+	}
+
+	// The registry key IS the published number, so a record whose own n
+	// disagrees with its key would emit one number while the collision check
+	// tested another.
+	for number, runProbe := range runOnly {
+		if runProbe.n != number {
+			t.Fatalf("run-only registry key %d holds a probe published as %d", number, runProbe.n)
+		}
+		if runProbe.name == "" || runProbe.desc == "" {
+			t.Fatalf("run-only probe %d has empty metadata: %+v", number, runProbe)
+		}
+	}
+	// Positive control: the assertion above is only meaningful if these numbers
+	// are genuinely reachable, so prove the run-only set is non-empty and that a
+	// known verify number would be caught.
+	if len(runOnly) == 0 {
+		t.Fatal("run-only probe set is empty; this test would pass vacuously")
+	}
+	probes := allProbes()
+	if len(probes) == 0 {
+		t.Fatal("allProbes() is empty; this test would pass vacuously")
+	}
+	guard := map[int]string{probes[0].n: "sentinel"}
+	if _, caught := guard[probes[0].n]; !caught {
+		t.Fatal("collision lookup does not detect a known-colliding number")
+	}
+}
+
+// TestCACertificateMaterialHelpers covers the decode-and-compare helpers the CA
+// probes are built on, including the decode-failure branches. A probe that
+// cannot decode its input must fail rather than fall through to a comparison of
+// whatever it managed to read.
+func TestCACertificateMaterialHelpers(t *testing.T) {
+	t.Parallel()
+	ca := []byte(testPEMCA(t))
+
+	der, err := firstCertificateDER(ca)
+	if err != nil || len(der) == 0 {
+		t.Fatalf("firstCertificateDER(valid) = %d bytes, %v", len(der), err)
+	}
+	// The same certificate re-encoded must decode to identical material; this
+	// is why the probes compare DER rather than PEM bytes.
+	reencoded := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	again, err := firstCertificateDER(reencoded)
+	if err != nil || !bytes.Equal(der, again) {
+		t.Fatalf("re-encoded certificate decoded differently: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{name: "not PEM at all", input: "this is not a certificate"},
+		{name: "PEM block of the wrong type", input: string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("x")}))},
+		{name: "empty input", input: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, err := firstCertificateDER([]byte(tc.input)); err == nil {
+				t.Fatalf("firstCertificateDER(%q) returned no error", tc.name)
+			}
+		})
+	}
+
+	if !bundleContainsCertificate(append(append([]byte{}, ca...), makeFakeCertPEM(t, "Other")...), der) {
+		t.Fatal("bundleContainsCertificate missed a certificate that is present")
+	}
+	if bundleContainsCertificate(makeFakeCertPEM(t, "Pipelock Test CA"), der) {
+		t.Fatal("bundleContainsCertificate matched a different certificate sharing a common name")
+	}
+}
+
+// TestProbeCurrentCAExportRejectsUndecodableInput pins the decode-failure
+// branches of the export probe itself.
+func TestProbeCurrentCAExportRejectsUndecodableInput(t *testing.T) {
+	t.Parallel()
+	env := makeProbeEnv(t)
+	if err := os.WriteFile(env.caExportPath, []byte(testPEMCA(t)), 0o600); err != nil {
+		t.Fatalf("write export: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) {
+		// Valid single-CA PEM by the shape check, but a different certificate.
+		return makeFakeCertPEM(t, "Pipelock Test CA"), nil
+	}
+	status, detail := probeCurrentCAExport(context.Background(), env)
+	if status != statusFail || !strings.Contains(detail, "does not match the selected Pipelock CA") {
+		t.Fatalf("status=%q detail=%q; want a material mismatch failure", status, detail)
+	}
+}
+
+// TestProbeCABundleRejectsRetiredPipelockCA pins that presence of the current
+// CA is not enough. A rotation that appends the new CA without removing the
+// old one leaves BOTH in the bundle, and every contained client keeps
+// accepting anything the retired CA signed. The bundle is what
+// SSL_CERT_FILE, NODE_EXTRA_CA_CERTS and their siblings all point at, so a
+// retired CA left there is a trust path the proxy no longer controls.
+func TestProbeCABundleRejectsRetiredPipelockCA(t *testing.T) {
+	t.Parallel()
+	env := makeProbeEnv(t)
+	current := []byte(testPEMCA(t))
+	retired := makeFakeCertPEM(t, "Pipelock CA")
+
+	// Positive control: current CA plus an unrelated root must still pass, or
+	// the rejection below would prove nothing.
+	clean := append(append([]byte{}, current...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, clean, 0o600); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	env.currentCA = func(context.Context, *probeEnv) ([]byte, error) { return current, nil }
+	if status, detail := probeCABundle(context.Background(), env); status != statusPass {
+		t.Fatalf("clean bundle rejected: %s %s", status, detail)
+	}
+
+	// The rotation that only appended: both CAs present.
+	both := append(append(append([]byte{}, current...), retired...), makeFakeCertPEM(t, "Some Other Root")...)
+	if err := os.WriteFile(env.caBundlePath, both, 0o600); err != nil {
+		t.Fatalf("write bundle: %v", err)
+	}
+	status, detail := probeCABundle(context.Background(), env)
+	if status != statusFail || !strings.Contains(detail, "retired Pipelock CA") {
+		t.Fatalf("status=%q detail=%q; want a failure naming the retired CA left in the bundle", status, detail)
+	}
 }

@@ -19,10 +19,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/luckyPipewrench/pipelock/internal/certgen"
+	"github.com/luckyPipewrench/pipelock/internal/cli/runtimeconfig"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/filesentry"
 	"github.com/luckyPipewrench/pipelock/internal/license"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -144,6 +146,7 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 		Version:    cliutil.Version,
 	}
 	report.Checks = []doctorReportCheck{
+		checkDoctorPromptInjectionDetection(cfg),
 		checkDoctorHTTPProxy(cfg),
 		checkDoctorTLSInterception(cfg),
 		checkDoctorTLSInterceptionCoverage(cfg),
@@ -152,13 +155,40 @@ func buildDoctorReport(cfg *config.Config, cfgLabel string) doctorReport {
 		checkDoctorMCPWrapperFeatures(cfg),
 		checkDoctorMCPBinaryIntegrity(cfg),
 		checkDoctorMCPToolProvenance(cfg),
+		checkDoctorMCPIdentities(cfg, currentDoctorGOOS()),
 		checkDoctorFileSentry(cfg),
 		checkDoctorFlightRecorder(cfg),
 		checkDoctorLicense(cfg),
 		checkDoctorSentry(cfg),
 		checkDoctorDeploymentBoundary(cfg),
 	}
+	for _, warning := range cfg.MCPCompatibilityWarnings() {
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name:    warning.Field + "_compatibility",
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusWarn,
+			Detail:  warning.Message,
+		})
+	}
+	for _, warning := range cfg.ResponseScanning.SizeExemptScanLimitWarnings(time.Now()) {
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name:    warning.Field,
+			Surface: doctorSurfaceConfig,
+			Status:  doctorStatusWarn,
+			Detail:  cfgLabel + ": " + warning.Message,
+		})
+	}
 	report.Checks = append(report.Checks, checkDoctorConfigSemantics(cfg)...)
+	for _, diagnostic := range cfg.MCPTaintDiagnostics() {
+		surface := doctorSurfaceMCP
+		if diagnostic.Field == "taint.mcp_recorder" {
+			surface = doctorSurfaceConfig
+		}
+		report.Checks = append(report.Checks, doctorReportCheck{
+			Name: diagnostic.Field, Surface: surface, Status: doctorStatusInfo,
+			Configured: cfg.Taint.Enabled, Detail: diagnostic.Message,
+		})
+	}
 	report.Checks = append(report.Checks, checkDoctorAvailableKnobs(cfg)...)
 	report.Summary = retallyDoctorSummary(report.Checks)
 	return report
@@ -497,35 +527,51 @@ func checkDoctorBrowserShield(cfg *config.Config) doctorReportCheck {
 }
 
 func checkDoctorMCPWrapperFeatures(cfg *config.Config) doctorReportCheck {
-	enabled := []string{}
-	if cfg.MCPInputScanning.Enabled {
-		enabled = append(enabled, "mcp_input_scanning")
-	}
-	if cfg.MCPToolScanning.Enabled {
-		enabled = append(enabled, "mcp_tool_scanning")
-	}
-	if cfg.MCPToolPolicy.Enabled {
-		enabled = append(enabled, "mcp_tool_policy")
-	}
-	if cfg.MCPSessionBinding.Enabled {
-		enabled = append(enabled, "mcp_session_binding")
-	}
-	if len(enabled) == 0 {
-		return doctorReportCheck{
-			Name:    "mcp_wrapper_scanning",
-			Surface: doctorSurfaceMCP,
-			Status:  doctorStatusInfo,
-			Detail:  "MCP wrapper-dependent scanning features are disabled",
-			Next:    "enable MCP scanning where tools are launched through pipelock mcp proxy or an MCP listener",
+	var modes []string
+	configured := false
+	for _, mode := range []struct {
+		name string
+		mode config.RuntimeMode
+	}{
+		{"MCP proxy", config.RuntimeMCPProxy},
+		{"MCP listener", config.RuntimeForwardWithMCPListener},
+		{"MCP scan", config.RuntimeMCPScan},
+	} {
+		effective, _ := runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
+			Mode: mode.mode, DefaultToolPolicyRules: policy.DefaultToolPolicyRules,
+		}, nil, mode.name)
+		var enabled []string
+		if mode.mode != config.RuntimeMCPScan && effective.MCPInputScanning.Enabled {
+			enabled = append(enabled, "mcp_input_scanning")
 		}
+		if effective.MCPToolScanning.Enabled {
+			enabled = append(enabled, "mcp_tool_scanning")
+		}
+		if mode.mode != config.RuntimeMCPScan && effective.MCPToolPolicy.Enabled {
+			enabled = append(enabled, "mcp_tool_policy")
+		}
+		if mode.mode != config.RuntimeMCPScan && effective.MCPSessionBinding.Enabled {
+			enabled = append(enabled, "mcp_session_binding")
+		}
+		features := "disabled"
+		if len(enabled) > 0 {
+			configured = true
+			features = strings.Join(enabled, ", ")
+		}
+		modes = append(modes, mode.name+": "+features)
+	}
+	modes = append(modes, "forward proxy without MCP listener: no MCP scanning")
+	status := doctorStatusInfo
+	if configured {
+		status = doctorStatusWarn
 	}
 	return doctorReportCheck{
 		Name:       "mcp_wrapper_scanning",
 		Surface:    doctorSurfaceMCP,
-		Status:     doctorStatusWarn,
-		Configured: true,
-		Detail:     "configured features: " + strings.Join(enabled, ", "),
-		Next:       "prove the agent launches MCP servers through pipelock mcp proxy -- or a Pipelock MCP listener",
+		Status:     status,
+		Configured: configured,
+		Detail:     "effective configuration by mode: " + strings.Join(modes, "; ") + "; topology, reachability, and enforcement are unproven",
+		Next:       "prove the agent uses the intended MCP proxy or listener; scan mode only inspects supplied input",
 	}
 }
 

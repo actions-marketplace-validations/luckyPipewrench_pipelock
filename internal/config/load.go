@@ -5,8 +5,6 @@ package config
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/digestorigin"
 	"github.com/luckyPipewrench/pipelock/internal/license"
 	"github.com/luckyPipewrench/pipelock/internal/secperm"
 	"gopkg.in/yaml.v3"
@@ -23,15 +22,23 @@ import (
 
 type loadOptions struct {
 	resolveLicense             bool
+	resolveRuntimeCredentials  bool
 	skipValidate               bool
 	skipRuntimePathResolution  bool
 	fullValidateWithoutLicense bool
 }
 
 // Load reads, parses, defaults, and validates a Pipelock config file.
-// If path is "-", the config is read from stdin.
+// If path is "-", the config is read from stdin. Runtime credential files are
+// validated syntactically but are read only by LoadForRuntime or LoadReload.
 func Load(path string) (*Config, error) {
 	return load(path, loadOptions{resolveLicense: true})
+}
+
+// LoadForRuntime loads a config and resolves its runtime credential files.
+// A configured file must be readable and valid even when an env token overrides it.
+func LoadForRuntime(path string) (*Config, error) {
+	return load(path, loadOptions{resolveLicense: true, resolveRuntimeCredentials: true})
 }
 
 // LoadBytes parses, defaults, and validates a Pipelock config from memory using
@@ -77,25 +84,37 @@ func LoadForInspection(path string) (*Config, error) {
 	return load(path, loadOptions{resolveLicense: false, skipValidate: true})
 }
 
+// LoadReload reads the source once and returns its raw-byte hash even when
+// parsing or validation rejects it. Paths and environment remain daemon-owned.
+func LoadReload(path string) (*Config, string, error) {
+	return loadWithSourceHash(path, loadOptions{resolveLicense: true, resolveRuntimeCredentials: true})
+}
+
 func load(path string, opts loadOptions) (*Config, error) {
+	cfg, _, err := loadWithSourceHash(path, opts)
+	return cfg, err
+}
+
+func loadWithSourceHash(path string, opts loadOptions) (*Config, string, error) {
 	var data []byte
 	var err error
 	if path == "-" {
 		data, err = io.ReadAll(os.Stdin)
 		if err != nil {
-			return nil, fmt.Errorf("reading config from stdin: %w", err)
+			return nil, "", fmt.Errorf("reading config from stdin: %w", err)
 		}
 	} else {
 		data, err = readStableRegularFile(filepath.Clean(path))
 		if err != nil {
-			return nil, fmt.Errorf("reading config %s: %w", path, err)
+			return nil, "", fmt.Errorf("reading config %s: %w", path, err)
 		}
 	}
 	configDir := "."
 	if path != "-" {
 		configDir = filepath.Dir(path)
 	}
-	return loadBytes(data, path, configDir, opts)
+	cfg, err := loadBytes(data, path, configDir, opts)
+	return cfg, policyHashOrigin.Sum(data).String(), err
 }
 
 func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Config, error) {
@@ -142,8 +161,19 @@ func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Co
 	// Detect omitted security booleans via raw YAML introspection and
 	// default them to true (fail-closed). Must run before ApplyDefaults().
 	applySecurityDefaults(data, cfg)
+	sourceLabel := sourceName
+	if sourceName == "-" {
+		sourceLabel = "stdin (no config file)"
+	}
+	for i := range cfg.mcpCompatibilityWarnings {
+		cfg.mcpCompatibilityWarnings[i].Message = fmt.Sprintf("config %q: %s", sourceLabel, cfg.mcpCompatibilityWarnings[i].Message)
+	}
 
 	cfg.ApplyDefaults()
+	cfg.runtimeConfigDir = configDir
+	if err := cfg.validateKillSwitchTokenSource(); err != nil {
+		return nil, err
+	}
 
 	// Validate named-agent sandbox overrides before the enterprise license gate
 	// can strip named profiles. A configuration must not become valid merely
@@ -238,9 +268,25 @@ func loadBytes(data []byte, sourceName, configDir string, opts loadOptions) (*Co
 		}
 	}
 
+	if opts.resolveRuntimeCredentials {
+		if err := cfg.ResolveRuntimeCredentials(); err != nil {
+			return nil, err
+		}
+	}
+
 	if !opts.skipValidate {
 		if opts.resolveLicense || opts.fullValidateWithoutLicense {
 			if err := cfg.Validate(); err != nil {
+				return nil, fmt.Errorf("invalid config: %w", err)
+			}
+			// An expired containment grant is a lapsed grant, not a broken
+			// file: drop it from the effective set before the policy hash is
+			// taken so it is never exposed, and keep it recorded for the
+			// runtime to report.
+			if _, err := cfg.LapseExpiredScannerExceptions(time.Now()); err != nil {
+				return nil, fmt.Errorf("invalid config: %w", err)
+			}
+			if _, err := cfg.LapseExpiredContainmentGrants(time.Now()); err != nil {
 				return nil, fmt.Errorf("invalid config: %w", err)
 			}
 		} else {
@@ -529,6 +575,10 @@ func (c *Config) Hash() string {
 	if c.rawBytes == nil {
 		return HashDefaults
 	}
-	h := sha256.Sum256(c.rawBytes)
-	return hex.EncodeToString(h[:])
+	return policyHashOrigin.Sum(c.rawBytes).String()
 }
+
+// policyHashOrigin records the policy hashes this package computes, so the
+// receipt content boundary excludes them as generated values while a
+// caller-chosen hash with the same spelling stays content.
+var policyHashOrigin = digestorigin.NewIssuer("config.policy_hash")

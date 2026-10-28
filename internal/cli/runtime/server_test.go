@@ -31,6 +31,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract"
 	"github.com/luckyPipewrench/pipelock/internal/contract/runtime/contractruntimetest"
+	"github.com/luckyPipewrench/pipelock/internal/edition/licenseclocktest"
 	"github.com/luckyPipewrench/pipelock/internal/filesentry"
 	mcptools "github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -1284,12 +1285,9 @@ func TestServer_StartArmsFileSentry(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	errCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		errCh <- s.Start(ctx)
-	}()
+	errCh := runJoined(t, ctx, s.Start, nil)
 
 	waitForServerCancel(t, s)
 	waitForServerOutput(t, buf, "file sentry watching 1 configured path(s)")
@@ -1334,8 +1332,7 @@ func TestServer_StartReturnsFileSentryRuntimeFailure(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	done := make(chan error, 1)
-	go func() { done <- s.Start(context.Background()) }()
+	done := runJoined(t, context.Background(), s.Start, nil)
 	select {
 	case <-watcher.started:
 	case <-time.After(5 * time.Second):
@@ -1372,8 +1369,7 @@ func TestServer_StartKeepsCleanCancellationNilWithFileSentry(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	done := make(chan error, 1)
-	go func() { done <- s.Start(context.Background()) }()
+	done := runJoined(t, context.Background(), s.Start, nil)
 	select {
 	case <-watcher.started:
 	case <-time.After(5 * time.Second):
@@ -1410,6 +1406,7 @@ func TestServer_StartRejectsFileSentryBlockWithoutSubprocessChild(t *testing.T) 
 	})
 	// The refusal must happen before any watcher exists: a constructed watcher
 	// would already be reading the filesystem for a block mode that cannot act.
+	requireNoLeakedRuns(t)
 	oldNew := newFileSentryWatcher
 	newFileSentryWatcher = func(*config.FileSentry, filesentry.DLPScanner, filesentry.Lineage, func(error)) (filesentry.Watcher, error) {
 		t.Error("file sentry watcher constructed despite the block-mode refusal")
@@ -1456,12 +1453,9 @@ func TestServer_StartReportsArmedWatchCount(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	errCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		errCh <- s.Start(ctx)
-	}()
+	errCh := runJoined(t, ctx, s.Start, nil)
 
 	waitForServerCancel(t, s)
 	// One configured root remains armed while the missing root is reported as
@@ -1502,10 +1496,7 @@ func TestServer_StartFailsWhenFileSentryArmsNoPaths(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.Start(context.Background())
-	}()
+	errCh := runJoined(t, context.Background(), s.Start, nil)
 
 	select {
 	case err := <-errCh:
@@ -1528,7 +1519,8 @@ func TestServer_StartFailsWhenFileSentryArmsNoPaths(t *testing.T) {
 			t.Fatalf("Shutdown after unexpected startup: %v", err)
 		}
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			t.Logf("goroutine result: %v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Start did not return after Shutdown")
 		}
@@ -1555,10 +1547,7 @@ func TestServer_StartFileSentryBestEffortRejectsZeroArmedPaths(t *testing.T) {
 		o.ListenChanged = true
 	})
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.Start(context.Background())
-	}()
+	errCh := runJoined(t, context.Background(), s.Start, nil)
 
 	select {
 	case err := <-errCh:
@@ -1570,7 +1559,8 @@ func TestServer_StartFileSentryBestEffortRejectsZeroArmedPaths(t *testing.T) {
 			t.Fatalf("Shutdown after unexpected startup: %v", err)
 		}
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			t.Logf("goroutine result: %v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Start did not return after Shutdown")
 		}
@@ -1630,10 +1620,7 @@ func TestServer_StartFileSentryBestEffortRejectsRequiredPathFailure(t *testing.T
 		o.ListenChanged = true
 	})
 
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- s.Start(context.Background())
-	}()
+	errCh := runJoined(t, context.Background(), s.Start, nil)
 
 	select {
 	case err := <-errCh:
@@ -1645,7 +1632,8 @@ func TestServer_StartFileSentryBestEffortRejectsRequiredPathFailure(t *testing.T
 			t.Fatalf("Shutdown after unexpected startup: %v", err)
 		}
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			t.Logf("goroutine result: %v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Start did not return after Shutdown")
 		}
@@ -1675,8 +1663,7 @@ func TestServer_StartFileSentryBestEffortRejectsNormalizedRequiredDuplicate(t *t
 		o.Listen = serverTestEphemeralListen
 		o.ListenChanged = true
 	})
-	errCh := make(chan error, 1)
-	go func() { errCh <- s.Start(context.Background()) }()
+	errCh := runJoined(t, context.Background(), s.Start, nil)
 	select {
 	case err := <-errCh:
 		if err == nil || !strings.Contains(err.Error(), "required watch coverage unavailable") {
@@ -1687,7 +1674,8 @@ func TestServer_StartFileSentryBestEffortRejectsNormalizedRequiredDuplicate(t *t
 			t.Fatalf("Shutdown after unexpected startup: %v", err)
 		}
 		select {
-		case <-errCh:
+		case err := <-errCh:
+			t.Logf("goroutine result: %v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("Start did not return after Shutdown")
 		}
@@ -3712,6 +3700,23 @@ func TestServer_Reload_IgnoresFlightRecorderHeartbeatIntervalChange(t *testing.T
 	}
 }
 
+func TestServer_Reload_ReceiptChainsRequiresRestart(t *testing.T) {
+	s, buf := newTestServer(t, nil)
+	oldLive := s.proxy.CurrentConfig()
+	updated := oldLive.Clone()
+	updated.FlightRecorder.ReceiptChains = 4
+	if err := s.Reload(updated); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	if got := s.proxy.CurrentConfig().FlightRecorder.ReceiptChainCount(); got != oldLive.FlightRecorder.ReceiptChainCount() {
+		t.Fatalf("live receipt chains=%d, want original %d", got, oldLive.FlightRecorder.ReceiptChainCount())
+	}
+	want := "flight_recorder.receipt_chains changed; restart required; continuing with 1"
+	if !buf.contains(want) {
+		t.Fatalf("stderr missing named receipt-chain restart warning: %s", buf.String())
+	}
+}
+
 func newContainmentEvidenceReloadServer(t *testing.T, require bool) (*Server, *syncBuffer) {
 	t.Helper()
 	dir := t.TempDir()
@@ -3980,8 +3985,9 @@ func TestServer_Reload_MediationVerifyInboundRejectsDowngrade(t *testing.T) {
 func TestReloadDowngradeRejectReason(t *testing.T) {
 	downgrade := []config.ReloadWarning{{Field: "enforce", Message: "enforcement disabled"}}
 	restartOnly := []config.ReloadWarning{{
-		Field:   "health_watchdog",
-		Message: "health_watchdog config changes require restart — ignored on reload",
+		Field:       "health_watchdog",
+		Message:     "health_watchdog config changes require restart — ignored on reload",
+		Disposition: config.ReloadWarningDispositionAdvisory,
 	}}
 
 	for _, tt := range []struct {
@@ -4602,16 +4608,15 @@ func TestServer_StartJoinsLicenseExpiryWatcher(t *testing.T) {
 	})
 	// Set before launching Start: goroutine creation establishes the
 	// happens-before edge, so currentConfig() reads this value.
-	s.cfg.LicenseExpiresAt = time.Now().Add(time.Hour).Unix()
+	clk := licenseclocktest.Install(t, time.Now().Add(-licenseclocktest.WallOffset))
+	s.cfg.LicenseExpiresAt = clk.Now().Add(time.Hour).Unix()
 
-	errCh := make(chan error, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		errCh <- s.Start(ctx)
-	}()
+	errCh := runJoined(t, ctx, s.Start, nil)
 
 	waitForServerCancel(t, s)
+	testwait.For(t, 5*time.Second, func() bool { return clk.Pending() == 1 }, "license expiry timer armed")
 
 	if err := s.Shutdown(context.Background()); err != nil {
 		t.Fatalf("Shutdown: %v", err)
@@ -4619,6 +4624,9 @@ func TestServer_StartJoinsLicenseExpiryWatcher(t *testing.T) {
 
 	select {
 	case err := <-errCh:
+		if clk.Pending() != 0 {
+			t.Error("shutdown retained the license expiry timer")
+		}
 		if err != nil {
 			t.Fatalf("Start returned error after Shutdown: %v", err)
 		}

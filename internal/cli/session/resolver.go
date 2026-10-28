@@ -107,14 +107,19 @@ func resolveEndpoint(flags *rootFlags, deps resolverDeps) (endpoint, error) {
 		ep.URL = apiURL
 	}
 	if ep.Token == "" {
-		ep.Token = cfg.KillSwitch.APIToken
+		if cfg.KillSwitch.APITokenFile != "" {
+			if err := cfg.ResolveRuntimeCredentials(); err != nil {
+				return endpoint{}, fmt.Errorf("cannot read kill_switch.api_token_file: set --api-token or PIPELOCK_KILLSWITCH_API_TOKEN; use --api-url to select the admin API endpoint: %w", err)
+			}
+		}
+		ep.Token = cfg.EffectiveKillSwitchAPIToken()
 	}
 
 	if ep.URL == "" {
 		return endpoint{}, fmt.Errorf("no admin API URL: set --api-url, PIPELOCK_API_URL, or kill_switch.api_listen in %s", cfgPath)
 	}
 	if ep.Token == "" {
-		return endpoint{}, fmt.Errorf("no admin API token: set --api-token, PIPELOCK_KILLSWITCH_API_TOKEN, or kill_switch.api_token in %s", cfgPath)
+		return endpoint{}, fmt.Errorf("no admin API token: set --api-token, PIPELOCK_KILLSWITCH_API_TOKEN, or kill_switch.api_token or api_token_file in %s", cfgPath)
 	}
 
 	return normalizeEndpoint(ep), nil
@@ -147,6 +152,14 @@ func resolveConfigPath(explicit string, userHomeDir func() (string, error), stat
 	return ""
 }
 
+// ConfigPermRejectMask is the permission mask this package refuses on a config
+// file used as an admin API source: owner-execute, any group bit, any world
+// bit. It is exported so the installer's contract test can assert the mode it
+// writes against THIS value rather than a copy of it. A copied literal lets the
+// two drift, which is how a config was shipped at 0o640 while the CLI demanded
+// 0o600 and every admin command failed against it.
+const ConfigPermRejectMask os.FileMode = 0o177
+
 // checkConfigPerms refuses any config file that carries group/world
 // permission bits OR an owner-execute bit. The admin API token is a
 // shared secret - a loose file perm is treated as a deployment error
@@ -170,7 +183,7 @@ func checkConfigPerms(path string, stat func(string) (os.FileInfo, error)) error
 	// Skipped on Windows (secperm.TooPermissive returns false): Go reports the
 	// mode from the read-only attribute, not the NTFS ACL, so the bits are not
 	// security-meaningful. Unix behavior is unchanged (mode&0o177 != 0).
-	if secperm.TooPermissive(mode, 0o177) {
+	if secperm.TooPermissive(mode, ConfigPermRejectMask) {
 		return fmt.Errorf("config file %s has group/world or owner-execute permission bits set (mode %o); restrict to 0o600 before using it as an admin API source", path, mode)
 	}
 	return nil

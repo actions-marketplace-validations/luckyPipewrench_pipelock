@@ -562,14 +562,14 @@ func TestExtractSchemaDescriptions_Definitions(t *testing.T) {
 func TestExtractSchemaDescriptions_DepthLimit(t *testing.T) {
 	// Build a schema nested beyond maxSchemaDepth
 	inner := `{"description": "deep"}`
-	for i := 0; i < 25; i++ {
+	for range maxSchemaDepth + 5 {
 		inner = fmt.Sprintf(`{"nested": %s}`, inner)
 	}
 	descs := ExtractSchemaDescriptions(json.RawMessage(inner))
 	// The "deep" description should be unreachable due to depth limit
 	for _, d := range descs {
 		if d == "deep" {
-			t.Error("description at depth 25+ should be unreachable due to maxSchemaDepth")
+			t.Error("description beyond maxSchemaDepth should be unreachable")
 		}
 	}
 }
@@ -3094,13 +3094,13 @@ func TestExtractParamNames_Empty(t *testing.T) {
 func TestExtractParamNames_DepthLimit(t *testing.T) {
 	// Build schema nested beyond maxSchemaDepth.
 	inner := `{"properties": {"deep_param": {"type": "string"}}}`
-	for i := 0; i < 25; i++ {
+	for range maxSchemaDepth + 5 {
 		inner = fmt.Sprintf(`{"nested": %s}`, inner)
 	}
 	names := ExtractParamNames(json.RawMessage(inner))
 	for _, n := range names {
 		if n == "deep_param" {
-			t.Error("param at depth 25+ should be unreachable due to maxSchemaDepth")
+			t.Error("param beyond maxSchemaDepth should be unreachable")
 		}
 	}
 }
@@ -4700,7 +4700,7 @@ func TestToolBaseline_ReserveToolInventoryCommitsOnlyForwardedState(t *testing.T
 		},
 		{
 			Name:        "invalid",
-			InputSchema: json.RawMessage(`{"type":"object","properties":[]}`),
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"region":{"type":"number","x-mcp-header":"Region"}}}`),
 		},
 	}
 
@@ -4739,8 +4739,8 @@ func TestToolBaseline_ReserveToolInventoryCommitsOnlyForwardedState(t *testing.T
 	if !slices.Equal(added, []string{"write"}) {
 		t.Fatalf("updated baseline added = %v, want [write]", added)
 	}
-	if _, ok := baseline.HeaderBindings("read"); ok {
-		t.Fatal("non-clean response retained a stale header contract")
+	if bindings, ok := baseline.HeaderBindings("read"); !ok || len(bindings) != 0 {
+		t.Fatal("warned replacement did not install its current unannotated contract")
 	}
 }
 
@@ -4768,9 +4768,9 @@ func TestToolBaseline_ReserveToolInventoryRejectsCompetingAndOverCapacityState(t
 	}
 
 	headerBaseline := NewToolBaseline()
-	headerBaseline.headerBindings = make(map[string]map[string]HeaderBinding, maxBaselineTools)
+	headerBaseline.headerBindings = make(map[string]HeaderContract, maxBaselineTools)
 	for i := 0; i < maxBaselineTools; i++ {
-		headerBaseline.headerBindings[fmt.Sprintf("bound-%d", i)] = map[string]HeaderBinding{}
+		headerBaseline.headerBindings[fmt.Sprintf("bound-%d", i)] = HeaderContract{State: HeaderContractValidWithoutBindings}
 	}
 	overflowDef := ToolDef{
 		Name:        "overflow-binding",
@@ -4895,9 +4895,9 @@ func TestScanTools_ResourceLimitResponsesFailClosed(t *testing.T) {
 			name: "header binding capacity",
 			cfg: func() *ToolScanConfig {
 				baseline := NewToolBaseline()
-				baseline.headerBindings = make(map[string]map[string]HeaderBinding, maxBaselineTools)
+				baseline.headerBindings = make(map[string]HeaderContract, maxBaselineTools)
 				for i := 0; i < maxBaselineTools; i++ {
-					baseline.headerBindings[fmt.Sprintf("bound-%d", i)] = map[string]HeaderBinding{}
+					baseline.headerBindings[fmt.Sprintf("bound-%d", i)] = HeaderContract{State: HeaderContractValidWithoutBindings}
 				}
 				return &ToolScanConfig{Action: "warn", Baseline: baseline}
 			}(),

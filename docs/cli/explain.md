@@ -1,5 +1,7 @@
 # `pipelock explain`
 
+`explain response` and `explain mcp-response` name wording-only evidence, mixed finding kinds, or an unattributed cause. These reports have no live session history. `pipelock session explain` and session inspection report the accumulated `finding_kinds` for a live session. Older hostile state without recorded causes stays hostile and reports that its cause was not recorded. Signed receipts omit finding-kind metadata.
+
 `pipelock explain <url>` runs a URL through the scanner pipeline using the loaded config and explains the verdict so that a block is **remediable**. For a blocked URL it prints the scanner/layer that produced the verdict, the matching pattern (for DLP and blocklist), which part of the URL was inspected, the destination host, the effective config path, and — most importantly — the **exact remediation knob that scanner consults**, plus any broader option and its tradeoff.
 
 ```sh
@@ -12,26 +14,34 @@ The remediation guidance is the point of the command: a hint must name a knob th
 
 ## No network access
 
-`explain` does not resolve DNS or fetch anything. It runs the layers that fire **before** DNS resolution: scheme, CRLF injection, path traversal, allowlist, blocklist, the immutable core SSRF literal check, core and URL DLP, and path/subdomain entropy. The hostname-based SSRF layer (layer 8) resolves DNS at runtime, so `explain` reports when a verdict would *additionally* depend on resolution rather than reaching out itself. Standard and legacy numeric IP forms such as `8.8` are deterministic literals, so they are not marked `dns_dependent`. IP literals that fall in private/loopback/link-local ranges are still caught here by the immutable core SSRF literal check, which needs no resolution.
+`explain` does not resolve DNS or fetch anything. It runs the layers that fire **before** DNS resolution: scheme, CRLF injection, path traversal, allowlist, blocklist, the immutable core SSRF literal check, core and URL DLP, path/query/subdomain entropy, and nested query-parameter destinations (allowlist, blocklist, and the literal-IP floor; nested DNS is not resolved). The hostname-based SSRF layer resolves DNS at runtime, so `explain` reports when a verdict would *additionally* depend on resolution rather than reaching out itself. Standard and legacy numeric IP forms such as `8.8` are deterministic literals, so they are not marked `dns_dependent`. IP literals that fall in private/loopback/link-local ranges are still caught here by the immutable core SSRF literal check, which needs no resolution.
 
 ## Per-scanner remediation mapping
 
 | Scanner / layer | Why it blocked | Correct (narrowest) knob | Broader option + tradeoff |
 |---|---|---|---|
-| `dlp` (URL DLP) | A configurable DLP pattern matched the URL | `dlp.patterns[].exempt_domains` for that pattern. **The top-level `suppress:` list does NOT apply to URL DLP** — it is body-DLP and response-scanning only. If a long token in the query also trips entropy, you may *additionally* need `fetch_proxy.monitoring.query_entropy_param_exclusions` for an exact endpoint+parameter, or `fetch_proxy.monitoring.query_entropy_exclusions` as the broader host-wide fallback (a separate gate). | `tls_interception.passthrough_domains` exempts the host in one line but blinds Pipelock to all inner TLS (method, path, body, response). Only for can't-scan-by-construction hosts. |
+| `dlp` (URL DLP) | A configurable DLP pattern matched the URL | `dlp.patterns[].exempt_domains` for that pattern. Built-in provider-key and messaging patterns carry a compiled audience: an entry the audience already covers is ignored with a warning, and one outside it skips the pattern for that host only and warns. A core pattern, such as GitHub tokens, refuses `exempt_domains`. Prefer sending the credential only to its issuer on the documented header — see [Provider-Key DLP Coverage](../security/provider-key-dlp-coverage.md). **The top-level `suppress:` list does NOT apply to URL DLP** — it is body-DLP and response-scanning only. If a long token in the query also trips entropy, you may *additionally* need `fetch_proxy.monitoring.query_entropy_param_exclusions` for an exact endpoint+parameter, or `fetch_proxy.monitoring.query_entropy_exclusions` as the broader host-wide fallback (a separate gate). | `tls_interception.passthrough_domains` exempts the host in one line but blinds Pipelock to all inner TLS (method, path, body, response). Only for can't-scan-by-construction hosts. |
 | `core_dlp` | An immutable critical-credential pattern matched | None — core DLP is a safety floor and cannot be exempted by config. A genuine false positive must be fixed by tightening the pattern in a release. | — |
 | `entropy` (query entropy) | A high-entropy query key/value crossed the threshold | `fetch_proxy.monitoring.query_entropy_param_exclusions` for an exact HTTPS endpoint+parameter when host, path, and param are known; otherwise `fetch_proxy.monitoring.query_entropy_exclusions` is the broader host-wide fallback. **Separate gate from DLP** — exempting a DLP pattern does not lift an entropy block. | Raising `fetch_proxy.monitoring.entropy_threshold` lowers sensitivity for every destination. |
-| `entropy` (path entropy) | A high-entropy path segment crossed the threshold | `fetch_proxy.monitoring.subdomain_entropy_exclusions` for host-wide path entropy false positives, or an enforced `request_policy` route for an exact host+path exemption. `query_entropy_exclusions` does **not** lift path entropy blocks. | Raising `fetch_proxy.monitoring.entropy_threshold` lowers sensitivity for every destination. |
+| `entropy` (path entropy) | A high-entropy path segment crossed the threshold | `fetch_proxy.monitoring.path_entropy_exclusions` with `host` and `path_prefix`; omit `scheme` for HTTPS or add a separate `scheme: http` entry for HTTP. This lifts path entropy only; HTTP paths remain visible on the network. `query_entropy_exclusions` does **not** lift path entropy blocks. | `fetch_proxy.monitoring.subdomain_entropy_exclusions` lifts both path and subdomain entropy across the host. Raising `fetch_proxy.monitoring.entropy_threshold` lowers sensitivity for every destination. |
 | `subdomain_entropy` | A high-entropy DNS label was detected | `fetch_proxy.monitoring.subdomain_entropy_exclusions`. | Raising `fetch_proxy.monitoring.subdomain_entropy_threshold` globally. |
 | `blocklist` | The host is on the domain blocklist | Remove or narrow the entry in `fetch_proxy.monitoring.blocklist`. | — |
 | `allowlist` | Strict mode and the host is not allowlisted | Add the host to `api_allowlist`. | Switching `mode` from `strict` to `balanced` permits monitored browsing for all destinations. |
-| `ssrf` / `ssrf_metadata` | The host resolves (at runtime) to a private/metadata IP | Top-level `trusted_domains` (hostname) or `ssrf.ip_allowlist` (IP range). This verdict depends on DNS resolution. | Disabling SSRF (`internal: []`) removes private-range protection for all destinations. |
-| `core_ssrf` | A private/loopback/link-local IP literal | `ssrf.ip_allowlist` is the only override (honored even by the core check). The floor cannot be disabled wholesale. | — |
-| `ratelimit` | Per-domain request ceiling reached | `fetch_proxy.monitoring.max_requests_per_minute`, or retry after the window. | — |
+| `ssrf` / `ssrf_metadata` | The host resolves (at runtime) to a private/metadata IP | `destination_grants` for an exact TCP host and port; broader alternatives are `trusted_domains` (hostname) and `ssrf.ip_allowlist` (IP range). Metadata and other protected addresses cannot be granted. This verdict depends on DNS resolution. | Disabling SSRF (`internal: []`) removes private-range protection for all destinations. |
+| `core_ssrf` | A private/loopback/link-local IP literal | `destination_grants` for an exact TCP address and port, or `ssrf.ip_allowlist` for an address range. Neither exempts metadata, link-local, multicast, or unspecified addresses. The floor cannot be disabled wholesale. | — |
+| `ratelimit` | Per-base-domain request ceiling reached (all subdomains share it) | `fetch_proxy.monitoring.max_requests_per_minute`, retry after the window, or (Pro) `agents.<name>.rate_limit.max_requests_per_minute`; an agent `rate_limit` block replaces both per-minute ceilings. | — |
 | `length` | URL exceeds the max length | `fetch_proxy.monitoring.max_url_length`, or inspect for query-param data stuffing. | — |
-| `databudget` | Per-domain data ceiling reached | Adjust the session data-budget configuration. | — |
+| `databudget` | Per-base-domain data ceiling reached (all subdomains share it) | `fetch_proxy.monitoring.max_data_per_minute` (0 disables it), or (Pro) `agents.<name>.rate_limit.max_data_per_minute`; an agent `rate_limit` block replaces both per-minute ceilings. | — |
 | `crlf_injection` / `path_traversal` | A header-injection or directory-escape sequence | None — never legitimate in a normal URL. Correct the URL at its source. | — |
 | `scheme` | A non-http/https scheme | None — use an `http`/`https` URL. | — |
+
+For a non-core compiled-audience pattern, `explain` also names the audience
+outcome: a block prints `blocked: credential audience mismatch (pattern
+<name>, canonical destination <host>, immutable audience hosts <hosts>)`, and
+an allowed URL that matched such a pattern at its audience prints `allowed:
+credential audience match (pattern <name>, canonical destination <host>)`.
+Core-floor patterns never report a mismatch note here, because the core URL
+floor blocks them before the audience check runs.
 
 ## Flags
 
@@ -80,6 +90,25 @@ pipelock explain mcp-response \
 
 Both A2A flags must be supplied together. Without them, the report covers generic MCP response scanning and explicitly says A2A policy was not evaluated. A one-shot explanation has no previous Agent Card baseline and cannot evaluate stateful card drift.
 
+## `pipelock explain response`
+
+`pipelock explain response` reads a saved HTTP response body from standard input and runs the raw-body response scanner that the forward proxy, TLS interception, the reverse proxy and non-HTML fetch use. It names every matching pattern, the scanner view it matched in, the byte position and length inside that view, a SHA-256 of the body and a SHA-256 of the retained match text. It never fetches a URL and never prints the matched text, because a blocked response can carry attacker instructions or credentials.
+
+```bash
+pipelock explain response --config /etc/pipelock/pipelock.yaml < saved-response.bin
+pipelock explain response --config /etc/pipelock/pipelock.yaml --json < saved-response.bin
+```
+
+Position, length and match SHA-256 index the named scanner view, not the raw stdin bytes, so slice that view rather than the saved file when you compare fingerprints. The report states the action the loaded config applies: under `response_scanning.action: warn` a match is reported as allowed with a note that runtime forwards the response and logs the finding. When `response_scanning.enabled` is `false`, a match on a core response pattern is reported as blocked whatever the action says, because runtime blocks it.
+
+This isn't a replay of a fetch HTML block. Fetch scans HTML after hidden-content extraction and readability and applies destination-scoped suppressions using the final response URL, so a saved HTML document can disagree with a live fetch verdict. Reconstruct the extracted text when diagnosing a fetch HTML block.
+
+| Exit code | Meaning |
+|---|---|
+| 0 | The loaded config lets the response through (no match, or only matches the configured action forwards). |
+| 2 | The config failed to load, or reading or scanning the input failed. |
+| 3 | A match the loaded config does not simply forward. Under `response_scanning.action: block` runtime blocks the response. Under `strip` the report still says blocked, but runtime replaces the matched text and delivers the rest of the response, unless the rewrite fails or the response is a partial (206) one, in which case runtime blocks it. |
+
 ## URL explanation exit codes
 
 These exit codes apply to `pipelock explain <url>`. `pipelock explain event`
@@ -105,7 +134,7 @@ report, together with the fact that it can still block the request at runtime:
 
 ```text
 Verdict: ALLOWED
-note: this config's SSRF layer (layer 8) resolves DNS at runtime; explain did not
+note: this config's SSRF layer resolves DNS at runtime; explain did not
       resolve, so a private/metadata IP or DNS failure could still block this URL
       when proxied
 note: this verdict covers URL-layer checks only; explain does not fetch the URL,
@@ -123,6 +152,7 @@ Notes are emitted for each of these when the relevant control is enabled:
 | Cross-request detection | Accumulates across a session; `explain` holds no session history. |
 | Adaptive enforcement | Escalates from accumulated state, for the same reason. |
 | Kill switch | With `kill_switch.enabled` set, every request is refused at runtime except exempt endpoints and allowlisted IPs, whatever the verdict above says. |
+| Environment-variable leak matching (`--command`, `--tool`, `--file`) | `explain` runs in its own process and does not read the runtime's environment, so with `dlp.scan_env` enabled, input containing one of the runtime's environment values can still be blocked as an Environment Variable Leak. |
 
 The notes follow the loaded config rather than printing unconditionally. With
 `response_scanning.enabled: false` the response-scanning note does not appear,

@@ -14,7 +14,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -256,9 +255,9 @@ func TestMCP_Adaptive_DLPBlockRecordsSignalBlock(t *testing.T) {
 	}
 }
 
-// TestMCP_Adaptive_WarnRecordsNearMiss verifies that a DLP hit with warn action
-// records SignalNearMiss (+1 point) and never SignalBlock.
-func TestMCP_Adaptive_WarnRecordsNearMiss(t *testing.T) {
+// TestMCP_Adaptive_WarnRecordsObservation verifies that a DLP hit with warn action
+// records SignalWarning (zero points) and never SignalBlock.
+func TestMCP_Adaptive_WarnRecordsObservation(t *testing.T) {
 	rec := &mockRecorder{}
 	adaptiveCfg := adaptiveCfgEnabled()
 
@@ -266,17 +265,49 @@ func TestMCP_Adaptive_WarnRecordsNearMiss(t *testing.T) {
 	dirtyMsg := makeRequest(5, methodToolsCall, map[string]string{"api_key": secret}) + "\n"
 	runAdaptiveInput(dirtyMsg, rec, adaptiveCfg, nil, config.ActionWarn)
 
-	hasNearMiss := false
+	hasWarning := false
 	for _, sig := range rec.signals {
-		if sig == session.SignalNearMiss {
-			hasNearMiss = true
+		if sig == session.SignalWarning {
+			hasWarning = true
 		}
 		if sig == session.SignalBlock {
 			t.Errorf("unexpected SignalBlock for warn-action request, signals: %v", rec.signals)
 		}
 	}
-	if !hasNearMiss {
-		t.Errorf("expected SignalNearMiss in signals for warn-action hit, got: %v", rec.signals)
+	if !hasWarning {
+		t.Errorf("expected SignalWarning in signals for warn-action hit, got: %v", rec.signals)
+	}
+}
+
+func TestMCP_Adaptive_EntropyResourceBlockDoesNotScore(t *testing.T) {
+	sc := newAdaptiveTestScanner()
+	defer sc.Close()
+	uri := "https://api.vendor.example/resource/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	msg := makeRequest(51, "resources/read", map[string]string{"uri": uri})
+	verdict := ScanRequest(t.Context(), []byte(msg), sc, config.ActionWarn, config.ActionBlock)
+	if !verdict.IsEntropyOnly() || verdict.Action != config.ActionBlock {
+		t.Fatalf("resource finding = %+v, want entropy-only block", verdict)
+	}
+
+	adaptiveCfg := adaptiveCfgEnabled()
+	adaptiveCfg.Levels.Elevated.UpgradeWarn = ptrStr(config.ActionBlock)
+	stdioRec := &mockRecorder{level: 1}
+	if forwarded := runAdaptiveInput(msg+"\n", stdioRec, adaptiveCfg, nil, config.ActionWarn); forwarded != "" {
+		t.Fatalf("blocked stdio resource was forwarded: %q", forwarded)
+	}
+	if len(stdioRec.signals) != 0 || stdioRec.ThreatScore() != 0 {
+		t.Fatalf("stdio entropy block scored: signals=%v score=%.1f", stdioRec.signals, stdioRec.ThreatScore())
+	}
+
+	httpRec := &mockRecorder{level: 1}
+	decision := scanHTTPInputDecision([]byte(msg), io.Discard, "entropy-session", "entropy-session", MCPProxyOpts{
+		Scanner: sc, InputCfg: newHTTPInputCfg(config.ActionWarn), Rec: httpRec, AdaptiveCfg: adaptiveCfg,
+	})
+	if decision.Blocked == nil {
+		t.Fatal("HTTP resource entropy block was forwarded")
+	}
+	if len(httpRec.signals) != 0 || httpRec.ThreatScore() != 0 {
+		t.Fatalf("HTTP entropy block scored: signals=%v score=%.1f", httpRec.signals, httpRec.ThreatScore())
 	}
 }
 
@@ -504,14 +535,7 @@ func startListenerProxyWithStore(
 
 	t.Cleanup(func() {
 		cancel()
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Errorf("RunHTTPListenerProxy: %v", err)
-			}
-		case <-time.After(5 * time.Second):
-			t.Error("timeout waiting for listener proxy to stop")
-		}
+		waitForListenerProxyStop(t, done)
 	})
 
 	return baseURL, cancel, &logBuf
@@ -1002,10 +1026,12 @@ func TestForwardScannedInput_Adaptive_WarnUpgradeToBlock(t *testing.T) {
 	if strings.Contains(output, secret) {
 		t.Error("DLP secret was forwarded to server instead of being blocked after escalation upgrade")
 	}
-	// The block must have recorded SignalBlock on the session.
-	wantPoints := session.SignalPoints[session.SignalBlock]
-	if rec.ThreatScore() < wantPoints {
-		t.Errorf("ThreatScore = %.1f, want >= %.1f after warn->block upgrade", rec.ThreatScore(), wantPoints)
+	// The refusal is caused by the existing level, not new enforced evidence.
+	if rec.ThreatScore() != 0 {
+		t.Errorf("ThreatScore = %.1f, want 0 after warn->block upgrade", rec.ThreatScore())
+	}
+	if len(rec.signals) != 1 || rec.signals[0] != session.SignalWarning {
+		t.Errorf("signals = %v, want [SignalWarning] after warn->block upgrade", rec.signals)
 	}
 }
 
@@ -1045,7 +1071,7 @@ func TestBlockSessionDenyResponse(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			data := blockSessionDenyResponse(tt.id, "critical")
+			data := blockSessionDenyResponse(tt.id, wantMessage)
 			if len(data) == 0 {
 				t.Fatal("expected non-empty response bytes")
 			}

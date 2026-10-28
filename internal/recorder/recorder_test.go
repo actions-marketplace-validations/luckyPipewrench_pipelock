@@ -946,8 +946,12 @@ func TestRecorder_RawEscrow(t *testing.T) {
 		EscrowPublicKey:    hex.EncodeToString(recipientPub[:]),
 	}
 
-	// Use a mock redact function that always redacts
+	// Use a mock redact function that always redacts entry content. The
+	// session handle is validated at acquisition and must stay clean.
 	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
 		return scanner.TextDLPResult{
 			Clean: false,
 			Matches: []scanner.TextDLPMatch{
@@ -1479,6 +1483,9 @@ func TestRecorder_RecordRecoversAfterClearlyOversizedEntry(t *testing.T) {
 	if !errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
 		t.Fatalf("Record overlong entry error = %v, want ErrEvidenceReadLimitExceeded", err)
 	}
+	if !errors.Is(err, recorder.ErrSerializedEntryTooLarge) {
+		t.Fatalf("Record overlong entry error = %v, want deterministic pre-write size error", err)
+	}
 
 	if err := rec.Record(recorder.Entry{
 		SessionID: "overlong-entry",
@@ -1639,8 +1646,12 @@ func TestRecorder_RedactionCleanResult(t *testing.T) {
 func TestRecorder_RedactionMarshalError(t *testing.T) {
 	dir := t.TempDir()
 
-	// Redact function - won't be called since marshal of channel fails
+	// Redact function - won't be called since marshal of channel fails. The
+	// session handle is validated at acquisition and must stay clean.
 	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
 		return scanner.TextDLPResult{Clean: false, Matches: []scanner.TextDLPMatch{
 			{PatternName: "test"},
 		}}
@@ -1829,8 +1840,12 @@ func TestRecorder_RawEscrowPerEntry(t *testing.T) {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 
-	// Always-redact function so every entry gets escrow written
-	redactFn := func(_ context.Context, _ string) scanner.TextDLPResult {
+	// Always-redact function so every entry gets escrow written. The session
+	// handle is validated at acquisition and must stay clean.
+	redactFn := func(_ context.Context, text string) scanner.TextDLPResult {
+		if strings.Contains(text, testSessionID) {
+			return scanner.TextDLPResult{Clean: true}
+		}
 		return scanner.TextDLPResult{
 			Clean: false,
 			Matches: []scanner.TextDLPMatch{

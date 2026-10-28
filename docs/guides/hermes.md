@@ -25,8 +25,8 @@
 ## Quick Start
 
 ```bash
-# 1. Install pipelock (requires Go 1.25+)
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
@@ -45,6 +45,8 @@ Both modes are idempotent — re-running wraps only new entries and never duplic
 ### Terminal coverage is cooperative
 
 `--mode full` adds Pipelock's proxy environment **names** (`HTTPS_PROXY`, `NODE_EXTRA_CA_CERTS`, …) to the terminal backend's `env_passthrough`. For terminal traffic to actually route through Pipelock you must also set those env **values** in Hermes' own environment and the backend must honor them. This is cooperative proxying, not binary-enforced network isolation; pair it with `pipelock contain`, a sandbox, or a network policy where you need a hard boundary.
+
+The plugin looks for the `pipelock` executable on its `PATH`. If Hermes does not inherit a `PATH` that includes it, set `PIPELOCK_BIN` in Hermes' process environment to the absolute path of the Pipelock executable.
 
 ## MCP-Only Mode: Auth-Header Preservation
 
@@ -84,6 +86,10 @@ The **full** column reflects what the plugin scans once enabled; the plugin path
 
 The exfil-class DLP checks — environment-variable and file-secret **value** matching, which detect a secret the proxy holds appearing in text — run only on **outbound** surfaces, where a secret could actually leave: a tool call's arguments (`pre_tool_call`). On **inbound** surfaces — an operator→agent message (`pre_gateway_dispatch`) and a tool result flowing back to the agent (`transform_tool_result`) — those checks are skipped, because a value the agent is *receiving* is not exfiltration. Inbound surfaces still get full prompt-injection scanning plus the generic DLP detectors (regex patterns, seed phrases, canary tokens, hostname exfiltration); only the agent's-own-secret value match is direction-scoped. The Hermes hook also applies a narrow inbound-only precision filter for AWS Access ID matches that exist only because whitespace collapse joined lowercase OCR/prose into a key-shaped string. Raw, decoded, credential-context, and outbound AWS findings still block. This prevents an operator message or a local file read that happens to contain an env value (a path, a config setting) from false-positively blocking the agent, without weakening exfiltration protection on the outbound path. Outbound exfil detection is unchanged.
 
+### Environment lookups in tool commands
+
+A `terminal` tool call's command, a tool result, and a gateway message are not sent anywhere as written, so the hook scans them with one narrow difference; other tools' arguments keep the full check because they can be sent to a server as literal bytes. A `Credential in URL` candidate does not count when it is an assignment at line start or right after a `;` that is not part of a URL, whose value is exactly one environment-variable lookup and the statement ends right after it, as in `token=os.environ.get("API_TOKEN");` in a one-line script. The accepted forms are `os.environ["NAME"]`, `os.environ.get("NAME")`, `os.getenv("NAME")`, `process.env.NAME`, `process.env["NAME"]`, `os.Getenv("NAME")`, `ENV["NAME"]`, and `ENV.fetch("NAME")`, with an uppercase POSIX variable name. After the lookup only spaces or tabs may come before `;`, the end of the text, or the closing quote of a `python3 -c '...'` argument. Every candidate is judged in each view the scanner checks, and any other candidate still blocks. A fallback argument, an `or` default, a comment, a trailing call, a lowercase name, a lookup after `?` or `&` or after a `;` that touches a URL, or any other form still blocks. DLP normalization removes line breaks, so a lookup followed only by a line break runs into the next statement and still blocks; end the statement with `;`. Other patterns are unaffected. The rule follows the built-in regex text: a custom pattern that reuses it exactly gets the same rule, and a pattern that replaces it with a different regex does not. The Claude Code and Cursor hooks apply the same rule to shell commands only. The proxy applies no such rule, because on the wire those characters are literal bytes and the quoted name could itself be a credential; a command that later sends the value is still blocked there.
+
 ## Verify and Roll Back
 
 ```bash
@@ -95,6 +101,18 @@ pipelock hermes rollback --restore-backup ~/.hermes/config.yaml.bak.<ts>   # exp
 ```
 
 `verify` reports coverage honestly, and counts the plugin as ready only when it will actually load and fire under Hermes: the plugin files are present, the `plugin.yaml` manifest exists (Hermes skips manifest-less plugin directories), the plugin is enabled in `plugins.enabled` (standalone plugins are opt-in), the hook binary is resolvable, and the config sidecar is sane. File presence alone is **not** coverage. `full` means a ready plugin **and** the proxy env names are present; `partial` means some coverage (a ready plugin, env, or wrapped MCP servers) but not all surfaces; `none` means nothing is wired. `verify` annotates a `full` result to note that terminal egress is cooperative (it routes through Pipelock only when the proxy env values are set in Hermes' environment); the plugin hook path itself is proven by `make hermes-e2e`. It also reports how many MCP servers are declared versus wrapped. Rollback is surgical by default and undoes both modes — it unwraps any wrapped `mcp_servers` (deleting their header sidecars), strips the proxy env names, and removes the plugin from `plugins.enabled` — so you do not have to remember which mode you installed.
+
+## Browser Defaults
+
+`pipelock hermes install` also writes `~/.agent-browser/config.json` in the resolved Hermes user's home. Hermes's browser tool drives Chromium through agent-browser, and under automation Chromium advertises an automation marker that managed bot challenges can loop on. Install adds `--disable-blink-features=AutomationControlled` to that file's `args` string, preserves existing keys and launch arguments, and backs up an existing file before changing it. Pass `--no-browser-defaults` to skip this step.
+
+When Hermes runs under `pipelock contain`, you don't need this step: `pipelock contain install` merges the same flag into the contained agent's agent-browser config for every contained agent, using the same merge and rollback rules (see [Browser launch default](../contain-cli.md#browser-launch-default)). `pipelock hermes install` keeps writing it for Hermes users who run without containment. The flag only reaches browsers launched through agent-browser; an agent that launches Playwright's or Puppeteer's bundled browser directly reads neither this file nor an environment variable for launch arguments, so only that agent's launch code can add it.
+
+`pipelock hermes verify` reports the browser setting as `present`, `missing`, `invalid` (the file is not valid JSON or `args` is not a string; repair it, then rerun install), `overridden`, or `unknown` (no home directory could be resolved; pass `--home`). An `AGENT_BROWSER_ARGS` environment value replaces the file's `args`. Hermes sets one itself when it decides Chromium needs its sandbox disabled: running as root, inside a container, or on hosts that restrict unprivileged user namespaces. In that case add the flag to the environment value Hermes starts with. Verify can only inspect its own environment, so it reports `overridden` when the variable is set where verify runs, not inside an already-running Hermes process.
+
+Concurrent `pipelock hermes install` and `pipelock hermes rollback` runs by the same account are serialized when they share a Hermes config directory, browser-state home, or plugin directory. An install with `--no-browser-defaults` touches no browser state, so it doesn't wait on the browser-state home, and a `--mode full` install still waits on its plugin directory. The locks live in that account's own cache directory (`~/.cache` from the account database on Linux and macOS, Local AppData on Windows), so a changed `XDG_CACHE_HOME` or `LOCALAPPDATA` can't split them; runs by different accounts, such as root with `--home` and the Hermes user itself, are not serialized against each other. If the lock wait times out after 30 seconds, the error names the lock file and means another install or rollback is running; wait for it to finish and retry.
+
+`pipelock hermes rollback` removes the flag only when Pipelock added it. If `args` is otherwise unchanged since install, rollback restores the previous value exactly; if you edited `args` afterward, it removes only Pipelock's flag and keeps your edits, including arguments you removed. It deletes the file when Pipelock created it and nothing else was added. Rollback undoes the Hermes integration first; if the agent-browser file cannot be read or parsed, rollback still completes, prints a warning naming the file, and a later rollback retries the browser cleanup. All three commands take `--home` to name the Hermes user's home when it is not the current user's. agent-browser opens bare hostnames over HTTPS.
 
 ## Choosing a Config
 

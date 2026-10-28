@@ -378,13 +378,15 @@ func (s *SessionState) RecordRequest(domain string, cfg *config.SessionProfiling
 
 	// Domain burst detection: count unique new domains in the rolling window.
 	windowCutoff := now.Add(-time.Duration(cfg.WindowMinutes) * time.Minute)
-	s.domainWindows, _ = pruneDomainWindow(s.domainWindows, domain, windowCutoff, now)
-
-	uniqueDomains := countUniqueDomains(s.domainWindows)
-	if uniqueDomains >= cfg.DomainBurst {
-		// Score only on first detection per window. Repeat detections still
-		// return the anomaly (so AnomalyAction=block fires) but with Score 0
-		// to prevent adaptive escalation from repeated signals.
+	var (
+		uniqueDomains int
+		domainAdded   bool
+	)
+	s.domainWindows, uniqueDomains, domainAdded = pruneDomainWindow(s.domainWindows, domain, windowCutoff, now)
+	if domainAdded && uniqueDomains >= cfg.DomainBurst {
+		// Score only on first detection per window. Later new destinations
+		// remain observable but score zero; requests to destinations already
+		// in the window are clean and can drive adaptive decay.
 		windowDur := time.Duration(cfg.WindowMinutes) * time.Minute
 		score := 0.0
 		if s.lastBurstAt.IsZero() || now.Sub(s.lastBurstAt) >= windowDur {
@@ -411,9 +413,10 @@ func countUniqueDomains(entries []domainEntry) int {
 }
 
 // pruneDomainWindow removes expired entries, appends domain if not already
-// present, and returns the updated slice plus the unique domain count.
+// present, and returns the updated slice, unique count, and whether the current
+// request introduced a new domain.
 // Shared by per-session RecordRequest and per-IP RecordIPDomain.
-func pruneDomainWindow(entries []domainEntry, domain string, windowCutoff, now time.Time) ([]domainEntry, int) {
+func pruneDomainWindow(entries []domainEntry, domain string, windowCutoff, now time.Time) ([]domainEntry, int, bool) {
 	pruned := entries[:0]
 	for _, de := range entries {
 		if de.at.After(windowCutoff) {
@@ -432,7 +435,7 @@ func pruneDomainWindow(entries []domainEntry, domain string, windowCutoff, now t
 		pruned = append(pruned, domainEntry{domain: domain, at: now})
 	}
 
-	return pruned, countUniqueDomains(pruned)
+	return pruned, countUniqueDomains(pruned), !seen
 }
 
 // defaultMaxLevelDuration is the maximum time a session stays at an escalation level
@@ -474,7 +477,9 @@ func adaptiveBlockAllCheck(cfg *config.AdaptiveEnforcement) func(int) bool {
 func (s *SessionState) RecordSignal(sig session.SignalType, threshold float64) (bool, string, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.globalSignalsAuthoritative = true
+	if sig != session.SignalWarning {
+		s.globalSignalsAuthoritative = true
+	}
 
 	escalated, from, to := recordAdaptiveSignalFields(
 		&s.threatScore,
@@ -502,6 +507,16 @@ func (s *SessionState) RecordScopedSignal(scope string, sig session.SignalType, 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// Observations must not allocate enforcement lanes: warning-only traffic
+	// cannot exhaust the scope cap and force later destinations into the
+	// stricter session-wide fallback.
+	if sig == session.SignalWarning {
+		s.cleanRequests = 0
+		if st := s.scopes[scope]; st != nil {
+			st.cleanRequests = 0
+		}
+		return false, "", ""
+	}
 	st := s.getOrCreateScopeLocked(scope)
 	if st == nil {
 		// Scope cap reached: record against the session-wide lane and make it
@@ -539,8 +554,11 @@ func (s *SessionState) RecordScopedSignal(scope string, sig session.SignalType, 
 }
 
 func recordAdaptiveSignalFields(score *float64, level *int, threshold *float64, lastEscalation *time.Time, cleanRequests *int, sig session.SignalType, initialThreshold float64) (bool, string, string) {
-	*score += session.SignalPoints[sig]
 	*cleanRequests = 0
+	if sig == session.SignalWarning {
+		return false, "", ""
+	}
+	*score += session.SignalPoints[sig]
 	if *threshold == 0 && initialThreshold > 0 {
 		*threshold = initialThreshold
 	}
@@ -1022,6 +1040,24 @@ func (s *SessionState) RuntimeTrustOverrides() []session.TrustOverride {
 	return append([]session.TrustOverride(nil), s.runtimeOverrides...)
 }
 
+// recordRetainedFindingKinds enriches evidence for a deduplicated source without
+// changing source history, timestamps, origin attribution or policy state.
+// The task ID binds the metadata to the snapshot used for deduplication.
+func (s *SessionState) recordRetainedFindingKinds(taskID string, kinds []session.HostileFindingKind) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.task.CurrentTaskID != taskID {
+		return
+	}
+	s.risk.FindingKinds = session.MergeFindingKinds(s.risk.HostileFindingKinds(), kinds)
+}
+
+func (s *SessionState) responseRiskSnapshot() (session.SessionRisk, string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.risk.Snapshot(), s.task.CurrentTaskID
+}
+
 // ObserveRisk folds a new taint observation into the session's sticky risk state.
 func (s *SessionState) ObserveRisk(observation session.RiskObservation) {
 	s.mu.Lock()
@@ -1089,11 +1125,27 @@ func (s *SessionState) RecordBytes(n int64) {
 	s.bytesTotal += n
 }
 
+// RecordToolActivity refreshes activity for a committed MCP tool call. Listener
+// baselines stay request-local; this only updates the shared session's idle clock.
+func (s *SessionState) RecordToolActivity() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.recordToolActivityLocked()
+}
+
+func (s *SessionState) recordToolActivityLocked() {
+	// Match RecordRequest: blocked retries must not prevent idle recovery.
+	if !s.atBlockAll {
+		s.lastActivity = time.Now()
+	}
+}
+
 // RecordToolCall increments the session's tool call counter and tracks
 // unique tool names. Called by MCP proxy when a tool invocation completes.
 func (s *SessionState) RecordToolCall(toolName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.recordToolActivityLocked()
 	s.toolCalls++
 	if s.uniqueTools == nil {
 		s.uniqueTools = make(map[string]struct{})
@@ -1187,19 +1239,20 @@ var invocationPrefixes = []string{"mcp-stdio-", "mcp-http-", "mcp-ws-"}
 
 // SessionSnapshot is a read-only DTO for the admin API.
 type SessionSnapshot struct {
-	Key              string    `json:"key"`
-	Agent            string    `json:"agent"`
-	ClientIP         string    `json:"client_ip"`
-	Kind             string    `json:"kind"`
-	CurrentTaskID    string    `json:"current_task_id,omitempty"`
-	CurrentTaskLabel string    `json:"current_task_label,omitempty"`
-	ThreatScore      float64   `json:"threat_score"`
-	EscalationLevel  string    `json:"escalation_level"`
-	BlockAll         bool      `json:"block_all"`
-	AirlockTier      string    `json:"airlock_tier"`
-	TaintLevel       string    `json:"taint_level"`
-	Contaminated     bool      `json:"contaminated"`
-	LastActivity     time.Time `json:"last_activity"`
+	Key              string                       `json:"key"`
+	Agent            string                       `json:"agent"`
+	ClientIP         string                       `json:"client_ip"`
+	Kind             string                       `json:"kind"`
+	CurrentTaskID    string                       `json:"current_task_id,omitempty"`
+	CurrentTaskLabel string                       `json:"current_task_label,omitempty"`
+	ThreatScore      float64                      `json:"threat_score"`
+	EscalationLevel  string                       `json:"escalation_level"`
+	BlockAll         bool                         `json:"block_all"`
+	AirlockTier      string                       `json:"airlock_tier"`
+	TaintLevel       string                       `json:"taint_level"`
+	FindingKinds     []session.HostileFindingKind `json:"finding_kinds,omitempty"`
+	Contaminated     bool                         `json:"contaminated"`
+	LastActivity     time.Time                    `json:"last_activity"`
 }
 
 type AdaptiveTopAnomaly struct {
@@ -1355,6 +1408,10 @@ type SessionManager struct {
 	// warn again.
 	baselineWarningMu          sync.Mutex
 	baselineUnproducibleWarned map[string]struct{}
+
+	// beforeEvictRecheck lets tests change a candidate between selection and
+	// the locked recheck. Nil in production.
+	beforeEvictRecheck func(*SessionState)
 }
 
 // SessionManagerOptions configures optional SessionManager behavior.
@@ -1483,12 +1540,22 @@ func baselineActionOrDefault(action string) string {
 // ReconfigureBaseline applies behavioral_baseline hot-reload changes without
 // resetting learned or locked profiles.
 func (sm *SessionManager) ReconfigureBaseline(cfg *config.BehavioralBaseline) error {
+	apply, err := sm.PrepareBaselineReconfigure(cfg)
+	if err != nil {
+		return err
+	}
+	apply()
+	return nil
+}
+
+// PrepareBaselineReconfigure performs all fallible baseline work without
+// changing the live snapshot. The returned update cannot fail.
+func (sm *SessionManager) PrepareBaselineReconfigure(cfg *config.BehavioralBaseline) (func(), error) {
 	if cfg == nil || !cfg.Enabled {
-		sm.baselinePtr.Store(nil)
-		return nil
+		return func() { sm.baselinePtr.Store(nil) }, nil
 	}
 	if snap := sm.baselinePtr.Load(); snap != nil && snap.mgr != nil {
-		if err := snap.mgr.Reconfigure(baseline.Config{
+		apply, err := snap.mgr.PrepareReconfigure(baseline.Config{
 			Enabled:          cfg.Enabled,
 			LearningWindow:   cfg.LearningWindow,
 			DeviationAction:  cfg.DeviationAction,
@@ -1498,13 +1565,20 @@ func (sm *SessionManager) ReconfigureBaseline(cfg *config.BehavioralBaseline) er
 			LockDimensions:   cfg.LockDimensions,
 			PoisonResistance: cfg.PoisonResistance,
 			SeasonalityMode:  cfg.SeasonalityMode,
-		}); err != nil {
-			return fmt.Errorf("baseline reconfigure: %w", err)
+		})
+		if err != nil {
+			return nil, fmt.Errorf("baseline reconfigure: %w", err)
 		}
-		sm.baselinePtr.Store(&baselineSnapshot{mgr: snap.mgr, action: baselineActionOrDefault(cfg.DeviationAction)})
-		return nil
+		return func() {
+			apply()
+			sm.baselinePtr.Store(&baselineSnapshot{mgr: snap.mgr, action: baselineActionOrDefault(cfg.DeviationAction)})
+		}, nil
 	}
-	return sm.EnableBaseline(cfg)
+	snap, err := newBaselineSnapshot(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return func() { sm.baselinePtr.Store(snap) }, nil
 }
 
 // BaselineManager returns the baseline manager, or nil if not enabled.
@@ -1692,7 +1766,7 @@ func (sm *SessionManager) recordSessionBaseline(sess *SessionState) {
 
 // GetOrCreate returns the session for a key, creating if needed.
 // It evicts the oldest eligible session at capacity. A nil result refuses
-// admission: active quarantine must not be evicted or exceed MaxSessions.
+// admission: live enforcement state must not be evicted or exceed MaxSessions.
 // Callers must deny new work rather than treating nil as disabled profiling.
 func (sm *SessionManager) GetOrCreate(key string) *SessionState {
 	sm.startMaintenance()
@@ -1786,13 +1860,13 @@ func (sm *SessionManager) RecordIPDomain(clientIP, domain string, cfg *config.Se
 	now := time.Now()
 	windowCutoff := now.Add(-time.Duration(cfg.WindowMinutes) * time.Minute)
 
-	pruned, uniqueDomains := pruneDomainWindow(sm.ipDomains[clientIP], domain, windowCutoff, now)
+	pruned, uniqueDomains, domainAdded := pruneDomainWindow(sm.ipDomains[clientIP], domain, windowCutoff, now)
 	sm.ipDomains[clientIP] = pruned
 
 	var anomalies []Anomaly
-	if uniqueDomains >= cfg.DomainBurst {
+	if domainAdded && uniqueDomains >= cfg.DomainBurst {
 		// Same cooldown pattern as per-session burst: score once per window,
-		// anomaly returned every time so AnomalyAction=block still fires.
+		// while each later new destination remains observable.
 		windowDur := time.Duration(cfg.WindowMinutes) * time.Minute
 		lastBurst := sm.ipBurstCooldown[clientIP]
 		score := 0.0
@@ -1873,9 +1947,9 @@ func (sm *SessionManager) AdaptiveSessionLevelCounts() map[string]float64 {
 	}
 
 	// Snapshot session pointers under the manager lock, then release it before
-	// taking individual session locks. Several lifecycle paths acquire these
-	// locks in the opposite order, so holding sm.mu here would risk a scrape
-	// deadlock. Removed sessions remain valid Go objects; a concurrent eviction
+	// taking individual session locks, keeping the scrape's manager lock hold
+	// short. The lock order is listener registry, store, session, then airlock.
+	// Removed sessions remain valid Go objects; a concurrent eviction
 	// may make one scrape briefly stale, but the next scrape reconciles from the
 	// current map and cannot go negative.
 	sm.mu.RLock()
@@ -1933,6 +2007,7 @@ func (sm *SessionManager) Snapshot() []SessionSnapshot {
 			BlockAll:         s.atBlockAll,
 			AirlockTier:      s.airlock.Tier(),
 			TaintLevel:       s.risk.Level.String(),
+			FindingKinds:     s.risk.HostileFindingKinds(),
 			Contaminated:     s.risk.Contaminated,
 			LastActivity:     s.lastActivity,
 		}
@@ -2003,6 +2078,7 @@ func (sm *SessionManager) ResetSession(key string) (prev SessionSnapshot, found 
 		EscalationLevel:  session.EscalationLabel(prevLevel),
 		BlockAll:         false,
 		TaintLevel:       riskSnapshot.Level.String(),
+		FindingKinds:     riskSnapshot.HostileFindingKinds(),
 		Contaminated:     riskSnapshot.Contaminated,
 		LastActivity:     time.Now(),
 	}
@@ -2075,6 +2151,7 @@ func (sm *SessionManager) ResetSessionIfResettable(key string) (prev SessionSnap
 		EscalationLevel:  session.EscalationLabel(prevLevel),
 		BlockAll:         false,
 		TaintLevel:       riskSnapshot.Level.String(),
+		FindingKinds:     riskSnapshot.HostileFindingKinds(),
 		Contaminated:     riskSnapshot.Contaminated,
 		LastActivity:     time.Now(),
 	}
@@ -2132,6 +2209,7 @@ func (sm *SessionManager) SnapshotAndResetIfResettable(key string) (preSnap sess
 			BlockAll:         sess.atBlockAll,
 			AirlockTier:      sess.airlock.tier,
 			TaintLevel:       sess.risk.Level.String(),
+			FindingKinds:     sess.risk.HostileFindingKinds(),
 			Contaminated:     sess.risk.Contaminated,
 			LastActivity:     sess.lastActivity,
 		},
@@ -2252,6 +2330,7 @@ func (sm *SessionManager) AdaptiveStatus() AdaptiveStatus {
 			BlockAll:         sess.atBlockAll,
 			AirlockTier:      tier,
 			TaintLevel:       sess.risk.Level.String(),
+			FindingKinds:     sess.risk.HostileFindingKinds(),
 			Contaminated:     sess.risk.Contaminated,
 			LastActivity:     sess.lastActivity,
 		})
@@ -2282,8 +2361,8 @@ func (sm *SessionManager) AdaptiveStatus() AdaptiveStatus {
 // request would land in, and a self-declared or forged header folds the same
 // way a self-declared request's traffic does - it can never read or be
 // mistaken for a bound bucket.
-func (sm *SessionManager) AdaptiveWhoami(clientIP, agent string, auth envelope.ActorAuth) AdaptiveWhoami {
-	key := sessionKeyFor(agent, clientIP, auth)
+func (sm *SessionManager) AdaptiveWhoami(cfg *config.Config, clientIP, agent string, auth envelope.ActorAuth) AdaptiveWhoami {
+	key := sessionKeyFor(cfg, agent, clientIP, auth)
 	out := AdaptiveWhoami{
 		ClientIP:        clientIP,
 		Agent:           agent,
@@ -2491,6 +2570,7 @@ func (sm *SessionManager) AdminSnapshotByKey(key string) (sessionAdminSnapshot, 
 			BlockAll:         sess.atBlockAll,
 			AirlockTier:      airlockTier,
 			TaintLevel:       sess.risk.Level.String(),
+			FindingKinds:     sess.risk.HostileFindingKinds(),
 			Contaminated:     sess.risk.Contaminated,
 			LastActivity:     sess.lastActivity,
 		},
@@ -2814,6 +2894,41 @@ func (a *storeAdapter) Delete(key string) {
 	a.sm.Delete(key)
 }
 
+// EvictIfUnprotected uses the same enforcement predicate as shared capacity
+// eviction. Listener state may retain a recorder after its clean store entry
+// was evicted, so inspect that recorder even when the map no longer holds it.
+func (a *storeAdapter) EvictIfUnprotected(key string, recorder session.Recorder) bool {
+	sess, ok := recorder.(*SessionState)
+	if !ok || sess == nil {
+		return false
+	}
+	sm := a.sm
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.key != key {
+		return false
+	}
+	current := sm.sessions[key]
+	if current != nil && current != sess {
+		// Never remove a replacement created by another owner of this key.
+		return false
+	}
+	adaptiveCfg := sm.adaptiveCfgPtr.Load()
+	if sess.hasCapacityProtectionLocked(adaptiveCfg != nil && adaptiveCfg.Enabled) {
+		return false
+	}
+	if current != nil {
+		delete(sm.sessions, key)
+		if sm.metrics != nil {
+			sm.metrics.RecordSessionEvicted()
+			sm.metrics.SetSessionsActive(float64(len(sm.sessions)))
+		}
+	}
+	return true
+}
+
 // AsStore returns a session.Store interface for this SessionManager.
 func (sm *SessionManager) AsStore() session.Store {
 	return &storeAdapter{sm: sm}
@@ -2837,47 +2952,91 @@ func (sm *SessionManager) Delete(key string) {
 	sm.mu.Unlock()
 }
 
-// evictOldest removes the session with the oldest lastActivity.
+// hasCapacityProtectionLocked reports whether dropping this session would
+// discard live enforcement. Idle expiry remains a separate session boundary.
+// Adaptive levels count only while adaptive enforcement is enabled: every
+// consumer ignores them otherwise, and the de-escalation sweep stops, so a
+// residual level would hold capacity that nothing enforces. Caller holds s.mu.
+func (s *SessionState) hasCapacityProtectionLocked(adaptiveEnabled bool) bool {
+	if s.hasActiveAirlockLocked() || s.atBlockAll || s.risk.HasPolicyTaint() {
+		return true
+	}
+	if adaptiveEnabled && s.escalationLevel > 0 {
+		return true
+	}
+	for _, st := range s.scopes {
+		if st.atBlockAll || (adaptiveEnabled && st.escalationLevel > 0) {
+			return true
+		}
+	}
+	return false
+}
+
+// evictOldest removes the eligible session with the oldest lastActivity.
 // Must be called with sm.mu held for writing. Returns the evicted
 // session (if any) so the caller can record baseline metrics after
 // releasing the lock.
 func (sm *SessionManager) evictOldest() *SessionState {
-	var oldestKey string
-	var oldestTime time.Time
-	var oldestSess *SessionState
+	adaptiveCfg := sm.adaptiveCfgPtr.Load()
+	adaptiveEnabled := adaptiveCfg != nil && adaptiveCfg.Enabled
 
-	var oldestEscLevel int
+	// A candidate that turns protected before removal is skipped and the next
+	// oldest is tried, so one late signal cannot refuse admission while another
+	// session is still safe to drop. Each pass removes a session or skips a new
+	// key, so the loop ends within len(sm.sessions) passes.
+	var skipped map[string]struct{}
+	for {
+		var oldestKey string
+		var oldestTime time.Time
+		var oldestSess *SessionState
+		for key, sess := range sm.sessions {
+			if _, ok := skipped[key]; ok {
+				continue
+			}
+			sess.mu.Lock()
+			la := sess.lastActivity
+			protected := sess.hasCapacityProtectionLocked(adaptiveEnabled)
+			sess.mu.Unlock()
 
-	for key, sess := range sm.sessions {
-		sess.mu.Lock()
-		la := sess.lastActivity
-		escLevel := sess.escalationLevel
-		quarantined := sess.hasActiveAirlockLocked()
-		sess.mu.Unlock()
+			// Capacity pressure must not reset enforcement history.
+			if protected {
+				continue
+			}
 
-		// Skip quarantined sessions: evicting them would escape enforcement.
-		if quarantined {
-			continue
-		}
-
-		if oldestKey == "" || la.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = la
-			oldestEscLevel = escLevel
-			oldestSess = sess
-		}
-	}
-
-	if oldestKey != "" {
-		if oldestEscLevel > 0 {
-			if sm.metrics != nil {
-				sm.metrics.SetAdaptiveSessionLevel(session.EscalationLabel(oldestEscLevel), -1)
+			if oldestKey == "" || la.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = la
+				oldestSess = sess
 			}
 		}
-		delete(sm.sessions, oldestKey)
-		if sm.metrics != nil {
-			sm.metrics.RecordSessionEvicted()
+		if oldestKey == "" {
+			return nil
 		}
+		if sm.beforeEvictRecheck != nil {
+			sm.beforeEvictRecheck(oldestSess)
+		}
+		if sm.removeIfUnprotected(oldestKey, oldestSess, adaptiveEnabled) {
+			return oldestSess
+		}
+		if skipped == nil {
+			skipped = make(map[string]struct{})
+		}
+		skipped[oldestKey] = struct{}{}
 	}
-	return oldestSess
+}
+
+// removeIfUnprotected rechecks a capacity candidate under its session lock
+// and holds that lock through removal, so a signal cannot land in between.
+// Caller holds sm.mu for writing.
+func (sm *SessionManager) removeIfUnprotected(key string, sess *SessionState, adaptiveEnabled bool) bool {
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	if sess.hasCapacityProtectionLocked(adaptiveEnabled) {
+		return false
+	}
+	delete(sm.sessions, key)
+	if sm.metrics != nil {
+		sm.metrics.RecordSessionEvicted()
+	}
+	return true
 }

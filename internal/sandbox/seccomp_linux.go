@@ -7,6 +7,7 @@ package sandbox
 
 import (
 	"fmt"
+	"runtime"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -37,11 +38,12 @@ func seccompFilterSupportedByBuild() bool {
 // process to a safe set of syscalls. Dangerous syscalls (ptrace, mount,
 // io_uring, kernel module loading, etc.) are blocked.
 //
-// MUST be called after PR_SET_NO_NEW_PRIVS. The filter is permanent and
-// inherited by all children (fork + exec).
-// ApplySeccomp installs the seccomp BPF filter. In strict mode, clone3 is
-// blocked entirely (EPERM) since BPF cannot inspect its pointer argument
-// for CLONE_NEW* flags.
+// Sets PR_SET_NO_NEW_PRIVS on the installing OS thread before installing the
+// filter. The filter is permanent and inherited by all children (fork + exec).
+// In strict mode, clone3 is blocked entirely (ENOSYS) since BPF cannot inspect
+// its pointer argument
+// for CLONE_NEW* flags. ENOSYS lets libc retry with the argument-filtered clone
+// syscall; EPERM prevents that compatibility fallback and breaks pthreads.
 func ApplySeccomp(strict ...bool) (LayerStatus, error) {
 	status := LayerStatus{Name: LayerSeccomp}
 	isStrict := len(strict) > 0 && strict[0]
@@ -51,6 +53,16 @@ func ApplySeccomp(strict ...bool) (LayerStatus, error) {
 	prog := unix.SockFprog{
 		Len:    uint16(len(filter)), //nolint:gosec // G115: filter length is always < 4096 instructions
 		Filter: &filter[0],
+	}
+
+	// no_new_privs is per-thread. A caller's earlier SetNoNewPrivs can belong
+	// to a different runtime thread after goroutine migration; TSYNC only
+	// synchronizes the filter after the installing thread passes this check.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetNoNewPrivs(); err != nil {
+		status.Reason = fmt.Sprintf("no_new_privs failed: %v", err)
+		return status, fmt.Errorf("setting no_new_privs before seccomp filter: %w", err)
 	}
 
 	// Install the BPF filter. Requires no_new_privs already set.
@@ -76,18 +88,20 @@ func ApplySeccomp(strict ...bool) (LayerStatus, error) {
 	return status, nil
 }
 
-// SetNoNewPrivs sets the PR_SET_NO_NEW_PRIVS flag, which is required
-// before installing a seccomp filter without CAP_SYS_ADMIN. This is
-// permanent and prevents privilege escalation via suid/sgid binaries.
+// SetNoNewPrivs sets PR_SET_NO_NEW_PRIVS on the calling OS thread. The flag is
+// permanent and prevents privilege escalation via suid/sgid binaries. Callers
+// that need it for a later syscall must stay pinned to that thread; ApplySeccomp
+// sets its own prerequisite while pinned rather than relying on an earlier call.
 func SetNoNewPrivs() error {
 	return unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 }
 
 // buildSeccompFilter constructs a BPF filter program that:
 // - Validates architecture is x86_64 (KILL on mismatch - prevents 32-bit ABI bypass)
-// - Kills the process on critical violations (kexec, kernel modules, io_uring)
+// - Kills the process on critical violations (kexec, kernel modules)
+// - Returns EPERM for io_uring and other blocked syscalls
 // - Applies argument-level filtering for clone, personality, and socket
-// - Allows a curated set of ~130 syscalls (Go + Python + Node.js compatible)
+// - Allows a curated syscall set (Go + Python + Node.js compatible)
 // - Returns EPERM for other blocked syscalls.
 func buildSeccompFilter(strict bool) []unix.SockFilter {
 	allow := allowedSyscalls()
@@ -137,7 +151,7 @@ func buildSeccompFilter(strict bool) []unix.SockFilter {
 
 	// Step 4: Conditional argument filtering.
 	// Each block is self-contained: if the syscall matches, it inspects args
-	// and returns ALLOW or EPERM. If the syscall doesn't match, it skips
+	// and returns ALLOW or an errno. If the syscall doesn't match, it skips
 	// the block and the accumulator (syscall number) is preserved.
 	prog = append(prog, cloneConditional()...)
 	prog = append(prog, clone3Conditional(strict)...)
@@ -166,10 +180,9 @@ func buildSeccompFilter(strict bool) []unix.SockFilter {
 // cloneConditional generates BPF instructions that allow clone but block
 // CLONE_NEW* flags which could create new namespaces.
 //
-// Note: clone3 takes a pointer to struct clone_args, which BPF cannot
-// dereference. clone3 is handled via the flat allowlist (no arg filtering).
-// This is mitigated by: (1) Landlock restrictions survive namespace creation,
-// (2) mount is blocked by seccomp, (3) no_new_privs prevents suid escalation.
+// clone3 takes a pointer to struct clone_args, which BPF cannot dereference.
+// clone3Conditional denies it in strict mode, so libc must use this checked
+// legacy syscall when it supports the ENOSYS compatibility fallback.
 func cloneConditional() []unix.SockFilter {
 	return []unix.SockFilter{
 		bpfJumpEq(unix.SYS_CLONE, 0, 4),                     // if clone, check args; else skip 4
@@ -182,16 +195,19 @@ func cloneConditional() []unix.SockFilter {
 
 // clone3Conditional handles clone3 based on strict mode.
 // Best-effort: allow (BPF can't inspect the pointer argument for CLONE_NEW* flags).
-// Strict: block entirely (EPERM). Go's runtime uses clone3 for goroutines on
-// newer kernels, but the sandboxed child has already forked - no new goroutines
-// are created after exec. Python/Node.js use fork+exec which falls through to
-// the clone conditional above.
+// Strict: block entirely with ENOSYS. Native runtimes create threads after
+// exec; glibc retries pthread creation with clone only when clone3 returns
+// ENOSYS. The fallback still passes through cloneConditional, which denies
+// namespace creation. No clone3 arguments are admitted or dereferenced.
+// A newer ERRNO filter can select a different errno from an inherited filter,
+// but clone3 still never executes. Higher-priority inherited deny actions and
+// inherited restrictions on legacy clone continue to apply.
 func clone3Conditional(strict bool) []unix.SockFilter {
 	if strict {
-		// Strict: deny clone3 entirely.
+		// Strict: report clone3 unavailable without executing it.
 		return []unix.SockFilter{
 			bpfJumpEq(unix.SYS_CLONE3, 0, 1),
-			bpfRet(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)),
+			bpfRet(unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)),
 		}
 	}
 	// Best-effort: allow clone3 unfiltered (known limitation).
@@ -312,6 +328,24 @@ func allowedSyscalls() []uint32 {
 		unix.SYS_RENAMEAT, unix.SYS_RENAMEAT2,
 		unix.SYS_SYMLINKAT, unix.SYS_LINKAT,
 		unix.SYS_UMASK, unix.SYS_GETCWD, unix.SYS_CHDIR, unix.SYS_FCHDIR,
+
+		// Legacy forms of syscalls whose modern siblings are allowed above.
+		// glibc on x86_64 still issues several of these (access, mkdir, rmdir,
+		// rename, unlink, chmod, link, symlink) instead of their *at variants,
+		// so without them ordinary Python and Node file operations fail with
+		// EPERM. open, creat, stat, lstat, getdents, chown and lchown are
+		// added for the same parity, since other libcs and static binaries
+		// can issue them. Each is a path operation that Landlock mediates the
+		// same way whichever form requests it, so it grants nothing its *at
+		// sibling does not. epoll_create is not a path operation and Landlock
+		// does not mediate it; it is equivalent to epoll_create1 with no
+		// flags, which is already allowed.
+		unix.SYS_ACCESS, unix.SYS_OPEN, unix.SYS_CREAT,
+		unix.SYS_STAT, unix.SYS_LSTAT, unix.SYS_GETDENTS,
+		unix.SYS_MKDIR, unix.SYS_RMDIR, unix.SYS_UNLINK, unix.SYS_RENAME,
+		unix.SYS_CHMOD, unix.SYS_CHOWN, unix.SYS_LCHOWN,
+		unix.SYS_LINK, unix.SYS_SYMLINK,
+		unix.SYS_EPOLL_CREATE,
 
 		// Network (SYS_SOCKET handled by socketConditional - AF_VSOCK blocked)
 		unix.SYS_SOCKETPAIR,

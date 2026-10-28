@@ -107,6 +107,49 @@ func TestPathEntropyExclusion_ExemptsOnlyTheNamedRoute(t *testing.T) {
 	}
 }
 
+func TestPathEntropyExclusion_HTTPEntryMatchesCleartextOnly(t *testing.T) {
+	t.Parallel()
+
+	entry := config.PathEntropyExclusion{
+		Scheme:     "http",
+		Host:       "files.vendor.example",
+		PathPrefix: "/artifacts/",
+	}
+	httpURL := "http://files.vendor.example/artifacts/" + highEntropyID
+	httpsURL := "https://files.vendor.example/artifacts/" + highEntropyID
+
+	s := pathExclusionScanner(t, entry)
+	defer s.Close()
+
+	for _, raw := range []string{httpURL, httpsURL} {
+		parsed, err := url.Parse(raw)
+		if err != nil {
+			t.Fatalf("url.Parse(%q): %v", raw, err)
+		}
+		bare := pathExclusionScanner(t)
+		if bare.checkEntropy(parsed).Allowed {
+			bare.Close()
+			t.Fatalf("probe %q is allowed with no exclusions, so this case cannot detect an installed entry", raw)
+		}
+		bare.Close()
+	}
+
+	httpParsed, err := url.Parse(httpURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(httpParsed); !res.Allowed {
+		t.Fatalf("http entry did not exempt the cleartext route: %s", res.Reason)
+	}
+	httpsParsed, err := url.Parse(httpsURL)
+	if err != nil {
+		t.Fatalf("url.Parse: %v", err)
+	}
+	if res := s.checkEntropy(httpsParsed); res.Allowed {
+		t.Fatal("http entry exempted the https URL")
+	}
+}
+
 // The whole point of a dedicated field is that it does not disable the other
 // gates the way the host-wide list does. Query entropy is the one that matters
 // most: the query is where a payload actually reaches a collector.
@@ -262,5 +305,54 @@ func TestPathEntropyExclusion_WildcardHost(t *testing.T) {
 		if blocked := !s.checkEntropy(parsed).Allowed; blocked != wantBlock {
 			t.Errorf("checkEntropy(%q) blocked = %v, want %v", raw, blocked, wantBlock)
 		}
+	}
+}
+
+// An operator's own list adds to the shipped vendor routes. It used to replace
+// them, so adding one route for one site silently dropped Google Docs and the
+// Cloudflare challenge route, and every Cloudflare-fronted site looped on its
+// bot check. An explicitly empty list is still the documented way to remove
+// the shipped set.
+func TestPathEntropyExclusion_OperatorListAddsToShippedRoutes(t *testing.T) {
+	t.Parallel()
+
+	operator := config.PathEntropyExclusion{Host: "app.vendor.example", PathPrefix: "/r/", Reason: "operator route"}
+	challenge := "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/flow/ov1/" + highEntropyID + "/" + highEntropyID
+
+	tests := []struct {
+		name      string
+		entries   []config.PathEntropyExclusion
+		rawURL    string
+		wantBlock bool
+	}{
+		{"operator route", []config.PathEntropyExclusion{operator}, "https://app.vendor.example/r/" + highEntropyID, false},
+		{"shipped challenge route kept beside an operator list", []config.PathEntropyExclusion{operator}, challenge, false},
+		{"shipped document route kept beside an operator list", []config.PathEntropyExclusion{operator}, "https://docs.google.com/document/d/" + highEntropyID + "/edit", false},
+		{"shipped challenge route on a fresh install", config.ShippedPathEntropyExclusions(), challenge, false},
+		{"explicitly empty list removes the shipped routes", []config.PathEntropyExclusion{}, challenge, true},
+		{"another path on the challenge host", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/x/" + highEntropyID, true},
+		{"a prefix that only shares the string", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/cdn-cgi/challenge-platformX/" + highEntropyID, true},
+		{"an encoded separator in the route", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com/cdn-cgi%2Fchallenge-platform/" + highEntropyID, true},
+		{"the challenge route on a third-party host", []config.PathEntropyExclusion{operator}, "https://collector.evil.test/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+		{"a lookalike challenge host", []config.PathEntropyExclusion{operator}, "https://challenges.cloudflare.com.evil.test/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+		{"cleartext to the challenge host", []config.PathEntropyExclusion{operator}, "http://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/" + highEntropyID, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			s := pathExclusionScanner(t, tt.entries...)
+			defer s.Close()
+			parsed, err := url.Parse(tt.rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			res := s.checkEntropy(parsed)
+			if blocked := !res.Allowed; blocked != tt.wantBlock {
+				t.Fatalf("checkEntropy(%q) blocked = %v, want %v; reason=%q", tt.rawURL, blocked, tt.wantBlock, res.Reason)
+			}
+			if tt.wantBlock && !strings.Contains(res.Reason, "path segment") {
+				t.Fatalf("expected a path-entropy block, got %q", res.Reason)
+			}
+		})
 	}
 }

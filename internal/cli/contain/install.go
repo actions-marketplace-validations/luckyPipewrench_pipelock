@@ -4,12 +4,14 @@
 package contain
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -20,9 +22,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"gopkg.in/yaml.v3"
 
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/serviceenv"
 )
 
 // installOpts collects the flag-derived state for runInstall. Mirrored as
@@ -80,7 +84,8 @@ Flags let CI and reviewers see the planned commands before running.
 
 Exit codes:
   0  All steps applied (or already in place).
-  1  A step failed; earlier applied steps were rolled back.
+  1  A step failed; earlier applied steps were rolled back. If an undo
+     also failed, the error names it and the host needs another install.
   2  Precondition error (not root, missing executable, bad --config).`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -185,6 +190,20 @@ func runInstall(ctx context.Context, env *installEnv, opts installOpts) error {
 	}
 
 	steps := installSteps(opts)
+	// Check the source before users, directories, or migration artifacts can
+	// change. The staged candidate is checked again before promotion.
+	target, err := pipelockConfigPreflightTargetFor(env, opts, true)
+	if err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+	}
+	if target.missingManaged {
+		// Reuse the existing missing-config diagnostic before creating users
+		// or directories for a service that cannot start.
+		return cliutil.ExitCodeError(cliutil.ExitConfig, missingManagedPipelockConfigError(target.unitPath))
+	}
+	if err := requireContainForwardProxy(env, target.checkPath, target.checkPath, opts); err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
+	}
 
 	if opts.dryRun {
 		if err := preflightPipelockConfig(ctx, env, opts, true); err != nil {
@@ -195,7 +214,7 @@ func runInstall(ctx context.Context, env *installEnv, opts installOpts) error {
 	}
 
 	_, _ = fmt.Fprintln(env.out, "pipelock contain install")
-	_, err := runSteps(ctx, env, env.out, steps)
+	_, err = runSteps(ctx, env, env.out, steps)
 	if err != nil {
 		return cliutil.ExitCodeError(cliutil.ExitGeneral, err)
 	}
@@ -299,6 +318,7 @@ func installSteps(opts installOpts) []step {
 		stepPreflight(opts),
 		stepCreateUser(true),  // proxy
 		stepCreateUser(false), // agent
+		stepCreateViewerUser(),
 		// /etc/pipelock must be traversable by pipelock-agent so the wrappers
 		// can reach /etc/pipelock/{ca.pem,combined-ca.pem,contain/tools.list}.
 		// /var/lib/pipelock holds capture data and stays pipelock-proxy-private.
@@ -307,6 +327,7 @@ func installSteps(opts installOpts) []step {
 		stepStagePipelockConfig(opts),
 		stepPreflightPipelockConfig(opts),
 		stepPromotePipelockConfig(opts),
+		stepRepairManagedConfigMode(),
 		stepChownToProxy("config", func(e *installEnv) string { return e.configDir }),
 		stepChownToProxy("data", func(e *installEnv) string { return e.dataDir }),
 		// Grant the human operator a user-scoped read+traverse ACL on the
@@ -322,7 +343,19 @@ func installSteps(opts installOpts) []step {
 		stepEnableSystemUnit(),
 		stepExportPipelockCA(),
 		stepWriteCombinedCABundle(),
+		stepInstallNetworkNamespace(),
+		// Publishes declared agent listeners to their operators. After the
+		// namespace step so the relay's JoinsNamespaceOf= target exists.
+		stepInstallPublishedServices(nil),
+		// Browsers do not consume the CA environment exported by plk-launch.
+		// Establish their per-user trust before containment can report ready.
+		stepEstablishBrowserCATrust(),
 		stepInstallNFTRules(),
+		// Resolves env.displayEnabled/displayNumber before either launch
+		// wrapper renders, so the wrappers bind the display socket that
+		// private /tmp would otherwise hide.
+		stepProvisionDisplay(),
+		stepProvisionViewer(),
 		stepWriteToolsList(),
 		stepWriteCredentialGuard(),
 		// undici shim must exist before the launch wrapper / profile script
@@ -330,15 +363,166 @@ func installSteps(opts installOpts) []step {
 		// would fail on a missing module.
 		stepWriteUndiciShim(),
 		stepWriteLaunchWrapper(),
+		stepWriteContainedLaunchWrapper(),
 		stepWriteMetaWrapper(),
 		stepWriteToolWrappers(),
 		stepWriteUtilityWrappers(),
 		stepWriteProfileScript(),
 		stepWriteAgentToolConfigs(),
+		// Chromium launch default for every contained agent that drives a browser
+		// through agent-browser. Its ownership record lives under configDir.
+		stepWriteAgentBrowserDefaults(),
 		stepWriteWrapperInventory(),
 		stepInstallSudoers(),
 		stepWaitPipelockReady(),
 	}
+}
+
+// stepWriteContainedLaunchWrapper writes the root-owned boundary that places
+// interactive plk-* launches in Pipelock's private network namespace before
+// it drops to the agent identity. Keeping namespace selection outside
+// plk-launch prevents an agent process from choosing the host namespace.
+func stepWriteContainedLaunchWrapper() step {
+	return step{
+		name: "write-plk-contained-launch",
+		desc: "write /usr/local/bin/plk-contained-launch (places agent tools in the private network namespace)",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			path := filepath.Join(env.wrapperDir, "plk-contained-launch")
+			body := renderContainedLaunchWrapper(env)
+			if existing, err := env.readFile(path); err == nil && string(existing) == body {
+				_ = env.chmod(path, modeWrapperExec)
+				return false, nil
+			}
+			if err := backupAndWrite(env, path, []byte(body), modeWrapperExec); err != nil {
+				return false, err
+			}
+			return true, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			return restoreBackup(env, filepath.Join(env.wrapperDir, "plk-contained-launch"))
+		},
+	}
+}
+
+// expandEnvironmentFlag returns the --expand-environment=no flag only when the
+// installed systemd understands it (254 and newer). A zero version means
+// detection did not run, and the flag is omitted rather than guessed: omitting
+// it costs a shell expansion the launcher does not rely on, while emitting it
+// on an older systemd breaks every contained launch.
+func expandEnvironmentFlag(env *installEnv) string {
+	if env != nil && env.systemdVersion >= systemdExpandEnvironmentMinVersion {
+		return " --expand-environment=no"
+	}
+	return ""
+}
+
+// systemdExpandEnvironmentMinVersion is the first systemd release that accepts
+// systemd-run --expand-environment. It matches the private-temp probe's gate.
+const systemdExpandEnvironmentMinVersion = 254
+
+// Absolute helper paths and a pinned PATH for the root-executed contained
+// launcher. These are the standard locations on the Linux distributions
+// containment supports; the script is refused by its own root check if it is
+// ever invoked somewhere these do not exist, which fails closed.
+const (
+	rootHelperPATH       = "/usr/sbin:/usr/bin:/sbin:/bin"
+	containIDPath        = "/usr/bin/id"
+	containSystemctlPath = "/usr/bin/systemctl"
+)
+
+// displayBindProperty returns the systemd-run --property=BindReadOnlyPaths
+// argument that exposes the managed display's Unix socket inside an
+// otherwise-private /tmp, or "" when no display is configured. This wrapper
+// is a static script rendered once at install time, so unlike `contain run`
+// (which resolves DISPLAY per invocation, honoring a live operator override)
+// it can only bind the socket for the CONFIGURED managed display; an
+// operator DISPLAY set only in their own shell is not visible here and is
+// not bound.
+func displayBindProperty(env *installEnv) string {
+	if !env.displayEnabled {
+		return ""
+	}
+	socket, ok := localDisplaySocket(displayName(env.displayNumber))
+	if !ok {
+		return ""
+	}
+	return " --property=BindReadOnlyPaths=" + socket
+}
+
+func renderContainedLaunchWrapper(env *installEnv) string {
+	anchor := filepath.Base(env.networkNamespaceUnitPath)
+	launcher := filepath.Join(env.wrapperDir, "plk-launch")
+	pinned := shellQuote(env.pipelockTarget)
+	agent := shellQuote(env.agentUserName)
+	expand := ""
+	if flag := strings.TrimSpace(expandEnvironmentFlag(env)); flag != "" {
+		expand = "  " + flag + "\n"
+	}
+	runtimeProperties := make([]string, 0, len(runtimeSocketProperties()))
+	for _, property := range runtimeSocketProperties() {
+		runtimeProperties = append(runtimeProperties, "  --property="+property)
+	}
+	return strings.Join([]string{
+		shebangBash(env),
+		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
+		"set -euo pipefail",
+		"",
+		// sudoers runs this script as ROOT, so every helper it invokes must be
+		// resolved from a path the caller cannot influence. A bare `systemctl`
+		// or `id` is looked up through PATH, and on a host whose sudo rule does
+		// not set secure_path the caller supplies that PATH: dropping a fake
+		// `systemctl` earlier in it executes arbitrary code as root, before
+		// systemd-run ever drops privileges. Pin PATH and call both helpers by
+		// absolute path so neither lookup is attacker-controlled.
+		`PATH=` + shellQuote(rootHelperPATH),
+		`export PATH`,
+		`if [[ "$(` + containIDPath + ` -u)" != "0" ]]; then`,
+		`    echo "plk-contained-launch: must run through the installed plk wrapper" >&2`,
+		`    exit 1`,
+		`fi`,
+		`if ! ` + containSystemctlPath + ` is-active --quiet ` + shellQuote(anchor) + `; then`,
+		`    echo "plk-contained-launch: the contained network namespace is inactive; run pipelock contain install" >&2`,
+		`    exit 1`,
+		`fi`,
+		// Filesystem properties are computed at launch. Command substitution
+		// under set -e aborts when the helper fails; a process substitution
+		// would not. The pinned binary is the one install placed, never PATH.
+		`launch_properties="$(` + pinned + ` contain launch-properties --agent-user ` + agent + `)" || exit 1`,
+		`property_args=()`,
+		`runtime_protect_home=''`,
+		`if [[ -n "${launch_properties}" ]]; then`,
+		`  while IFS= read -r line || [[ -n "${line}" ]]; do`,
+		`    [[ -z "${line}" ]] && continue`,
+		`    property_args+=("--property=${line}")`,
+		`    [[ "${line}" != '` + protectHomeTmpfsProperty + `' ]] || runtime_protect_home=tmpfs`,
+		`  done <<< "${launch_properties}"`,
+		`fi`,
+		`systemd_args=(`,
+		`  --wait`,
+		`  --collect`,
+		`  --service-type=exec`,
+		`  --setenv=` + runtimeProtectHomeEnv + `="${runtime_protect_home}"`,
+		strings.TrimRight(expand, "\n"),
+		`  --property=PrivateTmp=true`,
+		`  --property=PrivateNetwork=true`,
+		strings.Join(runtimeProperties, "\n"),
+		`  --property=JoinsNamespaceOf=` + shellQuote(anchor),
+		`)`,
+		`if ((${#property_args[@]} > 0)); then`,
+		`  systemd_args+=("${property_args[@]}")`,
+		`fi`,
+		`systemd_args+=(`,
+		`  --uid=` + agent,
+		`  --gid=` + agent,
+		`  --working-directory=` + shellQuote(env.agentHome),
+		`  --pipe`,
+		`  --pty`,
+		`  --`,
+		`  ` + shellQuote(launcher),
+		`)`,
+		`exec /usr/bin/systemd-run "${systemd_args[@]}" "$@"`,
+		"",
+	}, "\n")
 }
 
 func stepWaitPipelockReady() step {
@@ -357,12 +541,36 @@ func stepWaitPipelockReady() step {
 			if status != statusPass {
 				return false, fmt.Errorf("installed proxy failed readiness: %s", detail)
 			}
+			status, detail = probeContainedProxyReachability(ctx, &probeEnv{
+				agentUserName: env.agentUserName,
+				port:          env.proxyPort,
+				curlPath:      env.curlPath,
+				runCmd:        env.runCmd,
+			})
+			if status != statusPass {
+				return false, fmt.Errorf("installed proxy doorway failed readiness: %s", detail)
+			}
 			return false, nil
 		},
 	}
 }
 
 func stepWriteCredentialGuard() step {
+	// touched lists the guard files this attempt wrote. Undo restores only
+	// those: a rerun that wrote nothing must not delete or disable a guard
+	// that was already installed and current.
+	var touched []string
+	var modeChanges []struct {
+		path string
+		mode os.FileMode
+	}
+	// prevActive records a guard that was already running, so a rollback
+	// that restores its previous files starts it again instead of leaving
+	// the operator's credentials unguarded.
+	prevActive := false
+	prevEnabled := false
+	prevEnabledRuntime := false
+	enableAttempted := false
 	return step{
 		name: "write-credential-guard",
 		desc: "write and enable contain credential guard",
@@ -384,24 +592,78 @@ func stepWriteCredentialGuard() step {
 				{env.guardServiceUnit, renderCredentialGuardService(env.guardScriptPath), modeUnitFile},
 				{env.guardPathUnit, renderCredentialGuardPathUnit(home, filepath.Base(env.guardServiceUnit)), modeUnitFile},
 			}
-			appliedFiles := false
-			for _, item := range writes {
-				if err := env.mkdirAll(filepath.Dir(item.path), modeDirReadable); err != nil {
-					return false, fmt.Errorf("mkdir %s: %w", filepath.Dir(item.path), err)
+			touched = nil
+			modeChanges = nil
+			enableAttempted = false
+			rememberMode := func(path string, mode os.FileMode) {
+				for _, change := range modeChanges {
+					if change.path == path {
+						return
+					}
 				}
-				if err := env.chmod(filepath.Dir(item.path), modeDirReadable); err != nil {
-					return false, fmt.Errorf("chmod %s: %w", filepath.Dir(item.path), err)
+				modeChanges = append(modeChanges, struct {
+					path string
+					mode os.FileMode
+				}{path, mode})
+			}
+			activeOut, _, activeErr := env.runCmd(ctx, "systemctl", "is-active", filepath.Base(env.guardPathUnit))
+			if activeErr != nil {
+				return false, fmt.Errorf("systemctl is-active credential guard: %w", activeErr)
+			}
+			prevActive = strings.TrimSpace(activeOut) == systemctlActive
+			prevEnabled = false
+			prevEnabledRuntime = false
+			if _, err := env.lstat(env.guardPathUnit); err == nil {
+				enabledOut, enabledCode, enabledErr := env.runCmd(ctx, "systemctl", "is-enabled", filepath.Base(env.guardPathUnit))
+				if enabledErr != nil {
+					return false, fmt.Errorf("systemctl is-enabled credential guard: %w", enabledErr)
+				}
+				if enabledCode == 0 {
+					state := strings.TrimSpace(enabledOut)
+					prevEnabled = state == systemctlEnabled || state == "enabled-runtime"
+					prevEnabledRuntime = state == "enabled-runtime"
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return false, fmt.Errorf("stat credential guard unit %s: %w", env.guardPathUnit, err)
+			}
+			// Every error below reports the files already written, so the
+			// orchestrator runs undo and restores them.
+			for _, item := range writes {
+				dir := filepath.Dir(item.path)
+				var priorDirMode os.FileMode
+				priorDirExists := false
+				if info, err := env.lstat(dir); err == nil {
+					priorDirMode = info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky)
+					priorDirExists = true
+				} else if !errors.Is(err, os.ErrNotExist) {
+					return len(touched)+len(modeChanges) > 0, fmt.Errorf("stat %s: %w", dir, err)
+				}
+				if err := env.mkdirAll(dir, modeDirReadable); err != nil {
+					return len(touched)+len(modeChanges) > 0, fmt.Errorf("mkdir %s: %w", dir, err)
+				}
+				if priorDirExists && priorDirMode != modeDirReadable {
+					rememberMode(dir, priorDirMode)
+				}
+				if err := env.chmod(dir, modeDirReadable); err != nil {
+					return len(touched)+len(modeChanges) > 0, fmt.Errorf("chmod %s: %w", dir, err)
 				}
 				if existing, err := env.readFile(item.path); err == nil && string(existing) == item.body {
+					info, statErr := env.lstat(item.path)
+					if statErr != nil {
+						return len(touched)+len(modeChanges) > 0, fmt.Errorf("stat %s: %w", item.path, statErr)
+					}
+					if prior := info.Mode() & (os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky); prior != item.mode {
+						rememberMode(item.path, prior)
+					}
 					if err := env.chmod(item.path, item.mode); err != nil {
-						return false, fmt.Errorf("chmod %s: %w", item.path, err)
+						return len(touched)+len(modeChanges) > 0, fmt.Errorf("chmod %s: %w", item.path, err)
 					}
 					continue
 				}
 				if err := backupAndWrite(env, item.path, []byte(item.body), item.mode); err != nil {
-					return appliedFiles, fmt.Errorf("write %s: %w", item.path, err)
+					return len(touched)+len(modeChanges) > 0, fmt.Errorf("write %s: %w", item.path, err)
 				}
-				appliedFiles = true
+				touched = append(touched, item.path)
 			}
 			if out, code, err := env.runCmd(ctx, env.guardScriptPath); err != nil {
 				return true, fmt.Errorf("%s: %w", env.guardScriptPath, err)
@@ -414,6 +676,7 @@ func stepWriteCredentialGuard() step {
 				return true, fmt.Errorf("systemctl daemon-reload exit %d: %s", code, oneLine(out))
 			}
 			unit := filepath.Base(env.guardPathUnit)
+			enableAttempted = true
 			if out, code, err := env.runCmd(ctx, "systemctl", "enable", "--now", unit); err != nil {
 				return true, fmt.Errorf("systemctl enable %s: %w", unit, err)
 			} else if code != 0 {
@@ -422,22 +685,47 @@ func stepWriteCredentialGuard() step {
 			return true, nil
 		},
 		undo: func(ctx context.Context, env *installEnv) error {
-			unit := filepath.Base(env.guardPathUnit)
-			if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
-				return fmt.Errorf("disable credential guard %s: %w", unit, err)
+			if len(touched) == 0 && len(modeChanges) == 0 && !enableAttempted {
+				// No files or service state were changed by this attempt.
+				return nil
 			}
-			for _, path := range []string{env.guardPathUnit, env.guardServiceUnit, env.guardScriptPath} {
-				if err := restoreBackup(env, path); err != nil {
-					return err
+			unit := filepath.Base(env.guardPathUnit)
+			var errs []error
+			if err := runSystemctlCleanupUnit(ctx, env, "disable", "--now", unit); err != nil {
+				errs = append(errs, fmt.Errorf("disable credential guard %s: %w", unit, err))
+			}
+			for i := len(touched) - 1; i >= 0; i-- {
+				if err := restoreBackup(env, touched[i]); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			for i := len(modeChanges) - 1; i >= 0; i-- {
+				if err := env.chmod(modeChanges[i].path, modeChanges[i].mode); err != nil {
+					errs = append(errs, fmt.Errorf("restore mode %s: %w", modeChanges[i].path, err))
 				}
 			}
 			// Restore files before reloading so either manager outcome leaves the
 			// on-disk guard in its pre-install state. A failed reload is still
 			// returned; systemd may retain stale unit contents until it recovers.
 			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
-				return fmt.Errorf("systemctl daemon-reload after restoring credential guard: %w", err)
+				errs = append(errs, fmt.Errorf("systemctl daemon-reload after restoring credential guard: %w", err))
 			}
-			return nil
+			if prevEnabled {
+				args := []string{"enable"}
+				if prevEnabledRuntime {
+					args = append(args, "--runtime")
+				}
+				args = append(args, unit)
+				if err := runOrErr(ctx, env, "systemctl", args...); err != nil {
+					errs = append(errs, fmt.Errorf("restore credential guard %s enabled state: %w", unit, err))
+				}
+			}
+			if prevActive {
+				if err := runOrErr(ctx, env, "systemctl", "start", unit); err != nil {
+					errs = append(errs, fmt.Errorf("restart previous credential guard %s: %w", unit, err))
+				}
+			}
+			return errors.Join(errs...)
 		},
 	}
 }
@@ -565,25 +853,16 @@ func stepWriteToolsList() step {
 			if err := env.chmod(filepath.Dir(env.toolsListPath), modeDirTraversable); err != nil {
 				return false, fmt.Errorf("chmod %s: %w", filepath.Dir(env.toolsListPath), err)
 			}
-			defaults := resolvableDefaultToolEntries(env)
-			if len(defaults) == 0 {
-				return false, errors.New("no default agent tools found in pipelock-agent PATH (/home/pipelock-agent/.local/bin:/usr/local/bin:/usr/bin:/bin); install a tool such as claude into /usr/local/bin or use add-tool after install")
-			}
-			entries, err := readToolsList(env)
+			plan, err := plannedToolsList(env)
 			if err != nil {
-				if !errors.Is(err, os.ErrNotExist) {
-					return false, fmt.Errorf("read tools.list: %w", err)
-				}
-				if err := writeToolsList(env, defaults); err != nil {
-					return false, err
-				}
-				return true, nil
+				return false, err
 			}
-			merged, changed := mergeDefaultToolEntries(entries, defaults)
-			if !changed {
+			if !plan.changed && toolsListModeCurrent(env) {
 				return false, nil
 			}
-			if err := writeToolsList(env, merged); err != nil {
+			// Content or mode differs: rewrite through the backed-up writer so
+			// pipelock-agent can read the list and rollback restores the old file.
+			if err := writeToolsList(env, plan.entries); err != nil {
 				return false, err
 			}
 			return true, nil
@@ -592,6 +871,212 @@ func stepWriteToolsList() step {
 			return restoreBackup(env, env.toolsListPath)
 		},
 	}
+}
+
+type toolsListPlan struct {
+	entries []toolsListEntry
+	changed bool
+}
+
+// plannedToolsList computes the allow-list stepWriteToolsList writes: the
+// existing tools.list (parsed, so a malformed file fails here) merged with the
+// default tools pipelock-agent can execute. It fails unless at least one entry
+// is runnable. Preflight and the write step share it, so a host the write step
+// would refuse is refused before any step mutates it.
+func plannedToolsList(env *installEnv) (toolsListPlan, error) {
+	defaults := resolvableDefaultToolEntries(env)
+	existing, err := readToolsList(env)
+	existed := true
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return toolsListPlan{}, fmt.Errorf("read tools.list: %w", err)
+		}
+		existed = false
+	}
+	plan := toolsListPlan{entries: defaults, changed: true}
+	if existed {
+		plan.entries, plan.changed = mergeDefaultToolEntries(existing, defaults)
+	}
+	// plk-launch uses the first line whose name matches, so only the first
+	// entry for each name decides whether that tool can launch.
+	seen := make(map[string]bool, len(plan.entries))
+	for _, e := range plan.entries {
+		if seen[e.name] {
+			continue
+		}
+		seen[e.name] = true
+		if toolsListEntryRunnable(env, e) {
+			return plan, nil
+		}
+	}
+	return toolsListPlan{}, noAgentToolsError(env)
+}
+
+// toolsListModeCurrent reports whether an existing tools.list already has the
+// managed pipelock-agent-readable mode. Any stat failure reports false, so the
+// write step rewrites the file rather than trusting it.
+func toolsListModeCurrent(env *installEnv) bool {
+	info, err := env.stat(env.toolsListPath)
+	return err == nil && info.Mode().IsRegular() && info.Mode().Perm() == modeAllowListReadable
+}
+
+// agentToolsPrereq is the preflight form of plannedToolsList.
+func agentToolsPrereq(env *installEnv) error {
+	_, err := plannedToolsList(env)
+	return err
+}
+
+// toolsListEntryRunnable reports whether plk-launch could start the entry as
+// pipelock-agent: a pinned target, or the path an unpinned name resolves to in
+// pipelock-agent PATH, must be a regular file pipelock-agent can execute and
+// reach through directories it can search.
+func toolsListEntryRunnable(env *installEnv, e toolsListEntry) bool {
+	target := e.target
+	if target == "" {
+		resolved, ok := resolveToolInAgentPath(env, e.name)
+		if !ok {
+			return false
+		}
+		target = resolved
+	}
+	if env.toolCanExecute != nil {
+		return env.toolCanExecute(target)
+	}
+	return agentCanExecute(env, target)
+}
+
+// agentIdentity is the uid and group set execute permission is judged against.
+// known is false before install creates pipelock-agent; a new system user owns
+// no existing file and belongs to no existing group, so only "other" bits apply.
+type agentIdentity struct {
+	known  bool
+	uid    uint32
+	groups map[uint32]bool
+}
+
+func lookupAgentIdentity(env *installEnv) agentIdentity {
+	if env.lookupUser == nil {
+		return agentIdentity{}
+	}
+	u, err := env.lookupUser(env.agentUserName)
+	if err != nil {
+		return agentIdentity{}
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return agentIdentity{}
+	}
+	id := agentIdentity{known: true, uid: uint32(uid), groups: map[uint32]bool{}}
+	if gid, err := strconv.ParseUint(u.Gid, 10, 32); err == nil {
+		id.groups[uint32(gid)] = true
+	}
+	if gids, err := u.GroupIds(); err == nil {
+		for _, g := range gids {
+			if gid, err := strconv.ParseUint(g, 10, 32); err == nil {
+				id.groups[uint32(gid)] = true
+			}
+		}
+	}
+	return id
+}
+
+// permits reports whether id holds the permission bit (0o1 execute/search)
+// that mode grants to owner, group or other, as the kernel picks one class.
+func (id agentIdentity) permits(info os.FileInfo, bit os.FileMode) bool {
+	perm := info.Mode().Perm()
+	if id.known {
+		if uid, ok := fileOwnerUID(info); ok && uid == id.uid {
+			return perm&(bit<<6) != 0
+		}
+		if gid, ok := fileOwnerGID(info); ok && id.groups[gid] {
+			return perm&(bit<<3) != 0
+		}
+	}
+	return perm&bit != 0
+}
+
+// agentCanExecute reports whether pipelock-agent can execute path: every
+// ancestor directory grants it search, and path is a regular file granting it
+// execute. A stat failure anywhere reports false.
+func agentCanExecute(env *installEnv, path string) bool {
+	// The raw path is walked, not a filepath.Clean copy: Clean drops a
+	// trailing "/." or "/" and folds "link/.." lexically, while the kernel
+	// requires a directory there and resolves ".." after the link.
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	id := lookupAgentIdentity(env)
+	final, ok := agentWalkPath(env, id, path)
+	if !ok {
+		return false
+	}
+	info, err := env.stat(final)
+	return err == nil && info.Mode().IsRegular() && id.permits(info, 0o1)
+}
+
+// maxSymlinkHops matches Linux's MAXSYMLINKS for one path resolution.
+const maxSymlinkHops = 40
+
+// agentWalkPath resolves an absolute path the way the kernel does, one
+// component at a time, expanding every symlink where it is met (nested links
+// included) and requiring search permission for id on each directory it looks
+// a component up in. It returns the final resolved path.
+func agentWalkPath(env *installEnv, id agentIdentity, p string) (string, bool) {
+	cur := string(filepath.Separator)
+	pending := strings.Split(strings.TrimPrefix(p, cur), cur)
+	hops := 0
+	for len(pending) > 0 {
+		name := pending[0]
+		pending = pending[1:]
+		// Every component, including "", "." and "..", is looked up in cur, so
+		// cur must be a directory id can search. An empty component comes from
+		// a trailing or doubled slash; the kernel refuses "file/", "file/." and
+		// "file/.." with ENOTDIR, and so must this walk.
+		dirInfo, err := env.stat(cur)
+		if err != nil || !dirInfo.IsDir() || !id.permits(dirInfo, 0o1) {
+			return "", false
+		}
+		switch name {
+		case "", ".":
+			continue
+		case "..":
+			cur = filepath.Dir(cur)
+			continue
+		}
+		next := filepath.Join(cur, name)
+		linkInfo, err := env.lstat(next)
+		if err != nil {
+			// No lstat answer: accept only a path stat also finds, as a plain
+			// entry. On a real filesystem both fail together.
+			if _, statErr := env.stat(next); statErr != nil {
+				return "", false
+			}
+			cur = next
+			continue
+		}
+		if linkInfo.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		hops++
+		if hops > maxSymlinkHops {
+			return "", false
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", false
+		}
+		if filepath.IsAbs(target) {
+			cur = string(filepath.Separator)
+		}
+		pending = append(strings.Split(strings.TrimPrefix(target, string(filepath.Separator)), string(filepath.Separator)), pending...)
+	}
+	return cur, true
+}
+
+func noAgentToolsError(env *installEnv) error {
+	return fmt.Errorf("no agent tools found: none of %s is executable in pipelock-agent PATH (%s) and %s lists no runnable tool; install one into /usr/local/bin and rerun pipelock contain install",
+		strings.Join(defaultToolNames(), ", "), agentExecPath(env.agentUserName), env.toolsListPath)
 }
 
 // renderDefaultToolsList emits the v0.2 default allow-list. Format is
@@ -649,14 +1134,17 @@ func resolveToolInAgentPath(env *installEnv, name string) (string, bool) {
 }
 
 func mergeDefaultToolEntries(existing, defaults []toolsListEntry) ([]toolsListEntry, bool) {
-	defaultNames := make(map[string]bool, len(defaultToolWrappers))
-	for _, name := range defaultToolNames() {
-		defaultNames[name] = true
+	// A resolved default replaces an existing entry of the same name. An
+	// existing default-named entry with no resolved replacement (for example a
+	// pinned target outside the agent PATH) is kept rather than dropped.
+	replaced := make(map[string]bool, len(defaults))
+	for _, d := range defaults {
+		replaced[d.name] = true
 	}
 	merged := make([]toolsListEntry, 0, len(existing)+len(defaults))
 	merged = append(merged, defaults...)
 	for _, e := range existing {
-		if defaultNames[e.name] {
+		if replaced[e.name] {
 			continue
 		}
 		merged = append(merged, e)
@@ -777,19 +1265,25 @@ func toolsListEntriesEqual(a, b []toolsListEntry) bool {
 // Step 1: preflight
 // ---------------------------------------------------------------------------
 
-func stepPreflight(_ installOpts) step {
+func stepPreflight(opts installOpts) step {
 	return step{
 		name: "preflight",
-		desc: "preflight: required binaries present (useradd / systemctl / visudo / sudo / setfacl)",
+		desc: "preflight: required binaries present (useradd / systemctl / visudo / sudo / setfacl / certutil) and an agent tool to allow-list",
 		apply: func(_ context.Context, env *installEnv) (bool, error) {
 			for _, b := range []string{"useradd", "userdel", "systemctl", "visudo", "sudo", "setfacl", "find", "chmod"} {
 				if err := expectExec(b); err != nil {
+					if b == "setfacl" {
+						return false, fmt.Errorf("setfacl missing; install acl: %w", err)
+					}
 					return false, err
 				}
 			}
 			for label, path := range map[string]string{
 				"bash":    env.bashPath,
 				"nologin": env.nologinPath,
+				// The namespace doorway probe runs curl. Refusing here
+				// avoids writing units and then rolling them back.
+				"curl": env.curlPath,
 			} {
 				if err := expectExecutablePath(env.stat, label, path); err != nil {
 					return false, err
@@ -797,6 +1291,26 @@ func stepPreflight(_ installOpts) step {
 			}
 			if err := expectPrivilegedExecutablePath(env.stat, "nft", env.nftPath); err != nil {
 				return false, err
+			}
+			// Later steps need these unconditionally. Checking here refuses the
+			// host before any mutation instead of rolling back a partial install.
+			if err := resolveCertutil(env.lookPath); err != nil {
+				return false, missingCertutilError(env.platformFamily)
+			}
+			if err := agentToolsPrereq(env); err != nil {
+				return false, err
+			}
+			configPath := managedPipelockConfigPath(env)
+			if opts.configSource != "" {
+				configPath = opts.configSource
+			}
+			if cfg, err := config.LoadForInspection(configPath); err == nil {
+				display := cfg.Containment.Display
+				if display.IsEnabled(xvfbInstalled(env)) && display.EffectiveBackend() == "xvnc" {
+					if _, err := findXvnc(env); err != nil {
+						return false, err
+					}
+				}
 			}
 			return true, nil
 		},
@@ -897,7 +1411,8 @@ func stepCreateDir(label string, pathFn func(*installEnv) string, mode os.FileMo
 				return false, fmt.Errorf("mkdir %s: %w", path, err)
 			}
 			if err := env.chmod(path, mode); err != nil {
-				return false, fmt.Errorf("chmod %s: %w", path, err)
+				// The directory now exists; report it so undo removes it.
+				return true, fmt.Errorf("chmod %s: %w", path, err)
 			}
 			return true, nil
 		},
@@ -957,19 +1472,32 @@ func stepStagePipelockConfig(opts installOpts) step {
 			if err != nil {
 				return false, fmt.Errorf("read --config %s: %w", opts.configSource, err)
 			}
+			// Migration may already have written artifacts. Clean them up
+			// here; if that fails, report applied so rollback retries the
+			// cleanup and reports it if it still cannot.
+			cleanup := func(cause error) (bool, error) {
+				if cerr := cleanupMigratedConfigArtifacts(env, migrated); cerr != nil {
+					return true, errors.Join(cause, cerr)
+				}
+				return false, cause
+			}
 			data, migrated, err = migratePipelockConfigForContain(env, opts.configSource, data)
 			if err != nil {
-				_ = cleanupMigratedConfigArtifacts(env, migrated)
-				return false, err
+				return cleanup(err)
+			}
+			// A brand-new managed config gets filesystem enforce. An existing
+			// file, including one that never mentioned the key, stays as it is
+			// so an upgrade does not start hiding the operator's filesystem.
+			data, err = applyFreshFilesystemDefault(env, data)
+			if err != nil {
+				return cleanup(err)
 			}
 			paths, err := containServiceReadOnlyPaths(data, env.proxyPort)
 			if err != nil {
-				_ = cleanupMigratedConfigArtifacts(env, migrated)
-				return false, fmt.Errorf("read file_sentry paths for service sandbox: %w", err)
+				return cleanup(fmt.Errorf("read file_sentry paths for service sandbox: %w", err))
 			}
 			if err := env.writeFile(stagedPipelockConfigPath(env), data, modeConfigSecret); err != nil {
-				_ = cleanupMigratedConfigArtifacts(env, migrated)
-				return false, fmt.Errorf("stage config candidate: %w", err)
+				return cleanup(fmt.Errorf("stage config candidate: %w", err))
 			}
 			env.serviceReadOnlyPaths = paths
 			staged = true
@@ -987,6 +1515,75 @@ func stepStagePipelockConfig(opts installOpts) step {
 				}
 			}
 			return errors.Join(stagedErr, cleanupMigratedConfigArtifacts(env, migrated))
+		},
+	}
+}
+
+// stepRepairManagedConfigMode tightens an already-installed config that carries
+// a mode the admin CLI refuses. Promotion cannot do this: it returns early when
+// install runs without --config, and again when the staged bytes are identical
+// to what is already there, so an upgrade over a config written by an older
+// version keeps that version's mode forever. The admin CLI reads this file for
+// its API token and rejects any group, world or owner-execute bit, so leaving
+// the mode alone leaves every shipped admin command broken on exactly the
+// installs that have been running longest.
+// configModeRepairer returns the descriptor-based mode repair, letting a test
+// inject a failure. One accessor for both apply and undo keeps the two halves
+// using the same operation.
+func configModeRepairer(env *installEnv) func(string, os.FileMode, bool) (os.FileMode, bool, error) {
+	if env.repairLeafMode != nil {
+		return env.repairLeafMode
+	}
+	return setLeafModeNoFollow
+}
+
+func stepRepairManagedConfigMode() step {
+	var (
+		repaired     bool
+		previousMode os.FileMode
+		repairedPath string
+	)
+	return step{
+		name: "repair-config-mode",
+		desc: "tighten an existing pipelock.yaml that carries a mode the admin CLI rejects",
+		apply: func(_ context.Context, env *installEnv) (bool, error) {
+			repaired = false
+			dst := managedPipelockConfigPath(env)
+
+			// The descriptor-based repair reads and changes the mode through one
+			// O_NOFOLLOW open, so there is no path-based stat to race and no
+			// separate existence probe to get wrong.
+			prev, changed, err := configModeRepairer(env)(dst, modeConfigSecret, true)
+			if err != nil {
+				// Absence is the ordinary first-install case: promotion owns
+				// creating the file. Every OTHER error, including a permission
+				// or I/O failure and a symlinked leaf, must surface, or install
+				// reports success while leaving a config the admin CLI refuses.
+				if errors.Is(err, os.ErrNotExist) {
+					return false, nil
+				}
+				return false, fmt.Errorf("repair %s mode: %w", dst, err)
+			}
+			if !changed {
+				return false, nil
+			}
+			repaired, previousMode, repairedPath = true, prev, dst
+			_, _ = fmt.Fprintf(env.out,
+				"  tightened %s from %#o to %#o so the admin API commands can read it\n",
+				dst, prev, modeConfigSecret)
+			return true, nil
+		},
+		undo: func(_ context.Context, env *installEnv) error {
+			if !repaired {
+				return nil
+			}
+			// Rollback must put back the mode this step found, or a later step's
+			// failure leaves the file tightened and the install half-applied.
+			if _, _, err := configModeRepairer(env)(repairedPath, previousMode, false); err != nil {
+				return fmt.Errorf("restore %s mode: %w", repairedPath, err)
+			}
+			repaired = false
+			return nil
 		},
 	}
 }
@@ -1065,7 +1662,9 @@ func stepPreflightPipelockConfig(opts installOpts) step {
 			if err := preflightPipelockConfig(ctx, env, opts, false); err != nil {
 				return false, err
 			}
-			return false, nil
+			// The check ran and passed; report it like stepPreflight so the
+			// install log does not print a completed check as [SKIP].
+			return true, nil
 		},
 		undo: nil,
 	}
@@ -1084,13 +1683,11 @@ func preflightPipelockConfig(ctx context.Context, env *installEnv, opts installO
 		return err
 	}
 	if target.missingManaged {
-		return fmt.Errorf("contain install config preflight failed for %s: --config is required if the managed config is not already in place. "+
-			"No --config was given and no config exists at the managed path, so the service would start with no configuration. "+
-			"Pass --config to copy a pipelock.yaml to %s. "+
-			"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules",
-			target.unitPath, target.unitPath)
+		return missingManagedPipelockConfigError(target.unitPath)
 	}
+	pathCheckOpts := installOpts{dryRun: dryRun}
 	if target.drySource {
+		pathCheckOpts.configSource = opts.configSource
 		_, _ = fmt.Fprintf(env.out,
 			"  [INFO] dry-run config preflight: validating --config %s before it would be installed as %s\n",
 			target.checkPath, target.unitPath)
@@ -1101,29 +1698,36 @@ func preflightPipelockConfig(ctx context.Context, env *installEnv, opts installO
 			"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules",
 			target.unitPath, env.pipelockBinary, err)
 	}
-	out, code, err := env.runCmd(ctx, env.pipelockBinary, "check", "--config", target.checkPath)
+	if env.checkServiceConfig == nil {
+		return errors.New("contain install requires service configuration validation; refusing installer-environment fallback")
+	}
+	// The validator opens its executable without following a leaf symlink, but
+	// install itself hashes and copies through one. Hand it the resolved regular
+	// file so a symlinked --pipelock-binary is not refused with a message that
+	// blames the config; the before/after hashes still bind the same content.
+	validatorPath, err := filepath.Abs(env.pipelockBinary)
+	if err == nil {
+		validatorPath, err = filepath.EvalSymlinks(validatorPath)
+	}
 	if err != nil {
+		return errors.New("cannot resolve selected service validator path")
+	}
+	candidatePath, err := filepath.Abs(target.checkPath)
+	if err != nil {
+		return errors.New("cannot resolve service candidate configuration path")
+	}
+	if err := env.checkServiceConfig(ctx, serviceenv.CheckOptions{
+		Binary: validatorPath, ConfigFile: candidatePath, Service: serviceenv.Unit,
+		RequireBuildCompatibility: true, AllowMissing: true, PlannedUser: env.proxyUserName,
+		PlannedEnvironment: managedServiceEnvironment(env),
+	}); err != nil {
+		if dryRun && errors.Is(err, serviceenv.ErrUnavailable) {
+			_, _ = fmt.Fprintln(env.out, "  [DEFERRED] service environment validation unavailable; configuration not validated. The privileged install must validate after creating the service identity and again before service start.")
+			return requireContainForwardProxy(env, target.checkPath, target.unitPath, pathCheckOpts)
+		}
 		return fmt.Errorf("contain install config preflight failed for %s using selected binary %s: %w. "+
 			"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules; fix the config and rerun install",
 			target.unitPath, env.pipelockBinary, err)
-	}
-	if code != 0 {
-		detail := strings.TrimSpace(out)
-		if detail == "" {
-			detail = fmt.Sprintf("pipelock check exited %d", code)
-		}
-		// The binary reports the path it was handed, which during a --config
-		// install is the staging path. An operator has no such file to edit and
-		// no reason to know staging exists, so report the managed path the
-		// candidate was destined for instead.
-		// Dry run checks the operator's own --config file, which is the path
-		// they should see, so the rewrite applies only to the staging path.
-		if !target.drySource && target.checkPath != target.unitPath {
-			detail = strings.ReplaceAll(detail, target.checkPath, target.unitPath)
-		}
-		return fmt.Errorf("contain install config preflight failed for %s using selected binary %s: %s. "+
-			"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules; remove the unsupported or invalid field from the config and rerun install",
-			target.unitPath, env.pipelockBinary, oneLine(detail))
 	}
 	binaryHashAfter, err := env.hashFile(env.pipelockBinary)
 	if err != nil {
@@ -1136,10 +1740,47 @@ func preflightPipelockConfig(ctx context.Context, env *installEnv, opts installO
 			"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules; rerun install with a stable --pipelock-binary path",
 			target.unitPath, env.pipelockBinary)
 	}
+	if err := requireContainForwardProxy(env, target.checkPath, target.unitPath, pathCheckOpts); err != nil {
+		return err
+	}
 	if !dryRun {
 		env.preflightBinaryHash = binaryHashAfter
 	}
 	return nil
+}
+
+func missingManagedPipelockConfigError(path string) error {
+	return fmt.Errorf("contain install config preflight failed for %s: --config is required if the managed config is not already in place. "+
+		"No --config was given and no config exists at the managed path, so the service would start with no configuration. "+
+		"Pass --config to copy a pipelock.yaml to %s. "+
+		"Refusing before replacing the service binary, writing the system unit, restarting pipelock, or loading nftables rules",
+		path, path)
+}
+
+// General config validation permits fetch-only operation. Containment needs
+// forwarding because its clients use CONNECT and absolute-URI requests.
+func requireContainForwardProxy(env *installEnv, checkPath, displayPath string, opts installOpts) error {
+	data, err := env.readFile(checkPath)
+	if err != nil {
+		return fmt.Errorf("contain install config preflight failed for %s: read config: %w; refusing config promotion, binary installation, service restart, or nftables loading", displayPath, err)
+	}
+	if opts.configSource != "" {
+		data, err = previewContainWritablePaths(env, opts.configSource, data)
+		if err != nil {
+			return fmt.Errorf("contain install config preflight failed for %s: parse config for migration preview: %w", displayPath, err)
+		}
+	}
+	cfg := config.Defaults()
+	cfg.ForwardProxy.Enabled = false // containment requires an explicit declaration
+	// The selected binary still owns full schema and build compatibility.
+	// Apply runtime defaults without opening runtime files.
+	if err := yaml.Unmarshal(data, cfg); err != nil {
+		return fmt.Errorf("contain install config preflight failed for %s: parse config: %w; refusing config promotion, binary installation, service restart, or nftables loading", displayPath, err)
+	}
+	if !cfg.ForwardProxy.Enabled {
+		return fmt.Errorf("contain install config preflight failed for %s: containment requires forward_proxy.enabled: true for CONNECT and absolute-URI requests; set forward_proxy.enabled: true in this config and rerun contain install; refusing config promotion, binary installation, service restart, or nftables loading", displayPath)
+	}
+	return requireContainWritePaths(env, cfg, displayPath, opts.dryRun)
 }
 
 // pipelockConfigPreflightTargetFor resolves which config path preflight checks
@@ -1181,27 +1822,36 @@ func managedPipelockConfigPath(env *installEnv) string {
 
 // declaredContainmentLoopbackServices reads the already-promoted managed
 // config's containment.loopback_services, the outbound-exception sibling of
-// containment.metrics_exposure, so contain install can render the declared
-// exceptions into the SAME managed nft block as the implicit proxy-port
-// allow. A missing managed config (a first install ordering issue this
+// containment.metrics_exposure, so contain install can render namespace-bound
+// socket forwarders. A missing managed config (a first install ordering issue this
 // function is never reached at, or a test env with no staged config) is
 // treated as no declared exceptions rather than a hard error, matching the
 // pre-existing behavior of installs that never declared any loopback
 // service. Any other read/parse/validation failure fails install closed:
 // contain install must never load an nft ruleset it cannot account for.
 func declaredContainmentLoopbackServices(env *installEnv, proxyPort int) ([]config.ContainmentLoopbackService, error) {
+	declared, _, err := declaredContainmentLoopbackServicesWithLapsed(env, proxyPort)
+	return declared, err
+}
+
+// declaredContainmentLoopbackServicesWithLapsed is
+// declaredContainmentLoopbackServices plus the expired entries it dropped. An
+// expired entry is a lapsed grant: install proceeds without it, so the
+// operator can re-run install to retire its doorway, while a malformed,
+// duplicate, or proxy-port entry still fails install closed.
+func declaredContainmentLoopbackServicesWithLapsed(env *installEnv, proxyPort int) ([]config.ContainmentLoopbackService, []config.LapsedContainmentGrant, error) {
 	data, err := env.readFile(managedPipelockConfigPath(env))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("read managed config %s: %w", managedPipelockConfigPath(env), err)
+		return nil, nil, fmt.Errorf("read managed config %s: %w", managedPipelockConfigPath(env), err)
 	}
-	declared, err := parseContainmentLoopbackServicesFromConfigBytes(data, proxyPort, time.Now())
+	declared, lapsed, err := parseContainmentLoopbackServicesWithLapsed(data, proxyPort, time.Now())
 	if err != nil {
-		return nil, fmt.Errorf("managed config %s: %w", managedPipelockConfigPath(env), err)
+		return nil, nil, fmt.Errorf("managed config %s: %w", managedPipelockConfigPath(env), err)
 	}
-	return declared, nil
+	return declared, lapsed, nil
 }
 
 // bytesEqual compares two byte slices without dragging in the bytes
@@ -1268,11 +1918,18 @@ func walkAndChown(env *installEnv, root string, uid, gid int) error {
 // ---------------------------------------------------------------------------
 
 func stepInstallPipelockBinary() step {
+	var managedUnits []managedNamespaceRuntimeUnit
+	var managedStates map[string]unitRuntimeState
+	// binaryWritten records that this attempt replaced the binary. Undo
+	// restores it only then: after a quiesce failure the binary is untouched,
+	// and restoring it would delete it or swap in an older release's backup.
+	binaryWritten := false
 	return step{
 		name: "install-pipelock-binary",
 		desc: "install pipelock binary to /usr/local/bin/pipelock (0o755)",
-		apply: func(_ context.Context, env *installEnv) (bool, error) {
+		apply: func(ctx context.Context, env *installEnv) (bool, error) {
 			env.serviceBinaryChanged = false
+			binaryWritten = false
 			if env.preflightBinaryHash != "" {
 				srcHash, err := env.hashFile(env.pipelockBinary)
 				if err != nil {
@@ -1306,17 +1963,41 @@ func stepInstallPipelockBinary() step {
 					return false, nil
 				}
 			}
-			if err := backupAndWrite(env, env.pipelockTarget, data, modeWrapperExec); err != nil {
-				return false, err
+			managedUnits, err = managedNamespaceRuntimeUnits(env)
+			if err != nil {
+				return false, fmt.Errorf("read managed namespace units before binary replacement: %w", err)
 			}
+			managedStates = captureManagedNamespaceRuntimeState(ctx, env, managedUnits)
+			if err := quiesceManagedNamespaceRuntimeUnits(ctx, env, managedUnits, managedStates); err != nil {
+				return true, err
+			}
+			if err := backupAndWrite(env, env.pipelockTarget, data, modeWrapperExec); err != nil {
+				return true, err
+			}
+			binaryWritten = true
 			env.serviceBinaryChanged = true
+			if err := restoreManagedNamespaceRuntimeUnits(ctx, env, managedUnits, managedStates); err != nil {
+				return true, fmt.Errorf("restore managed namespace units after binary replacement: %w", err)
+			}
 			return true, nil
 		},
 		undo: func(ctx context.Context, env *installEnv) error {
-			if err := restoreBackup(env, env.pipelockTarget); err != nil {
-				return err
+			var errs []error
+			if err := quiesceManagedNamespaceRuntimeUnits(ctx, env, managedUnits, managedStates); err != nil {
+				errs = append(errs, err)
 			}
-			return restartRestoredServiceIfNeeded(ctx, env)
+			if binaryWritten {
+				if err := restoreBackup(env, env.pipelockTarget); err != nil {
+					errs = append(errs, err)
+				}
+			}
+			if err := restartRestoredServiceIfNeeded(ctx, env); err != nil {
+				errs = append(errs, err)
+			}
+			if err := restoreManagedNamespaceRuntimeUnits(ctx, env, managedUnits, managedStates); err != nil {
+				errs = append(errs, err)
+			}
+			return errors.Join(errs...)
 		},
 	}
 }
@@ -1356,8 +2037,11 @@ func stepWriteIntegrityPin() step {
 			}
 			// Pin file ownership: pipelock-proxy owns the private
 			// integrity directory and pin. pipelock-agent cannot traverse it.
+			// The pin is already rewritten, so report it applied: rollback
+			// must restore the previous pin, or a restored binary is refused
+			// by the pin that names the binary this attempt installed.
 			if err := ensureIntegrityOwnership(env); err != nil {
-				return false, err
+				return true, err
 			}
 			return true, nil
 		},
@@ -1515,13 +2199,21 @@ func leadingVersionNumber(field string) int {
 	return version
 }
 
+// managedServiceEnvironment is shared by the provisional observer and unit.
+// XDG_STATE_HOME keeps writable runtime state under the service data directory.
+func managedServiceEnvironment(env *installEnv) []string {
+	return []string{config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue, "XDG_STATE_HOME=" + filepath.Join(env.dataDir, "state")}
+}
+
+func managedServiceArgv(env *installEnv) []string {
+	return []string{env.pipelockTarget, "run", "--config", managedPipelockConfigPath(env), "--capture-output", filepath.Join(env.dataDir, "captures")}
+}
+
 // renderSystemUnit produces the pipelock.service body. Inline here so tests
 // can call it directly without a tmpdir. The hardening directives mirror
 // the runbook; the firewall is the real boundary, these are defense in
 // depth.
 func renderSystemUnit(env *installEnv) string {
-	configPath := managedPipelockConfigPath(env)
-	capturePath := filepath.Join(env.dataDir, "captures")
 	// On systemd 253+ the unit is Type=notify-reload: systemd sends SIGHUP
 	// itself and `systemctl reload` waits for the daemon's own verdict. No
 	// ExecReload there, because one that also sends SIGHUP would run every
@@ -1545,9 +2237,12 @@ func renderSystemUnit(env *installEnv) string {
 		serviceType,
 		"User=" + env.proxyUserName,
 		"Group=" + env.proxyUserName,
-		"Environment=" + config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue,
-		"ExecStart=" + env.pipelockTarget + " run --config " + configPath + " --capture-output " + capturePath,
 	}
+	// Use the same declarations for provisional validation and rendering.
+	for _, assignment := range managedServiceEnvironment(env) {
+		lines = append(lines, "Environment="+assignment)
+	}
+	lines = append(lines, "ExecStart="+strings.Join(managedServiceArgv(env), " "))
 	lines = append(lines, reloadLines...)
 	lines = append(lines,
 		"Restart=on-failure",
@@ -1557,7 +2252,11 @@ func renderSystemUnit(env *installEnv) string {
 		// overrides DefaultTimeoutStartSec to infinity would otherwise turn a
 		// stuck start into a hung boot dependency. 90 s is systemd's stock
 		// default, so ordinary hosts see no change.
-		"TimeoutStartSec=90",
+		fmt.Sprintf("TimeoutStartSec=%d", int64(cliutil.ServiceStartTimeout/time.Second)),
+		// Stated for the opposite reason: closing the receipt group at shutdown
+		// can outlast systemd's 90 s stock stop budget on a small host with a
+		// long history, and a SIGKILL there leaves the run unsealed.
+		fmt.Sprintf("TimeoutStopSec=%d", int64(cliutil.ServiceStopTimeout/time.Second)),
 		"",
 		"NoNewPrivileges=true",
 		"ProtectSystem=strict",
@@ -1611,6 +2310,12 @@ func stepEnableSystemUnit() step {
 		desc: "systemctl daemon-reload + enable --now pipelock.service",
 		apply: func(ctx context.Context, env *installEnv) (bool, error) {
 			if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
+				return false, err
+			}
+			// This is the prospective unit after its replacement and reload.
+			// Checking the previous unit's environment before writing it cannot
+			// prove that an upgrade will still resolve its configuration inputs.
+			if err := validateProspectivePipelockConfig(ctx, env); err != nil {
 				return false, err
 			}
 			activeOut, _, _ := env.runCmd(ctx, "systemctl", "is-active", "pipelock")
@@ -1668,6 +2373,31 @@ func stepEnableSystemUnit() step {
 	}
 }
 
+func validateProspectivePipelockConfig(ctx context.Context, env *installEnv) error {
+	if env.checkServiceConfig == nil {
+		return errors.New("prospective unit configuration validator is unavailable; refusing service start")
+	}
+	if env.preflightBinaryHash == "" {
+		return errors.New("config-preflight binary identity is missing; refusing service start")
+	}
+	hash, err := env.hashFile(env.pipelockTarget)
+	if err != nil || hash != env.preflightBinaryHash {
+		return errors.New("installed binary differs from config-preflight binary; refusing service start")
+	}
+	if err := env.checkServiceConfig(ctx, serviceenv.CheckOptions{
+		Binary: env.pipelockTarget, ConfigFile: managedPipelockConfigPath(env), Service: serviceenv.Unit,
+		RequireBuildCompatibility: true, ExpectedFragmentPath: env.systemUnitPath,
+		ExpectedExecStart: managedServiceArgv(env),
+	}); err != nil {
+		return fmt.Errorf("prospective pipelock.service configuration validation failed before service start: %w", err)
+	}
+	hash, err = env.hashFile(env.pipelockTarget)
+	if err != nil || hash != env.preflightBinaryHash {
+		return errors.New("installed binary changed during prospective config validation; refusing service start")
+	}
+	return nil
+}
+
 func restartRestoredServiceIfNeeded(ctx context.Context, env *installEnv) error {
 	if !env.installServiceStateKnown || !env.installServiceWasActive {
 		return nil
@@ -1698,28 +2428,47 @@ func stepExportPipelockCA() step {
 		desc: "export pipelock TLS-MITM CA to /etc/pipelock/ca.pem",
 		apply: func(ctx context.Context, env *installEnv) (bool, error) {
 			wrote = false
-			if pathExists(env, env.caExportPath) {
-				return false, nil
-			}
-			// Run as pipelock-proxy so the CA lookup uses the running
-			// instance's data dir layout. The pipelock CLI writes the CA
-			// PEM to stdout via `tls show-ca` - there is no --output flag,
-			// so we capture stdout here and write the file in Go after a
-			// PEM-shape sanity check.
-			if err := exportPipelockCA(ctx, env); err != nil {
+			current, err := currentPipelockCA(ctx, env)
+			if err != nil {
 				return false, err
 			}
-			wrote = true
-			return true, nil
+			changed, err := backupAndWriteIfChanged(env, env.caExportPath, current, modeCAReadable)
+			if err != nil {
+				return false, fmt.Errorf("write current Pipelock CA export: %w", err)
+			}
+			// Everything below runs AFTER the file has already been mutated, so
+			// each failure restores the previous export itself. If that
+			// restore fails, report applied so rollback retries it (the
+			// restore is safe to repeat) and reports it if it still cannot.
+			restore := func(cause error) (bool, error) {
+				if !changed {
+					return false, cause
+				}
+				if rerr := restoreBackup(env, env.caExportPath); rerr != nil {
+					wrote = true
+					return true, fmt.Errorf("%w (and restoring the previous export failed: %w)", cause, rerr)
+				}
+				return false, cause
+			}
+			exported, err := env.readFile(env.caExportPath)
+			if err != nil {
+				return restore(fmt.Errorf("read exported Pipelock CA %s: %w", env.caExportPath, err))
+			}
+			verifiedCurrent, err := currentPipelockCA(ctx, env)
+			if err != nil {
+				return restore(fmt.Errorf("read current Pipelock CA after export: %w", err))
+			}
+			if !bytes.Equal(exported, verifiedCurrent) {
+				return restore(fmt.Errorf("exported Pipelock CA %s does not match the selected Pipelock CA", env.caExportPath))
+			}
+			wrote = changed
+			return changed, nil
 		},
 		undo: func(_ context.Context, env *installEnv) error {
 			if !wrote {
 				return nil
 			}
-			if err := env.removeFile(env.caExportPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("remove %s: %w", env.caExportPath, err)
-			}
-			return nil
+			return restoreBackup(env, env.caExportPath)
 		},
 	}
 }
@@ -1777,8 +2526,8 @@ func stepInstallNFTRules() step {
 // stepInstallNFTRulesApplyLocked wraps stepInstallNFTRulesApply in the
 // exclusive reconcile lock shared with `contain reload-nft-rules` (see
 // withContainmentReconcileLock): this step snapshots the just-promoted
-// managed config's declared loopback services, applies the kernel
-// transaction, and persists the rules file, and a concurrent boot-time or
+// managed config, applies the kernel transaction, and persists the rules file,
+// and a concurrent boot-time or
 // operator reload must not interleave with any of that.
 func stepInstallNFTRulesApplyLocked(ctx context.Context, env *installEnv) (bool, error) {
 	// The reconcile lock lives beside the nft rules file (see
@@ -1874,6 +2623,14 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 	if err != nil {
 		return false, err
 	}
+	listenerData, err := env.readFile(managedPipelockConfigPath(env))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("read managed listener config: %w", err)
+	}
+	agentListener, err := agentListenerFromConfigBytes(listenerData)
+	if err != nil {
+		return false, fmt.Errorf("managed listener config: %w", err)
+	}
 	body := renderNFTRulesWithServices(nftRuleOptions{
 		OperatorUID:      operatorUID,
 		ProxyUID:         proxyUID,
@@ -1882,12 +2639,21 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 		Table:            env.nftTableOrDefault(),
 		Chain:            env.nftChainOrDefault(),
 		LoopbackServices: loopbackServices,
+		AgentListener:    agentListener,
 	})
 
 	rulesMatch := false
+	// The replaced rules file records the UIDs its managed block was rendered
+	// with. When they differ from the current ones, reload must recognize the
+	// live block by those as well, or the old block survives a UID change.
+	var priorUIDs []nftRulesHeaderUIDs
 	if existing, err := env.readFile(env.nftRulesPath); err == nil {
 		existingBody := string(existing)
 		rulesMatch = existingBody == body
+		if prior, ok, headerErr := parseNFTRulesHeaderUIDs(existing); ok && headerErr == nil &&
+			(prior.operatorUID != operatorUID || prior.proxyUID != proxyUID || prior.agentUID != agentUID) {
+			priorUIDs = append(priorUIDs, prior)
+		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return false, fmt.Errorf("read %s: %w", env.nftRulesPath, err)
 	}
@@ -1900,7 +2666,7 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 		if _, err := attributedNFTChainLines(out, env.nftChainOrDefault()); err == nil {
 			liveChainAttributed = true
 		}
-		liveRulesDrifted = !liveNFTContainmentMatches(out, env.nftChainOrDefault(), operatorUID, proxyUID, agentUID, env.proxyPort, loopbackServices)
+		liveRulesDrifted = !liveNFTContainmentMatches(out, env.nftChainOrDefault(), operatorUID, proxyUID, agentUID, env.proxyPort)
 		liveRulesManaged = liveNFTContainmentLooksManaged(out, env.nftChainOrDefault(), operatorUID, proxyUID, agentUID, env.proxyPort)
 	}
 	if tableLoaded && liveChainAttributed && (!rulesMatch || liveRulesDrifted) && !liveRulesManaged {
@@ -1913,7 +2679,11 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 		return false, err
 	}
 	captureNFTPreState(ctx, env)
-
+	// Rollback must know the table was live before this attempt even when
+	// its contents could not be captured, so it never deletes it.
+	if tableLoaded && !env.nftTableMutatedByInstall {
+		env.nftTableLoadedBeforeInstall = true
+	}
 	rulesChanged := false
 	if !rulesMatch {
 		// No mkdir or chmod here. ensureNFTRulesDirSafe already ran, before
@@ -1926,16 +2696,21 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 			return false, err
 		}
 		rulesChanged = true
+		env.nftRulesWrittenByInstall = true
 	}
+	// Every error return below reports each file this step already changed,
+	// so the orchestrator runs this step's undo and restores them. Reporting
+	// false after a write left the new rules file on disk for the next boot
+	// to load while the kernel kept the old table.
 	persistUnitChanged, err := ensureNFTPersistUnit(env)
 	if err != nil {
-		return false, err
+		return rulesChanged || persistUnitChanged, err
 	}
 	expiryUnitChanged, err := ensureNFTExpiryUnits(env)
 	if err != nil {
-		return persistUnitChanged || expiryUnitChanged, err
+		return rulesChanged || persistUnitChanged || expiryUnitChanged, err
 	}
-	changed := rulesChanged || persistUnitChanged || expiryUnitChanged
+	changed := rulesChanged || persistUnitChanged || expiryUnitChanged || !tableLoaded
 	if changed || !tableLoaded || liveRulesDrifted {
 		// Validate before loading.
 		if err := runOrErr(ctx, env, nftExecutable(env), "-c", "-f", env.nftRulesPath); err != nil {
@@ -1943,25 +2718,35 @@ func stepInstallNFTRulesApply(ctx context.Context, env *installEnv) (bool, error
 		}
 		reloadedManagedChain := false
 		if tableLoaded && (rulesChanged || liveRulesDrifted) {
-			if err := reloadNFTManagedChain(ctx, env, body, operatorUID, proxyUID, agentUID); err != nil {
+			if err := reloadNFTManagedChain(ctx, env, body, operatorUID, proxyUID, agentUID, priorUIDs...); err != nil {
 				return changed, err
 			}
+			env.nftTableMutatedByInstall = true
 			reloadedManagedChain = true
 		}
 		if !reloadedManagedChain && (!tableLoaded || rulesChanged || liveRulesDrifted) {
 			if err := runOrErr(ctx, env, nftExecutable(env), "-f", env.nftRulesPath); err != nil {
 				return changed, fmt.Errorf("nft load failed: %w", err)
 			}
+			env.nftTableMutatedByInstall = true
 		}
 	}
+	// A drift-only reload changed the kernel table without changing a file,
+	// so these errors report the table too; otherwise rollback never runs.
+	// An enable command can change unit state before reporting failure. Undo
+	// must run even when no file or nft rule changed earlier in this step.
+	mutated := changed || env.nftTableMutatedByInstall
 	if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
-		return changed, fmt.Errorf("systemctl daemon-reload: %w", err)
+		return mutated, fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
+	env.nftPersistEnableAttempted = true
+	mutated = true
 	if err := runOrErr(ctx, env, "systemctl", "enable", filepath.Base(env.nftPersistUnitPath)); err != nil {
-		return changed, fmt.Errorf("enable %s: %w", filepath.Base(env.nftPersistUnitPath), err)
+		return mutated, fmt.Errorf("enable %s: %w", filepath.Base(env.nftPersistUnitPath), err)
 	}
+	env.nftTimerEnableAttempted = true
 	if err := runOrErr(ctx, env, "systemctl", "enable", "--now", filepath.Base(env.nftExpiryTimerPath)); err != nil {
-		return changed, fmt.Errorf("enable %s: %w", filepath.Base(env.nftExpiryTimerPath), err)
+		return mutated, fmt.Errorf("enable %s: %w", filepath.Base(env.nftExpiryTimerPath), err)
 	}
 	timerReconciled := !env.prevNFTExpiryTimerStateKnown || !env.prevNFTExpiryTimerEnabled || !env.prevNFTExpiryTimerActive
 	persistReconciled := !env.prevNFTPersistStateKnown || !env.prevNFTPersistEnabled
@@ -1981,55 +2766,118 @@ func stepInstallNFTRulesUndo(ctx context.Context, env *installEnv) error {
 	// Restore any previous live table captured during this install
 	// attempt before deleting the newly installed table. If no
 	// previous table existed, drop the table created by this step.
-	if env.prevNFTTableStateKnown && strings.TrimSpace(env.prevNFTTableDump) != "" {
+	var incomplete error
+	if env.nftPersistEnableAttempted && !env.prevNFTPersistStateKnown {
+		incomplete = errors.Join(incomplete, fmt.Errorf("undo: previous enabled state of %s is unknown; rerun `pipelock contain install` as root", filepath.Base(env.nftPersistUnitPath)))
+	}
+	if env.nftTimerEnableAttempted && !env.prevNFTExpiryTimerStateKnown {
+		incomplete = errors.Join(incomplete, fmt.Errorf("undo: previous enabled and active state of %s is unknown; rerun `pipelock contain install` as root", filepath.Base(env.nftExpiryTimerPath)))
+	}
+	if env.prevNFTTableStateKnown && env.nftTableMutatedByInstall && strings.TrimSpace(env.prevNFTTableDump) != "" {
 		if err := restorePreviousNFTState(ctx, env); err != nil {
-			return err
+			incomplete = errors.Join(incomplete, err)
 		}
+	} else if env.nftTableMutatedByInstall && env.nftTableLoadedBeforeInstall {
+		// The table was live before this attempt reloaded it, but its
+		// previous contents could not be captured. Deleting it would leave the
+		// agent with no containment at all, so keep the table this attempt
+		// loaded, finish the file restores, and report the rollback as
+		// incomplete.
+		incomplete = errors.Join(incomplete, fmt.Errorf("undo: containment table inet %s was loaded before this install but its previous contents could not be captured; left the table this install loaded in place, rerun `pipelock contain install` as root", env.nftTableOrDefault()))
+	} else if !env.nftTableMutatedByInstall {
+		// This attempt never changed the table: an atomic nft batch that failed
+		// leaves it as it was. Leave any table alone, including when its prior
+		// state could not be captured, so rollback cannot remove a live table
+		// this attempt did not create. A failed delete or restore here would
+		// also skip the file restores below.
 	} else {
 		// Report a failed drop. Every other branch of this rollback returns
 		// its error; discarding this one meant an install that failed on a
 		// host with no prior table could report a clean rollback while the
 		// table this step created was still loaded in the kernel.
 		if _, code, err := env.runCmd(ctx, nftExecutable(env), "delete", "table", "inet", env.nftTableOrDefault()); err != nil {
-			return fmt.Errorf("undo: delete table inet %s: %w", env.nftTableOrDefault(), err)
+			incomplete = errors.Join(incomplete, fmt.Errorf("undo: delete table inet %s: %w", env.nftTableOrDefault(), err))
 		} else if code != 0 {
-			return fmt.Errorf("undo: delete table inet %s exited %d; the table this install created may still be loaded", env.nftTableOrDefault(), code)
+			incomplete = errors.Join(incomplete, fmt.Errorf("undo: delete table inet %s exited %d; the table this install created may still be loaded", env.nftTableOrDefault(), code))
 		}
 	}
-	if err := restoreBackup(env, env.nftRulesPath); err != nil {
-		return err
+	if err := restoreNFTFilesWrittenByInstall(env); err != nil {
+		incomplete = errors.Join(incomplete, err)
 	}
-	if err := restoreNFTUnitBackup(env, env.nftPersistUnitPath, env.prevNFTPersistUnitExisted); err != nil {
-		return err
-	}
-	if err := restoreNFTUnitBackup(env, env.nftExpiryTimerPath, env.prevNFTExpiryTimerExisted); err != nil {
-		return err
-	}
-	if err := restoreNFTUnitBackup(env, env.nftExpiryServicePath, env.prevNFTExpiryServiceExisted); err != nil {
-		return err
-	}
-	if env.prevNFTPersistStateKnown && !env.prevNFTPersistEnabled {
-		if err := runSystemctlCleanupUnit(ctx, env, "disable", filepath.Base(env.nftPersistUnitPath)); err != nil {
-			return fmt.Errorf("restore %s disabled state: %w", filepath.Base(env.nftPersistUnitPath), err)
+	if env.prevNFTPersistStateKnown {
+		persistUnit := filepath.Base(env.nftPersistUnitPath)
+		if !env.prevNFTPersistEnabled {
+			if err := runSystemctlCleanupUnit(ctx, env, "disable", persistUnit); err != nil {
+				incomplete = errors.Join(incomplete, fmt.Errorf("restore %s disabled state: %w", persistUnit, err))
+			}
+		} else if env.nftPersistEnableAttempted {
+			args := []string{"enable"}
+			if env.prevNFTPersistEnabledRuntime {
+				// The attempted plain enable may have added persistent links.
+				// Remove them before restoring the prior runtime-only state.
+				if err := runSystemctlCleanupUnit(ctx, env, "disable", persistUnit); err != nil {
+					incomplete = errors.Join(incomplete, fmt.Errorf("remove persistent %s enablement: %w", persistUnit, err))
+				}
+				args = append(args, "--runtime")
+			}
+			args = append(args, persistUnit)
+			if err := runOrErr(ctx, env, "systemctl", args...); err != nil {
+				incomplete = errors.Join(incomplete, fmt.Errorf("restore %s enabled state: %w", persistUnit, err))
+			}
 		}
 	}
 	if err := runOrErr(ctx, env, "systemctl", "daemon-reload"); err != nil {
-		return fmt.Errorf("systemctl daemon-reload after restoring expiry units: %w", err)
+		incomplete = errors.Join(incomplete, fmt.Errorf("systemctl daemon-reload after restoring expiry units: %w", err))
 	}
 	if env.prevNFTExpiryTimerStateKnown {
 		timer := filepath.Base(env.nftExpiryTimerPath)
 		if env.prevNFTExpiryTimerEnabled {
-			if err := runOrErr(ctx, env, "systemctl", "enable", timer); err != nil {
-				return fmt.Errorf("restore %s enabled state: %w", timer, err)
+			args := []string{"enable"}
+			if env.prevNFTExpiryTimerEnabledRuntime {
+				args = append(args, "--runtime")
+			}
+			args = append(args, timer)
+			if err := runOrErr(ctx, env, "systemctl", args...); err != nil {
+				incomplete = errors.Join(incomplete, fmt.Errorf("restore %s enabled state: %w", timer, err))
 			}
 		}
 		if env.prevNFTExpiryTimerActive {
 			if err := runOrErr(ctx, env, "systemctl", "start", timer); err != nil {
-				return fmt.Errorf("restore %s active state: %w", timer, err)
+				incomplete = errors.Join(incomplete, fmt.Errorf("restore %s active state: %w", timer, err))
 			}
 		}
 	}
-	return nil
+	return incomplete
+}
+
+// restoreNFTFilesWrittenByInstall restores only the containment files this
+// attempt wrote. A file the attempt left alone still matches what the kernel
+// and the next boot need; restoring it would delete it or swap in an older
+// release's backup.
+func restoreNFTFilesWrittenByInstall(env *installEnv) error {
+	var incomplete error
+	if env.nftRulesWrittenByInstall {
+		if err := restoreBackup(env, env.nftRulesPath); err != nil {
+			incomplete = errors.Join(incomplete, err)
+		}
+	}
+	for _, unit := range []struct {
+		written bool
+		path    string
+		existed bool
+	}{
+		{env.nftPersistUnitWrittenByInstall, env.nftPersistUnitPath, env.prevNFTPersistUnitExisted},
+		{env.nftExpiryTimerWrittenByInstall, env.nftExpiryTimerPath, env.prevNFTExpiryTimerExisted},
+		{env.nftExpiryServiceWrittenByInstall, env.nftExpiryServicePath, env.prevNFTExpiryServiceExisted},
+	} {
+		if !unit.written {
+			continue
+		}
+		if err := restoreNFTUnitBackup(env, unit.path, unit.existed); err != nil {
+			incomplete = errors.Join(incomplete, err)
+		}
+	}
+	return incomplete
 }
 
 func captureNFTPreState(ctx context.Context, env *installEnv) {
@@ -2043,9 +2891,10 @@ func captureNFTPreState(ctx context.Context, env *installEnv) {
 		}
 	}
 	if !env.prevNFTPersistStateKnown {
-		_, code, err := env.runCmd(ctx, "systemctl", "is-enabled", filepath.Base(env.nftPersistUnitPath))
+		out, code, err := env.runCmd(ctx, "systemctl", "is-enabled", filepath.Base(env.nftPersistUnitPath))
 		if err == nil {
 			env.prevNFTPersistEnabled = code == 0
+			env.prevNFTPersistEnabledRuntime = strings.TrimSpace(out) == "enabled-runtime"
 			env.prevNFTPersistStateKnown = true
 		}
 	}
@@ -2053,7 +2902,9 @@ func captureNFTPreState(ctx context.Context, env *installEnv) {
 		enabledOut, _, enabledErr := env.runCmd(ctx, "systemctl", "is-enabled", filepath.Base(env.nftExpiryTimerPath))
 		activeOut, _, activeErr := env.runCmd(ctx, "systemctl", "is-active", filepath.Base(env.nftExpiryTimerPath))
 		if enabledErr == nil && activeErr == nil {
-			env.prevNFTExpiryTimerEnabled = strings.TrimSpace(enabledOut) == systemctlEnabled
+			state := strings.TrimSpace(enabledOut)
+			env.prevNFTExpiryTimerEnabled = state == systemctlEnabled || state == "enabled-runtime"
+			env.prevNFTExpiryTimerEnabledRuntime = state == "enabled-runtime"
 			env.prevNFTExpiryTimerActive = strings.TrimSpace(activeOut) == systemctlActive
 			env.prevNFTExpiryTimerStateKnown = true
 		}
@@ -2118,7 +2969,7 @@ func restorePreviousNFTState(ctx context.Context, env *installEnv) error {
 	return nil
 }
 
-func reloadNFTManagedChain(ctx context.Context, env *installEnv, rulesBody string, operatorUID, proxyUID, agentUID int) error {
+func reloadNFTManagedChain(ctx context.Context, env *installEnv, rulesBody string, operatorUID, proxyUID, agentUID int, prior ...nftRulesHeaderUIDs) error {
 	out, code, err := env.runCmd(ctx, nftExecutable(env), "-n", "-a", "list", "chain", "inet", env.nftTableOrDefault(), env.nftChainOrDefault())
 	if err != nil {
 		return fmt.Errorf("list nft managed chain for reload: %w", err)
@@ -2126,7 +2977,20 @@ func reloadNFTManagedChain(ctx context.Context, env *installEnv, rulesBody strin
 	if code != 0 {
 		return fmt.Errorf("list nft managed chain for reload exit=%d: %s", code, oneLine(out))
 	}
-	reloadScript := renderNFTManagedChainReloadScript(out, rulesBody, env.nftTableOrDefault(), env.nftChainOrDefault(), operatorUID, proxyUID, agentUID)
+	// Remove the superseded cgroup receiver chain in the same validated
+	// transaction that installs the namespace-era OUTPUT rules. The query is
+	// live-kernel state because nft refuses to delete a chain that is absent.
+	receiverChainLive := false
+	input, inputCode, inputErr := env.runCmd(ctx, nftExecutable(env), "-n", "list", "chain", "inet", env.nftTableOrDefault(), legacyOwnedLoopbackInputChain)
+	if inputErr != nil {
+		return fmt.Errorf("list legacy owned loopback receiver chain for reload: %w", inputErr)
+	}
+	if inputCode == 0 {
+		receiverChainLive = true
+	} else if !strings.Contains(strings.ToLower(input), "no such file") {
+		return fmt.Errorf("list legacy owned loopback receiver chain exit=%d: %s", inputCode, oneLine(input))
+	}
+	reloadScript := renderNFTManagedChainReloadScript(out, rulesBody, env.nftTableOrDefault(), env.nftChainOrDefault(), operatorUID, proxyUID, agentUID, receiverChainLive, prior...)
 	reloadPath := env.nftRulesPath + ".reload"
 	if err := env.writeFile(reloadPath, []byte(reloadScript), modeConfigSecret); err != nil {
 		return fmt.Errorf("write nft managed chain reload file %s: %w", reloadPath, err)
@@ -2153,7 +3017,7 @@ func nftTableDumpDeclaresExpectedTable(dump, table string) bool {
 	return false
 }
 
-func liveNFTContainmentMatches(out, chainName string, operatorUID, proxyUID, agentUID, proxyPort int, loopbackServices []config.ContainmentLoopbackService) bool {
+func liveNFTContainmentMatches(out, chainName string, operatorUID, proxyUID, agentUID, proxyPort int) bool {
 	lines, err := attributedNFTChainLines(out, chainName)
 	if err != nil {
 		return false
@@ -2161,23 +3025,18 @@ func liveNFTContainmentMatches(out, chainName string, operatorUID, proxyUID, age
 	if !nftChainLinesHaveManagedOutputBaseChain(lines) ||
 		!chainLinesHaveSkuidAcceptForUID(lines, operatorUID) ||
 		!chainLinesHaveSkuidAcceptForUID(lines, proxyUID) ||
-		!chainLinesHaveAgentCatchAllDrop(lines, agentUID) ||
 		!chainLinesHaveAgentProxyLoopbackAllowBeforeDrop(lines, agentUID, proxyPort) ||
+		!chainLinesHaveAgentCatchAllDrop(lines, agentUID) ||
 		!chainLinesHaveAgentDNSDropBeforeCatchAll(lines, agentUID, "udp") ||
 		!chainLinesHaveAgentDNSDropBeforeCatchAll(lines, agentUID, "tcp") {
 		return false
-	}
-	for _, svc := range loopbackServices {
-		if !chainLinesHaveDeclaredLoopbackPairBeforeDrop(lines, agentUID, svc.Host, svc.Port) {
-			return false
-		}
 	}
 	return !chainLinesHaveUnsafeVerdictBeforeAgentDrop(lines, containmentUIDs{
 		operatorUID:   operatorUID,
 		operatorKnown: true,
 		proxyUID:      proxyUID,
 		agentUID:      agentUID,
-	}, proxyPort, loopbackServices)
+	}, proxyPort)
 }
 
 func liveNFTContainmentLooksManaged(out, chainName string, operatorUID, proxyUID, agentUID, proxyPort int) bool {
@@ -2185,7 +3044,8 @@ func liveNFTContainmentLooksManaged(out, chainName string, operatorUID, proxyUID
 	if err != nil {
 		return false
 	}
-	return chainLinesHaveManagedAgentLoopbackBeforeCatchAllDrop(lines, proxyPort) ||
+	return len(legacyOwnedLoopbackMarkRuleHandles(out, agentUID)) > 0 ||
+		chainLinesHaveManagedAgentLoopbackBeforeCatchAllDrop(lines, proxyPort) ||
 		chainLinesHaveSkuidAcceptForUID(lines, operatorUID) &&
 			chainLinesHaveSkuidAcceptForUID(lines, proxyUID) &&
 			chainLinesHaveAgentCatchAllDrop(lines, agentUID) &&
@@ -2246,15 +3106,25 @@ func nftRulesIncludeLine(path string) string {
 }
 
 func ensureNFTPersistUnit(env *installEnv) (bool, error) {
-	return ensureContainmentUnit(env, env.nftPersistUnitPath, renderNFTPersistUnit(env))
+	changed, err := ensureContainmentUnit(env, env.nftPersistUnitPath, renderNFTPersistUnit(env))
+	if changed {
+		env.nftPersistUnitWrittenByInstall = true
+	}
+	return changed, err
 }
 
 func ensureNFTExpiryUnits(env *installEnv) (bool, error) {
 	serviceChanged, err := ensureContainmentUnit(env, env.nftExpiryServicePath, renderNFTExpiryService(env))
+	if serviceChanged {
+		env.nftExpiryServiceWrittenByInstall = true
+	}
 	if err != nil {
 		return serviceChanged, err
 	}
 	timerChanged, err := ensureContainmentUnit(env, env.nftExpiryTimerPath, renderNFTExpiryTimer(env))
+	if timerChanged {
+		env.nftExpiryTimerWrittenByInstall = true
+	}
 	return serviceChanged || timerChanged, err
 }
 
@@ -2506,20 +3376,6 @@ func operatorUIDFromEnv(env *installEnv) (int, error) {
 	return uid, nil
 }
 
-// nftLoopbackAcceptLines renders the complete forward/reply pair for one
-// declared agent-reachable loopback service. A service that shares the agent
-// UID needs its SYN-ACK to pass the OUTPUT chain too. Both rules are narrow:
-// loopback only, with the forward rule matching the declared destination and
-// the reply rule matching the declared source, source port, established state, and
-// reply direction.
-func nftLoopbackAcceptLines(agentUID int, host string, port int) string {
-	daddrKeyword, saddrKeyword := "ip daddr", "ip saddr"
-	if host == "::1" {
-		daddrKeyword, saddrKeyword = "ip6 daddr", "ip6 saddr"
-	}
-	return fmt.Sprintf("\t        meta skuid %d oifname \"lo\" %s %s tcp dport %d accept\n\t        meta skuid %d oifname \"lo\" %s %s tcp sport %d ct state established ct direction reply accept\n", agentUID, daddrKeyword, host, port, agentUID, saddrKeyword, host, port)
-}
-
 // nftRuleOptions carries renderNFTRules' inputs once the addition of declared
 // loopback services would otherwise push the parameter count past six.
 type nftRuleOptions struct {
@@ -2530,15 +3386,14 @@ type nftRuleOptions struct {
 	Table            string
 	Chain            string
 	LoopbackServices []config.ContainmentLoopbackService
+	AgentListener    string
 }
 
-// renderNFTRules emits the table definition. Matches the runbook one-to-one
-// with concrete UIDs interpolated. Declared loopback services (the outbound
-// sibling of containment.metrics_exposure) render as additional agent-owned
-// loopback accepts inside the SAME managed block, immediately after the
-// implicit proxy-port allow and before the DNS drops, so a reload that
-// recognizes and replaces the managed block replaces these too instead of
-// leaving them as a hand-inserted carve-out.
+// renderNFTRules emits the table definition with concrete UIDs interpolated.
+// The agent's host-loopback proxy allow remains part of the independent UID
+// boundary: it preserves the existing fail-closed evidence contract if a
+// process ever runs outside the managed namespace. Extra declared loopback
+// services never render here; namespace-bound socket forwarders own them.
 func renderNFTRules(operatorUID, proxyUID, agentUID, proxyPort int, table, chain string) string {
 	return renderNFTRulesWithServices(nftRuleOptions{
 		OperatorUID: operatorUID,
@@ -2550,14 +3405,22 @@ func renderNFTRules(operatorUID, proxyUID, agentUID, proxyPort int, table, chain
 	})
 }
 
-// renderNFTRulesWithServices is renderNFTRules plus declared
-// containment.loopback_services exceptions rendered into the same managed
-// block, immediately after the implicit proxy-port allow and before the DNS
-// drops.
+// renderNFTRulesWithServices retains the declared-service argument while those
+// services are reconciled into namespace-bound socket units. The host ruleset
+// contains only the implicit proxy-port exception, never a declared service.
 func renderNFTRulesWithServices(opts nftRuleOptions) string {
-	var loopback strings.Builder
-	for _, svc := range opts.LoopbackServices {
-		loopback.WriteString(nftLoopbackAcceptLines(opts.AgentUID, svc.Host, svc.Port))
+	listenerRule := ""
+	if opts.AgentListener != "" {
+		host, port, err := net.SplitHostPort(opts.AgentListener)
+		ip := net.ParseIP(host)
+		if err != nil || ip == nil || !ip.IsLoopback() {
+			return "invalid containment.agent_listener\n"
+		}
+		family := "ip"
+		if ip.To4() == nil {
+			family = "ip6"
+		}
+		listenerRule = fmt.Sprintf("\t        meta skuid != { 0, %d } %s daddr %s tcp dport %s counter log prefix \"pipelock_agent_listener_blocked \" drop\n", opts.ProxyUID, family, host, port)
 	}
 	return fmt.Sprintf(`# Pipelock containment ruleset (managed by pipelock contain install).
 	# operator=%d  pipelock-proxy=%d  pipelock-agent=%d  proxy-port=%d
@@ -2565,18 +3428,18 @@ func renderNFTRulesWithServices(opts nftRuleOptions) string {
 	    chain %s {
 	        type filter hook output priority filter; policy accept;
 
-	        meta skuid %d accept
+%s	        meta skuid %d accept
 	        meta skuid %d accept
 
 	        meta skuid %d ip daddr 127.0.0.1 tcp dport %d accept
-%s	        meta skuid %d udp dport 53 counter log prefix "%s " drop
+	        meta skuid %d udp dport 53 counter log prefix "%s " drop
 	        meta skuid %d tcp dport 53 counter log prefix "%s " drop
 	        meta skuid %d counter log prefix "%s " drop
 	    }
-	}
-	`, opts.OperatorUID, opts.ProxyUID, opts.AgentUID, opts.ProxyPort, opts.Table, opts.Chain,
-		opts.OperatorUID, opts.ProxyUID, opts.AgentUID, opts.ProxyPort,
-		loopback.String(),
+}
+`, opts.OperatorUID, opts.ProxyUID, opts.AgentUID, opts.ProxyPort, opts.Table, opts.Chain, listenerRule,
+		opts.OperatorUID, opts.ProxyUID,
+		opts.AgentUID, opts.ProxyPort,
 		opts.AgentUID, nftLogPrefix(EgressClassDirectDNS),
 		opts.AgentUID, nftLogPrefix(EgressClassDirectDNS),
 		opts.AgentUID, nftLogPrefix(EgressClassNotRoutingThroughPipelock))
@@ -2594,9 +3457,9 @@ func RenderNFTRules(operatorUID, proxyUID, agentUID, proxyPort int) string {
 	return renderNFTRules(operatorUID, proxyUID, agentUID, proxyPort, defaultNFTTable, defaultNFTChain)
 }
 
-// RenderNFTRulesWithLoopbackServices is RenderNFTRules plus declared
-// containment.loopback_services exceptions, for a caller (contain install,
-// contain verify) that has resolved the managed config's declared set.
+// RenderNFTRulesWithLoopbackServices is retained for API compatibility.
+// Declared services are now namespace socket forwarders, so the returned host
+// ruleset is identical to RenderNFTRules.
 func RenderNFTRulesWithLoopbackServices(operatorUID, proxyUID, agentUID, proxyPort int, loopbackServices []config.ContainmentLoopbackService) string {
 	return renderNFTRulesWithServices(nftRuleOptions{
 		OperatorUID:      operatorUID,
@@ -2723,6 +3586,12 @@ func renderLaunchWrapper(env *installEnv) string {
 		`    exit 8`,
 		`fi`,
 		"",
+		// A configured JoinsNamespaceOf= relationship is not proof that
+		// systemd actually placed this process in the managed namespace. The
+		// final unprivileged launcher checks the kernel namespace identities
+		// immediately before exec, closing both stale-unit and late-load gaps.
+		shellQuote(env.pipelockTarget) + " contain assert-agent-netns --agent-user " + shellQuote(env.agentUserName) + " --proxy-port " + strconv.Itoa(env.proxyPort),
+		"",
 		// The runtime contract (proxy + CA across tool ecosystems, plus the
 		// node undici shim) is rendered from the single source of truth in
 		// runtime_contract.go so plk-launch, the profile.d script, and the
@@ -2787,7 +3656,7 @@ func renderMetaWrapper(env *installEnv) string {
 		`    echo "plk: missing or empty allow-list at $TOOLS_LIST (run pipelock contain install)" >&2`,
 		`    exit 4`,
 		`fi`,
-		"exec sudo -n -u " + env.agentUserName + " " + filepath.Join(env.wrapperDir, "plk-launch") + ` "$@"`,
+		"exec sudo -n " + filepath.Join(env.wrapperDir, "plk-contained-launch") + ` "$@"`,
 		"",
 	}, "\n")
 }
@@ -2800,14 +3669,7 @@ func stepWriteToolWrappers() step {
 		apply: func(_ context.Context, env *installEnv) (bool, error) {
 			touched = nil
 			restoreTouched := func(cause error) (bool, error) {
-				var errs []error
-				errs = append(errs, cause)
-				for i := len(touched) - 1; i >= 0; i-- {
-					if err := restoreBackup(env, touched[i]); err != nil {
-						errs = append(errs, err)
-					}
-				}
-				return false, errors.Join(errs...)
+				return restoreTouchedInline(env, touched, cause)
 			}
 			entries, err := readToolsList(env)
 			if err != nil {
@@ -2838,10 +3700,10 @@ func stepWriteToolWrappers() step {
 					if _, err := backupCurrentToBak(env, path); err != nil {
 						return restoreTouched(fmt.Errorf("backup stale wrapper %s: %w", path, err))
 					}
+					touched = append(touched, path)
 					if err := env.removeFile(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 						return restoreTouched(fmt.Errorf("remove stale wrapper %s: %w", path, err))
 					}
-					touched = append(touched, path)
 				} else if !errors.Is(err, os.ErrNotExist) {
 					return restoreTouched(fmt.Errorf("stat stale wrapper %s: %w", path, err))
 				}
@@ -2884,7 +3746,7 @@ func renderToolWrapper(env *installEnv, tool string) string {
 	return strings.Join([]string{
 		shebangBash(env),
 		"# Managed by `pipelock contain install`. Edits are clobbered on next install.",
-		"exec sudo -n -u " + env.agentUserName + " " + filepath.Join(env.wrapperDir, "plk-launch") + " " + tool + ` "$@"`,
+		"exec sudo -n " + filepath.Join(env.wrapperDir, "plk-contained-launch") + " " + tool + ` "$@"`,
 		"",
 	}, "\n")
 }
@@ -2990,9 +3852,12 @@ func stepInstallSudoers() step {
 			}
 			if err := runOrErr(ctx, env, "visudo", "-cf", env.sudoersPath); err != nil {
 				// Roll back inside the step so a malformed sudoers never
-				// ends up loaded. The orchestrator would also undo, but
-				// removing the bad file ourselves is cheaper and clearer.
-				_ = restoreBackup(env, env.sudoersPath)
+				// stays loaded. If that restore fails, report applied so the
+				// orchestrator retries it; restoreBackup is safe to repeat and
+				// never removes a file an earlier attempt already put back.
+				if rerr := restoreBackup(env, env.sudoersPath); rerr != nil {
+					return true, errors.Join(fmt.Errorf("visudo rejected new sudoers: %w", err), fmt.Errorf("restore previous sudoers: %w", rerr))
+				}
 				return false, fmt.Errorf("visudo rejected new sudoers: %w", err)
 			}
 			return true, nil
@@ -3007,9 +3872,9 @@ func stepInstallSudoers() step {
 // the operator can run plk-* wrappers without prompting, but the rule does
 // NOT grant general-purpose sudo to pipelock-agent.
 func renderSudoers(env *installEnv) string {
-	launcher := filepath.Join(env.wrapperDir, "plk-launch")
+	launcher := filepath.Join(env.wrapperDir, "plk-contained-launch")
 	return fmt.Sprintf(
-		"# Managed by `pipelock contain install`. Do not edit by hand.\n%s ALL=(%s) NOPASSWD: %s *\n",
-		env.operatorUser, env.agentUserName, launcher,
+		"# Managed by `pipelock contain install`. Do not edit by hand.\n%s ALL=(root) NOPASSWD: %s *\n",
+		env.operatorUser, launcher,
 	)
 }

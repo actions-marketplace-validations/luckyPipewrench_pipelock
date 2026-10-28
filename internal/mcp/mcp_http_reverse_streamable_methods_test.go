@@ -5,6 +5,7 @@ package mcp
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/hex"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -172,6 +174,11 @@ func readStreamableAuditSessions(t *testing.T, path string) []string {
 		var entry map[string]any
 		if err := json.Unmarshal(line, &entry); err != nil {
 			t.Fatalf("Unmarshal(audit): %v; line=%s", err, line)
+		}
+		// A block event carries the scanner finding, not a session key; the
+		// adaptive events it accompanies are the ones that bind to a session.
+		if _, hasSession := entry["session"]; !hasSession && entry["event"] == "blocked" {
+			continue
 		}
 		sessionValue, ok := entry["session"].(string)
 		if !ok {
@@ -334,7 +341,8 @@ func TestHTTPListener_GETStreamBlocksCompressedUpstream(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+	logger, events := newListenerEventLogger(t)
+	baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t), AuditLogger: logger})
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, baseURL+"/", nil)
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)
@@ -358,6 +366,12 @@ func TestHTTPListener_GETStreamBlocksCompressedUpstream(t *testing.T) {
 	}
 	if bytes.Contains(body, []byte("upstream body must not leak")) {
 		t.Fatalf("compressed upstream body leaked: %s", body)
+	}
+	// The refusal follows a completed upstream exchange, so it is a withheld
+	// response even though no withhold helper wrote it.
+	got := events.String()
+	if strings.Count(got, `"event":"blocked"`) != 1 || !strings.Contains(got, `"direction":"response"`) {
+		t.Fatalf("GET stream refusal lost its response direction: %s", got)
 	}
 }
 
@@ -794,6 +808,9 @@ func TestHTTPListener_GETStreamFailsClosedOnUnexpectedStatus(t *testing.T) {
 }
 
 func TestHTTPListener_POSTFailsClosedOnUnexpected2xxStatus(t *testing.T) {
+	// The request here is owed an answer, so 204 fails closed too; for a
+	// notification it acknowledges like 202
+	// (TestHTTPListener_EmptyUpstream2xxAcknowledgesNotification).
 	for _, status := range []int{http.StatusSwitchingProtocols, http.StatusCreated, http.StatusNonAuthoritativeInfo, http.StatusNoContent, http.StatusPartialContent} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			const upstreamBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"unexpected 2xx body must not leak"}]}}`
@@ -838,22 +855,41 @@ func TestHTTPListener_DELETESuppressesUpstreamBodyAndHeadersAcrossStatuses(t *te
 	for _, tc := range []struct {
 		status     int
 		wantStatus int
+		// relayed marks a 4xx refusal, whose scanned body is the answer.
+		relayed bool
 	}{
 		{status: http.StatusOK, wantStatus: http.StatusOK},
 		{status: http.StatusAccepted, wantStatus: http.StatusAccepted},
 		{status: http.StatusNoContent, wantStatus: http.StatusNoContent},
 		{status: http.StatusPartialContent, wantStatus: http.StatusBadGateway},
 		{status: http.StatusFound, wantStatus: http.StatusBadGateway},
-		{status: http.StatusForbidden, wantStatus: http.StatusBadGateway},
+		{status: http.StatusForbidden, wantStatus: http.StatusForbidden, relayed: true},
 		{status: http.StatusInternalServerError, wantStatus: http.StatusBadGateway},
 		{status: http.StatusSwitchingProtocols, wantStatus: http.StatusBadGateway},
 	} {
 		t.Run(http.StatusText(tc.status), func(t *testing.T) {
 			const upstreamBody = "DELETE upstream body must not leak"
+			// The upstream is a catch-all on an ephemeral port, and a port that
+			// was just freed can still receive requests aimed at it by an
+			// earlier listener's pollers or clients, here or in another process.
+			// Judge only the request this test caused: the one for its own
+			// unique path. Anything else is not the proxy's doing. The proxy
+			// requests the configured upstream URL as given, with no path
+			// joining, so the DELETE arrives at exactly upstreamPath.
+			upstreamPath := "/delete-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+			var deleteSeen atomic.Bool
+			var wrongMethod atomic.Value
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodDelete {
-					t.Fatalf("method = %s, want DELETE", r.Method)
+				if r.URL.Path != upstreamPath {
+					http.NotFound(w, r)
+					return
 				}
+				if r.Method != http.MethodDelete {
+					wrongMethod.Store(r.Method)
+					w.WriteHeader(http.StatusInternalServerError)
+					return
+				}
+				deleteSeen.Store(true)
 				if tc.status == http.StatusSwitchingProtocols {
 					writeSwitchingProtocolsResponse(t, w, "text/plain", upstreamBody)
 					return
@@ -865,7 +901,7 @@ func TestHTTPListener_DELETESuppressesUpstreamBodyAndHeadersAcrossStatuses(t *te
 			}))
 			defer upstream.Close()
 
-			baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+			baseURL, _ := startListenerProxyWithOpts(t, upstream.URL+upstreamPath, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
 			req, err := http.NewRequestWithContext(context.Background(), http.MethodDelete, baseURL+"/", nil)
 			if err != nil {
 				t.Fatalf("NewRequest: %v", err)
@@ -880,13 +916,23 @@ func TestHTTPListener_DELETESuppressesUpstreamBodyAndHeadersAcrossStatuses(t *te
 				t.Fatalf("ReadAll: %v", err)
 			}
 
+			if method := wrongMethod.Load(); method != nil {
+				t.Fatalf("proxy sent %v upstream, want DELETE", method)
+			}
+			if !deleteSeen.Load() {
+				t.Fatal("DELETE never reached the upstream")
+			}
 			if resp.StatusCode != tc.wantStatus {
 				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, body)
 			}
-			if tc.wantStatus == tc.status && len(body) != 0 {
+			switch {
+			case tc.relayed:
+				if string(body) != upstreamBody {
+					t.Fatalf("DELETE refusal body = %q, want the scanned upstream body", body)
+				}
+			case tc.wantStatus == tc.status && len(body) != 0:
 				t.Fatalf("DELETE body = %q, want empty", body)
-			}
-			if bytes.Contains(body, []byte(upstreamBody)) {
+			case bytes.Contains(body, []byte(upstreamBody)):
 				t.Fatalf("DELETE upstream body leaked: %s", body)
 			}
 			if got := resp.Header.Get("Location"); got != "" {
@@ -961,6 +1007,18 @@ func TestHTTPListener_AuditSessionKeySanitizedForAdaptiveSignals(t *testing.T) {
 			}
 			if got := upstreamCalls.Load(); got != afterSetup {
 				t.Fatalf("listener-header DLP block reached upstream: calls = %d, want %d", got, afterSetup)
+			}
+			rawAudit, err := os.ReadFile(filepath.Clean(auditPath))
+			if err != nil {
+				t.Fatalf("ReadFile(audit): %v", err)
+			}
+			if !bytes.Contains(rawAudit, []byte(`"event":"blocked"`)) {
+				t.Fatalf("listener-header DLP block emitted no blocked event: %s", rawAudit)
+			}
+			for _, secret := range []string{dlpToken, rawSessionID, token} {
+				if bytes.Contains(rawAudit, []byte(secret)) {
+					t.Fatalf("audit stream leaked header credential or routing data: %s", rawAudit)
+				}
 			}
 		})
 	}
@@ -1091,7 +1149,7 @@ func TestHTTPListener_GETAndDELETEBlockPathsEmitReceipts(t *testing.T) {
 						cfg := config.Defaults()
 						cfg.Internal = []string{"127.0.0.0/8", "10.0.0.0/8"}
 						cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-						sc := scanner.MustNew(cfg)
+						sc := newFailingDNSScanner(t, cfg)
 						t.Cleanup(sc.Close)
 						opts.Scanner = sc
 						opts.A2ACfg = &config.A2AScanning{
@@ -1438,7 +1496,7 @@ func TestHTTPListener_DELETEForwardsSessionTerminationStatus(t *testing.T) {
 		{name: "ok", statusCode: http.StatusOK, wantStatus: http.StatusOK},
 		{name: "accepted", statusCode: http.StatusAccepted, wantStatus: http.StatusAccepted},
 		{name: "no_content", statusCode: http.StatusNoContent, wantStatus: http.StatusNoContent},
-		{name: "unsupported", statusCode: http.StatusMethodNotAllowed, wantStatus: http.StatusBadGateway},
+		{name: "unsupported", statusCode: http.StatusMethodNotAllowed, wantStatus: http.StatusMethodNotAllowed},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			const sessionID = "session-delete"
@@ -1478,6 +1536,13 @@ func TestHTTPListener_DELETEForwardsSessionTerminationStatus(t *testing.T) {
 			}
 			if obs.session != sessionID {
 				t.Fatalf("upstream session = %q, want %q", obs.session, sessionID)
+			}
+			if tc.statusCode >= http.StatusBadRequest {
+				// A refusal keeps its scanned body; the session was not ended.
+				if string(body) != "upstream body must not leak" {
+					t.Fatalf("DELETE refusal body = %q, want the scanned upstream body", body)
+				}
+				return
 			}
 			if tc.wantStatus == tc.statusCode && len(bytes.TrimSpace(body)) != 0 {
 				t.Fatalf("DELETE response body = %q, want empty", body)
@@ -2021,7 +2086,7 @@ func TestHTTPListener_GETAndDELETEA2AHeaderInfrastructureErrorIsAdaptiveNeutral(
 			cfg := config.Defaults()
 			cfg.Internal = []string{"127.0.0.0/8"}
 			cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-			sc := scanner.MustNew(cfg)
+			sc := newFailingDNSScanner(t, cfg)
 			t.Cleanup(sc.Close)
 
 			a2aCfg := &config.A2AScanning{
@@ -2244,6 +2309,13 @@ func TestA2AHeaderBlockReason(t *testing.T) {
 			want: blockreason.SSRFMetadata,
 		},
 		{
+			name: "query_entropy",
+			in: A2AScanResult{
+				URLFindings: []scanner.Result{{Scanner: scanner.ScannerEntropy, Reason: `high entropy query param "sig"`}},
+			},
+			want: blockreason.QueryEntropy,
+		},
+		{
 			name: "infrastructure_timeout",
 			in: A2AScanResult{
 				URLFindings: []scanner.Result{{
@@ -2386,7 +2458,7 @@ func TestHTTPListener_GETAndDELETEBlockA2AInfrastructureErrorBeforeUpstream(t *t
 			cfg := config.Defaults()
 			cfg.Internal = []string{"127.0.0.0/8", "10.0.0.0/8"}
 			cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
-			sc := scanner.MustNew(cfg)
+			sc := newFailingDNSScanner(t, cfg)
 			t.Cleanup(sc.Close)
 
 			baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{
@@ -2465,4 +2537,94 @@ func TestHTTPListener_GETAndDELETEFailClosedWhenScannerUnavailable(t *testing.T)
 			}
 		})
 	}
+}
+
+// TestHTTPListener_POSTDecodesCompressedJSONUpstream pins the listener to the
+// same answer the MCP HTTP client already gives. A gzip JSON-RPC response is
+// legal and the client in internal/mcp/transport decodes it, but the listener
+// refused every non-identity encoding, so one upstream worked through one path
+// and returned 403 through the other. Decoding is also what makes the body
+// scannable: the injection case below proves the decoded bytes reach the
+// scanner rather than passing through as opaque ones.
+func TestHTTPListener_POSTDecodesCompressedJSONUpstream(t *testing.T) {
+	gz := func(t *testing.T, s string) []byte {
+		t.Helper()
+		var buf bytes.Buffer
+		zw := gzip.NewWriter(&buf)
+		if _, err := zw.Write([]byte(s)); err != nil {
+			t.Fatalf("gzip write: %v", err)
+		}
+		if err := zw.Close(); err != nil {
+			t.Fatalf("gzip close: %v", err)
+		}
+		return buf.Bytes()
+	}
+
+	t.Run("clean body is decoded and delivered", func(t *testing.T) {
+		const upstreamBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"quarterly totals"}]}}`
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = w.Write(gz(t, upstreamBody))
+		}))
+		defer upstream.Close()
+
+		baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/", strings.NewReader(jsonToolsCallBare))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+		}
+		if !bytes.Contains(body, []byte("quarterly totals")) {
+			t.Fatalf("decoded upstream body did not reach the client: %s", body)
+		}
+	})
+
+	t.Run("a malformed stream stays fail-closed", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Encoding", "gzip")
+			_, _ = w.Write([]byte("this is not a gzip stream, and must not be forwarded"))
+		}))
+		defer upstream.Close()
+
+		baseURL, _ := startListenerProxyWithOpts(t, upstream.URL, MCPProxyOpts{Scanner: testScannerForHTTP(t)})
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, baseURL+"/", strings.NewReader(jsonToolsCallBare))
+		if err != nil {
+			t.Fatalf("NewRequest: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST: %v", err)
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("ReadAll: %v", err)
+		}
+
+		if resp.StatusCode != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403; body=%s", resp.StatusCode, body)
+		}
+		if got := resp.Header.Get(blockreason.HeaderReason); got != string(blockreason.CompressedResponse) {
+			t.Fatalf("%s = %q, want %q", blockreason.HeaderReason, got, blockreason.CompressedResponse)
+		}
+		if bytes.Contains(body, []byte("must not be forwarded")) {
+			t.Fatalf("undecodable upstream body leaked: %s", body)
+		}
+	})
 }

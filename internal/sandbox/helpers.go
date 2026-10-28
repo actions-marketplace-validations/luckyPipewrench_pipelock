@@ -93,7 +93,8 @@ func waitForParentHardening() error {
 		return fmt.Errorf("waiting for parent hardening: %w", err)
 	case <-timer.C:
 		_ = ready.Close()
-		<-readResult
+		// Closing an inherited blocking descriptor may not interrupt its read.
+		// Do not wait for it: both init callers exit on this timeout error.
 		return errors.New("waiting for parent hardening: timed out")
 	}
 }
@@ -132,6 +133,9 @@ func appliedLaunchOutcome(strict, noNetNS, seccompSupported bool, landlock, secc
 	if !landlock.Active {
 		return LaunchOutcomeRefused, fmt.Errorf("landlock is required for sandbox filesystem containment; use a kernel with Landlock support or a separately labelled `pipelock contain` host boundary")
 	}
+	if strict && !seccompSupported && landlock.Version < 9 {
+		return LaunchOutcomeRefused, fmt.Errorf("strict mode on this architecture requires Landlock ABI 9 for Unix socket isolation (kernel ABI %d) and a supported seccomp filter; this build has no seccomp support", landlock.Version)
+	}
 	if !seccomp.Active && (strict || seccompSupported) {
 		return LaunchOutcomeRefused, fmt.Errorf("seccomp was not applied; refusing a launch whose build supports the filter")
 	}
@@ -150,16 +154,25 @@ func appliedLaunchOutcome(strict, noNetNS, seccompSupported bool, landlock, secc
 	return LaunchOutcomeFull, nil
 }
 
-func reportAppliedLaunchOutcome(w io.Writer, outcome AppliedLaunchOutcome) {
+func reportAppliedLaunchOutcome(w io.Writer, outcome AppliedLaunchOutcome, landlockVersion int) {
+	ipcDetail := ""
+	fallbackDetail := ""
+	if landlockVersion < 9 {
+		ipcDetail = "; pathname AF_UNIX is not enforced"
+		fallbackDetail = fmt.Sprintf("; Unix socket fallback: AF_UNIX sockets, datagram pairs and recvmsg/recvmmsg denied (Landlock ABI %d<9)", landlockVersion)
+	}
+	if landlockVersion < 6 {
+		ipcDetail += "; abstract AF_UNIX is not enforced"
+	}
 	switch outcome {
 	case LaunchOutcomeFull:
-		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: FULL (Landlock + seccomp + network namespace applied)")
+		_, _ = fmt.Fprintf(w, "[sandbox] launch outcome: FULL (Landlock + seccomp + network namespace applied%s)\n", fallbackDetail)
 	case LaunchOutcomePartial:
-		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: PARTIAL (Landlock + network namespace applied; seccomp filter unavailable in this build)")
+		_, _ = fmt.Fprintf(w, "[sandbox] launch outcome: PARTIAL (Landlock + network namespace applied; seccomp filter unavailable in this build%s)\n", ipcDetail)
 	case LaunchOutcomeAdvisoryOverride:
-		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (no network namespace; direct egress may bypass Pipelock)")
+		_, _ = fmt.Fprintf(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (no network namespace; direct egress may bypass Pipelock%s)\n", fallbackDetail)
 	case LaunchOutcomeAdvisoryOverridePartial:
-		_, _ = fmt.Fprintln(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (network) + PARTIAL (seccomp unavailable in this build; direct egress may bypass Pipelock)")
+		_, _ = fmt.Fprintf(w, "[sandbox] launch outcome: ADVISORY-OVERRIDE (network) + PARTIAL (seccomp unavailable in this build; direct egress may bypass Pipelock%s)\n", ipcDetail)
 	}
 }
 

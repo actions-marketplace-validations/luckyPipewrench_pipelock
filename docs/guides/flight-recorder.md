@@ -1,19 +1,22 @@
 # Flight Recorder Guide
 
-The flight recorder writes configured enforcement evidence to a per-writer
-hash-chained, tamper-evident log. Blocks produce receipts; allow receipts require
-`flight_recorder.require_receipts: true`, and clean stream frames are summarized
-rather than individually receipted. Each recorded entry is cryptographically
-linked to the one before it in that writer stream, so deletion or modification
-within an observed chain breaks verification. Signed checkpoints prove the chain
-state observed by one writer at specific points; they do not prove that traffic
-which bypassed Pipelock was recorded, or that several processes sharing one
-recorder directory formed one deployment-wide sequence. Use
-`pipelock evidence doctor DIR` to detect structural fork damage in a directory.
-The recorder is designed for post-incident investigation, compliance evidence,
-and forensic replay.
+The flight recorder writes configured enforcement evidence to a hash-chained log for each writer. It records allow receipts in best-effort mode when emission succeeds. Clean stream frames are summarized rather than receipted one by one.
+
+Set `flight_recorder.require_receipts: true` to require a successful allow-path receipt before traffic is forwarded. For allow decisions, the `X-Pipelock-Receipt` response header is returned only when `require_receipts` is enabled.
+
+Each recorded entry is cryptographically linked to the one before it. Deleting or modifying an entry inside the chain breaks verification of that writer's chain. Cutting entries off the end leaves a shorter chain that still passes chain-only verification. On a clean shutdown the recorder writes a `transcript_root` seal naming the final receipt, and `pipelock verify-receipt --whole-recorder --chain --key <signer-public-key>` checks it, so a missing tail is detected there. Without a trusted key, `--allow-unpinned` runs the same structural check but can't authenticate the signer. A run that ended without a seal, such as one killed by SIGKILL, needs another completeness check: a signed checkpoint or a copy held elsewhere. Entries written after the last checkpoint have no such anchor.
+
+Signed checkpoints prove the chain state one writer recorded at specific points. They can't prove that Pipelock recorded traffic that bypassed it or that several processes sharing one recorder directory formed one deployment-wide sequence. Use `pipelock evidence doctor DIR` to find structural fork damage. The recorder supports post-incident investigation, compliance evidence, and forensic replay.
 
 **On by default.** `enabled` defaults to `true` so receipts are available out of the box ("verify the boundary"). It only *records* once a `dir` is configured, and because `sign_checkpoints` defaults to `true` a signing key is required alongside it unless you opt into an unsigned recorder with `sign_checkpoints: false`. Without a `dir` the recorder is inert and writes nothing, so the default flip never breaks an existing config. `pipelock init` generates a recorder directory and an Ed25519 signing key and writes them into the config, which is what makes receipts live. Receipt emission is best-effort by default; set `require_receipts: true` when allow-path receipt failures must fail closed before traffic is forwarded.
+
+To create a receipt-signing key without running `pipelock init`, generate a deployment-level key file and set `flight_recorder.signing_key_path` to that file:
+
+```bash
+pipelock signing key generate \
+  --purpose receipt-signing \
+  --out /etc/pipelock/keys/receipt-signing.json
+```
 
 ## Whole-Corpus Auditor
 
@@ -29,7 +32,12 @@ Pass `--no-auditor` to `pipelock init` to skip installing it, or `--dry-run` to
 see what would be installed without installing anything. If the host has no
 usable `systemd --user` session (no `systemctl` binary, no `XDG_RUNTIME_DIR`,
 or the session bus is unreachable), init skips the auditor with a printed
-notice instead of failing. Stop and disable an installed timer with
+notice instead of failing. `running` and `degraded` both count as usable.
+While the session reports `starting` or `initializing`, a login-time `init`
+retries briefly (a bound of well under a second) before treating the session
+as unavailable, so a normal login race no longer causes a permanent skip; any
+other reported state (for example `offline`) skips immediately with that
+state named in the notice. Stop and disable an installed timer with
 `systemctl --user disable --now pipelock-evidence-corpus-auditor.timer`; that
 leaves the generated unit, alert and metric files in place but inert, so delete
 them under `$XDG_CONFIG_HOME/systemd/user/` and
@@ -42,6 +50,14 @@ run fails rather than reporting a skip, and a disclosure that cannot be written
 fails before anything is installed. Under `--json` the outcome is also reported in the
 `evidence_corpus_auditor` object, and the disclosure is written to stderr so
 stdout stays a single JSON document.
+
+Rerunning `init` never silently retargets an already-installed auditor: if the
+existing managed service's executable or `flight_recorder.dir` differs from
+what this run would install, or an unmanaged file exists with the same name,
+init fails with an error rather than replacing it. To migrate deliberately,
+stop the timer with `systemctl --user`, update the service's `ExecStart` to
+the intended binary and recorder directory, run
+`systemctl --user daemon-reload`, then rerun `init`.
 
 Point the Prometheus node-exporter textfile collector at
 `$XDG_CONFIG_HOME/pipelock/prometheus/textfile/`, and add a rule-file GLOB such
@@ -132,7 +148,21 @@ TLS-intercepted CONNECT inner HTTP requests, WebSocket, reverse proxy, MCP
 stdio, and MCP HTTP. Block-path receipts stay best-effort because the action is
 already denied.
 
+The same rule covers DLP's credential-audience allow and the issuer-cookie and
+issuer-query allows on TLS-intercepted requests: when DLP or entropy scanning
+lets a value through because it matches its compiled issuer audience or a value
+the destination issued, that allow is itself an allow-path record. Under
+`require_receipts` its receipt must be durably confirmed before the request is
+forwarded. A confirmation failure blocks with reason `receipt_emission_failed`.
+The layer is `credential_audience_receipt` for the credential-audience allow and
+`issuer_allow_receipt` for the issuer-cookie and issuer-query allows, so either
+can be told apart from an admission-receipt failure, which uses layer
+`receipt_emission`. With `require_receipts` off, these allow records stay
+best-effort like every other receipt on this page.
+
 MCP startup requests (`initialize` and `tools/list`) receive correlated intent and outcome receipts. The `notifications/initialized` notification receives a durable forwarding receipt and does not claim a server response. Required recording still blocks forwarding when the recorder fails.
+
+An MCP call can pass the input scan, get its intent receipt, and still be refused before Pipelock sends it. The stdio-to-HTTP bridge and the HTTP listener check the upstream against the live contract for every call, so a contract promoted mid-session can deny one. That call's outcome receipt has `verdict: block` under the intent's action ID, with `layer: mcp_contract` and `status=blocked` in its pattern. Tool calls sent as notifications get the same outcome even though no response goes back. The HTTP listener does the same when its `x-mcp-header` contract check refuses a current-protocol call after the input scan, including a call for a tool whose contract it first had to look up: the outcome has `verdict: block` and `layer: mcp_header_contract`, and its pattern gives the reason (`tool_header_contract_unavailable`, `tool_header_contract_invalid`, `mcp_param_header_mismatch`, or `tool_header_contract_wait_ended` when the request ended first). Intent/outcome pairing in the completeness checks matches on action ID and doesn't read the verdict, so a refused call counts as a closed pair, the same as a sent one. The completeness result doesn't tell them apart; the outcome receipt does, through its block verdict, its refusing layer and `status=blocked`.
 
 Strict MCP recording currently supports startup, tool calls, and supported A2A methods. Other MCP methods, including resource and prompt operations, can be refused because their receipt identity is not defined. The error message distinguishes that limitation from a recorder failure; replacing the signing key does not add method support. Check the methods your client and server need before enabling strict recording.
 
@@ -155,6 +185,23 @@ Operational notes:
       is refused rather than ignored.
   Turning `require_receipts` **off** through a reload is rejected in every case
   and takes a restart, because it is a required security contract.
+- **A failed durability confirmation stops that receipt chain until restart.**
+  A required receipt is confirmed with `fsync` before its request is forwarded.
+  If that sync fails, every receipt waiting on it fails, and so does every later
+  receipt on the same chain: after a failed `fsync` a later one can report
+  success even though the earlier writes were lost, so nothing written after
+  the failure can be confirmed. Requests are blocked with
+  `receipt_emission_failed`; the first failure is counted under the
+  `durability` reason and the later refusals under `durability_inherited`.
+  Graceful shutdown then refuses to sign a final checkpoint over the failed
+  chain. Fix the storage problem, then restart Pipelock or, with a single
+  chain, reload its configuration: either way receipts continue in a new run
+  and the failed run is kept as it was. That new run is not linked to the
+  failed one by a recovery seal, so verification lists it as unlinked.
+  With several receipt chains the storage failure is local to one chain, but
+  under `require_receipts` Pipelock still stops the whole group, because a
+  required group cannot keep writing to its surviving chains as if complete.
+  Closing the group reports it incomplete.
 - **An allowed request that is later blocked carries two receipts.** The
   pre-egress allow receipt attests the egress *decision*; if response scanning
   then blocks the reply, a block receipt is emitted under the **same
@@ -204,13 +251,66 @@ Because the recorder is on by default, two footguns are bounded by the defaults 
 
 ### Completeness anchor (transcript root)
 
-On a **clean shutdown** the recorder writes a `transcript_root` entry naming the final receipt sequence number and receipt-chain root hash. `pipelock verify-receipt --whole-recorder --chain` verifies that commitment, along with every recorder entry present. Without `--whole-recorder`, `verify-receipt --chain` verifies only the receipt subsequence. After a signing-key rotation, the root commits the final signing segment; verification still checks the trusted receipt chain and rotation continuity across every preceding segment.
+On a **clean shutdown** the recorder writes a `transcript_root` entry naming the final receipt sequence number and receipt-chain root hash. `pipelock verify-receipt --whole-recorder --chain` verifies that commitment, along with every recorder entry present. Without `--whole-recorder`, `verify-receipt --chain` verifies only the receipt subsequence. In that mode a single-chain run that recorded EvidenceReceipt v2 receipts, which can come from allowed or blocked requests, reports `VALID PREFIX, END UNPROVEN` and exits 3 even after a clean shutdown, because the v2 chain carries no end marker of its own. Use `--whole-recorder` to prove that a recorder run ended. After a signing-key rotation, the root commits the final signing segment; verification still checks the trusted receipt chain and rotation continuity across every preceding segment.
 
 Scope and limits:
 
-- **Clean exit only.** The root is written during graceful shutdown, after in-flight receipt emits have drained (drain-then-seal). An unsealed recorder is reported as incomplete by `--whole-recorder`; this can mean the recorder is still running or that its tail was truncated. The root cannot prove that a trailing checkpoint written after the root is present.
-- **Restart resumes cleanly.** A transcript root is a per-run checkpoint, not a permanent seal. The next start by the same writer resumes emission into the same hash-linked chain (a continuous per-writer chain still verifies), so receipts are never silently bricked by a prior clean shutdown.
-- **Large evidence directories keep emitting.** Resume reads only the tail record it needs and is not subject to the bounded directory-read cap used by query, verification, and dashboard paths. Those content-read paths stay bounded so a truncated scan cannot be mistaken for complete evidence. Resume and health selection parse the session id out of each shard filename instead of matching a raw prefix, so a session such as `agent` cannot accidentally adopt shards from `agent-debug`.
+- **Clean exit only.** The root is written during graceful shutdown, after in-flight receipt emits have drained (drain-then-seal). With `--whole-recorder`, an unsealed run is reported as `INCOMPLETE` and `VALID PREFIX, END UNPROVEN` with exit 3, whether you verify the directory, select a run with `--session`, or check a single file; directory and `--session` output also lists it under `INCOMPLETE RUNS`. `--allow-prefix` changes that exit to 0, and `--require-seal` makes a missing seal invalid evidence (exit 1) even with `--allow-prefix`. An unsealed run can be live or have ended unexpectedly. The root cannot prove that a trailing checkpoint written after the root is present.
+- **A restart starts a new chain.** A transcript root seals one process run. The next start records a new run chain beside it (see [One chain per process run](#one-chain-per-process-run)), so a prior clean shutdown never blocks receipts.
+- **Large evidence directories keep emitting.** Resume reads only the tail record it needs and is not subject to the bounded directory-read cap used by query and dashboard paths. Display reads stay bounded and report truncation. Native verification, group lifecycle operations and anchoring read complete session history through separate authoritative readers. Resume and health selection parse the session id out of each shard filename instead of matching a raw prefix, so a session such as `agent` cannot accidentally adopt shards from `agent-debug`.
+
+### Stop budget
+
+Stopping a recording proxy takes time. On SIGTERM, Pipelock stops accepting traffic, drains in-flight receipts, then closes the receipt group: it finishes verifying segments the background worker hasn't reached and rehashes the run's earlier evidence before signing the close. That work grows with recorded history and shrinks with available CPU. In one development measurement with 8 chains and required receipts, a run of 300,000 requests closed in about 15 seconds on 8 CPUs and 109 seconds on 2. These are single measurements, not limits.
+
+Every deployment Pipelock ships states a 10-minute stop budget instead of its manager's default:
+
+| Deployment | Setting | Manager default |
+|---|---|---|
+| `pipelock contain install` systemd unit | `TimeoutStopSec=600` | 90 s |
+| Helm chart | `terminationGracePeriodSeconds: 600` (value `terminationGracePeriodSeconds`) | 30 s |
+| `pipelock init sidecar` generated proxy Deployment and Helm values | `terminationGracePeriodSeconds: 600` | 30 s |
+| `pipelock generate docker-compose`, the Compose examples and the guides' Compose snippets | `stop_grace_period: 10m` | 10 s |
+
+`pipelock contain upgrade` from 3.7.0 or later adds `TimeoutStopSec=600` to an existing unit's `[Service]` section unless the unit already sets `TimeoutStopSec` or `TimeoutSec` there; a drop-in under `pipelock.service.d/` still overrides it. An upgrade run by an earlier binary doesn't add it, because the old binary performs the upgrade; afterwards, run `pipelock contain install` with the new binary to rewrite the unit. For `docker run`, pass `--stop-timeout 600`, or `docker stop --timeout 600` when stopping it by hand. Ten minutes is a chosen budget, not a proven bound. Raise it for a long-lived recorder on a small CPU limit, and size CPU and memory limits for recording separately: a longer grace period doesn't help a container that runs out of memory.
+
+In Kubernetes the grace period is shared by the whole pod. Time spent in `preStop` hooks or waiting to signal native sidecars reduces the time left for those containers to stop. A helper container that ignores SIGTERM, such as a shell loop running as PID 1, can keep the pod alive until the shared deadline even after Pipelock has exited, and a `Recreate` rollout waits for it before starting the replacement. Make helpers exit on SIGTERM, for example with `trap 'exit 0' TERM` and a background `sleep` followed by `wait "$!"` in place of a bare `sleep`.
+
+If the manager kills Pipelock before the close finishes, receipts that were already durable stay on disk and still authenticate, but the group has no signed close. `pipelock verify-receipt --chain DIR --group <group-id> --key <signer-public-key>` reports it as `GROUP_INCOMPLETE` and exits nonzero, so a killed run can't pass as complete. A kill earlier in shutdown, while requests are still draining, can also leave a torn final record or, with best-effort receipts, an action without its receipt.
+
+### One chain per process run
+
+Each Pipelock process run records its own receipt chain under a session named `<base>.run.<id>`, for example `proxy.run.3f9c...`. Two processes sharing one evidence directory therefore never extend the same chain. Each run chain holds only entry types the shipped verifiers already accept, and it opens with an ordinary genesis `session_open`. Verify the full run with `pipelock verify-receipt --chain DIR --session <session> --whole-recorder --key KEY`, where `DIR` contains all its shards. A single-file command checks only the named shard.
+
+The TypeScript and Rust verifier CLIs default `--dir` to the legacy `proxy` session. For a full run chain, pass `--session-id proxy.run.<id>` with `--dir`. Passing `evidence-proxy.run.<id>-0.jsonl` directly checks only the first shard. Obtain the full session ID from the evidence filename.
+
+Evidence written by older binaries lives in the plain `proxy` session. It is still verified as before.
+
+An incomplete final write is reported as a torn tail: trailing NUL bytes, a truncated final line, or a final JSON record without its newline. Pipelock never appends to that shard or rewrites it. A reload that encounters a torn tail in its current run starts a fresh run session and publishes the configuration only after the new receipt emitter opens successfully. Malformed complete records, invalid signatures, and broken hash links still reject the reload. If the fresh run cannot open, inspect `flight_recorder.dir` storage and `flight_recorder.signing_key_path`; `flight_recorder.require_receipts` continues to enforce receipt availability.
+
+The unsigned `evidence_health.torn_tails` snapshot records the latest observed shard path, byte offset, and observation time. `pipelock_evidence_torn_tails_total` counts each observed shard boundary once per process. `pipelock evidence doctor DIR` reports retained torn shards as damaged. Recovery doesn't restore missing evidence. When a fresh run opens after torn-tail recovery, Pipelock also writes a signed recovery seal in the predecessor's chain-link claim file. The seal identifies the damaged shard, its raw digest and size, the complete prefix, and the successor run. It records what the signer observed; it doesn't prove the damage was accidental or that no earlier evidence was removed. See [Recovery seals](../specs/evidence-recovery-seal-v1.md).
+
+Alerting must watch `pipelock_evidence_torn_tail_present == 1`, also exposed as `evidence_health.torn_tail_present` in `/stats`. This damage signal remains set until process restart, including after a successful reload or recovery into a fresh run. `local_recorder_operational` and `run_state: OPEN` describe the current run and can remain healthy while an older shard is damaged. Restart clears process-local observations; use `pipelock evidence doctor DIR` and the whole-corpus integrity alert to inspect retained damage.
+
+**Restart continuity uses one optional predecessor claim file.** When a run writes its first receipt, it looks for the most recent chain of the same base whose writer has exited and that no run has continued yet. For a complete predecessor, it publishes a signed `ChainLink` v1 in `chain-link-<predecessor>.json`, naming the predecessor's exact final receipt (sequence and hash). After torn-tail recovery, it publishes a signed `recovery_seal` v1 in that same slot. Both claim files are created atomically and only if absent, so at most one run can continue a given predecessor. The claim lives beside the chain, never inside it.
+
+A run is legitimately *unlinked* when it is the first run, when its predecessor was still running (concurrent processes), when its predecessor's tail was damaged, or when the platform cannot prove the earlier writer has exited. Unlinked runs are reported, not treated as failures.
+
+`pipelock verify-receipt --chain DIR` verifies every run chain of the base, then every predecessor claim. For a `ChainLink`, it checks the signature, exact predecessor receipt tail, absence of later predecessor entries, one-successor rule, and key continuity; a changed key must be pinned with `--key` or authorized by a `--rotation-endorsement`. For a recovery seal, it checks the signature and binds the damaged shard bytes, complete prefix, and successor opening receipt. The successor is reported as linked across an attested discontinuity, while the evidence remains damaged and verification exits nonzero. The command lists linked runs, unlinked runs, and findings. `pipelock evidence doctor DIR` checks claim signatures and placement without judging key trust, and reports recovery discontinuities separately from structural health.
+
+What this does not prove:
+
+- **Deleting a link file is not detected.** Its successor then looks exactly like an honest unlinked run. The unlinked list shows it, but nothing marks it as tampering.
+- **A structurally clean directory does not prove continuity.** Sequence and hash checks pass for every chain even when a whole run's evidence is missing.
+- Tamper-resistant completeness across runs needs a signed head commitment that a later run or an outside witness can check. Pipelock does not provide one yet. See [hard limits](../evidence/hard-limits.md#l-restart-continuity-deletion---restart-continuity-deletion).
+
+### Held calls and restart recovery
+
+When a `defer` rule holds an MCP call, Pipelock tracks the hold in `deferred-actions.jsonl` under `flight_recorder.dir` and writes its signed resolution receipt to the chain. It syncs every journal entry to disk before acting on it. Releasing an allowed hold takes three steps in order. First a `deferred_held` row with `release_pending: true`, then the signed allow resolution receipt, then a `resolved_allow` row, and only then does the call go out. A hold whose release reached neither `resolved_allow` nor a closing `resolved_block` row is still pending at the next start, and restart recovery closes it with a block receipt (`resolution_source: restart_recovery`). The journal doesn't store the call's payload, so a recovered hold is never sent. Recovery syncs that receipt before it records the hold as closed. Older Pipelock releases read a `release_pending` row as an ordinary held row, so after a rollback they also close the hold to block.
+
+If the journal accepts the release and the receipt but then can't confirm `resolved_allow`, the call isn't sent and resolves to block with the reason `release could not be journaled`. Pipelock writes the corrective block receipt before the corrective terminal block row. If that corrective receipt can't be written either, no terminal row is written. The hold stays pending, and the next start's recovery closes it, or refuses to start while it still can't write the receipt. If both receipts succeed, that hold has two resolution receipts, and `pipelock verify-receipt --clean-report` refuses the chain instead of reporting the call as allowed. A storage error can also leave a complete `resolved_allow` row on disk after its sync reports failure, and restart recovery can't tell from that row whether the call went out. The allow receipt is written before the send, so it records that Pipelock released the call, not that the upstream received it. If Pipelock stops after the `resolved_allow` row and before the send, the hold stays closed as allowed even though the call never went out.
+
+Grouped receipts also persist each held call's selected shard in the journal. Recovery writes the block resolution to that same shard index in the successor group. Changing `flight_recorder.receipt_chains` is supported only when the saved index still exists. If it doesn't, startup refuses recovery and names the minimum count; set `receipt_chains` back to at least that count (the original count works) and restart. The refused start leaves its own group unclosed, and the next start at a sufficient count builds on it. Journal entries from a single-chain run or an older release have no saved selection and can't be recovered into a receipt group. Start once with `receipt_chains` set to 1, which recovers them, then restore the group setting. Preserve the journal and its receipt evidence; don't delete pending entries or assign a replacement shard to force startup. Group verification authenticates the successor evidence, but a per-session clean report doesn't pair a hold from the previous run with its recovery resolution in the new run.
 
 ### Key-free evidence capture (`--capture-output`)
 
@@ -254,10 +354,11 @@ inspect them.
 
 Pipelock **rejects `flight_recorder.signing_key_path` changes at hot-reload time.** If you edit the config and SIGHUP (or rely on fsnotify), pipelock keeps the previously loaded key in memory, logs `WARNING: config reload: flight_recorder.signing_key_path changed — receipt chain cannot rotate at runtime, ignoring (restart required)`, and continues signing with the old key. This is intentional: rotating the key mid-run would break chain verification (consumers would see entries signed with two different public keys under one `chain_id`). To rotate safely:
 
-1. Stop pipelock so the old chain closes cleanly at its last checkpoint.
+1. Stop pipelock so the old run chain closes cleanly at its last checkpoint.
 2. Swap the key file referenced by `signing_key_path`.
-3. Start pipelock. On resume it detects the key change and opens a new chain
-   **segment** that is cryptographically linked to the old one (see below).
+3. Start pipelock. The new run records a new chain signed by the new key, and
+   its link file names the old run's exact tail (see
+   [One chain per process run](#one-chain-per-process-run)).
 
 If you keep the same `signing_key_path` and replace the key file at
 that path, a reload re-reads the file contents. Treat that as an
@@ -265,19 +366,19 @@ advanced operation: the documented operator-safe path is still a
 restart so the old chain closes cleanly before the new key starts
 signing.
 
-The new segment is a linked verifiable unit, not an orphan: its first receipt
-carries a `KeyTransition` marker and links to the prior segment's tail hash, so
 `pipelock verify-receipt --chain DIR --key old.pub --key new.pub` verifies
-continuously across the rotation and lists each segment's signer for you to
-confirm. Earlier builds opened a fully *separate* chain here — and, worse, could
-brick emission entirely when the resume saw the rotation; both are fixed, and a
-rotated chain now stays offline-verifiable. See the
-[receipt verification guide](receipt-verification.md#chains-that-rotated-the-signing-key)
-for the verification flow.
+both run chains and the link between them, and reports the link as
+`trusted_key`. A chain in the legacy `proxy` session that rotated keys in place
+still carries a `KeyTransition` marker and verifies as one segmented chain; see
+the
+[receipt verification guide](receipt-verification.md#chains-that-rotated-the-signing-key).
 
 To let a verifier trust the successor from the original pinned key instead of
-pinning every segment key separately, prepare an old-key-signed rotation
-endorsement while Pipelock is stopped:
+pinning every key separately, prepare an old-key-signed rotation endorsement
+while Pipelock is stopped. Pass `--session` the run session of the process you
+just stopped: the newest `proxy.run.<id>` in the directory, which
+`pipelock verify-receipt --chain DIR` lists. For evidence written only by an
+older binary, the session is `proxy`.
 
 ```bash
 sudo pipelock signing pubkey \
@@ -292,7 +393,7 @@ sudo systemctl stop pipelock
 
 sudo pipelock signing receipt-rotation endorse \
   --chain /var/lib/pipelock/evidence \
-  --session proxy \
+  --session proxy.run.<id-of-the-stopped-run> \
   --prior-key-file /etc/pipelock/keys/flight-recorder-signing.key \
   --new-key-file /etc/pipelock/keys/flight-recorder-signing.next.json \
   --root-key /etc/pipelock/keys/flight-recorder-signing.root.pub \
@@ -334,10 +435,22 @@ root:
 ```bash
 pipelock verify-receipt \
   --chain /var/lib/pipelock/evidence \
-  --session proxy \
   --key /etc/pipelock/keys/flight-recorder-signing.root.pub \
   --rotation-endorsement /etc/pipelock/keys/receipt-rotation-2026-07-30.json
 ```
+
+Without `--whole-recorder` this command checks the receipt chain only. A run
+that has not ended in a signed `session_close` exits 3 with
+`VALID PREFIX, END UNPROVEN`. Against a recorder that is still running, the
+command can also fail with exit 1 if a shard or link changes during verification;
+use `pipelock evidence doctor DIR` for a live check, or verify a copy. A clean
+stop writes that `session_close`. If the run recorded no EvidenceReceipt v2
+receipts, the same command can then exit 0, which proves the receipt chain
+ended but not the recorder entries around it. A single-chain run that recorded v2 receipts,
+which can come from allowed or blocked requests, still exits 3 with
+`VALID PREFIX, END UNPROVEN` after a clean stop. Add `--whole-recorder`, and
+keep `--key` and every `--rotation-endorsement` flag, to check the
+`transcript_root` seal.
 
 For a later rotation, pin the same original root and pass each earlier
 `--rotation-endorsement` to both the endorsement command and the verifier. This
@@ -412,7 +525,7 @@ V2 inserts `event_kind` after `type`. V3 inserts `chain_kind` and
 `writer_instance_id` after `session_id`. The recorder continues writing v2
 during the reader-first compatibility window.
 
-The first entry in a writer chain has `prev_hash: "genesis"`. Each subsequent entry's `prev_hash` must equal the `hash` of the previous entry from that writer. Any gap, deletion, modification, or concurrent-writer fork breaks the chain. Current releases do not reject multiple processes sharing a recorder directory. The whole-corpus auditor installed by `pipelock init` detects the resulting damage; run `pipelock evidence doctor DIR` manually when investigating its alert. The doctor reports symptoms rather than causes; a concurrent-writer fork and a deliberate edit can produce the same structure.
+The first entry in a writer chain has `prev_hash: "genesis"`. Each subsequent entry's `prev_hash` must equal the `hash` of the previous entry from that writer. Any gap, deletion, modification, or concurrent-writer fork breaks the chain. Current binaries give every process run its own chain, so processes sharing a recorder directory do not fork each other. An older binary writing the legacy `proxy` session alongside another writer still can. The whole-corpus auditor installed by `pipelock init` detects the resulting damage; run `pipelock evidence doctor DIR` manually when investigating its alert. The doctor reports symptoms rather than causes; a concurrent-writer fork and a deliberate edit can produce the same structure.
 
 To verify a chain:
 
@@ -540,7 +653,7 @@ Filter fields:
 | `MaxDirectoryEntries` | Optional evidence-directory entry ceiling. Zero uses the default ceiling. |
 | `MaxBytesRead` | Optional byte ceiling. Positive values apply across scanned evidence files. Zero uses the default per-file byte ceiling. If reached, `QueryResult.Truncated` is true. |
 
-Recorder reads are bounded. `ReadEntries` and `ReadEntriesFromReader` return an
+Display reads are bounded. `ReadEntries` and `ReadEntriesFromReader` return an
 error if the default evidence size or entry-count ceiling is exceeded. Query
 APIs that can return read metadata set `QueryResult.Truncated` instead of
 silently returning a partial session as complete.
@@ -554,6 +667,8 @@ sessions, err := recorder.ListSessions("/var/lib/pipelock/evidence")
 Session listing is also bounded by default. Use `ListSessionsBoundedResult` when
 a UI can display an explicit truncation warning; strict helpers return an error
 when the directory entry cap is exceeded.
+
+Authoritative consumers use `WalkSessionHistory` or `WalkSessionHistoryFiles` to stream complete history, and `WalkHistorySessions` to enumerate sessions without a display budget. These readers keep the recorder's 1 MiB entry limit, secure file opens, session membership checks and change detection. Capture replay and coverage-certificate generation use this path too. Callers that extract receipts into a slice still need memory proportional to the receipts they retain. Evidence doctor has separate diagnostic limits; the Rust, TypeScript and Python verifiers and browser archive ingress also have their own input limits.
 
 ## File Rotation and Retention
 
@@ -569,7 +684,7 @@ To trigger cleanup immediately, run:
 pipelock evidence expire --config pipelock.yaml
 ```
 
-`pipelock doctor` warns when any session reaches 200 shards. Receipt emission is not affected by shard count. Resume scans the session's shards to find the newest one that actually holds entries, walking past empty shards left by a crash between file creation and the first write, and reads only that tail. The candidate scan is not capped and each file read is, so emission keeps working past the 256-entry ceiling that stops the read paths. The scan does hold one filename and sequence per shard in memory while it runs, so it is bounded by available resources rather than unconditionally, and bounding that is tracked follow-up work. The 256-shard ceiling applies to the evidence read paths (`evidence view`, `evidence serve`, query, and the dashboard), which refuse rather than show a truncated view, so those surfaces degrade on a directory past it.
+`pipelock doctor` warns when any session reaches 200 shards. Receipt emission is not affected by shard count. Resume scans the session's shards to find the newest one that actually holds entries, walking past empty shards left by a crash between file creation and the first write, and reads only that tail. The candidate scan is not capped and each file read is, so emission keeps working past the 256-entry ceiling that stops the read paths. The scan does hold one filename and sequence per shard in memory while it runs, so it is bounded by available resources rather than unconditionally, and bounding that is tracked follow-up work. The 256-shard ceiling applies to the evidence read paths (`evidence view`, `evidence serve`, query, and the dashboard), which refuse rather than show a truncated view, so those surfaces degrade on a directory past it. Verification, receipt group close, successor creation and anchoring don't use those readers: they read the session's complete history and ignore unrelated files in the directory.
 
 The warning matters anyway, because nothing prunes chain shards. Retention expires raw sidecars only; `.jsonl` shards are the hash-chain spine and removing one breaks full-history verification and can strand external anchors, so a long-running session grows without bound. Treat a warning as a signal to archive and verify, not as a countdown to an outage.
 

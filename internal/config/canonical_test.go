@@ -49,6 +49,28 @@ func TestCanonicalPolicyHash_Deterministic(t *testing.T) {
 	}
 }
 
+func TestCanonicalPolicyHash_CredentialAudienceCarriers(t *testing.T) {
+	t.Parallel()
+	baseline := canonicalHashOf(t, nil)
+	for _, mask := range []uint16{0, CredentialAudienceCarrierAuthorizationBearer} {
+		changed := canonicalHashOf(t, func(cfg *Config) {
+			found := false
+			for i := range cfg.DLP.Patterns {
+				if cfg.DLP.Patterns[i].Name == "JWT Token" {
+					cfg.DLP.Patterns[i].CredentialAudienceCarrierMask = mask
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("control: JWT pattern missing")
+			}
+		})
+		if changed == baseline {
+			t.Errorf("carrier mask %d did not change policy identity", mask)
+		}
+	}
+}
+
 func TestCanonicalPolicyHash_Cached(t *testing.T) {
 	t.Parallel()
 
@@ -475,6 +497,43 @@ func TestCanonicalPolicyHash_PolicyFieldsDoAffect(t *testing.T) {
 	}
 }
 
+func TestCanonicalPolicyHash_ExactException(t *testing.T) {
+	base := func(c *Config) {
+		c.RequestPolicy.Enabled = true
+		c.RequestPolicy.Rules = []RequestPolicyRule{{
+			Name: "block-move", Action: ActionBlock,
+			Route: RequestPolicyRoute{
+				Hosts: []string{"api.service.example.com"}, Methods: []string{"POST"},
+				PathPatterns: []string{`/items/.+/move$`},
+			},
+		}}
+	}
+	hash := func(except *RequestPolicyException) string {
+		return canonicalHashOf(t, func(c *Config) {
+			base(c)
+			c.RequestPolicy.Rules[0].Except = except
+		})
+	}
+	without := hash(nil)
+	archive := hash(&RequestPolicyException{Field: "destinationId", Values: []string{"archive"}})
+	if archive == without {
+		t.Fatal("adding exact exception did not change canonical policy hash")
+	}
+	for _, tc := range []struct {
+		name   string
+		except *RequestPolicyException
+	}{
+		{"field", &RequestPolicyException{Field: "folderId", Values: []string{"archive"}}},
+		{"value", &RequestPolicyException{Field: "destinationId", Values: []string{"other"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hash(tc.except); got == archive {
+				t.Fatal("changing exact exception did not change canonical policy hash")
+			}
+		})
+	}
+}
+
 func TestCanonicalPolicyHash_AgentBestEffortAuthorizationIsInert(t *testing.T) {
 	bestEffort := true
 	first := canonicalHashOf(t, func(c *Config) {
@@ -717,19 +776,19 @@ func TestCanonicalPolicyHash_HostSetsCanonicalized(t *testing.T) {
 		{
 			name: "request body content entropy exclusions",
 			lowercase: func(c *Config) {
-				c.RequestBodyScanning.ContentEntropyExclusions = []string{"uploads.vendor.example"}
+				c.RequestBodyScanning.ContentEntropyExclusions = EntropyHostExclusions("uploads.vendor.example")
 			},
 			uppercase: func(c *Config) {
-				c.RequestBodyScanning.ContentEntropyExclusions = []string{"UPLOADS.VENDOR.EXAMPLE"}
+				c.RequestBodyScanning.ContentEntropyExclusions = EntropyHostExclusions("UPLOADS.VENDOR.EXAMPLE")
 			},
 			duplicate: func(c *Config) {
-				c.RequestBodyScanning.ContentEntropyExclusions = []string{"uploads.vendor.example", "UPLOADS.VENDOR.EXAMPLE"}
+				c.RequestBodyScanning.ContentEntropyExclusions = EntropyHostExclusions("uploads.vendor.example", "UPLOADS.VENDOR.EXAMPLE")
 			},
 			trailing: func(c *Config) {
-				c.RequestBodyScanning.ContentEntropyExclusions = []string{"uploads.vendor.example."}
+				c.RequestBodyScanning.ContentEntropyExclusions = EntropyHostExclusions("uploads.vendor.example.")
 			},
 			different: func(c *Config) {
-				c.RequestBodyScanning.ContentEntropyExclusions = []string{"other.vendor.example"}
+				c.RequestBodyScanning.ContentEntropyExclusions = EntropyHostExclusions("other.vendor.example")
 			},
 		},
 		{
@@ -753,19 +812,19 @@ func TestCanonicalPolicyHash_HostSetsCanonicalized(t *testing.T) {
 		{
 			name: "websocket content entropy exclusions",
 			lowercase: func(c *Config) {
-				c.WebSocketProxy.ContentEntropyExclusions = []string{"stream.vendor.example"}
+				c.WebSocketProxy.ContentEntropyExclusions = EntropyHostExclusions("stream.vendor.example")
 			},
 			uppercase: func(c *Config) {
-				c.WebSocketProxy.ContentEntropyExclusions = []string{"STREAM.VENDOR.EXAMPLE"}
+				c.WebSocketProxy.ContentEntropyExclusions = EntropyHostExclusions("STREAM.VENDOR.EXAMPLE")
 			},
 			duplicate: func(c *Config) {
-				c.WebSocketProxy.ContentEntropyExclusions = []string{"stream.vendor.example", "STREAM.VENDOR.EXAMPLE"}
+				c.WebSocketProxy.ContentEntropyExclusions = EntropyHostExclusions("stream.vendor.example", "STREAM.VENDOR.EXAMPLE")
 			},
 			trailing: func(c *Config) {
-				c.WebSocketProxy.ContentEntropyExclusions = []string{"stream.vendor.example."}
+				c.WebSocketProxy.ContentEntropyExclusions = EntropyHostExclusions("stream.vendor.example.")
 			},
 			different: func(c *Config) {
-				c.WebSocketProxy.ContentEntropyExclusions = []string{"other.vendor.example"}
+				c.WebSocketProxy.ContentEntropyExclusions = EntropyHostExclusions("other.vendor.example")
 			},
 		},
 		{

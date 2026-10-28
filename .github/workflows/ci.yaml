@@ -6,6 +6,9 @@ on:
     tags-ignore: ['v*']
   pull_request:
     branches: [main]
+  merge_group:
+    types: [checks_requested]
+    branches: [main]
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,7 +31,7 @@ jobs:
   # "Secrets detected in PR diff" with no secret present.
   #
   # Building from origin/main rather than from the pull request head also means
-  # a pull request cannot supply the scanner that inspects it.
+  # a pull request or merge group cannot supply its own scanner.
   security-scan:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -41,7 +44,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
           cache: false
 
       - name: Build scanner from origin/main
@@ -63,8 +66,8 @@ jobs:
 
       - name: Scan the diff
         env:
-          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
         run: |
           set -euo pipefail
           zero_sha=0000000000000000000000000000000000000000
@@ -99,7 +102,6 @@ jobs:
             --exclude test/secureiqlab/ \
             --exclude README.md \
             --exclude assets/demo.cast \
-            --exclude .github/actions/pr-review/pr_review.py \
             --exclude docs/attacks-blocked.md \
             --exclude docs/bypass-resistance.md \
             --exclude docs/configuration.md \
@@ -111,22 +113,27 @@ jobs:
             --exclude sdk/conformance/testdata/aarp-corpus/ \
             < "${diff_file}"
 
-  # Pull requests skip the Go 1.26 lane by default (see the producer jobs
+  # Merge groups use the same test selection as pull requests on the combined
+  # commit. The classifier compares the queue base/head, including CI policy.
+  # Go 1.26 race tests remain main-push-only; cache writes stay main-push-only.
+  #
+  # The Go 1.27 race lane is skipped by default (see the producer jobs
   # below), but a PR that changes CI policy, Go pins, or the guard that checks
   # them must still prove both versions before merge -- the whole reason the
-  # 1.26 lane is being skipped elsewhere is that it never catches anything
-  # OTHER than a real toolchain change, and this is exactly that case. Uses a
+  # 1.27 lane is skipped elsewhere is that it never catches anything OTHER
+  # than a real toolchain change, and this is exactly that case. Uses a
   # job-level output (not a workflow-level `paths:` trigger filter) because a
   # `paths:`-filtered workflow run is entirely skipped rather than reporting a
   # check, and a skipped workflow leaves a required check permanently pending
   # instead of green.
   changed-files:
     needs: [security-scan]
-    if: ${{ github.event_name == 'pull_request' }}
+    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
       ci_policy: ${{ steps.check.outputs.ci_policy }}
+      docs_only: ${{ steps.docs.outputs.docs_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -136,12 +143,14 @@ jobs:
       - name: Detect CI-policy file changes
         id: check
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
           changed="$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" -- \
-            .github/workflows/ go.mod go.sum scripts/check-go-matrix.sh)"
+            .github/workflows/ go.mod go.sum scripts/check-go-matrix.sh \
+            scripts/ci_test_packages.py scripts/ci_test_durations.json \
+            scripts/ci-test-with-retry.sh scripts/run-race-test.sh Makefile codecov.yml)"
           if [ -n "$changed" ]; then
             echo "PR touches CI-policy files:"
             printf '%s\n' "$changed"
@@ -151,78 +160,103 @@ jobs:
             echo "ci_policy=false" >> "$GITHUB_OUTPUT"
           fi
 
-  # Keep each Go minor in a separate producer. A matrix-level aggregate cannot
-  # distinguish which minor failed: its single result is red for either one.
-  test-oss-go125:
-    needs: [security-scan]
-    runs-on: ubuntu-latest
-    name: test-oss (1.25, ${{ matrix.shard }})
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version: '1.25'
-
-      - name: Verify dependencies
-        run: bash scripts/ci-retry.sh go mod verify
-
-      - name: Download dependencies
-        run: bash scripts/ci-retry.sh go mod download
-
-      - name: Run tests (OSS)
+      # A pull request that changes only prose skips the Go build, test, lint
+      # and platform jobs; docs-check and the config-example job, which read
+      # docs/*.md, still run, and main runs everything after merge. A Markdown
+      # file is not prose when Go can reach it: a test or embed that names it
+      # by path, or a Go package at or above it, since //go:embed globs and
+      # directories reach every file below their package without naming it.
+      # Anything this classifier cannot prove is prose runs the full suite.
+      - name: Detect documentation-only changes
+        id: docs
         env:
-          TEST_LABEL: OSS Go 1.25 ${{ matrix.shard }}
-          TEST_SHARD: ${{ matrix.shard }}
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
-          set -o pipefail
-          set +e
-          packages="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD")" || exit $?
-          package_parallelism=2
-          if [ "$TEST_SHARD" = "proxy" ]; then
-            # The proxy shard has two race-instrumented packages. Running them
-            # sequentially lowers peak memory without serializing t.Parallel
-            # tests inside either package.
-            package_parallelism=1
+          set -euo pipefail
+          # Every git read lands in a file first, so a failed command fails
+          # this step (and the required gates that need it) instead of
+          # feeding a short list to the loop below. No rename detection: a
+          # Go file renamed to Markdown must be seen as a removed Go file.
+          work="$(mktemp -d)"
+          git diff -z --no-renames --name-only "${BASE_SHA}...${HEAD_SHA}" > "$work/changed"
+          # NUL-delimited, like the diff: without -z git quotes non-ASCII names
+          # and a quoted "...\303\251.go" no longer ends in .go.
+          git ls-tree -rz --name-only "$HEAD_SHA" > "$work/tree"
+          declare -A go_dirs=()
+          root_go=false
+          while IFS= read -r -d '' tracked; do
+            case "$tracked" in
+              */*.go) go_dirs["${tracked%/*}"]=1 ;;
+              *.go) root_go=true ;;
+            esac
+          done < "$work/tree"
+          docs_only=true
+          count=0
+          while IFS= read -r -d '' path; do
+            count=$((count + 1))
+            reason=""
+            case "$path" in
+              testdata/*|*/testdata/*|.github/*|sdk/*) reason="fixture or tooling path" ;;
+              *.md) ;;
+              *) reason="not Markdown" ;;
+            esac
+            if [ -z "$reason" ]; then
+              dir="$path"
+              while [[ "$dir" == */* ]]; do
+                dir="${dir%/*}"
+                if [ -n "${go_dirs[$dir]:-}" ]; then
+                  reason="inside Go package $dir"
+                  break
+                fi
+              done
+            fi
+            if [ -z "$reason" ] && [ "$root_go" = true ]; then
+              reason="the repository root is a Go package"
+            fi
+            if [ -z "$reason" ]; then
+              # git grep exits 1 for no match; anything else is a failure,
+              # which must not read as "no Go code names this file".
+              status=0
+              git grep -q -F -e "$path" -e "${path##*/}" "$HEAD_SHA" -- '*.go' || status=$?
+              case "$status" in
+                0) reason="named by Go code" ;;
+                1) ;;
+                *) reason="git grep failed with status $status" ;;
+              esac
+            fi
+            if [ -n "$reason" ]; then
+              echo "full CI: $path ($reason)"
+              docs_only=false
+              break
+            fi
+          done < "$work/changed"
+          if [ "$count" -eq 0 ]; then
+            echo "full CI: empty diff"
+            docs_only=false
           fi
-          # Public runners are 4 vCPU, and -race multiplies scheduler pressure.
-          # Keep package and intra-package test fan-out below CPU count so
-          # deadline/timer tests are not starved by the shard matrix.
-          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
-            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
-            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-oss.json
-          test_status=$?
-          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-oss.json
-          summary_status=$?
-          if [ "$summary_status" -ne 0 ]; then
-            exit "$summary_status"
-          fi
-          exit "$test_status"
+          echo "docs_only=$docs_only"
+          echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
+  # Race lane. The race detector multiplies test time by five to eleven, so the
+  # full race suite costs about six runner-hours per run. Pull requests get the
+  # fast no-race suite below instead; this lane runs on every push to main.
+  # GitHub keeps at most one pending main run per ref, so a burst of merges is
+  # proven by one race run against the newest commit.
+  # max-parallel leaves most of the account's concurrent-job limit to pull
+  # requests, which are waiting on their results; main is not.
   test-oss-go126:
-    needs: [security-scan, changed-files]
-    # Pull requests run only the Go 1.25 floor unless the PR itself touches
-    # CI policy / Go pins (see the changed-files job); this Go 1.26 lane
-    # otherwise runs on push to main (and is proven again, pinned, in
-    # release.yaml before a tag). Three days of PR history showed this lane
-    # catching only timing flakes, never a version-specific failure, so
-    # duplicating it on every ordinary PR was pure runner-queue contention.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name != 'pull_request' || needs.changed-files.outputs.ci_policy == 'true') }}
+    needs: [security-scan]
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-latest
-    name: test-oss (1.26, ${{ matrix.shard }})
-    timeout-minutes: 20
+    name: race-oss (1.26, ${{ matrix.shard }})
+    # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
+    timeout-minutes: 48
     strategy:
       fail-fast: false
+      max-parallel: 6
       matrix:
-        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -239,38 +273,98 @@ jobs:
       - name: Download dependencies
         run: bash scripts/ci-retry.sh go mod download
 
-      - name: Run tests (OSS)
+      - name: Run tests (OSS race)
         env:
-          TEST_LABEL: OSS Go 1.26 ${{ matrix.shard }}
+          TEST_LABEL: OSS race Go 1.26 ${{ matrix.shard }}
           TEST_SHARD: ${{ matrix.shard }}
+          # Advisory test-step budget: warns when a shard drifts so its weights
+          # get refreshed. Never fails.
+          SHARD_BUDGET_SECONDS: '600'
+          # Hard ceiling for one top-level test. The planner places whole
+          # top-level tests, so one test this slow overloads its shard; the
+          # summarizer fails the shard and names the test to split.
+          TEST_CEILING_SECONDS: '300'
         run: |
           set -o pipefail
           set +e
           packages="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD")" || exit $?
+          # proxy-N and scanner-N run disjoint halves of one package tree's tests.
+          test_selector="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD" --selector)" || exit $?
           package_parallelism=2
-          if [ "$TEST_SHARD" = "proxy" ]; then
+          if [[ "$TEST_SHARD" == proxy-* ]]; then
+            # The proxy shard has two race-instrumented packages. Running them
+            # sequentially lowers peak memory without serializing t.Parallel
+            # tests inside either package.
             package_parallelism=1
           fi
-          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
-            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
+          # Public runners are 4 vCPU, and -race multiplies scheduler pressure.
+          # Keep package and intra-package test fan-out below CPU count so
+          # deadline/timer tests are not starved by the shard matrix.
+          # go test's own -timeout must fire well inside the whole-command
+          # attempt deadline: only go test's timeout panic names the test that
+          # hung. With a 20m timeout and a 21m attempt, compile time let the
+          # attempt deadline win and the shard died without naming anything.
+          bash scripts/ci-test-with-retry.sh --packages "$packages" --attempt-timeout-seconds 1260 -- \
+            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 ${test_selector:+"$test_selector"} -json \
             | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-oss.json
           test_status=$?
-          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-oss.json
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" --max-test-seconds "$TEST_CEILING_SECONDS" < /tmp/go-test-oss.json
           summary_status=$?
+          if [ "$SECONDS" -gt "$SHARD_BUDGET_SECONDS" ]; then
+            echo "::warning title=CI shard over time budget::${TEST_LABEL} took ${SECONDS}s, over the ${SHARD_BUDGET_SECONDS}s budget. Refresh scripts/ci_test_durations.json from the go-test-json artifacts or raise TEST_SPLITS for the tree."
+          fi
           if [ "$summary_status" -ne 0 ]; then
             exit "$summary_status"
           fi
           exit "$test_status"
 
-  test-enterprise-go125:
-    needs: [security-scan]
+      - name: Upload test timing
+        # Raw go test JSON, kept so scripts/ci_test_durations.py can refresh
+        # the shard weights from real runner timings.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: go-test-json-oss-go126-${{ matrix.shard }}
+          path: /tmp/go-test-oss.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  # Fast suite: every test package, no race detector, under both build variants.
+  # This is what pull requests wait on. Without -race the same tests run five to
+  # eleven times faster (the scanner tree: about 40s against 7m50s), so whole
+  # package trees fit one shard and a pull request needs a handful of runners
+  # instead of forty. The race lane above proves the same tests under
+  # -race after merge. Coverage comes from this lane: set-mode counters cost
+  # little without -race, and every pull request and main push reports it.
+  #
+  # No retry wrapper here. A timeout is either a hang or a slow test, and both
+  # should fail fast with the test named: go test's own timeout panic lists the
+  # running tests, and the job limit leaves room for it to fire first.
+  #
+  # Go's test cache. Each shard restores the build and test-result cache main
+  # saved, and go test runs without -count=1, so a package whose code and the
+  # files its tests read are unchanged reports the cached pass instead of
+  # running again (coverage profiles are replayed from the cache too). A rest
+  # shard measured 302s cold and 46s with every result cached. Go's cache is
+  # content-addressed, so a stale entry is never used for changed input; the
+  # race lane on main still runs everything with -count=1. Only main saves,
+  # once per shard per day, after pruning what that run did not use, which
+  # keeps the shards inside the repository's cache allowance. A pull request
+  # can read main's entries but cannot write any main reads.
+  test-unit-go126:
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
-    name: test-enterprise (1.25, ${{ matrix.shard }})
-    timeout-minutes: 20
+    name: test-${{ matrix.variant }} (1.26, ${{ matrix.shard }})
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+        variant: ['oss', 'enterprise']
+        # Must equal scripts/ci_test_packages.py --list-unit-shards (UNIT_SPLITS).
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'scanner', 'mcp-0', 'mcp-1', 'mcp-2', 'runtime', 'rest-0', 'rest-1', 'rest-2']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -279,7 +373,33 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
+          # setup-go's one shared cache holds whichever job saved it first;
+          # this job keeps its own per-shard cache below instead.
+          cache: false
+
+      - name: Go cache key
+        id: go-cache-key
+        run: |
+          set -euo pipefail
+          {
+            echo "go=$(go env GOVERSION)"
+            echo "day=$(date -u +%Y%m%d)"
+            echo "dir=$(go env GOCACHE)"
+          } >> "$GITHUB_OUTPUT"
+          # Anything older than this marker after the tests ran was restored
+          # and never used; the save step prunes it.
+          touch "$RUNNER_TEMP/go-cache-start"
+
+      - name: Restore Go build and test-result cache
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.go-cache-key.outputs.dir }}
+          key: go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
+          restore-keys: |
+            go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-
+            go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-
 
       - name: Verify dependencies
         run: bash scripts/ci-retry.sh go mod verify
@@ -287,16 +407,257 @@ jobs:
       - name: Download dependencies
         run: bash scripts/ci-retry.sh go mod download
 
-      - name: Run tests (enterprise with coverage)
+      - name: Run tests (no race)
         env:
-          TEST_LABEL: enterprise Go 1.25 ${{ matrix.shard }}
+          TEST_LABEL: ${{ matrix.variant }} Go 1.26 ${{ matrix.shard }}
           TEST_SHARD: ${{ matrix.shard }}
+          VARIANT: ${{ matrix.variant }}
+          # One top-level test slower than this, without -race, is a test to
+          # split or speed up; the summarizer fails the shard and names it.
+          # 120s tripped on receipt-load's four real-proxy integrity runs
+          # (147s beside the receipt packages on a 4-core runner), a normal
+          # run under contention rather than a runaway test, so the ceiling
+          # leaves room for that and still sits far inside the 8m timeout.
+          TEST_CEILING_SECONDS: '240'
+        run: |
+          set -o pipefail
+          # GitHub runs this under bash -e; the summary below must still run
+          # after a failing go test, because it is what names the failure.
+          set +e
+          tags=()
+          if [ "$VARIANT" = enterprise ]; then
+            tags=(-tags enterprise)
+          fi
+          # The planner's no-race plan: whole heavy trees or UNIT_SPLITS
+          # sub-shards of them, complete and disjoint by construction, and the
+          # race lane's rest packing.
+          planner_tags=()
+          if [ "$VARIANT" = enterprise ]; then
+            planner_tags=(--tags enterprise)
+          fi
+          # Packages whose tests run the go tool in a subprocess depend on
+          # source Go's result cache cannot see, so they always run fresh;
+          # every other package may report main's cached result.
+          fresh_packages="$(python3 scripts/ci_test_packages.py "${planner_tags[@]}" --unit-shard "$TEST_SHARD" --fresh only)" || exit $?
+          cached_packages="$(python3 scripts/ci_test_packages.py "${planner_tags[@]}" --unit-shard "$TEST_SHARD" --fresh exclude)" || exit $?
+          test_selector="$(python3 scripts/ci_test_packages.py --unit-shard "$TEST_SHARD" --selector)" || exit $?
+          test_status=0
+          : > /tmp/go-test.json
+          profiles=()
+          if [ -n "$fresh_packages" ]; then
+            # shellcheck disable=SC2086 # a space-separated package list
+            go test "${tags[@]}" -p=4 -timeout=8m -count=1 -covermode=set -coverprofile=coverage-fresh.out ${test_selector:+"$test_selector"} $fresh_packages -json \
+              | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL fresh" --json-out /tmp/go-test-fresh.json
+            status=$?
+            [ "$status" -eq 0 ] || test_status=$status
+            cat /tmp/go-test-fresh.json >> /tmp/go-test.json
+            profiles+=(coverage-fresh.out)
+          fi
+          if [ -n "$cached_packages" ]; then
+            # shellcheck disable=SC2086 # a space-separated package list
+            go test "${tags[@]}" -p=4 -timeout=8m -covermode=set -coverprofile=coverage-cached.out ${test_selector:+"$test_selector"} $cached_packages -json \
+              | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-cached.json
+            status=$?
+            [ "$status" -eq 0 ] || test_status=$status
+            cat /tmp/go-test-cached.json >> /tmp/go-test.json
+            profiles+=(coverage-cached.out)
+          fi
+          # One set-mode profile for the upload: one mode line, then every
+          # block from both passes.
+          echo "mode: set" > coverage.out
+          for profile in "${profiles[@]}"; do
+            [ -f "$profile" ] && tail -n +2 "$profile" >> coverage.out
+          done
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" --max-test-seconds "$TEST_CEILING_SECONDS" < /tmp/go-test.json
+          summary_status=$?
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+      - name: Upload test timing
+        # Not named go-test-json-*: the shard drift job reads those as race
+        # timings, and no-race seconds would underweight every race shard.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-test-json-${{ matrix.variant }}-go126-${{ matrix.shard }}
+          path: /tmp/go-test.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Verify coverage profile
+        # Uploading is best-effort telemetry; producing a real profile is not.
+        run: bash scripts/check-coverage-profile.sh coverage.out
+
+      - name: Upload coverage
+        # Enterprise profiles exclude Apache-only runtime stubs, so both variants
+        # upload. Uploader failures are telemetry failures; codecov/* gates
+        # coverage, and the Codecov CLI's own key fetch fails intermittently.
+        continue-on-error: true
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
+
+      # Go marks a cache entry used by touching it, so files still older than
+      # the start marker were restored and never needed. Dropping them keeps
+      # each day's entry to what that day's tree uses instead of every day's
+      # leftovers. Go touches an entry only when it is over an hour old, so an
+      # entry saved less than an hour earlier can be pruned while in use; that
+      # costs a rebuild later, never a wrong result.
+      - name: Prune unused Go cache entries
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true' }}
+        env:
+          GO_CACHE_DIR: ${{ steps.go-cache-key.outputs.dir }}
+        run: |
+          set -euo pipefail
+          before="$(du -sh "$GO_CACHE_DIR" | cut -f1)"
+          find "$GO_CACHE_DIR" -type f ! -newer "$RUNNER_TEMP/go-cache-start" -delete
+          echo "Go cache: ${before} before pruning, $(du -sh "$GO_CACHE_DIR" | cut -f1) after"
+
+      - name: Save Go build and test-result cache
+        if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ${{ steps.go-cache-key.outputs.dir }}
+          key: go-test-v1-${{ matrix.variant }}-${{ matrix.shard }}-${{ steps.go-cache-key.outputs.go }}-${{ hashFiles('go.sum') }}-${{ steps.go-cache-key.outputs.day }}
+
+  test-oss-go127:
+    needs: [security-scan, changed-files]
+    # Runs only on pull requests or merge groups that touch CI policy / Go pins (see the
+    # changed-files job). release.yaml proves every shard on the pinned Go 1.27
+    # before a tag. Running it on every PR and main push only ever caught timing
+    # flakes, never a version-specific failure, while its race jobs were the
+    # largest share of runner queue time for every overlapping run.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.ci_policy == 'true' }}
+    runs-on: ubuntu-latest
+    name: race-oss (1.27, ${{ matrix.shard }})
+    # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
+    timeout-minutes: 48
+    strategy:
+      fail-fast: false
+      # Size for GitHub Team's 60 standard concurrent jobs:
+      # https://docs.github.com/en/actions/reference/limits#job-concurrency-limits-for-github-hosted-runners
+      # Two 22-shard race matrices get 10 slots each (three waves). The PR also
+      # has 22 unit shards and 23 companion jobs, plus up to 16 jobs in other
+      # PR workflows. Those short jobs can queue initially; after they drain,
+      # the 20 race slots leave 40 for other PRs to make progress. Re-size if
+      # the plan limit, job counts, or ordinary PR workload (~52 jobs) changes.
+      max-parallel: 10
+      matrix:
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (OSS)
+        env:
+          TEST_LABEL: OSS Go 1.27 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+          # Advisory test-step budget: warns when a shard drifts toward the
+          # 15-minute end-to-end goal so its weights get refreshed. Never fails.
+          SHARD_BUDGET_SECONDS: '600'
+          # Hard ceiling for one top-level test. The planner places whole
+          # top-level tests, so one test this slow overloads its shard; the
+          # summarizer fails the shard and names the test to split.
+          TEST_CEILING_SECONDS: '300'
+        run: |
+          set -o pipefail
+          set +e
+          packages="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD")" || exit $?
+          # proxy-N and scanner-N run disjoint halves of one package tree's tests.
+          test_selector="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD" --selector)" || exit $?
+          package_parallelism=2
+          if [[ "$TEST_SHARD" == proxy-* ]]; then
+            package_parallelism=1
+          fi
+          bash scripts/ci-test-with-retry.sh --packages "$packages" --attempt-timeout-seconds 1260 -- \
+            go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 ${test_selector:+"$test_selector"} -json \
+            | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-oss.json
+          test_status=$?
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" --max-test-seconds "$TEST_CEILING_SECONDS" < /tmp/go-test-oss.json
+          summary_status=$?
+          if [ "$SECONDS" -gt "$SHARD_BUDGET_SECONDS" ]; then
+            echo "::warning title=CI shard over time budget::${TEST_LABEL} took ${SECONDS}s, over the ${SHARD_BUDGET_SECONDS}s budget. Refresh scripts/ci_test_durations.json from the go-test-json artifacts or raise TEST_SPLITS for the tree."
+          fi
+          if [ "$summary_status" -ne 0 ]; then
+            exit "$summary_status"
+          fi
+          exit "$test_status"
+
+      - name: Upload test timing
+        # Raw go test JSON, kept so scripts/ci_test_durations.py can refresh
+        # the shard weights from real runner timings.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: go-test-json-oss-go127-${{ matrix.shard }}
+          path: /tmp/go-test-oss.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  test-enterprise-go126:
+    needs: [security-scan]
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    name: race-enterprise (1.26, ${{ matrix.shard }})
+    # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
+    timeout-minutes: 48
+    strategy:
+      fail-fast: false
+      max-parallel: 6
+      matrix:
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Verify dependencies
+        run: bash scripts/ci-retry.sh go mod verify
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run tests (enterprise race)
+        env:
+          TEST_LABEL: enterprise race Go 1.26 ${{ matrix.shard }}
+          TEST_SHARD: ${{ matrix.shard }}
+          # Advisory test-step budget: warns when a shard drifts so its weights
+          # get refreshed. Never fails.
+          SHARD_BUDGET_SECONDS: '600'
+          # Hard ceiling for one top-level test. The planner places whole
+          # top-level tests, so one test this slow overloads its shard; the
+          # summarizer fails the shard and names the test to split.
+          TEST_CEILING_SECONDS: '300'
         run: |
           set -o pipefail
           set +e
           packages="$(python3 scripts/ci_test_packages.py --tags enterprise --shard "$TEST_SHARD")" || exit $?
+          # proxy-N and scanner-N run disjoint halves of one package tree's tests.
+          test_selector="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD" --selector)" || exit $?
           package_parallelism=2
-          if [ "$TEST_SHARD" = "proxy" ]; then
+          if [[ "$TEST_SHARD" == proxy-* ]]; then
             # The proxy shard has two race-instrumented packages. Running them
             # sequentially lowers peak memory without serializing t.Parallel
             # tests inside either package.
@@ -305,45 +666,60 @@ jobs:
           # Public runners are 4 vCPU, and -race multiplies scheduler pressure.
           # Keep package and intra-package test fan-out below CPU count so
           # deadline/timer tests are not starved by the shard matrix.
-          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
-            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -coverprofile="coverage-${TEST_SHARD}.out" -json \
+          # go test's own -timeout must fire well inside the whole-command
+          # attempt deadline: only go test's timeout panic names the test that
+          # hung. With a 20m timeout and a 21m attempt, compile time let the
+          # attempt deadline win and the shard died without naming anything.
+          bash scripts/ci-test-with-retry.sh --packages "$packages" --attempt-timeout-seconds 1260 -- \
+            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 ${test_selector:+"$test_selector"} -json \
             | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-enterprise.json
           test_status=$?
-          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-enterprise.json
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" --max-test-seconds "$TEST_CEILING_SECONDS" < /tmp/go-test-enterprise.json
           summary_status=$?
+          if [ "$SECONDS" -gt "$SHARD_BUDGET_SECONDS" ]; then
+            echo "::warning title=CI shard over time budget::${TEST_LABEL} took ${SECONDS}s, over the ${SHARD_BUDGET_SECONDS}s budget. Refresh scripts/ci_test_durations.json from the go-test-json artifacts or raise TEST_SPLITS for the tree."
+          fi
           if [ "$summary_status" -ne 0 ]; then
             exit "$summary_status"
           fi
           exit "$test_status"
 
-      - name: Upload coverage
-        # Coverage upload is best-effort telemetry: the Codecov uploader's own
-        # CLI-integrity GPG check intermittently fails to fetch Codecov's public
-        # key ("no valid OpenPGP data found"), which exits non-zero regardless of
-        # fail_ci_if_error. Coverage is gated by the separate codecov/* status
-        # checks, so a transient uploader hiccup must never red a green test job.
+      - name: Upload test timing
+        # Raw go test JSON, kept so scripts/ci_test_durations.py can refresh
+        # the shard weights from real runner timings.
+        if: ${{ !cancelled() }}
         continue-on-error: true
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          files: ./coverage-${{ matrix.shard }}.out
-          fail_ci_if_error: false
+          name: go-test-json-enterprise-go126-${{ matrix.shard }}
+          path: /tmp/go-test-enterprise.json
+          retention-days: 14
+          if-no-files-found: ignore
 
-  test-enterprise-go126:
+  test-enterprise-go127:
     needs: [security-scan, changed-files]
-    # Pull requests run only the Go 1.25 floor unless the PR itself touches
-    # CI policy / Go pins (see the changed-files job); this Go 1.26 lane
-    # otherwise runs on push to main (and is proven again, pinned, in
-    # release.yaml before a tag). Three days of PR history showed this lane
-    # catching only timing flakes, never a version-specific failure, so
-    # duplicating it on every ordinary PR was pure runner-queue contention.
-    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name != 'pull_request' || needs.changed-files.outputs.ci_policy == 'true') }}
+    # Runs only on pull requests or merge groups that touch CI policy / Go pins (see the
+    # changed-files job). release.yaml proves every shard on the pinned Go 1.27
+    # before a tag. Running it on every PR and main push only ever caught timing
+    # flakes, never a version-specific failure, while its race jobs were the
+    # largest share of runner queue time for every overlapping run.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') && needs.changed-files.outputs.ci_policy == 'true' }}
     runs-on: ubuntu-latest
-    name: test-enterprise (1.26, ${{ matrix.shard }})
-    timeout-minutes: 20
+    name: race-enterprise (1.27, ${{ matrix.shard }})
+    # Two 21-minute whole-command attempts, kill grace, plus setup and upload.
+    timeout-minutes: 48
     strategy:
       fail-fast: false
+      # Size for GitHub Team's 60 standard concurrent jobs:
+      # https://docs.github.com/en/actions/reference/limits#job-concurrency-limits-for-github-hosted-runners
+      # Two 22-shard race matrices get 10 slots each (three waves). The PR also
+      # has 22 unit shards and 23 companion jobs, plus up to 16 jobs in other
+      # PR workflows. Those short jobs can queue initially; after they drain,
+      # the 20 race slots leave 40 for other PRs to make progress. Re-size if
+      # the plan limit, job counts, or ordinary PR workload (~52 jobs) changes.
+      max-parallel: 10
       matrix:
-        shard: ['proxy', 'scanner', 'mcp', 'rest-0', 'rest-1', 'rest-2']
+        shard: ['proxy-0', 'proxy-1', 'proxy-2', 'proxy-3', 'proxy-4', 'proxy-5', 'scanner-0', 'scanner-1', 'scanner-2', 'scanner-3', 'mcp-0', 'mcp-1', 'mcp-2', 'mcp-3', 'mcp-4', 'mcp-5', 'runtime-0', 'runtime-1', 'rest-0', 'rest-1', 'rest-2', 'rest-3']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -352,7 +728,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify dependencies
         run: bash scripts/ci-retry.sh go mod verify
@@ -362,33 +738,57 @@ jobs:
 
       - name: Run tests (enterprise)
         env:
-          TEST_LABEL: enterprise Go 1.26 ${{ matrix.shard }}
+          TEST_LABEL: enterprise Go 1.27 ${{ matrix.shard }}
           TEST_SHARD: ${{ matrix.shard }}
+          # Advisory test-step budget: warns when a shard drifts toward the
+          # 15-minute end-to-end goal so its weights get refreshed. Never fails.
+          SHARD_BUDGET_SECONDS: '600'
+          # Hard ceiling for one top-level test. The planner places whole
+          # top-level tests, so one test this slow overloads its shard; the
+          # summarizer fails the shard and names the test to split.
+          TEST_CEILING_SECONDS: '300'
         run: |
           set -o pipefail
           set +e
           packages="$(python3 scripts/ci_test_packages.py --tags enterprise --shard "$TEST_SHARD")" || exit $?
+          # proxy-N and scanner-N run disjoint halves of one package tree's tests.
+          test_selector="$(python3 scripts/ci_test_packages.py --shard "$TEST_SHARD" --selector)" || exit $?
           package_parallelism=2
-          if [ "$TEST_SHARD" = "proxy" ]; then
+          if [[ "$TEST_SHARD" == proxy-* ]]; then
             package_parallelism=1
           fi
-          bash scripts/ci-test-with-retry.sh --packages "$packages" -- \
-            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \
+          bash scripts/ci-test-with-retry.sh --packages "$packages" --attempt-timeout-seconds 1260 -- \
+            go test -tags enterprise -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 ${test_selector:+"$test_selector"} -json \
             | python3 scripts/stream_go_test_json.py --label "$TEST_LABEL" --json-out /tmp/go-test-enterprise.json
           test_status=$?
-          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" < /tmp/go-test-enterprise.json
+          python3 scripts/summarize_go_test_json.py --label "$TEST_LABEL" --max-test-seconds "$TEST_CEILING_SECONDS" < /tmp/go-test-enterprise.json
           summary_status=$?
+          if [ "$SECONDS" -gt "$SHARD_BUDGET_SECONDS" ]; then
+            echo "::warning title=CI shard over time budget::${TEST_LABEL} took ${SECONDS}s, over the ${SHARD_BUDGET_SECONDS}s budget. Refresh scripts/ci_test_durations.json from the go-test-json artifacts or raise TEST_SPLITS for the tree."
+          fi
           if [ "$summary_status" -ne 0 ]; then
             exit "$summary_status"
           fi
           exit "$test_status"
 
+      - name: Upload test timing
+        # Raw go test JSON, kept so scripts/ci_test_durations.py can refresh
+        # the shard weights from real runner timings.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: go-test-json-enterprise-go127-${{ matrix.shard }}
+          path: /tmp/go-test-enterprise.json
+          retention-days: 14
+          if-no-files-found: ignore
+
   test-subprocess-coverage:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
-    # Includes subprocess coverage plus four race-enabled Guard conformance
-    # invocations, each with its own five-minute timeout.
-    timeout-minutes: 35
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -397,7 +797,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: Verify dependencies
         run: bash scripts/ci-retry.sh go mod verify
@@ -408,44 +808,47 @@ jobs:
       - name: Collect sandbox subprocess coverage
         run: bash scripts/coverage-with-subprocess.sh coverage-subprocess.out
 
-      - name: Run Guard hostile-input conformance gate
-        run: bash scripts/check-guard-conformance.sh
+      - name: Verify coverage profile
+        # Uploading is best-effort telemetry; producing a real profile is not.
+        run: bash scripts/check-coverage-profile.sh coverage-subprocess.out
 
       - name: Upload subprocess coverage
         # Best-effort telemetry; see the Upload coverage step above. A Codecov
         # uploader-integrity hiccup must not red this job when coverage collection
         # itself succeeded.
         continue-on-error: true
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7
         with:
           files: ./coverage-subprocess.out
           fail_ci_if_error: false
 
-  test-replay-go125:
-    needs: [security-scan]
+  # Four race-enabled Guard conformance invocations, each with its own
+  # five-minute timeout. Split from subprocess coverage so neither job waits on
+  # the other.
+  guard-conformance:
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
-      - name: Replay harness (deterministic regression)
-        run: make test-replay-harness
+          go-version: '1.26'
+
+      - name: Download dependencies
+        run: bash scripts/ci-retry.sh go mod download
+
+      - name: Run Guard hostile-input conformance gate
+        run: bash scripts/check-guard-conformance.sh
 
   test-replay-go126:
     needs: [security-scan]
-    # NOT gated behind the changed-files check the two heavy shard matrices
-    # below use: the CI topology contract (scripts/test_ci_workflow_topology.py)
-    # requires this job's needs to be exactly {security-scan}, because the
-    # test-go126 aggregate's fail-closed gate must be able to demand this
-    # single cheap job's real success unconditionally. It is also five minutes
-    # of "make test-replay-harness" with no shard fan-out, so skipping it on
-    # ordinary PRs was never where the runner-queue contention came from --
-    # that was the twelve 20-minute race-test shard jobs below.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -459,44 +862,102 @@ jobs:
       - name: Replay harness (deterministic regression)
         run: make test-replay-harness
 
-  test-go125:
-    needs: [security-scan, test-oss-go125, test-enterprise-go125, test-subprocess-coverage, test-replay-go125]
+  test-replay-go127:
+    needs: [security-scan]
+    # NOT gated behind the changed-files check the two heavy shard matrices
+    # below use: the CI topology contract (scripts/test_ci_workflow_topology.py)
+    # requires this job's needs to be exactly {security-scan}, because the
+    # test-go127 aggregate's fail-closed gate must be able to demand this
+    # single cheap job's real success unconditionally. It is also five minutes
+    # of "make test-replay-harness" with no shard fan-out, so skipping it on
+    # ordinary PRs was never where the runner-queue contention came from --
+    # that was the sixteen Go 1.27 race-test shard jobs in the matrices above.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27'
+      - name: Replay harness (deterministic regression)
+        run: make test-replay-harness
+
+  test-go126:
+    needs: [security-scan, changed-files, test-unit-go126, test-subprocess-coverage, guard-conformance, test-replay-go126]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    name: test (1.25)
+    name: test (1.26)
     timeout-minutes: 5
     steps:
       - name: Required check compatibility gate
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -u
+          # On a pull request or merge group, a skipped producer counts only when the
+          # classifier succeeded and said the change is documentation-only.
+          # Every other non-success result reds this required check.
+          test "${{ needs.security-scan.result }}" = "success"
+          if [ "$EVENT_NAME" != "push" ]; then
+            test "${{ needs.changed-files.result }}" = "success"
+          fi
+          echo "test-unit-go126 result: ${{ needs.test-unit-go126.result }}"
+          if ! test "${{ needs.test-unit-go126.result }}" = "success"; then
+            if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.test-unit-go126.result }}" != "skipped" ]; then
+              exit 1
+            fi
+            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+          fi
+          echo "test-subprocess-coverage result: ${{ needs.test-subprocess-coverage.result }}"
+          if ! test "${{ needs.test-subprocess-coverage.result }}" = "success"; then
+            if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.test-subprocess-coverage.result }}" != "skipped" ]; then
+              exit 1
+            fi
+            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+          fi
+          echo "guard-conformance result: ${{ needs.guard-conformance.result }}"
+          if ! test "${{ needs.guard-conformance.result }}" = "success"; then
+            if [ "$EVENT_NAME" = "push" ] || [ "${{ needs.guard-conformance.result }}" != "skipped" ]; then
+              exit 1
+            fi
+            test "${{ needs.changed-files.outputs.docs_only }}" = "true"
+          fi
+          echo "test-replay-go126 result: ${{ needs.test-replay-go126.result }}"
+          test "${{ needs.test-replay-go126.result }}" = "success"
+
+  # Race lane rollup for main. It does not run on pull requests, where the race
+  # producers are skipped by design, so a skipped "race (1.26)" on a pull request
+  # means "not this lane's event", never "proven".
+  race-go126:
+    needs: [security-scan, test-oss-go126, test-enterprise-go126]
+    if: ${{ always() && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    name: race (1.26)
+    timeout-minutes: 5
+    steps:
+      - name: Race lane gate
         run: |
           echo "security-scan result: ${{ needs.security-scan.result }}"
-          echo "test-oss-go125 result: ${{ needs.test-oss-go125.result }}"
-          echo "test-enterprise-go125 result: ${{ needs.test-enterprise-go125.result }}"
-          echo "test-subprocess-coverage result: ${{ needs.test-subprocess-coverage.result }}"
-          echo "test-replay-go125 result: ${{ needs.test-replay-go125.result }}"
+          echo "test-oss-go126 result: ${{ needs.test-oss-go126.result }}"
+          echo "test-enterprise-go126 result: ${{ needs.test-enterprise-go126.result }}"
           test "${{ needs.security-scan.result }}" = "success"
-          test "${{ needs.test-oss-go125.result }}" = "success"
-          test "${{ needs.test-enterprise-go125.result }}" = "success"
-          test "${{ needs.test-subprocess-coverage.result }}" = "success"
-          test "${{ needs.test-replay-go125.result }}" = "success"
+          test "${{ needs.test-oss-go126.result }}" = "success"
+          test "${{ needs.test-enterprise-go126.result }}" = "success"
 
-  test-go126:
-    needs: [security-scan, test-oss-go126, test-enterprise-go126, test-replay-go126]
+  test-go127:
+    needs: [security-scan, changed-files, test-oss-go127, test-enterprise-go127, test-replay-go127]
     if: ${{ always() }}
     runs-on: ubuntu-latest
-    # "test (1.26)" is a required check name on every PR (see the branch
-    # ruleset), so it must exist and complete on pull_request events even
-    # though test-oss-go126/test-enterprise-go126 are skipped there on
-    # ordinary PRs. This job's `needs` is exactly {security-scan, the three
-    # go126 producers} per the CI topology contract
-    # (scripts/test_ci_workflow_topology.py) -- it does NOT also depend on
-    # changed-files, so it cannot read that job's output directly. It does
-    # not need to: a producer's own `if:` only ever lets it report "skipped"
-    # when the event is pull_request AND changed-files said no CI-policy file
-    # changed, so seeing "skipped" here on a pull_request already proves that
-    # was a safe, intentional skip -- there is no other way to reach it. A
-    # push to main, or a pull_request that DID touch CI policy (so the
-    # producer actually ran), still demands a real "success".
-    name: test (1.26)
+    # "test (1.27)" is a required check name on every PR (see the branch
+    # ruleset), so it must exist even when the Go 1.27 race producers skip.
+    # On a pull request or merge group, require policy detection and a boolean
+    # output. Only an explicit false justifies skipped race producers. On a
+    # push, the policy detector and race producers intentionally skip.
+    # Security scan and replay evidence must succeed on every event.
+    name: test (1.27)
     timeout-minutes: 5
     steps:
       - name: Required check compatibility gate
@@ -515,26 +976,40 @@ jobs:
           # producer result. Every non-success path below exits explicitly
           # instead of relying on the compound's own exit status.
           test "${{ needs.security-scan.result }}" = "success"
-
-          echo "test-oss-go126 result: ${{ needs.test-oss-go126.result }}"
-          if ! test "${{ needs.test-oss-go126.result }}" = "success"; then
-            if [ "$EVENT_NAME" != "pull_request" ] || [ "${{ needs.test-oss-go126.result }}" != "skipped" ]; then
-              exit 1
+          if [ "$EVENT_NAME" != "push" ]; then
+            test "${{ needs.changed-files.result }}" = "success"
+            if [ "${{ needs.changed-files.outputs.ci_policy }}" != "false" ]; then
+              test "${{ needs.changed-files.outputs.ci_policy }}" = "true"
             fi
           fi
 
-          echo "test-enterprise-go126 result: ${{ needs.test-enterprise-go126.result }}"
-          if ! test "${{ needs.test-enterprise-go126.result }}" = "success"; then
-            if [ "$EVENT_NAME" != "pull_request" ] || [ "${{ needs.test-enterprise-go126.result }}" != "skipped" ]; then
+          echo "test-oss-go127 result: ${{ needs.test-oss-go127.result }}"
+          if ! test "${{ needs.test-oss-go127.result }}" = "success"; then
+            if [ "${{ needs.test-oss-go127.result }}" != "skipped" ]; then
               exit 1
+            fi
+            if [ "$EVENT_NAME" != "push" ]; then
+              test "${{ needs.changed-files.outputs.ci_policy }}" = "false"
             fi
           fi
 
-          echo "test-replay-go126 result: ${{ needs.test-replay-go126.result }}"
-          test "${{ needs.test-replay-go126.result }}" = "success"
+          echo "test-enterprise-go127 result: ${{ needs.test-enterprise-go127.result }}"
+          if ! test "${{ needs.test-enterprise-go127.result }}" = "success"; then
+            if [ "${{ needs.test-enterprise-go127.result }}" != "skipped" ]; then
+              exit 1
+            fi
+            if [ "$EVENT_NAME" != "push" ]; then
+              test "${{ needs.changed-files.outputs.ci_policy }}" = "false"
+            fi
+          fi
+
+          echo "test-replay-go127 result: ${{ needs.test-replay-go127.result }}"
+          test "${{ needs.test-replay-go127.result }}" = "success"
 
   test-macos:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: macos-latest
     timeout-minutes: 10
     steps:
@@ -545,7 +1020,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify native target is darwin/arm64
         run: |
@@ -563,8 +1038,11 @@ jobs:
         run: go build ./...
 
   test-macos-intel:
-    needs: [security-scan]
-    runs-on: macos-15-intel
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    # GitHub's x64 image labels: https://github.com/actions/runner-images#available-images
+    runs-on: macos-26-intel
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -574,7 +1052,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify native target is darwin/amd64
         run: |
@@ -605,7 +1083,9 @@ jobs:
   # builds _test.go files. The scoped run below compiles that package so the
   # break cannot return silently.
   test-windows:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
@@ -616,7 +1096,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify native target is windows/amd64
         shell: pwsh
@@ -655,8 +1135,13 @@ jobs:
       - name: internal/config test package builds on Windows
         run: go test -count=1 -run "TestWindows" ./internal/config/...
 
+      - name: Replace and roll back a running Windows executable
+        run: go test -count=1 ./internal/cli/selfupdate/...
+
   test-windows-arm64:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: windows-11-arm
     timeout-minutes: 15
     steps:
@@ -667,7 +1152,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify native target is windows/arm64
         shell: pwsh
@@ -703,6 +1188,9 @@ jobs:
       - name: internal/config test package builds on Windows
         run: go test -count=1 -run "TestWindows" ./internal/config/...
 
+      - name: Replace and roll back a running Windows executable
+        run: go test -count=1 ./internal/cli/selfupdate/...
+
   # Native linux/arm64 lane. GoReleaser publishes a linux/arm64 binary
   # (.goreleaser.yaml) and no job has ever executed a test on that architecture,
   # so three of six published Go targets ran zero tests. arm64 is not a
@@ -722,8 +1210,10 @@ jobs:
   # TARGETED, like the macOS and Windows lanes above, not full parity. The amd64
   # matrix remains the exhaustive lane.
   test-linux-arm64:
-    needs: [security-scan]
-    runs-on: ubuntu-24.04-arm
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-26.04-arm
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -733,7 +1223,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Verify native target is linux/arm64
         run: |
@@ -782,7 +1272,9 @@ jobs:
   # then compile the same contracts for WASI and AIX so build-tag gaps cannot
   # silently remove their implementations.
   test-unsupported-filesystems:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -793,58 +1285,77 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Run browser target fallback contracts
-        run: GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 -run "TestOpenRegularNonblockingFailsClosedOnUnsupportedPlatform|TestEvidenceFileOperationsFailClosedOnUnsupportedPlatform" ./internal/securefile/... ./internal/recorder/...
+        run: GOOS=js GOARCH=wasm go test -exec="$(go env GOROOT)/lib/wasm/go_js_wasm_exec" -count=1 -run "TestOpenRegularNonblockingFailsClosedOnUnsupportedPlatform|TestEvidenceFileOperationsFailClosedOnUnsupportedPlatform|TestLoadSaltFileFailsClosedOnUnsupportedPlatform|TestMCPAckKeyFileSourceRefusedOnBrowserTarget" ./internal/securefile/... ./internal/recorder/... ./internal/contract/privacy/...
 
       - name: Compile WASI fallback contracts
         run: |
           GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/securefile-wasi.test ./internal/securefile
           GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/recorder-wasi.test ./internal/recorder
           GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/license-wasi.test ./internal/license
+          GOOS=wasip1 GOARCH=wasm go test -c -o /tmp/privacy-wasi.test ./internal/contract/privacy
 
       - name: Compile AIX fallback contracts
         run: |
           GOOS=aix GOARCH=ppc64 go test -c -o /tmp/recorder-aix.test ./internal/recorder
           GOOS=aix GOARCH=ppc64 go test -c -o /tmp/license-aix.test ./internal/license
 
-  # The reviewer's own regression suite now runs on pull requests.
-  #
-  # The repositories that kept their own copy of the reviewer ran these as a
-  # step inside the review itself. That never gated anything: a review is
-  # triggered by a comment, so it only ever executes the copy already on the
-  # default branch, and by then the change is merged. Consolidating onto one
-  # shared workflow then dropped even that step. So the suite has been proving
-  # nothing in either arrangement, while every guard in it reported green.
-  #
-  # This job is what makes them load-bearing, because it runs on the pull
-  # request that changes them. It covers the reviewer, the review workflow's
-  # permissions and authorization gate, and the adoption stub that other
-  # repositories copy.
-  pr-review-tests:
-    needs: [security-scan]
+  lint:
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          fetch-depth: 0
           persist-credentials: false
 
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          python-version: '3.12'
+          go-version: '1.26'
 
-      - name: Install pinned dependencies
-        run: |
-          pip install --require-hashes -r .github/actions/pr-review/requirements.txt
-          pip install --require-hashes -r .github/requirements-pr-review-test.txt
+      - name: golangci-lint (OSS)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.15.0
+          skip-cache: true
 
-      - name: Run reviewer tests
-        run: python -m unittest scripts.pr_review_test
 
-  lint:
+  # Same linter, enterprise build graph. A separate job so the two passes run
+  # side by side instead of back to back.
+  lint-enterprise:
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: golangci-lint (enterprise)
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.15.0
+          skip-cache: true
+          args: --build-tags enterprise
+
+  # Repository policy checks that used to run after golangci-lint in the lint
+  # job. They need no lint result, so running them beside lint keeps both
+  # jobs well inside the shard budget instead of one eleven-minute job.
+  lint-policy:
     needs: [security-scan]
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -857,16 +1368,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
-
-      - name: golangci-lint (OSS)
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
-        with:
-          version: v2.13.2
-          skip-cache: true
-
-      - name: golangci-lint (enterprise)
-        run: golangci-lint run --build-tags enterprise ./...
+          go-version: '1.26'
 
       - name: Python pin policy
         run: bash scripts/check-python-pins.sh
@@ -877,7 +1379,7 @@ jobs:
       # ship, because an undeclared dependency that works today breaks silently
       # when the image changes.
       - name: Install pinned release-tooling test dependencies
-        run: pip install --require-hashes -r .github/requirements-pr-review-test.txt
+        run: pip install --require-hashes -r .github/requirements-scripts-test.txt
 
       # Release-tooling tests had no PR-time runner, so breaks stayed invisible
       # until tag time. The pattern covers both test_*.py and *_test.py modules.
@@ -896,11 +1398,11 @@ jobs:
       - name: Release workflow proves every Go minor main proves
         run: bash scripts/check-go-matrix.sh
 
-      - name: Config example startability policy
-        run: bash scripts/check-config-examples.sh
-
       - name: Clock-dependent literal policy
         run: bash scripts/check-clock-literals.sh
+
+      - name: Subprocess test deadline scaling policy
+        run: bash scripts/check-test-deadline-scaling.sh
 
       - name: Install documentation search dependency
         run: bash scripts/ci-apt-install.sh ripgrep
@@ -910,6 +1412,40 @@ jobs:
 
       - name: Source file headers
         run: make source-header-check
+
+      - name: Shard load budget (OSS)
+        run: python3 scripts/ci_test_packages.py --check-budget
+
+      - name: Shard load budget (enterprise)
+        run: python3 scripts/ci_test_packages.py --tags enterprise --check-budget
+
+  # Builds and boots every shipped example, then rebuilds the binary twice to
+  # prove the OSS build is reproducible. All of it compiles; none of it needs
+  # the lint-policy checks, so it runs beside them.
+  config-examples:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.26'
+
+      - name: Config example startability policy
+        run: bash scripts/check-config-examples.sh
+
+      # Released binaries are built with the enterprise tag, so the shipped
+      # examples must also check and boot against that build shape.
+      - name: Config example startability policy (enterprise build)
+        run: |
+          go build -tags enterprise -o "$RUNNER_TEMP/pipelock-enterprise" ./cmd/pipelock
+          bash scripts/check-config-examples.sh "$RUNNER_TEMP/pipelock-enterprise"
 
       - name: Reproducible OSS build
         run: make reproducible-build-check
@@ -929,9 +1465,17 @@ jobs:
   # cross-target pass separate from lint so neither job consumes the other's
   # timeout budget.
   test-cross-target:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
+    name: test-cross-target (${{ matrix.target }})
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Published targets other than the runner's own linux/amd64.
+        target: ['linux/arm64', 'darwin/amd64', 'darwin/arm64', 'windows/amd64', 'windows/arm64']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -940,19 +1484,20 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
-      - name: Test code compiles for every published target
+      - name: Test code compiles for the published target
+        env:
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            printf '==> %s\n' "$target"
-            GOOS="${target%%/*}" GOARCH="${target##*/}" go vet ./...
-            GOOS="${target%%/*}" GOARCH="${target##*/}" go vet -tags enterprise ./...
-          done
+          GOOS="${TARGET%%/*}" GOARCH="${TARGET##*/}" go vet ./...
+          GOOS="${TARGET%%/*}" GOARCH="${TARGET##*/}" go vet -tags enterprise ./...
 
   helm:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -969,7 +1514,9 @@ jobs:
         run: bash scripts/check-helm-chart.sh
 
   govulncheck:
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -982,22 +1529,17 @@ jobs:
         with:
           # Pin the exact patched release. govulncheck analyzes the active
           # toolchain's stdlib (go env GOVERSION), so the setup-go version is the
-          # lever, not the go.mod directive. The pin is the newest published
-          # 1.26 patch, because each one carries stdlib advisory fixes this tree
-          # reaches through the proxy and MCP transport call paths. The 1.26.6
-          # pin that preceded this one was chosen for six such fixes over
-          # go1.26.5 across crypto/tls, html/template, net/http and net/url
-          # (GO-2026-5026, GO-2026-5972, GO-2026-6089, GO-2026-6090,
-          # GO-2026-6091, GO-2026-6218). A float to '1.26' can lag on the
+          # lever, not the go.mod directive. Go 1.26.10 fixes GO-2026-6809 in
+          # crypto/x509. A float to '1.26' can lag on the
           # actions/go-versions manifest, so the scan stays red until the
           # manifest publishes the patched toolchain. An EXACT version makes
           # setup-go fall back to a direct download from the official Go
           # distribution, bypassing the manifest.
           #
-          # This job scans the 1.26 toolchain. Release binaries are built on the
-          # 1.25 pins in release.yaml, so a green scan here does NOT establish
-          # that the shipped artifact is clean; the release pins have to be
-          # moved too, and were found trailing this one on 2026-09-05.
+          # This job scans the same 1.26 toolchain release.yaml builds the
+          # shipped binaries with, so a green scan here covers the released
+          # artifact only while the two pins match. Move them together; the
+          # release pins were found trailing this one on 2026-09-05.
           #
           # THIS PIN GOES STALE BY DESIGN. Every Go patch release that fixes a
           # reachable stdlib advisory turns this job red repo-wide until the pin
@@ -1006,7 +1548,7 @@ jobs:
           # half-done bump fails loudly instead of scanning the wrong toolchain.
           # Revert to '1.26' + check-latest for steady-state self-healing once
           # the manifest reliably carries the newest patch.
-          go-version: '1.26.8'
+          go-version: '1.26.10'
           check-latest: true
 
       - name: Verify Go version
@@ -1015,7 +1557,7 @@ jobs:
         run: |
           got="$(go env GOVERSION)"
           echo "GOVERSION=$got"
-          test "$got" = "go1.26.8"
+          test "$got" = "go1.26.10"
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
@@ -1052,7 +1594,9 @@ jobs:
   build-binaries:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [security-scan]
+    needs: [security-scan, changed-files]
+    # Skipped only on a documentation-only pull request; see changed-files.
+    if: ${{ !cancelled() && needs.security-scan.result == 'success' && needs.changed-files.outputs.docs_only != 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -1062,7 +1606,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: Build binary
         run: |
@@ -1091,13 +1635,133 @@ jobs:
           GOOS=windows GOARCH=amd64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-amd64.exe ./cmd/pipelock
           GOOS=windows GOARCH=arm64 go build -tags enterprise -trimpath -o /tmp/pipelock-windows-arm64.exe ./cmd/pipelock
 
+  # The /review caller calls a reusable workflow in pipelab-org/agent-review,
+  # so without this job nothing here notices the caller drifting: inherited or
+  # extra secrets, a branch instead of a commit, another repository, or wider
+  # permissions. It runs the pinned engine revision's own caller contract against
+  # the caller and profile, read as data. The accepted caller text lives only in
+  # that contract and the pin lives only in the caller, so neither is copied here.
+  # It holds no secrets and only a read token, and it never skips.
+  agent-review-contract:
+    needs: [security-scan]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: caller
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/agent-review.yaml
+            .github/agent-review.toml
+          sparse-checkout-cone-mode: false
+
+      - name: Read the pinned engine revision
+        id: pin
+        run: |
+          set -euo pipefail
+          caller=caller/.github/workflows/agent-review.yaml
+          # grep exits 1 for no match; anything else means the caller is unreadable.
+          status=0
+          uses="$(grep -E '^[[:space:]-]*uses:' "$caller")" || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "agent review caller could not be read" >&2
+            exit 1
+          fi
+          # Exactly one call, to the engine repository, at a full commit SHA.
+          pattern='^    uses: pipelab-org/agent-review/\.github/workflows/agent-review-reusable\.yaml@[0-9a-f]{40} # main$'
+          if [ "$status" -ne 0 ] || [ "$(wc -l <<<"$uses")" -ne 1 ] || ! grep -Eq "$pattern" <<<"$uses"; then
+            echo "agent review caller must call pipelab-org/agent-review at a full commit SHA" >&2
+            exit 1
+          fi
+          pin="${uses##*@}"
+          pin="${pin%% *}"
+          echo "sha=$pin" >> "$GITHUB_OUTPUT"
+
+      # GitHub also resolves a SHA that exists only in a fork of the engine, so
+      # the pin must be on the engine's main branch before its validator runs.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: pipelab-org/agent-review
+          ref: main
+          fetch-depth: 0
+          path: engine
+          persist-credentials: false
+
+      # A pull request may only move the pin forward. Any commit on engine main
+      # would pass the check above, including an older engine whose validator is
+      # weaker, so a pin the base branch already carries must be an ancestor of
+      # the new one. A base without a pin (first adoption) has nothing to compare.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            .github/workflows/agent-review.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Read the base branch engine revision
+        id: base_pin
+        if: (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        run: |
+          set -euo pipefail
+          caller=base/.github/workflows/agent-review.yaml
+          pattern='^    uses: pipelab-org/agent-review/\.github/workflows/agent-review-reusable\.yaml@[0-9a-f]{40} # main$'
+          if [ -f "$caller" ]; then
+            status=0
+            line="$(grep -E "$pattern" "$caller")" || status=$?
+            if [ "$status" -gt 1 ]; then
+              echo "base agent review caller could not be read" >&2
+              exit 1
+            fi
+            if [ "$status" -eq 1 ]; then
+              exit 0
+            fi
+            pin="${line##*@}"
+            pin="${pin%% *}"
+            echo "sha=$pin" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Require the pin on the engine main branch
+        env:
+          PIN: ${{ steps.pin.outputs.sha }}
+          BASE_PIN: ${{ steps.base_pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if ! git -C engine merge-base --is-ancestor "$PIN" HEAD; then
+            echo "agent review pin is not a commit on pipelab-org/agent-review main" >&2
+            exit 1
+          fi
+          if [ -n "${BASE_PIN:-}" ] && ! git -C engine merge-base --is-ancestor "$BASE_PIN" "$PIN"; then
+            echo "agent review pin $PIN is older than the base branch pin $BASE_PIN" >&2
+            exit 1
+          fi
+          git -C engine checkout --quiet --detach "$PIN"
+          if [ "$(git -C engine rev-parse HEAD)" != "$PIN" ]; then
+            echo "engine checkout does not match the agent review pin" >&2
+            exit 1
+          fi
+
+      - name: Validate the caller with the pinned engine contract
+        env:
+          PIN: ${{ steps.pin.outputs.sha }}
+          CALLER_WORKFLOW_REF: ${{ github.repository }}/.github/workflows/agent-review.yaml@refs/heads/${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 -I engine/scripts/agent_review_contract.py --root caller --source-sha "$PIN"
+
   # Helm remains a separate diagnostic job, but the required `build` context
   # intentionally carries its result through `needs`. Keep that dependency
   # until a separately approved ruleset change makes `helm` required itself.
   # The parallel binary and cross-target producers also flow through this gate,
   # so a compilation failure cannot present as a successful required build check.
+  # The agent review caller contract flows through it too and never skips.
   build:
-    needs: [security-scan, test-go125, test-go126, lint, test-cross-target, helm, build-binaries]
+    needs: [security-scan, changed-files, test-go126, test-go127, lint, lint-enterprise, lint-policy, config-examples, test-cross-target, helm, build-binaries, agent-review-contract]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -1105,22 +1769,56 @@ jobs:
       - name: Report required build evidence
         env:
           SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
-          TEST_GO125_RESULT: ${{ needs.test-go125.result }}
           TEST_GO126_RESULT: ${{ needs.test-go126.result }}
+          TEST_GO127_RESULT: ${{ needs.test-go127.result }}
           LINT_RESULT: ${{ needs.lint.result }}
+          LINT_POLICY_RESULT: ${{ needs.lint-policy.result }}
+          LINT_ENTERPRISE_RESULT: ${{ needs.lint-enterprise.result }}
+          CONFIG_EXAMPLES_RESULT: ${{ needs.config-examples.result }}
           CROSS_TARGET_RESULT: ${{ needs.test-cross-target.result }}
           HELM_RESULT: ${{ needs.helm.result }}
           BUILD_BINARIES_RESULT: ${{ needs.build-binaries.result }}
+          AGENT_REVIEW_CONTRACT_RESULT: ${{ needs.agent-review-contract.result }}
+          CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
+          DOCS_ONLY: ${{ needs.changed-files.outputs.docs_only }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
+          # test (1.27) accepts skipped upper-lane producers on a pull request
+          # because changed-files decided no CI-policy file changed. A failed or
+          # cancelled classifier skips them too, so a pull request needs a
+          # successful classifier here before that skip counts as intentional.
+          if [ "$EVENT_NAME" != push ] && [ "$CHANGED_FILES_RESULT" != success ]; then
+            echo "changed-files did not succeed, so skipped upper-lane tests are not evidence" >&2
+            exit 1
+          fi
+          # A documentation-only pull request skips these producers on purpose.
+          # The skip is evidence only with a successful classifier that said so.
+          docs_skip_ok=false
+          if [ "$EVENT_NAME" != push ] && [ "$CHANGED_FILES_RESULT" = success ] && [ "$DOCS_ONLY" = true ]; then
+            docs_skip_ok=true
+          fi
           for result in \
             "$SECURITY_SCAN_RESULT" \
-            "$TEST_GO125_RESULT" \
             "$TEST_GO126_RESULT" \
+            "$TEST_GO127_RESULT" \
+            "$LINT_POLICY_RESULT" \
+            "$CONFIG_EXAMPLES_RESULT" \
+            "$AGENT_REVIEW_CONTRACT_RESULT"; do
+            if [ "$result" != success ]; then
+              echo "required build evidence is incomplete or failed" >&2
+              exit 1
+            fi
+          done
+          for result in \
             "$LINT_RESULT" \
+            "$LINT_ENTERPRISE_RESULT" \
             "$CROSS_TARGET_RESULT" \
             "$HELM_RESULT" \
             "$BUILD_BINARIES_RESULT"; do
+            if [ "$result" = skipped ] && [ "$docs_skip_ok" = true ]; then
+              continue
+            fi
             if [ "$result" != success ]; then
               echo "required build evidence is incomplete or failed" >&2
               exit 1
@@ -1130,7 +1828,7 @@ jobs:
   # Operator-facing rollup only. Branch protection continues to evaluate the
   # required producer checks independently.
   pipelock-ci-summary:
-    needs: [security-scan, test-go125, test-go126, test-macos, lint, build, govulncheck]
+    needs: [security-scan, changed-files, test-go126, test-go127, test-macos, lint, build, govulncheck]
     if: ${{ always() }}
     runs-on: ubuntu-latest
     name: Pipelock CI Summary
@@ -1139,12 +1837,15 @@ jobs:
       - name: Report required check evidence
         env:
           SECURITY_SCAN_RESULT: ${{ needs.security-scan.result }}
-          TEST_GO125_RESULT: ${{ needs.test-go125.result }}
           TEST_GO126_RESULT: ${{ needs.test-go126.result }}
+          TEST_GO127_RESULT: ${{ needs.test-go127.result }}
           MACOS_RESULT: ${{ needs.test-macos.result }}
           LINT_RESULT: ${{ needs.lint.result }}
           BUILD_RESULT: ${{ needs.build.result }}
           GOVULNCHECK_RESULT: ${{ needs.govulncheck.result }}
+          EVENT_NAME: ${{ github.event_name }}
+          CHANGED_FILES_RESULT: ${{ needs.changed-files.result }}
+          DOCS_ONLY: ${{ needs.changed-files.outputs.docs_only }}
         run: |
           set -euo pipefail
           failed=0
@@ -1153,9 +1854,21 @@ jobs:
           printf '%s\n\n' '| Required check | Evidence |' >> "$summary"
           printf '%s\n' '| --- | --- |' >> "$summary"
 
+          docs_skip_ok=false
+          if [ "$EVENT_NAME" != push ] && [ "$CHANGED_FILES_RESULT" = success ] && [ "$DOCS_ONLY" = true ]; then
+            docs_skip_ok=true
+          fi
+
+          # A third argument marks a producer a documentation-only pull request
+          # skips on purpose.
           record_result() {
             local name="$1"
             local result="$2"
+            local docs_skippable="${3:-}"
+            if [ "$result" = skipped ] && [ -n "$docs_skippable" ] && [ "$docs_skip_ok" = true ]; then
+              printf '| %s | skipped (documentation only) |\n' "$name" >> "$summary"
+              return
+            fi
             printf '| %s | %s |\n' "$name" "$result" >> "$summary"
             case "$result" in
               success) ;;
@@ -1164,12 +1877,12 @@ jobs:
           }
 
           record_result 'security-scan' "$SECURITY_SCAN_RESULT"
-          record_result 'test (1.25)' "$TEST_GO125_RESULT"
           record_result 'test (1.26)' "$TEST_GO126_RESULT"
-          record_result 'test-macos' "$MACOS_RESULT"
-          record_result 'lint' "$LINT_RESULT"
+          record_result 'test (1.27)' "$TEST_GO127_RESULT"
+          record_result 'test-macos' "$MACOS_RESULT" docs
+          record_result 'lint' "$LINT_RESULT" docs
           record_result 'build' "$BUILD_RESULT"
-          record_result 'govulncheck' "$GOVULNCHECK_RESULT"
+          record_result 'govulncheck' "$GOVULNCHECK_RESULT" docs
 
           printf '\nCodeQL is separately required and runs in its own workflow; it is intentionally outside this summary.\n' >> "$summary"
 

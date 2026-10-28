@@ -9,6 +9,48 @@ import (
 	"time"
 )
 
+func TestEntropyExclusionExpiryReloadDirection(t *testing.T) {
+	t.Parallel()
+	soon := time.Now().UTC().AddDate(0, 0, 1).Format(time.DateOnly)
+	later := time.Now().UTC().AddDate(0, 0, 2).Format(time.DateOnly)
+	for _, tc := range []struct {
+		name, before, after string
+		widened             bool
+	}{
+		{"unchanged", soon, soon, false},
+		{"shorter", later, soon, false},
+		{"permanent to temporary", "", soon, false},
+		{"extension", soon, later, true},
+		{"temporary to permanent", soon, "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			old := Defaults()
+			old.Mode = ModeStrict
+			old.FetchProxy.Monitoring.PathEntropyExclusions = []PathEntropyExclusion{{Host: "api.vendor.example", PathPrefix: "/files/", Expires: tc.before}}
+			old.FetchProxy.Monitoring.QueryEntropyParamExclusions = []QueryEntropyParamExclusion{{Host: "api.vendor.example", Path: "/files", Param: "id", Expires: tc.before}}
+			next := old.Clone()
+			next.FetchProxy.Monitoring.PathEntropyExclusions[0].Expires = tc.after
+			next.FetchProxy.Monitoring.QueryEntropyParamExclusions[0].Expires = tc.after
+			warnings := ValidateReload(old, next)
+			want := 0
+			if tc.widened {
+				want = 2
+			}
+			if len(warnings) != want {
+				t.Fatalf("warnings = %+v, want %d", warnings, want)
+			}
+			for _, warning := range warnings {
+				if warning.Disposition != "" || !strings.Contains(warning.Message, "added") {
+					t.Fatalf("extension must remain a rejectable downgrade: %+v", warning)
+				}
+			}
+			if (old.CanonicalPolicyHash() == next.CanonicalPolicyHash()) != (tc.before == tc.after) {
+				t.Fatal("expiry change lost its policy identity")
+			}
+		})
+	}
+}
+
 // A reload that adds an exemption reduces detection coverage, and an operator
 // running strict mode needs that surfaced rather than applied silently. A
 // reload that only rewrites a reason or an owner is not a coverage change and
@@ -54,23 +96,26 @@ func TestPathEntropyExclusionsReloadWarnings(t *testing.T) {
 	second := PathEntropyExclusion{Scheme: "https", Host: "drive.vendor.example", PathPrefix: "/file/d/"}
 
 	tests := []struct {
-		name    string
-		before  []PathEntropyExclusion
-		after   []PathEntropyExclusion
-		want    string
-		wantNil bool
-		why     string
+		name            string
+		before          []PathEntropyExclusion
+		after           []PathEntropyExclusion
+		want            string
+		wantDisposition []ReloadWarningDisposition
+		wantNil         bool
+		why             string
 	}{
 		{
-			name:  "adding an exemption warns that coverage dropped",
-			after: []PathEntropyExclusion{pathEntropyReloadEntry},
-			want:  "path entropy exclusions added: https://docs.vendor.example/document/d/",
-			why:   "a reload that quietly reduces detection is the case this exists for",
+			name:            "adding an exemption warns that coverage dropped",
+			after:           []PathEntropyExclusion{pathEntropyReloadEntry},
+			want:            "path entropy exclusions added: https://docs.vendor.example/document/d/",
+			wantDisposition: []ReloadWarningDisposition{""},
+			why:             "a reload that quietly reduces detection is the case this exists for",
 		},
 		{
-			name:   "removing an exemption reports coverage restored",
-			before: []PathEntropyExclusion{pathEntropyReloadEntry},
-			want:   "path entropy exclusions removed: https://docs.vendor.example/document/d/",
+			name:            "removing an exemption reports coverage restored",
+			before:          []PathEntropyExclusion{pathEntropyReloadEntry},
+			want:            "path entropy exclusions removed: https://docs.vendor.example/document/d/",
+			wantDisposition: []ReloadWarningDisposition{ReloadWarningDispositionAdvisory},
 		},
 		{
 			name:    "an unchanged list is silent",
@@ -95,7 +140,7 @@ func TestPathEntropyExclusionsReloadWarnings(t *testing.T) {
 				PathPrefix: "/document/d/",
 				Reason:     "a corrected explanation",
 				Owner:      "someone else",
-				Expires:    temporaryExpiryDate(MaxPathEntropyExclusionHorizon - 24*time.Hour),
+				Expires:    pathEntropyReloadEntry.Expires,
 			}},
 			wantNil: true,
 			why:     "strict mode refuses downgrades, so a comment edit must not read as one",
@@ -111,10 +156,11 @@ func TestPathEntropyExclusionsReloadWarnings(t *testing.T) {
 			why:     "https is the default, so spelling it out is not a policy change",
 		},
 		{
-			name:   "swapping one route for another reports both directions",
-			before: []PathEntropyExclusion{pathEntropyReloadEntry},
-			after:  []PathEntropyExclusion{second},
-			want:   "added: https://drive.vendor.example/file/d/",
+			name:            "swapping one route for another reports both directions",
+			before:          []PathEntropyExclusion{pathEntropyReloadEntry},
+			after:           []PathEntropyExclusion{second},
+			want:            "added: https://drive.vendor.example/file/d/",
+			wantDisposition: []ReloadWarningDisposition{"", ReloadWarningDispositionAdvisory},
 		},
 	}
 
@@ -131,6 +177,14 @@ func TestPathEntropyExclusionsReloadWarnings(t *testing.T) {
 			}
 			if !strings.Contains(joined, tt.want) {
 				t.Fatalf("expected a warning containing %q (%s), got:\n%s", tt.want, tt.why, joined)
+			}
+			if len(got) != len(tt.wantDisposition) {
+				t.Fatalf("warning count = %d, want %d: %s", len(got), len(tt.wantDisposition), joined)
+			}
+			for i, warning := range got {
+				if warning.Disposition != tt.wantDisposition[i] {
+					t.Fatalf("warning %d disposition = %q, want %q", i, warning.Disposition, tt.wantDisposition[i])
+				}
 			}
 		})
 	}

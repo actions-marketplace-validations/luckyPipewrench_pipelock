@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
 // maxBatchDepth bounds nested-batch recursion so a maliciously deep nesting
@@ -103,9 +104,12 @@ func (m *Matcher) evaluateBatch(meta RequestMeta, body []byte, depth int) (best 
 		if !b.routeMatches(meta) {
 			continue
 		}
-		subs, ok := b.parseSubRequests(body)
+		subs, ok, ambiguous := b.parseSubRequests(body)
 		if !ok {
 			parseOK = false
+			if ambiguous {
+				best = Stricter(best, Decision{Action: config.ActionBlock, RuleName: batchRuleName, Reason: "batch contains duplicate JSON keys"})
+			}
 			continue
 		}
 		for _, sub := range subs {
@@ -140,7 +144,18 @@ func (m *Matcher) evaluateSubRequest(host string, sub batchSubRequest, depth int
 	}
 	ops, parseOK, opaque := extractSubRequestGraphQL(sub)
 	subMeta.Operations = ops
+	if len(sub.body) > 0 {
+		var doc any
+		if err := json.Unmarshal(sub.body, &doc); err == nil {
+			subMeta.JSONBody = doc
+			subMeta.JSONBodyParsed = true
+			subMeta.JSONDupKeys = topLevelBatchDuplicateKeys(sub.body)
+		}
+	}
 	d := m.Evaluate(subMeta)
+	if !subMeta.JSONBodyParsed {
+		d = Stricter(d, m.EvaluateUninspectable(subMeta, m.onParseError, PredDiscriminator))
+	}
 	switch {
 	case !parseOK:
 		d = Stricter(d, m.uninspectableSub(subMeta, m.onParseError))
@@ -148,6 +163,10 @@ func (m *Matcher) evaluateSubRequest(host string, sub batchSubRequest, depth int
 		d = Stricter(d, m.uninspectableSub(subMeta, m.onOpaqueOperation))
 	}
 	return d
+}
+
+func topLevelBatchDuplicateKeys(body []byte) map[string]struct{} {
+	return jsonscan.TopLevelDuplicateKeys(body)
 }
 
 // uninspectableSub applies a fail-closed action to a sub-request whose body
@@ -175,38 +194,48 @@ func extractSubRequestGraphQL(sub batchSubRequest) (ops []RequestOperation, pars
 // a sub-request whose route cannot be classified must not silently evaluate as
 // method="" path="/". A sub-request's body is kept as raw JSON bytes for
 // downstream operation extraction.
-func (b *compiledBatch) parseSubRequests(body []byte) ([]batchSubRequest, bool) {
+func (b *compiledBatch) parseSubRequests(body []byte) ([]batchSubRequest, bool, bool) {
 	if len(body) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(body, &envelope); err != nil {
-		return nil, false
+		return nil, false, false
+	}
+	if len(topLevelBatchDuplicateKeys(body)) != 0 || jsonscan.HasKeyAlias(envelope, b.requestsField) {
+		return nil, false, true
 	}
 	rawReqs, ok := envelope[b.requestsField]
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
-	var items []map[string]json.RawMessage
-	if err := json.Unmarshal(rawReqs, &items); err != nil {
-		return nil, false
+	var rawItems []json.RawMessage
+	if err := json.Unmarshal(rawReqs, &rawItems); err != nil {
+		return nil, false, false
 	}
-	if len(items) > b.maxSubRequests {
-		return nil, false
+	if len(rawItems) > b.maxSubRequests {
+		return nil, false, false
 	}
-	subs := make([]batchSubRequest, 0, len(items))
-	for _, item := range items {
+	subs := make([]batchSubRequest, 0, len(rawItems))
+	for _, rawItem := range rawItems {
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(rawItem, &item); err != nil {
+			return nil, false, false
+		}
+		if len(topLevelBatchDuplicateKeys(rawItem)) != 0 || jsonscan.HasKeyAlias(item, b.methodField) || jsonscan.HasKeyAlias(item, b.urlField) || jsonscan.HasKeyAlias(item, b.bodyField) {
+			return nil, false, true
+		}
 		method, ok := requiredStringField(item, b.methodField)
 		if !ok {
-			return nil, false
+			return nil, false, false
 		}
 		rawURL, ok := requiredStringField(item, b.urlField)
 		if !ok {
-			return nil, false
+			return nil, false, false
 		}
 		subPath, subQuery, ok := splitBatchSubRequestURL(rawURL)
 		if !ok {
-			return nil, false
+			return nil, false, false
 		}
 		sub := batchSubRequest{method: method, path: subPath, query: subQuery}
 		// A JSON null body is treated as no body: json.RawMessage("null") is
@@ -218,7 +247,7 @@ func (b *compiledBatch) parseSubRequests(body []byte) ([]batchSubRequest, bool) 
 		}
 		subs = append(subs, sub)
 	}
-	return subs, true
+	return subs, true, false
 }
 
 func requiredStringField(item map[string]json.RawMessage, field string) (string, bool) {

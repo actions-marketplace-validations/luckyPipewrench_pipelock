@@ -25,6 +25,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
+
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
@@ -48,6 +51,14 @@ const (
 	testNotJSON       = "this is not json"
 	osWindows         = "windows"
 )
+
+// stripRPCResponse provides typed assertions for response-strip tests.
+type stripRPCResponse struct {
+	JSONRPC string              `json:"jsonrpc"`
+	ID      json.RawMessage     `json:"id"`
+	Result  *jsonrpc.ToolResult `json:"result,omitempty"`
+	Error   json.RawMessage     `json:"error,omitempty"`
+}
 
 // syncBuffer is a goroutine-safe bytes.Buffer. Needed for RunProxy tests
 // where cmd.Stderr goroutine and ForwardScanned write to the same logW.
@@ -950,7 +961,12 @@ func TestForwardScanned_StripAction(t *testing.T) {
 
 func TestForwardScanned_StripRequireReceiptsDurabilityFailureBlocksResponse(t *testing.T) {
 	sc := testScannerWithAction(t, config.ActionStrip)
-	var out, log bytes.Buffer
+	var out, log, events bytes.Buffer
+	auditLogger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(auditLogger.Close)
 	emitter, rec, _, _ := newReceiptTestHarness(t)
 	rec.SetSyncForTest(func(*os.File) error {
 		return errors.New("injected durable sync failure")
@@ -966,6 +982,7 @@ func TestForwardScanned_StripRequireReceiptsDurabilityFailureBlocksResponse(t *t
 		tracker,
 		MCPProxyOpts{
 			Scanner:         sc,
+			AuditLogger:     auditLogger,
 			ReceiptEmitter:  emitter,
 			Transport:       transportMCPStdio,
 			RequireReceipts: true,
@@ -986,9 +1003,16 @@ func TestForwardScanned_StripRequireReceiptsDurabilityFailureBlocksResponse(t *t
 	if !strings.Contains(log.String(), "receipt emission failed") {
 		t.Fatalf("expected receipt failure log, got: %s", log.String())
 	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditReceiptEmission+`"`) ||
+		!strings.Contains(got, `"block_class":"infrastructure_error"`) || strings.Contains(got, `"mitre_technique"`) {
+		t.Fatalf("required receipt failure missing one operational block: %s", got)
+	}
 }
 
-func TestForwardScanned_ResponseV2ReceiptFailureDoesNotReplaceWhenV1Emits(t *testing.T) {
+// The old v1-only success expectation allowed a warn response to leave without
+// its required v2 receipt. A v2 failure now produces a block response.
+func TestForwardScanned_ResponseV2ReceiptFailureBlocksWhenV1Emits(t *testing.T) {
 	sc := testScannerWithAction(t, config.ActionWarn)
 	var out, log bytes.Buffer
 	emitter, rec, dir, _ := newReceiptTestHarness(t)
@@ -1023,20 +1047,21 @@ func TestForwardScanned_ResponseV2ReceiptFailureDoesNotReplaceWhenV1Emits(t *tes
 	if !found {
 		t.Fatal("expected injection detected")
 	}
-	if !strings.Contains(out.String(), "Ignore all previous instructions") {
-		t.Fatalf("expected warn-mode response to pass after v1 receipt, got: %s", out.String())
+	if strings.Contains(out.String(), "Ignore all previous instructions") {
+		t.Fatalf("warn-mode response forwarded without v2 receipt: %s", out.String())
 	}
-	if strings.Contains(out.String(), "receipt emission failed") {
-		t.Fatalf("unexpected fail-closed receipt error response: %s", out.String())
+	if !strings.Contains(out.String(), "receipt emission failed") {
+		t.Fatalf("missing fail-closed receipt error response: %s", out.String())
 	}
-	if strings.Contains(log.String(), "audit_gap=true") {
-		t.Fatalf("unexpected v2 audit-gap log after v1 receipt succeeded: %s", log.String())
+	if !strings.Contains(log.String(), "receipt emission failed") {
+		t.Fatalf("missing receipt failure log: %s", log.String())
 	}
 	if err := rec.Close(); err != nil {
 		t.Fatalf("recorder.Close: %v", err)
 	}
 	receipts := readActionReceipts(t, dir)
 	var originalActionID string
+	var replacement receipt.Receipt
 	for _, rcpt := range receipts {
 		if rcpt.ActionRecord.Layer == "mcp_response_scan" {
 			originalActionID = rcpt.ActionRecord.ActionID
@@ -1044,15 +1069,21 @@ func TestForwardScanned_ResponseV2ReceiptFailureDoesNotReplaceWhenV1Emits(t *tes
 		if rcpt.ActionRecord.Verdict == config.ActionBlock &&
 			rcpt.ActionRecord.Layer == "receipt_emission_failed" &&
 			strings.Contains(rcpt.ActionRecord.Pattern, "mcp_response_scan receipt emission failed") {
-			t.Fatalf("unexpected replacement block receipt after v1 receipt succeeded: %+v", rcpt.ActionRecord)
+			replacement = rcpt
 		}
 	}
 	if originalActionID == "" {
 		t.Fatalf("missing original mcp_response_scan receipt in %d receipts", len(receipts))
 	}
+	if replacement.ActionRecord.ParentActionID != originalActionID {
+		t.Fatalf("replacement parent_action_id = %q, want %q", replacement.ActionRecord.ParentActionID, originalActionID)
+	}
 }
 
-func TestForwardScanned_ResponseReceiptFailureOmitsParentWhenOriginalNotDurable(t *testing.T) {
+// After the original receipt's sync fails, the stream stays failed: the
+// request fails closed and nothing further, including the best-effort
+// replacement block receipt, is written over the unconfirmed prefix.
+func TestForwardScanned_ResponseReceiptSyncFailureWritesNothingFurther(t *testing.T) {
 	sc := testScannerWithAction(t, config.ActionWarn)
 	var out, log bytes.Buffer
 	emitter, rec, dir, _ := newReceiptTestHarness(t)
@@ -1088,23 +1119,19 @@ func TestForwardScanned_ResponseReceiptFailureOmitsParentWhenOriginalNotDurable(
 	if !strings.Contains(out.String(), "receipt emission failed") {
 		t.Fatalf("expected fail-closed receipt error response, got: %s", out.String())
 	}
-	if err := rec.Close(); err != nil {
-		t.Fatalf("recorder.Close: %v", err)
+	// The injected sync failure leaves the stream failed, so close
+	// refuses to sign a final checkpoint over it.
+	if err := rec.Close(); !errors.Is(err, recorder.ErrDurabilityInherited) {
+		t.Fatalf("recorder close after a failed sync = %v, want the final checkpoint refused", err)
 	}
 	receipts := readActionReceipts(t, dir)
-	var replacement receipt.Receipt
 	for _, rcpt := range receipts {
-		if rcpt.ActionRecord.Verdict == config.ActionBlock &&
-			rcpt.ActionRecord.Layer == "receipt_emission_failed" &&
-			strings.Contains(rcpt.ActionRecord.Pattern, "mcp_response_scan receipt emission failed") {
-			replacement = rcpt
+		if rcpt.ActionRecord.Verdict == config.ActionBlock && rcpt.ActionRecord.Layer == "receipt_emission_failed" {
+			t.Fatalf("replacement block receipt was written to a failed stream: %+v", rcpt.ActionRecord)
 		}
 	}
-	if replacement.ActionRecord.ActionID == "" {
-		t.Fatalf("missing replacement block receipt in %d receipts", len(receipts))
-	}
-	if replacement.ActionRecord.ParentActionID != "" {
-		t.Fatalf("replacement parent_action_id = %q, want empty after original durable failure", replacement.ActionRecord.ParentActionID)
+	if len(receipts) != 1 {
+		t.Fatalf("receipts = %d, want only the original whose sync failed", len(receipts))
 	}
 }
 
@@ -1731,6 +1758,26 @@ func TestRunProxy_AskAction(t *testing.T) {
 	}
 }
 
+// recordingEchoCommand records upstream delivery independently of response
+// scanning, which might otherwise hide an incorrectly forwarded request.
+func recordingEchoCommand(t *testing.T, wantInput string) []string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "upstream-input.jsonl")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		got, err := os.ReadFile(filepath.Clean(path))
+		if err != nil {
+			t.Fatalf("read upstream input: %v", err)
+		}
+		if string(got) != wantInput {
+			t.Errorf("upstream received %q, want %q", got, wantInput)
+		}
+	})
+	return []string{"tee", path}
+}
+
 func TestRunProxy_InputScanningBlocksDirtyRequest(t *testing.T) {
 	if runtime.GOOS == osWindows {
 		t.Skip("echo subprocess test requires unix")
@@ -1750,17 +1797,16 @@ func TestRunProxy_InputScanningBlocksDirtyRequest(t *testing.T) {
 		OnParseError: "block",
 	}
 
-	// echo outputs a clean server response regardless of stdin.
-	err := RunProxy(context.Background(), strings.NewReader(dirtyReq), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
+	// The child echoes only input that actually reaches it.
+	err := RunProxy(context.Background(), strings.NewReader(dirtyReq), &out, logBuf, recordingEchoCommand(t, ""), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	outStr := out.String()
 
-	// Should contain the clean server response forwarded by ForwardScanned.
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected clean server response in output, got: %s", outStr)
+	if strings.Contains(outStr, secret) {
+		t.Errorf("blocked input reached the echo child: %s", outStr)
 	}
 
 	// Should contain a block error response for the dirty request (code -32001).
@@ -1793,16 +1839,16 @@ func TestRunProxy_InputScanningForwardsCleanRequest(t *testing.T) {
 		OnParseError: "block",
 	}
 
-	err := RunProxy(context.Background(), strings.NewReader(cleanReq), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
+	err := RunProxy(context.Background(), strings.NewReader(cleanReq), &out, logBuf, recordingEchoCommand(t, cleanReq), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	outStr := out.String()
 
-	// Should contain the server response.
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected server response in output, got: %s", outStr)
+	// Output proves delivery to the child, not an unsolicited canned reply.
+	if outStr != cleanReq {
+		t.Errorf("forwarded request = %q, want %q", outStr, cleanReq)
 	}
 
 	// Should NOT contain any block error (clean request forwarded fine).
@@ -2274,16 +2320,15 @@ func TestRunProxy_InputScanningBlocksNotification(t *testing.T) {
 		OnParseError: "block",
 	}
 
-	err := RunProxy(context.Background(), strings.NewReader(notification), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
+	err := RunProxy(context.Background(), strings.NewReader(notification), &out, logBuf, recordingEchoCommand(t, ""), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	outStr := out.String()
 
-	// Should contain the clean server response (echo output).
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected clean server response, got: %s", outStr)
+	if outStr != "" {
+		t.Errorf("blocked notification produced output: %s", outStr)
 	}
 
 	// Notification block should NOT produce a -32001 error response
@@ -2819,40 +2864,10 @@ func TestStripResponse_BatchInvalidJSON(t *testing.T) {
 
 func TestStripResponse_BatchElementStripError(t *testing.T) {
 	sc := testScannerWithAction(t, "strip")
-
-	// Batch with a 5-level nested array element that exceeds maxStripDepth (4).
-	// At depth 4, stripResponseDepth sees '[' and returns "batch nesting too deep",
-	// which stripBatchDepth catches and replaces with blockResponse(nil).
 	deep := `[[[[[` + injectionResponse + `]]]]]`
 	batch := `[` + deep + `,` + cleanResponse + `]`
-
-	stripped, err := stripResponse([]byte(batch), sc)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// The result should be valid JSON.
-	var result []json.RawMessage
-	if err := json.Unmarshal(stripped, &result); err != nil {
-		t.Fatalf("not valid JSON array: %v", err)
-	}
-	if len(result) != 2 {
-		t.Fatalf("expected 2 elements, got %d", len(result))
-	}
-
-	// First element was deeply nested so strip modified it (contains blockResponse
-	// somewhere in the nesting). Verify it's not the original injection text.
-	if strings.Contains(string(result[0]), "Ignore all previous") {
-		t.Error("deeply nested injection should have been blocked, not forwarded intact")
-	}
-
-	// Second element should be the clean response (unchanged).
-	var rpc2 stripRPCResponse
-	if err := json.Unmarshal(result[1], &rpc2); err != nil {
-		t.Fatalf("second element not valid JSON: %v", err)
-	}
-	if rpc2.Result == nil || len(rpc2.Result.Content) == 0 {
-		t.Fatal("expected result content in second element")
+	if _, err := stripResponse([]byte(batch), sc); err == nil {
+		t.Fatal("an uninspectable batch element must fail the whole strip")
 	}
 }
 
@@ -2969,16 +2984,15 @@ func TestRunProxy_PolicyBlocksDangerousToolCall(t *testing.T) {
 		},
 	})
 
-	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg})
+	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, recordingEchoCommand(t, ""), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	outStr := out.String()
 
-	// Should contain the clean server response (echo output).
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected clean server response, got: %s", outStr)
+	if strings.Contains(outStr, strings.TrimSpace(req)) {
+		t.Errorf("blocked tool call reached the echo child: %s", outStr)
 	}
 
 	// Should contain a policy block error response (code -32002).
@@ -3022,16 +3036,17 @@ func TestRunProxy_PolicyWarnForwardsToolCall(t *testing.T) {
 		},
 	})
 
-	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg})
+	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, recordingEchoCommand(t, req), MCPProxyOpts{Scanner: sc, InputCfg: inputCfg, PolicyCfg: policyCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	outStr := out.String()
 
-	// Should contain the server response (warn mode forwards).
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected server response, got: %s", outStr)
+	// A canned reply can arrive before request registration and prove nothing
+	// about forwarding. The child must echo the actual warn-mode request.
+	if outStr != req {
+		t.Errorf("forwarded request = %q, want %q", outStr, req)
 	}
 
 	// Should NOT contain a block error (warn forwards).
@@ -3071,7 +3086,7 @@ func TestRunProxy_PolicyOnlyWithoutInputScanning(t *testing.T) {
 	})
 
 	// inputCfg is nil - only policy engine is active.
-	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
+	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, recordingEchoCommand(t, ""), MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -3083,9 +3098,8 @@ func TestRunProxy_PolicyOnlyWithoutInputScanning(t *testing.T) {
 		t.Errorf("expected -32002 policy block when inputCfg=nil, got: %s", outStr)
 	}
 
-	// Server response should still be present (echo output).
-	if !strings.Contains(outStr, "The weather is sunny today.") {
-		t.Errorf("expected server response, got: %s", outStr)
+	if strings.Contains(outStr, strings.TrimSpace(req)) {
+		t.Errorf("blocked tool call reached the echo child: %s", outStr)
 	}
 }
 
@@ -3116,7 +3130,7 @@ func TestRunProxy_PolicyOnlyMalformedJSONBlocked(t *testing.T) {
 	})
 
 	// inputCfg is nil - only policy engine is active.
-	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, []string{"echo", cleanResponse}, MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
+	err := RunProxy(context.Background(), strings.NewReader(req), &out, logBuf, recordingEchoCommand(t, ""), MCPProxyOpts{Scanner: sc, PolicyCfg: policyCfg})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -4806,9 +4820,10 @@ func TestRunProxy_ResponseTimeoutTerminatesHungUpstream(t *testing.T) {
 	}()
 
 	select {
-	case <-done:
+	case err := <-done:
+		t.Logf("goroutine result: %v", err)
 		// Returned: the hung child was killed before cmd.Wait(). Good.
-	case <-time.After(15 * time.Second):
+	case <-time.After(testwait.Deadline(15 * time.Second)):
 		t.Fatal("RunProxy hung after upstream response timeout (cmd.Wait blocked on a live child)")
 	}
 
@@ -4846,7 +4861,7 @@ func TestRunProxy_ResponseTimeoutReturnsWithOpenClientInput(t *testing.T) {
 		if !errors.Is(err, transport.ErrResponseTimeout) {
 			t.Fatalf("RunProxy error = %v, want ErrResponseTimeout", err)
 		}
-	case <-time.After(15 * time.Second):
+	case <-time.After(testwait.Deadline(15 * time.Second)):
 		t.Fatal("RunProxy hung after timeout while client input stayed open")
 	}
 

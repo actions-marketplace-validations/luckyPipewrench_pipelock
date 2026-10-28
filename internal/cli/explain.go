@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -124,7 +125,7 @@ tradeoff.
 explain does not perform network access. It runs the layers that fire before
 DNS resolution (scheme, CRLF, path traversal, allowlist, blocklist, core SSRF
 literal, core/URL DLP, path and subdomain entropy). The hostname-based SSRF
-layer (layer 8) resolves DNS at runtime, so explain reports when a verdict
+layer resolves DNS at runtime, so explain reports when a verdict
 would additionally depend on resolution rather than reaching out itself. IP
 literals that resolve to private ranges are still caught here by the immutable
 core SSRF literal check, which needs no resolution.
@@ -205,6 +206,10 @@ var errExplainBlocked = errors.New("url blocked")
 
 var errExplainActionBlocked = errors.New("action blocked")
 
+// explainEnvScanSkippedNote is reported by the command, tool and file modes when
+// the config enables `dlp.scan_env`.
+const explainEnvScanSkippedNote = "environment-variable leak matching (`dlp.scan_env`) did not run: explain does not read the runtime's environment, so input containing one of its values can still be blocked at runtime as an Environment Variable Leak"
+
 func explainLoadConfig(path string) (*config.Config, string, error) {
 	if path == "" {
 		return config.Defaults(), explainConfigLabelDefaults, nil
@@ -230,7 +235,6 @@ func explainLoadSurfaceConfig(path string) (*config.Config, string, error) {
 			return nil, "", fmt.Errorf("config load error: %w", err)
 		}
 		cfg.ApplyDefaults()
-		cfg.DLP.ScanEnv = false
 		return cfg, path, nil
 	}
 
@@ -245,7 +249,6 @@ func explainLoadSurfaceConfig(path string) (*config.Config, string, error) {
 	cfg.ResponseScanning.Enabled = true
 	cfg.ResponseScanning.Action = config.ActionBlock
 	cfg.ApplyDefaults()
-	cfg.DLP.ScanEnv = false
 
 	return cfg, explainConfigLabelDefaults, nil
 }
@@ -402,6 +405,10 @@ func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL
 		Version:    cliutil.Version,
 	}
 
+	if notice := cfg.PromptInjectionNotice(); notice != "" {
+		report.Notes = append(report.Notes, notice)
+	}
+
 	// Merge any installed rule bundles into the config exactly as the runtime
 	// scanner would, so URL-DLP patterns from bundles are reflected in the
 	// verdict. Surface bundle load errors as warnings, not a hard failure.
@@ -426,12 +433,23 @@ func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL
 		return report, fmt.Errorf("create scanner: %w", err)
 	}
 	defer sc.Close()
-	result := sc.Scan(cmd.Context(), rawURL)
+	// A URL explanation models a fetch, which always dispatches GET. A native
+	// OAuth endpoint grant depends on that method, so say when it decided the
+	// verdict: any other method at this URL keeps the ordinary gates.
+	result := sc.Scan(scanner.WithOAuthAuthorizationMethod(cmd.Context(), http.MethodGet), rawURL)
+	if result.Allowed && len(cfg.FetchProxy.Monitoring.OAuthAuthorizationEndpoints) > 0 {
+		if other := sc.ScanPreflight(cmd.Context(), rawURL); !other.Allowed {
+			report.Notes = append(report.Notes, "Explained as GET: `fetch_proxy.monitoring.oauth_authorization_endpoints` admits this native OAuth authorization request only for GET; another method at this URL is refused by "+other.Scanner+".")
+		}
+	}
 
 	report.Allowed = result.Allowed
 	report.Scanner = result.Scanner
 	report.Layer = result.Scanner
 	report.Reason = result.Reason
+	if strings.Contains(result.Reason, "outside its validity window") {
+		report.Notes = append(report.Notes, "The grant allowance is withheld because its validity window does not include the current host clock. URL explanations use the current clock, so a URL from an earlier log may have expired; check the host clock or obtain a current URL.")
+	}
 	report.Score = result.Score
 	report.Host = explainHost(rawURL)
 	report.TargetView = explainTargetView(result, rawURL)
@@ -455,7 +473,7 @@ func buildExplainReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, rawURL
 		if ssrfActive && !explainHostIsIPLiteral(report.Host) {
 			report.DNSDependent = true
 			report.Notes = append(report.Notes,
-				"this config's SSRF layer (layer 8) resolves DNS at runtime; explain did not resolve, so a private/metadata IP or DNS failure could still block this URL when proxied")
+				"this config's SSRF layer resolves DNS at runtime; explain did not resolve, so a private/metadata IP or DNS failure could still block this URL when proxied")
 		}
 		report.Notes = append(report.Notes, explainUnevaluatedLayerNotes(cfg, report.Host)...)
 		return report, nil
@@ -623,6 +641,9 @@ func explainResponseScanExemptNotes(cfg *config.Config, host string) []string {
 }
 
 func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel, surface, blockedAction string, action decide.Action) (explainReport, error) {
+	// Bundle merging and offline-only overrides must not alter the caller's
+	// config or hide skipped checks on subsequent reports.
+	cfg = cfg.Clone()
 	report := explainReport{
 		Surface:       surface,
 		BlockedAction: blockedAction,
@@ -630,6 +651,9 @@ func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel,
 		Mode:          cfg.Mode,
 		Version:       cliutil.Version,
 		TargetView:    surface,
+	}
+	if notice := cfg.PromptInjectionNotice(); notice != "" {
+		report.Notes = append(report.Notes, notice)
 	}
 
 	bundleResult := rules.MergeIntoConfig(cfg, cliutil.Version)
@@ -640,12 +664,24 @@ func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel,
 		report.Notes = append(report.Notes, "rule bundle warning: "+w)
 	}
 
+	// Explain runs in its own process, not the hooked agent's, so the values
+	// env-leak matching would compare against are not the ones the runtime
+	// sees. The check is switched off here, and said so: otherwise ALLOWED
+	// reads as covering a check that never ran.
+	if cfg.DLP.ScanEnv {
+		cfg.DLP.ScanEnv = false
+		report.Notes = append(report.Notes, explainEnvScanSkippedNote)
+	}
+
 	sc, err := scanner.New(cfg)
 	if err != nil {
 		return report, fmt.Errorf("create scanner: %w", err)
 	}
 	defer sc.Close()
 	pc := policy.New(cfg.MCPToolPolicy)
+	// Explain answers what an agent hook on this host would decide, so it
+	// resolves paths here the same way the hooks do.
+	pc.EnableLocalPathIdentity()
 	decision := decide.Decide(cmd.Context(), cfg, sc, pc, action)
 
 	report.Allowed = decision.Outcome == decide.Allow
@@ -660,7 +696,7 @@ func buildExplainSurfaceReport(cmd *cobra.Command, cfg *config.Config, cfgLabel,
 	report.Reason = explainEvidenceReason(primary, decision)
 	report.Remediation = explainRemediationForEvidence(primary)
 	if report.Remediation != nil {
-		if g, ok := scanner.GuidanceForResult(primary.Scanner, report.Reason); ok {
+		if g, ok := scanner.GuidanceForResultWithPatterns(primary.Scanner, report.Reason, []string{primary.Pattern}); ok {
 			report.AgentReason = g.AgentReason
 		}
 	}
@@ -698,7 +734,7 @@ func explainRemediationForEvidence(e decide.Evidence) *explainRemediation {
 	if reason == "" {
 		reason = e.Pattern
 	}
-	if g, ok := scanner.GuidanceForResult(e.Scanner, reason); ok {
+	if g, ok := scanner.GuidanceForResultWithPatterns(e.Scanner, reason, []string{e.Pattern}); ok {
 		return &explainRemediation{
 			Knob:      g.OperatorKnob,
 			Broader:   g.OperatorBroader,
@@ -740,7 +776,7 @@ func explainTargetView(result scanner.Result, rawURL string) string {
 		}
 		return explainViewURL
 	case scanner.ScannerEntropy:
-		if strings.Contains(result.Reason, "query ") {
+		if scanner.IsQueryEntropyResult(result) {
 			return explainViewURLQuery
 		}
 		return explainViewPath

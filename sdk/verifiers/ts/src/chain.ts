@@ -6,7 +6,7 @@ import type { ChainResult, Receipt } from "./types.js";
 import { canonicalizeReceipt } from "./canonical.js";
 import { canonicalizeBytes } from "./aarp/canonical.js";
 import { sha256Hex } from "./util.js";
-import { normalizeEvidenceReceipt, unpinnedReceiptBanner, verifyReceipt } from "./signing.js";
+import { unpinnedReceiptBanner, verifyReceipt } from "./signing.js";
 
 export const genesisHash = "genesis";
 export const genesisSessionOpenPrefix = "g1:";
@@ -321,13 +321,16 @@ function startRotatedSegment(
       `seq ${seq}: key_transition prior_signer_key does not match prior segment key`,
     );
   }
+  const signerKey = (receipt.signer_key ?? "").toLowerCase();
+  if (signerKey === state.curKey) {
+    return broken(seq, `seq ${seq}: key_transition does not change signer key`);
+  }
   if (marker?.["prior_chain_seq"] !== state.priorSegmentSeq) {
     return broken(
       seq,
       `seq ${seq}: key_transition prior_chain_seq does not match prior segment final seq`,
     );
   }
-  const signerKey = (receipt.signer_key ?? "").toLowerCase();
   if (trustedKeys.size === 0) {
     if (!allowUnpinned || signerKey !== state.curKey) {
       return broken(seq, `seq ${seq}: signer key ${signerKey} is not in the trusted set`);
@@ -492,12 +495,12 @@ async function verifyEvidenceChain(
     if (receipt.record_type !== evidenceRecordType) {
       return broken(seq, `seq ${seq}: mixed receipt record_type`);
     }
+    // Without a pinned key every signature is still checked, against the
+    // chain's own declared signer, as the Go reference does: an edit after
+    // signing fails either way. That proves nothing about who signed, so the
+    // caller still reports the chain as unpinned.
     try {
-      if (keyHex === "") {
-        normalizeEvidenceReceipt(receipt);
-      } else {
-        await verifyReceipt(receipt, keyHex);
-      }
+      await verifyReceipt(receipt, keyHex === "" ? signerID.toLowerCase() : keyHex);
     } catch (err) {
       return broken(seq, `seq ${seq}: signature: ${(err as Error).message}`);
     }
@@ -577,4 +580,27 @@ export function computeTotals(receipts: Receipt[]) {
     }
   }
   return totals;
+}
+
+// evidenceChainKey picks the key an EvidenceReceipt v2 chain is verified
+// against. A v2 chain has one signer and is verified against one key. Given a
+// trusted set (directory mode passes each run its scoped trust, which includes
+// an endorsed successor key), it is the trusted key equal to the chain's
+// declared signer_key_id. The declared id only selects: every receipt is still
+// verified against that key, and a signer outside the set gets the first
+// trusted key, which then fails. A single key is returned unchanged.
+export function evidenceChainKey(keyHex: string, receipts: Receipt[]): string {
+  const keys = keyHex
+    .split(",")
+    .map((key) => key.trim().toLowerCase())
+    .filter((key) => key !== "");
+  if (keys.length <= 1) return keyHex;
+  const signature = receipts[0]?.signature;
+  const declared =
+    typeof signature === "object" &&
+    signature !== null &&
+    typeof (signature as Record<string, unknown>)["signer_key_id"] === "string"
+      ? ((signature as Record<string, unknown>)["signer_key_id"] as string).toLowerCase()
+      : "";
+  return keys.find((key) => key === declared) ?? (keys[0] as string);
 }

@@ -91,6 +91,30 @@ func TestServer_ReloadCarriesContainmentLoopbackServices(t *testing.T) {
 	}
 }
 
+func TestServer_ReloadKeepsInstalledDisplayBackend(t *testing.T) {
+	initial := "mode: balanced\ncontainment:\n  display:\n    enabled: true\n    backend: xvfb\n"
+	candidate := "mode: balanced\ncontainment:\n  display:\n    enabled: true\n    backend: xvnc\n"
+	stderr := &syncBuffer{}
+	s, err := NewServer(ServerOpts{ConfigFile: writeServerTestConfig(t, initial), Listen: serverTestEphemeralListen, ListenChanged: true, Stdout: &syncBuffer{}, Stderr: stderr, allowEphemeralListenersForTesting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.cleanup)
+	newCfg, err := config.LoadBytes([]byte(candidate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Reload(newCfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.proxy.CurrentConfig().Containment.Display.EffectiveBackend(); got != "xvfb" {
+		t.Fatalf("reload changed installed display backend to %s", got)
+	}
+	if !strings.Contains(stderr.String(), "run `pipelock contain install`") {
+		t.Fatalf("reload omitted install remedy: %s", stderr.String())
+	}
+}
+
 func loadServerTestConfig(t *testing.T, body string) (*config.Config, error) {
 	t.Helper()
 	return config.Load(writeServerTestConfig(t, body))
@@ -194,14 +218,17 @@ func TestServer_ReloadRejectsInvalidLoopbackServiceCandidate(t *testing.T) {
 		wantErr string
 	}{
 		{
-			name: "expired declaration",
+			// An expired entry is a lapsed grant and is dropped, not rejected
+			// (see TestServer_ReloadAppliesContainmentGrantPartition). Expiry
+			// must not hide a malformed sibling: a duplicate still rejects.
+			name: "expired duplicate of a live declaration",
 			mutate: func(c *config.Config) {
-				c.Containment.LoopbackServices = []config.ContainmentLoopbackService{{
-					Host: "127.0.0.1", Port: 9200, Owner: "search-team", Reason: "local index",
-					ExpiresAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
-				}}
+				c.Containment.LoopbackServices = []config.ContainmentLoopbackService{
+					{Host: "127.0.0.1", Port: 9200, Owner: "search-team", Reason: "local index", ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339)},
+					{Host: "127.0.0.1", Port: 9200, Owner: "search-team", Reason: "local index", ExpiresAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)},
+				}
 			},
-			wantErr: "expired",
+			wantErr: "duplicates",
 		},
 		{
 			name: "host that is not a loopback literal",
@@ -358,8 +385,8 @@ func TestServer_ReloadDoesNotPromiseReconciliationForARejectedCandidate(t *testi
 		t.Fatalf("load candidate: %v", loadErr)
 	}
 	rejected.Containment.LoopbackServices = []config.ContainmentLoopbackService{{
-		Host: "127.0.0.1", Port: 9200, Owner: "search-team", Reason: "local index",
-		ExpiresAt: time.Now().UTC().Add(-time.Hour).Format(time.RFC3339),
+		Host: "10.20.0.20", Port: 9200, Owner: "search-team", Reason: "local index",
+		ExpiresAt: time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 	}}
 	if err := s.Reload(rejected); err == nil {
 		t.Fatal("this test is vacuous unless the candidate is rejected")
@@ -383,5 +410,65 @@ func TestServer_ReloadDoesNotPromiseReconciliationForARejectedCandidate(t *testi
 	}
 	if !strings.Contains(stderr.String(), "run `pipelock contain reload-nft-rules`") {
 		t.Errorf("an accepted change must still tell the operator to reconcile; stderr = %q", stderr.String())
+	}
+}
+
+// TestServer_ReloadWarnsOnContainmentPublishedServicesChange proves a changed
+// published_services set gets the same policy-only warning as loopback
+// services, naming the reconciliation command, and an unchanged set stays
+// silent.
+func TestServer_ReloadWarnsOnContainmentPublishedServicesChange(t *testing.T) {
+	t.Setenv(config.ContainmentManagedEnvKey, config.ContainmentManagedEnvValue)
+	expiresAt := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	metricsAddr := reserveTCPAddress(t, "127.0.0.1")
+	configWithPublication := func(port int) string {
+		return "mode: balanced\n" +
+			"metrics_listen: " + metricsAddr + "\n" +
+			"containment:\n" +
+			"  published_services:\n" +
+			"  - name: viewer\n" +
+			"    agent_port: " + strconv.Itoa(port) + "\n" +
+			"    operator_user: operator\n" +
+			"    owner: ops-team\n" +
+			"    reason: view the agent browser\n" +
+			"    expires_at: " + expiresAt + "\n"
+	}
+	stderr := &syncBuffer{}
+	s, err := NewServer(ServerOpts{
+		ConfigFile:                        writeServerTestConfig(t, configWithPublication(8075)),
+		Listen:                            serverTestEphemeralListen,
+		ListenChanged:                     true,
+		Stdout:                            &syncBuffer{},
+		Stderr:                            stderr,
+		allowEphemeralListenersForTesting: true,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	t.Cleanup(s.cleanup)
+
+	const wantWarning = "containment.published_services changed"
+	stderr.reset()
+	changed, err := loadServerTestConfig(t, configWithPublication(8076))
+	if err != nil {
+		t.Fatalf("load changed config: %v", err)
+	}
+	if err := s.Reload(changed); err != nil {
+		t.Fatalf("Reload with a changed publication must not be rejected: %v", err)
+	}
+	if !stderr.contains(wantWarning) || !stderr.contains("pipelock contain reload-nft-rules") {
+		t.Fatalf("stderr = %q, want a warning naming %q and the reload command", stderr.String(), wantWarning)
+	}
+
+	stderr.reset()
+	unchanged, err := loadServerTestConfig(t, configWithPublication(8076))
+	if err != nil {
+		t.Fatalf("load unchanged config: %v", err)
+	}
+	if err := s.Reload(unchanged); err != nil {
+		t.Fatalf("Reload with an unchanged publication: %v", err)
+	}
+	if stderr.contains(wantWarning) {
+		t.Fatalf("stderr = %q, an unchanged publication must not warn", stderr.String())
 	}
 }

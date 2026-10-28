@@ -10,6 +10,8 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -31,7 +33,12 @@ func (s scriptedRun) cmd(_ context.Context, _ string, args ...string) (string, i
 func newDoctorEnv(t *testing.T, run scriptedRun) *doctorEnv {
 	t.Helper()
 	env := defaultDoctorEnv()
-	env.runCmd = run.cmd
+	env.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+		if name == "/usr/bin/systemd-run" {
+			return "LOOPBACK_PASS", 0, nil
+		}
+		return run.cmd(ctx, name, args...)
+	}
 	counter := uint64(10)
 	env.dropCounter = func(context.Context) (uint64, error) {
 		counter++
@@ -40,12 +47,281 @@ func newDoctorEnv(t *testing.T, run scriptedRun) *doctorEnv {
 	env.chainStructure = func(context.Context) doctorResult {
 		return pass("managed chain structure is as installed; enforcement is observed by the raw-egress check")
 	}
+	env.doorwaySockets = func(context.Context) doctorResult {
+		return pass("all managed doorway sockets are enabled and active")
+	}
 	env.dialCtx = func(_ context.Context, _, _ string, _ time.Duration) (net.Conn, error) {
 		return &fakeConn{}, nil
 	}
 	env.readFile = func(string) ([]byte, error) { return nil, errors.New("no read") }
 	env.stat = func(string) (os.FileInfo, error) { return nil, nil } // shim present
+	env.filesystemProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusFilesystemOff, "filesystem profile: off"
+	}
+	env.runtimeSocketProbe = func(context.Context, *doctorEnv) doctorResult {
+		return pass("managed runtime socket mounts are present")
+	}
 	return env
+}
+
+func TestDoctorDisabledForwardingRemedy(t *testing.T) {
+	env := newDoctorEnv(t, func([]string) (string, int, error) {
+		return "CONNECT tunnel failed, response 405", 56, nil
+	})
+	env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(env.configPath, []byte("forward_proxy:\n  enabled: false\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.readFile = os.ReadFile
+	for _, check := range []func(context.Context, *doctorEnv) doctorResult{checkCurlThroughProxy, checkPythonThroughProxy} {
+		res := check(context.Background(), env)
+		if !strings.Contains(res.remediation, "forward_proxy.enabled") {
+			t.Fatalf("ineffective remedy: %+v", res)
+		}
+	}
+}
+
+func TestDoctorForwardProxyAttribution(t *testing.T) {
+	tests := []struct {
+		name     string
+		body     string
+		disabled bool
+	}{
+		{"omitted", "mode: balanced\n", true},
+		{"null section", "forward_proxy: null\n", true},
+		{"blank section", "forward_proxy:\n", true},
+		{"null enabled", "forward_proxy:\n  enabled: null\n", true},
+		{"blank enabled", "forward_proxy:\n  enabled:\n", true},
+		{"false", "forward_proxy:\n  enabled: false\n", true},
+		{"true unrelated 405", "forward_proxy:\n  enabled: true\n", false},
+		{"malformed", "forward_proxy: [\n", false},
+		{"invalid boolean", "forward_proxy:\n  enabled: invalid\n", false},
+		{"unknown field", "unknown_field: true\n", false},
+		{"unreadable", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			env := newDoctorEnv(t, func([]string) (string, int, error) {
+				calls++
+				return "CONNECT tunnel failed, response 405\n405", 56, nil
+			})
+			env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
+			if tc.name != "unreadable" {
+				if err := os.WriteFile(env.configPath, []byte(tc.body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(env.configPath, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			checks := []func(context.Context, *doctorEnv) doctorResult{checkCurlThroughProxy, checkPythonThroughProxy, checkNodeThroughProxy, checkDNSFailure}
+			for _, check := range checks {
+				res := check(context.Background(), env)
+				if strings.Contains(res.remediation, "forward_proxy.enabled: true") != tc.disabled {
+					t.Fatalf("attribution = %+v", res)
+				}
+				if tc.disabled && (res.status != statusFail || res.class != classInfra || !strings.Contains(res.remediation, env.configPath)) {
+					t.Fatalf("disabled forwarding = %+v", res)
+				}
+			}
+			if tc.disabled && calls != 0 {
+				t.Fatalf("disabled config still ran %d probes", calls)
+			}
+			if !tc.disabled && calls != len(checks) {
+				t.Fatalf("unknown/enabled config suppressed probes: %d", calls)
+			}
+		})
+	}
+}
+
+func TestDoctorForwardProxyRemedyOutput(t *testing.T) {
+	for _, jsonOutput := range []bool{false, true} {
+		t.Run(strconv.FormatBool(jsonOutput), func(t *testing.T) {
+			env := allPassDoctorEnv(t)
+			env.configPath = filepath.Join(t.TempDir(), "pipelock.yaml")
+			if err := os.WriteFile(env.configPath, []byte("forward_proxy:\n  enabled: false\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cmd := &cobra.Command{}
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			if err := runDoctor(cmd, env, doctorOpts{jsonOutput: jsonOutput}); err == nil {
+				t.Fatal("disabled forwarding reported success")
+			}
+			if !jsonOutput {
+				if !strings.Contains(out.String(), "[FAIL] check 2") || !strings.Contains(out.String(), "forward_proxy.enabled: true") {
+					t.Fatalf("text output: %s", out.String())
+				}
+				return
+			}
+			seen := 0
+			for _, line := range strings.Split(strings.TrimSpace(out.String()), "\n") {
+				var record doctorRecord
+				if err := json.Unmarshal([]byte(line), &record); err != nil {
+					t.Fatal(err)
+				}
+				if record.Check >= 2 && record.Check <= 5 {
+					seen++
+					if record.Status != statusFail || record.Class != classInfra || !strings.Contains(record.Remediation, "forward_proxy.enabled: true") {
+						t.Fatalf("JSON record: %+v", record)
+					}
+				}
+			}
+			if seen != 4 {
+				t.Fatalf("got %d forwarding records", seen)
+			}
+		})
+	}
+}
+
+func TestDoctorVerifyRunFilesystemProfileInputsMatch(t *testing.T) {
+	t.Setenv("DISPLAY", "")
+	t.Setenv("SUDO_USER", "operator")
+	const (
+		configPath = "/fixture/pipelock.yaml"
+		invPath    = "/fixture/workspaces.json"
+		agentUser  = "pipelock-agent"
+		agentHome  = "/home/pipelock-agent"
+	)
+	yamlText := []byte("containment:\n  filesystem:\n    mode: enforce\nflight_recorder:\n  signing_key_path: /var/lib/pipelock/signing.key\n  dir: /var/lib/pipelock/flight\n")
+	inventory := []byte(`{"workspaces":[{"path":"/srv/granted","mode":"rw","agent_user":"pipelock-agent"}]}`)
+	read := func(path string) ([]byte, error) {
+		switch path {
+		case configPath:
+			return yamlText, nil
+		case invPath:
+			return inventory, nil
+		default:
+			return nil, os.ErrNotExist
+		}
+	}
+	stat := func(path string) (os.FileInfo, error) {
+		if path == defaultXvfbPath {
+			return nil, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	lookup := func(name string) (*user.User, error) {
+		if name == "operator" {
+			return &user.User{Username: name, HomeDir: "/home/operator"}, nil
+		}
+		return nil, errors.New("unknown user")
+	}
+	now := func() time.Time { return time.Unix(1_700_000_000, 0).UTC() }
+	apply := func(probe *probeEnv) {
+		t.Helper()
+		probe.configPath = configPath
+		probe.configDir = "/fixture"
+		probe.agentUserName = agentUser
+		probe.agentHome = agentHome
+		probe.operatorUser = "operator"
+		probe.workspaceInvPath = invPath
+		probe.readFile = read
+		probe.stat = stat
+		probe.lookupUser = lookup
+		probe.now = now
+		probe.display = ""
+	}
+	loadGrants := func(probe *probeEnv) {
+		t.Helper()
+		inv, err := loadWorkspaceInventoryFrom(probe.readFile, probe.workspaceInvPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		probe.workspaceGrants = grantsForAgent(inv.Workspaces, probe.agentUserName)
+	}
+
+	doctorProbe := filesystemProbeEnvForDoctor(&doctorEnv{
+		configPath:       configPath,
+		configDir:        "/fixture",
+		agentUserName:    agentUser,
+		agentHome:        agentHome,
+		operatorUser:     "operator",
+		workspaceInvPath: invPath,
+		readFile:         read,
+		stat:             stat,
+		lookupUser:       lookup,
+		now:              now,
+	})
+	verifyProbe := defaultProbeEnv()
+	apply(verifyProbe)
+	loadGrants(verifyProbe)
+	runProbe := defaultProbeEnv()
+	apply(runProbe)
+	loadGrants(runProbe)
+	cfg, err := loadProbeConfig(runProbe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runProbe.display = resolveLaunchDisplay(cfg, runProbe.display, probeXvfbPresent(runProbe))
+
+	doctorIn, err := filesystemProfileInputForProbe(doctorProbe, doctorProbe.agentHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyIn, err := filesystemProfileInputForProbe(verifyProbe, verifyProbe.agentHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runIn, err := filesystemProfileInputForProbe(runProbe, runProbe.agentHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSocket := displaySocketPath(99)
+	for _, in := range []filesystemProfileInput{doctorIn, verifyIn, runIn} {
+		if in.DisplaySocket != wantSocket || in.OperatorHome != "/home/operator" || in.Mode != "enforce" || in.AgentHome != agentHome || in.AgentUser != agentUser {
+			t.Fatalf("profile input = %+v", in)
+		}
+		if len(in.Grants) != 1 || in.Grants[0].Path != "/srv/granted" || in.Grants[0].Mode != "rw" {
+			t.Fatalf("grants = %+v", in.Grants)
+		}
+		if len(in.RequiredSecretPaths) != 1 || in.RequiredSecretPaths[0] != "/var/lib/pipelock/signing.key" {
+			t.Fatalf("required secrets = %+v", in.RequiredSecretPaths)
+		}
+		if len(in.OptionalSecretPaths) != 1 || in.OptionalSecretPaths[0] != "/var/lib/pipelock/flight" {
+			t.Fatalf("optional secrets = %+v", in.OptionalSecretPaths)
+		}
+	}
+}
+
+func TestDoctorOperatorIdentityNamesSudo(t *testing.T) {
+	env := &doctorEnv{
+		configPath:   "/fixture/pipelock.yaml",
+		operatorUser: "",
+		readFile: func(string) ([]byte, error) {
+			return []byte("containment:\n  filesystem:\n    mode: enforce\n"), nil
+		},
+	}
+	result := checkFilesystemConfinement(context.Background(), env)
+	if result.status != statusFail {
+		t.Fatalf("status=%s detail=%s", result.status, result.detail)
+	}
+	if !strings.Contains(result.detail, "run this command through sudo from the operator account") {
+		t.Fatalf("detail = %q", result.detail)
+	}
+	if result.remediation != "run this command through sudo from the operator account" {
+		t.Fatalf("remediation = %q", result.remediation)
+	}
+}
+
+func TestDoctorViewerMissingConfigurationAndRFB(t *testing.T) {
+	root := t.TempDir()
+	env := &doctorEnv{
+		configPath: filepath.Join(root, "missing.yaml"),
+		agentHome:  root,
+		stat:       os.Stat,
+	}
+	service := checkDoctorViewerService(context.Background(), env)
+	if service.status != statusFail || !strings.Contains(service.detail, "viewer config missing:") || !strings.Contains(service.remediation, "check display viewer configuration") {
+		t.Fatalf("missing viewer config = %+v", service)
+	}
+	// Xvnc discovery stats fixed install paths; report them all absent so a
+	// workstation with TigerVNC installed cannot decide this case.
+	env.stat = func(string) (os.FileInfo, error) { return nil, os.ErrNotExist }
+	rfb := checkDoctorDisplayRFB(context.Background(), env)
+	if rfb.status != statusFail || !strings.Contains(rfb.detail, "TigerVNC Xvnc missing") {
+		t.Fatalf("missing RFB server = %+v", rfb)
+	}
 }
 
 func TestDoctorCounterProbeEnvUsesLiveDoctorOverrides(t *testing.T) {
@@ -61,6 +337,46 @@ func TestDoctorCounterProbeEnvUsesLiveDoctorOverrides(t *testing.T) {
 	}
 	if base.port != defaultProxyPort || base.agentUserName != defaultAgentUser {
 		t.Fatalf("base probe env was mutated: port=%d agent=%q", base.port, base.agentUserName)
+	}
+}
+
+func TestDoctorDoorwaySocketReaderConfigAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		readErr    error
+		wantStatus string
+		wantDetail string
+	}{
+		{"unreadable config", os.ErrPermission, statusUnknown, "could not be read"},
+		{"absent config", os.ErrNotExist, statusPass, "enabled and active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			base := diagnosticDoorwayEnv(nil)
+			base.configPath = "/etc/pipelock/pipelock.yaml"
+			readFile := base.readFile
+			base.readFile = func(path string) ([]byte, error) {
+				if path == base.configPath {
+					return nil, tc.readErr
+				}
+				return readFile(path)
+			}
+			runCmd := base.runCmd
+			base.runCmd = func(ctx context.Context, name string, args ...string) (string, int, error) {
+				calls++
+				return runCmd(ctx, name, args...)
+			}
+
+			doctor := &doctorEnv{port: defaultProxyPort, agentUserName: testAgentUser}
+			result := doctorDoorwaySocketReader(base, doctor)(context.Background())
+			if result.status != tc.wantStatus || !strings.Contains(result.detail, tc.wantDetail) {
+				t.Fatalf("result = (%q, %q), want %q containing %q", result.status, result.detail, tc.wantStatus, tc.wantDetail)
+			}
+			// Six enablement/activity reads plus the forwarder readiness read.
+			if tc.wantStatus == statusUnknown && calls != 0 || tc.wantStatus == statusPass && calls != 7 {
+				t.Fatalf("socket probe calls = %d for %s", calls, tc.name)
+			}
+		})
 	}
 }
 
@@ -168,6 +484,19 @@ func TestCheckGatewayHealth(t *testing.T) {
 	res := checkGatewayHealth(context.Background(), env)
 	if res.status != statusFail || res.class != classInfra {
 		t.Fatalf("dead proxy: got status=%q class=%q", res.status, res.class)
+	}
+}
+
+func TestNFTOutputConfirmsAbsent(t *testing.T) {
+	for out, want := range map[string]bool{
+		"Error: No such file or directory; did you mean chain 'x'?": true,
+		"Error: chain pipelock_owned_input does not exist":          true,
+		"Error: Could not process rule: Operation not permitted":    false,
+		"netlink: Error: cache initialization failed":               false,
+	} {
+		if got := nftOutputConfirmsAbsent(out); got != want {
+			t.Errorf("nftOutputConfirmsAbsent(%q) = %t, want %t", out, got, want)
+		}
 	}
 }
 
@@ -475,7 +804,7 @@ func TestRunDoctor_TextAllPass(t *testing.T) {
 		t.Fatalf("runDoctor: %v", err)
 	}
 	out := buf.String()
-	if !strings.Contains(out, "7 PASS") || !strings.Contains(out, "exit 0") {
+	if !strings.Contains(out, "10 PASS") || !strings.Contains(out, "exit 0") {
 		t.Fatalf("unexpected output:\n%s", out)
 	}
 }
@@ -494,8 +823,26 @@ func TestRunDoctor_JSONAllPass(t *testing.T) {
 		t.Fatalf("unexpected json:\n%s", out)
 	}
 	if !strings.Contains(out, `"check":7,"name":"managed_chain_structure"`) ||
-		!strings.Contains(out, `"total":7`) {
+		!strings.Contains(out, `"check":8,"name":"managed_doorway_sockets"`) ||
+		!strings.Contains(out, `"total":10`) {
 		t.Fatalf("JSON missing managed-chain check or correct total:\n%s", out)
+	}
+	doorwaySockets := 0
+	dec := json.NewDecoder(strings.NewReader(out))
+	for dec.More() {
+		var rec doctorRecord
+		if err := dec.Decode(&rec); err != nil {
+			t.Fatalf("decode doctor JSON record: %v\n%s", err, out)
+		}
+		if rec.Name == "managed_doorway_sockets" {
+			doorwaySockets++
+			if rec.Status != statusPass {
+				t.Fatalf("managed_doorway_sockets status = %q, want %q:\n%s", rec.Status, statusPass, out)
+			}
+		}
+	}
+	if doorwaySockets != 1 {
+		t.Fatalf("managed_doorway_sockets records = %d, want exactly 1:\n%s", doorwaySockets, out)
 	}
 }
 
@@ -598,14 +945,15 @@ func TestRunDoctor_MixedOutcomesPreserveWorstResultInTextAndJSON(t *testing.T) {
 				if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
 					t.Fatalf("decode aggregate: %v\n%s", err, out)
 				}
-				if agg.Aggregate.Pass != 4 || agg.Aggregate.Fail != 1 ||
+				if agg.Aggregate.Pass != 6 || agg.Aggregate.Fail != 1 ||
 					agg.Aggregate.Skip != 1 || agg.Aggregate.Unknown != 1 ||
+					agg.Aggregate.Off != 1 ||
 					agg.Aggregate.ExitCode != cliutil.ExitGeneral {
-					t.Fatalf("mixed aggregate = %+v, want 4 pass / 1 fail / 1 skip / 1 unknown / exit 1", agg.Aggregate)
+					t.Fatalf("mixed aggregate = %+v, want 6 pass / 1 fail / 1 skip / 1 unknown / 1 off / exit 1", agg.Aggregate)
 				}
 				return
 			}
-			if !strings.Contains(out, "4 PASS / 1 FAIL / 1 SKIP / 1 UNKNOWN — exit 1") {
+			if !strings.Contains(out, "6 PASS / 1 FAIL / 1 SKIP / 1 UNKNOWN / 1 OFF — exit 1") {
 				t.Fatalf("text lost a mixed outcome or fail precedence:\n%s", out)
 			}
 		})
@@ -651,8 +999,8 @@ func TestRunDoctor_RecordAndAggregateWriteFailuresFailClosed(t *testing.T) {
 		want             string
 	}{
 		{name: "text check", successfulWrites: 1, want: "writing check 1 text"},
-		{name: "text aggregate", successfulWrites: 9, want: "writing doctor aggregate"},
-		{name: "JSON aggregate", jsonOutput: true, successfulWrites: 7, want: "encoding aggregate JSON"},
+		{name: "text aggregate", successfulWrites: 12, want: "writing doctor aggregate"},
+		{name: "JSON aggregate", jsonOutput: true, successfulWrites: 10, want: "encoding aggregate JSON"},
 	}
 
 	for _, tc := range tests {
@@ -960,7 +1308,7 @@ func TestRunDoctor_TextSkipRemediation(t *testing.T) {
 // and direct egress is refused.
 func allPassDoctorEnv(t *testing.T) *doctorEnv {
 	t.Helper()
-	return newDoctorEnv(t, func(args []string) (string, int, error) {
+	env := newDoctorEnv(t, func(args []string) (string, int, error) {
 		switch {
 		case argsContain(args, "--noproxy"):
 			return "curl: (7) refused\nPLK_TIME_CONNECT=0.000000\n000", 7, nil // direct egress blocked
@@ -970,4 +1318,31 @@ func allPassDoctorEnv(t *testing.T) *doctorEnv {
 			return "200", 0, nil // proxied curl/python/node
 		}
 	})
+	env.filesystemProbe = func(context.Context, *probeEnv) (string, string) {
+		return statusPass, "filesystem profile enforced"
+	}
+	return env
+}
+
+func TestRunDoctorAggregateCountsConfiguredDisplayChecks(t *testing.T) {
+	env := allPassDoctorEnv(t)
+	env.configPath = filepath.Join(t.TempDir(), "config.yaml")
+	env.stat = os.Lstat
+	env.lstat = os.Lstat
+	if err := os.WriteFile(env.configPath, []byte("containment:\n  display:\n    enabled: true\n    backend: xvnc\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	cmd := &cobra.Command{}
+	cmd.SetOut(&buf)
+	cmd.SetContext(context.Background())
+	_ = runDoctor(cmd, env, doctorOpts{jsonOutput: true})
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var agg aggregateRecord
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &agg); err != nil {
+		t.Fatal(err)
+	}
+	if agg.Aggregate.Total != 14 || len(lines) != 15 {
+		t.Fatalf("aggregate total = %d, records = %d; want 14 checks", agg.Aggregate.Total, len(lines)-1)
+	}
 }

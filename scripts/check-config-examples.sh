@@ -26,6 +26,25 @@
 
 set -euo pipefail
 
+# Every loopback connect is bounded. Where a host firewall silently drops SYNs to
+# a closed port instead of refusing them, an unbounded /dev/tcp connect waits for
+# the kernel's full SYN retry schedule (about two minutes at the Linux default of
+# net.ipv4.tcp_syn_retries=6) on every probe, and it also holds the boot loop past
+# its own deadline. One second is far above a loopback round trip.
+PROBE_CONNECT_TIMEOUT="${CONFIG_EXAMPLES_CONNECT_TIMEOUT:-1}"
+# Bash arithmetic wraps on overflow. printf rejects values outside its signed
+# integer range; the comparison also reserves room for the read deadline.
+if ! [[ "$PROBE_CONNECT_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+    || ! printf -v PROBE_CONNECT_TIMEOUT '%d' "$PROBE_CONNECT_TIMEOUT" 2>/dev/null \
+    || (( PROBE_CONNECT_TIMEOUT + 1 <= PROBE_CONNECT_TIMEOUT )); then
+    echo "config-examples: CONFIG_EXAMPLES_CONNECT_TIMEOUT must be a positive whole number of seconds with room for the read deadline" >&2
+    exit 1
+fi
+if ! command -v timeout >/dev/null 2>&1; then
+    echo "config-examples: the timeout command (GNU coreutils) is required" >&2
+    exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
@@ -136,6 +155,7 @@ fragment_expected_error() {
         mcp-session-binding) echo "mcp_session_binding.enabled requires mcp_tool_scanning.enabled" ;;
         adaptive-enforcement) echo "adaptive_enforcement.enabled requires session_profiling.enabled" ;;
         mcp-drift-reset-authority) echo "listener drift reset authority public key" ;;
+        mcp-acknowledged-findings) echo "server_binding_hmac must be" ;;
         license-path-precedence) echo "unmarshal errors" ;;
         license-complete-reference | license-container-layout | license-activation) echo "license" ;;
         trusted-rule-key) echo "public_key must be exactly 64 hex chars" ;;
@@ -156,7 +176,7 @@ metadata_value() {
 environment_failure_reason() {
     local cfg="$1" out="$2" phase="$3"
 
-    if grep -qE "^[[:space:]]*(license_file|license_crl_file|license_intermediate_file|trust_roster_path|server_ca_file|client_cert_path|client_key_path|enrollment_token_path|ca_cert|ca_key|secrets_file|signing_key_path|manifest_path|signature_path|keystore|roster_path):[[:space:]]*(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#][^#]*)" "$cfg" \
+    if grep -qE "^[[:space:]]*(license_file|license_crl_file|license_intermediate_file|trust_roster_path|server_ca_file|client_cert_path|client_key_path|enrollment_token_path|ca_cert|ca_key|secrets_file|signing_key_path|manifest_path|signature_path|keystore|roster_path|api_token_file):[[:space:]]*(\"[^\"]+\"|'[^']+'|[^\"'[:space:]#][^#]*)" "$cfg" \
         && grep -qiE '(no such file|permission denied|not found|cannot (open|read)|failed to (open|read|load)|load(ing)? .*(file|key|cert|roster|manifest))' "$out"; then
         echo "needs an external input file"
         return
@@ -202,14 +222,51 @@ environment_failure_reason() {
         fi
     fi
 
+    # An enterprise build without a license disables named agent profiles at
+    # load, so `check` refuses a setting that refers to one (for example
+    # containment.agent_listener). The refusal carries one fixed phrase from
+    # internal/config.LicenseDisabledProfileRefusal. The skip applies only when
+    # EVERY non-blank line of the check output is either that exact refusal or
+    # the license gate's fixed warning, so no other diagnostic, on its own line
+    # or on the refusal line, can ride along. Unlike the build gates above, no
+    # per-block opt-in is required: an OSS build never disables profiles, so
+    # the OSS run of this gate still checks and boots every block this covers.
+    local license_profile_phrase='named agent profiles require a Pro license with the agents feature'
+    local license_profile_refusal_line="^(Config validation FAILED: )?invalid config: containment\\.agent_listener \"[^\"]+\" is declared only by agents\\.[A-Za-z0-9_.-]+(, agents\\.[A-Za-z0-9_.-]+)*, which was disabled because [^;]+; ${license_profile_phrase}, and without it the listener is never bound\$"
+    local license_gate_boilerplate='^(WARNING: agents: section requires a license key\. Multi-agent profiles disabled\. Single-agent protection is active\.|Get a license key at https://pipelab\.org/pricing)$'
+    if [ "$phase" = "check" ] && grep -qE "$license_profile_refusal_line" "$out"; then
+        local unexplained
+        unexplained="$(grep -vE '^[[:space:]]*$' "$out" \
+            | grep -vE "$license_profile_refusal_line" \
+            | grep -cvE "$license_gate_boilerplate" || true)"
+        if [ "$unexplained" -eq 0 ]; then
+            echo "named agent profiles require a license"
+            return
+        fi
+    fi
+
     echo ""
+}
+
+# Prints the first status line of GET /health on 127.0.0.1:$1. The extra second
+# covers the one-second read of the reply. Exit 124 means the limit fired.
+probe_exchange() {
+    timeout "$((PROBE_CONNECT_TIMEOUT + 1))" bash -c '
+        exec 3<>"/dev/tcp/127.0.0.1/$1" || exit 1
+        printf "GET /health HTTP/1.0\r\n\r\n" >&3
+        IFS= read -r -t 1 status <&3
+        printf "%s" "$status"
+    ' _ "$1" 2>/dev/null
 }
 
 choose_port() {
     local port i
     for ((i=0; i<40; i++)); do
         port=$((20000 + RANDOM % 30000))
-        if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+        # Only a completed connect proves the port is taken. A refusal or a
+        # dropped SYN both leave it available; a bind collision is still caught
+        # and retried by the caller.
+        if ! timeout "$PROBE_CONNECT_TIMEOUT" bash -c 'exec 3<>"/dev/tcp/127.0.0.1/$1"' _ "$port" 2>/dev/null; then
             echo "$port"
             return 0
         fi
@@ -218,13 +275,8 @@ choose_port() {
 }
 
 http_ready() {
-    local port="$1" status
-    status="$({
-        exec 3<>"/dev/tcp/127.0.0.1/$port"
-        printf 'GET /health HTTP/1.0\r\n\r\n' >&3
-        IFS= read -r -t 1 status <&3
-        printf '%s' "$status"
-    } 2>/dev/null)" || return 1
+    local status
+    status="$(probe_exchange "$1")" || return 1
     [[ "$status" == HTTP/* ]]
 }
 

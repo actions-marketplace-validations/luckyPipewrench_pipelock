@@ -4,7 +4,7 @@
 // This file implements `pipelock contain upgrade`, a containment-aware
 // one-command upgrade that atomically replaces the deployed binary, re-pins
 // the integrity hash, restarts the service, and verifies the containment
-// boundary — rolling back both binary and pin on any post-replacement failure.
+// boundary, restoring the binary, pin, and migrated unit on failure.
 //
 // Checked 2026-08-03: no existing contain subcommand performs this lifecycle.
 // `pipelock update` (internal/cli/selfupdate) replaces the binary but is
@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -126,8 +127,8 @@ The upgrade is FAIL-CLOSED at every step:
   3. Restart the pipelock systemd service and wait for readiness.
   4. Run 'contain verify' and require exit 0 (every probe passed).
 
-If any step after binary replacement fails, the previous binary AND its
-integrity pin are restored before exit.
+If any step after binary replacement fails, the previous binary, integrity
+pin, and any migrated service unit are restored before exit.
 
 This eliminates the gap between 'pipelock update' and the containment
 integrity pin: an ordinary update leaves the pin stale, causing probe 10
@@ -143,7 +144,8 @@ Must be run as root.
 
 Exit codes:
   0  Upgrade completed and verified.
-  1  Upgrade failed; previous state restored.
+  1  Upgrade failed; previous state restored, or the error names each
+     rollback step that could not be restored.
   2  Precondition error (not root, deployed binary missing or not a regular file, or no integrity pin).`,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -263,7 +265,8 @@ func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
 
 	// ── Rollback helper ─────────────────────────────────────────────────
 	// Direction: restores binary FIRST (so the pin is always consistent
-	// with whatever is on disk), then pin, then best-effort restart.
+	// with whatever is on disk), then pin and unit, then best-effort restart.
+	var restoreUnit func() error
 	rollbackAll := func() error {
 		var errs []error
 		_, _ = fmt.Fprintln(w, "restoring previous binary...")
@@ -283,7 +286,14 @@ func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
 			// eliminate, reintroduced through its own recovery path.
 			errs = append(errs, fmt.Errorf("restore pin ownership: %w", ownErr))
 		}
-		_, _, _ = env.runCmd(ctx, "systemctl", "daemon-reload")
+		if restoreUnit != nil {
+			if err := restoreUnit(); err != nil {
+				errs = append(errs, fmt.Errorf("restore service unit: %w", err))
+			}
+		}
+		if err := upgradeDaemonReload(ctx, env); err != nil {
+			errs = append(errs, fmt.Errorf("daemon-reload after rollback: %w", err))
+		}
 		if _, code, rErr := env.runCmd(ctx, "systemctl", "restart", env.serviceName); rErr != nil || code != 0 {
 			_, _ = fmt.Fprintf(env.errOut,
 				"warning: best-effort restart of %s after rollback did not succeed (code %d, err %v)\n",
@@ -343,8 +353,12 @@ func runUpgrade(ctx context.Context, env *upgradeEnv, opts upgradeOpts) error {
 	// marker, so the guard would stay inactive on exactly the hosts this command
 	// is meant to bring current. Upgrade already reloads and restarts, so this is
 	// the one moment the correction costs nothing extra.
-	if err := ensureContainmentMarkerInUnit(env); err != nil {
-		_, _ = fmt.Fprintf(env.errOut, "unit marker update failed: %v\n", err)
+	// The stop timeout rides the same moment: an upgraded host otherwise keeps
+	// systemd's default stop budget, which a receipt-group close can outlast.
+	var unitErr error
+	restoreUnit, unitErr = upgradeMigrateUnit(env)
+	if err := unitErr; err != nil {
+		_, _ = fmt.Fprintf(env.errOut, "unit update failed: %v\n", err)
 		if rbErr := rollbackAll(); rbErr != nil {
 			return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.Join(
 				fmt.Errorf("%w: %w", errUpgradeConfig, err),
@@ -475,12 +489,19 @@ func upgradeRestorePinOwnership(env *upgradeEnv) error {
 	return nil
 }
 
-// upgradeRestartAndWait does daemon-reload + restart + readiness poll.
-func upgradeRestartAndWait(ctx context.Context, env *upgradeEnv) error {
+func upgradeDaemonReload(ctx context.Context, env *upgradeEnv) error {
 	if _, code, err := env.runCmd(ctx, "systemctl", "daemon-reload"); err != nil {
 		return fmt.Errorf("daemon-reload: %w", err)
 	} else if code != 0 {
 		return fmt.Errorf("daemon-reload exited %d", code)
+	}
+	return nil
+}
+
+// upgradeRestartAndWait does daemon-reload + restart + readiness poll.
+func upgradeRestartAndWait(ctx context.Context, env *upgradeEnv) error {
+	if err := upgradeDaemonReload(ctx, env); err != nil {
+		return err
 	}
 
 	out, code, err := env.runCmd(ctx, "systemctl", "restart", env.serviceName)
@@ -551,65 +572,238 @@ func upgradePostVerify(ctx context.Context, env *upgradeEnv) error {
 // would skip the insertion and leave the host unguarded while the upgrade
 // reported success, which is the exact failure this migration exists to fix.
 func unitHasActiveContainmentMarker(body, marker string) bool {
-	section := ""
-	for _, raw := range strings.Split(body, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
-			continue
-		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
-			continue
-		}
-		if section == "Service" && line == marker {
+	key, value, _ := strings.Cut(marker, "=")
+	for _, a := range unitServiceAssignments(body) {
+		if a.key == key && a.value == value {
 			return true
 		}
 	}
 	return false
 }
 
+// upgradeMigrateUnit captures the unit before either migration can write it.
+// The restore closure is returned even on a migration error: an atomic writer
+// can report a directory-sync failure after its rename has already taken effect.
+// Units that need no migration have no restore closure and are never rewritten.
+func upgradeMigrateUnit(env *upgradeEnv) (func() error, error) {
+	body, info, err := readManagedUnitState(env)
+	if err != nil {
+		return nil, err
+	}
+	marker := "Environment=" + config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue
+	if unitHasActiveContainmentMarker(body, marker) && unitServiceSetsDirective(body, "TimeoutStopSec", "TimeoutSec") {
+		return nil, nil
+	}
+	uid, uidOK := fileOwnerUID(info)
+	gid, gidOK := fileOwnerGID(info)
+	if runtime.GOOS != "windows" && (!uidOK || !gidOK) {
+		return nil, fmt.Errorf("cannot determine service unit ownership for %s; refusing migration", env.unitPath)
+	}
+	restore := func() error {
+		if err := env.writeFile(env.unitPath, []byte(body), info.Mode()); err != nil {
+			return fmt.Errorf("write %s: %w", env.unitPath, err)
+		}
+		var errs []error
+		if uidOK && gidOK {
+			if err := env.chown(env.unitPath, int(uid), int(gid)); err != nil {
+				errs = append(errs, fmt.Errorf("chown %s: %w", env.unitPath, err))
+			}
+		}
+		// chown may clear special permission bits, so restore the mode last.
+		if err := env.chmod(env.unitPath, info.Mode()); err != nil {
+			errs = append(errs, fmt.Errorf("chmod %s: %w", env.unitPath, err))
+		}
+		return errors.Join(errs...)
+	}
+	if err := ensureContainmentMarkerInUnit(env); err != nil {
+		return restore, err
+	}
+	return restore, ensureStopTimeoutInUnit(env)
+}
+
 func ensureContainmentMarkerInUnit(env *upgradeEnv) error {
 	marker := "Environment=" + config.ContainmentManagedEnvKey + "=" + config.ContainmentManagedEnvValue
 
-	// This is a root-privileged write to a path under /etc, so refuse anything
-	// that is not a plain file before touching it. A symlink here would
-	// redirect the write to a target of someone else's choosing.
-	if info, err := env.lstat(env.unitPath); err != nil {
-		return fmt.Errorf("inspect service unit %s: %w", env.unitPath, err)
-	} else if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("service unit %s is a symlink; refusing privileged write", env.unitPath)
-	} else if !info.Mode().IsRegular() {
-		return fmt.Errorf("service unit %s is not a regular file; refusing privileged write", env.unitPath)
-	}
-
-	current, err := env.readFile(env.unitPath)
+	body, err := readManagedUnit(env)
 	if err != nil {
-		return fmt.Errorf("read service unit %s: %w", env.unitPath, err)
+		return err
 	}
-	body := string(current)
 	if unitHasActiveContainmentMarker(body, marker) {
 		return nil
 	}
-
-	lines := strings.Split(body, "\n")
-	inserted := false
-	out := make([]string, 0, len(lines)+1)
-	for _, line := range lines {
-		out = append(out, line)
-		if !inserted && strings.TrimSpace(line) == "[Service]" {
-			out = append(out, marker)
-			inserted = true
-		}
-	}
-	if !inserted {
+	updated, ok := insertServiceDirective(body, marker)
+	if !ok {
 		return fmt.Errorf("service unit %s has no [Service] section; refusing to guess where the containment marker belongs", env.unitPath)
 	}
-
-	if err := env.writeFile(env.unitPath, []byte(strings.Join(out, "\n")), modeUnitFile); err != nil {
+	if err := env.writeFile(env.unitPath, []byte(updated), modeUnitFile); err != nil {
 		return fmt.Errorf("write service unit %s: %w", env.unitPath, err)
 	}
 	_, _ = fmt.Fprintf(env.out, "  containment marker added to %s\n", env.unitPath)
 	return nil
+}
+
+// ensureStopTimeoutInUnit gives a unit written before the stop budget existed
+// the same TimeoutStopSec a fresh install renders.
+//
+// Without it the longer budget reaches only new hosts, while every upgraded host
+// keeps systemd's 90 s default and can kill the receipt-group close. An operator
+// who already chose a stop budget keeps it: TimeoutSec= sets the stop timeout
+// too, and either directive active in [Service] means the choice was made. A
+// drop-in still overrides the main unit, so nothing here can undo one.
+func ensureStopTimeoutInUnit(env *upgradeEnv) error {
+	body, err := readManagedUnit(env)
+	if err != nil {
+		return err
+	}
+	if unitServiceSetsDirective(body, "TimeoutStopSec", "TimeoutSec") {
+		return nil
+	}
+	directive := fmt.Sprintf("TimeoutStopSec=%d", int64(cliutil.ServiceStopTimeout/time.Second))
+	updated, ok := insertServiceDirective(body, directive)
+	if !ok {
+		return fmt.Errorf("service unit %s has no [Service] section; refusing to guess where the stop timeout belongs", env.unitPath)
+	}
+	if err := env.writeFile(env.unitPath, []byte(updated), modeUnitFile); err != nil {
+		return fmt.Errorf("write service unit %s: %w", env.unitPath, err)
+	}
+	_, _ = fmt.Fprintf(env.out, "  stop timeout added to %s\n", env.unitPath)
+	return nil
+}
+
+// readManagedUnit reads the service unit an upgrade is about to edit.
+//
+// The later write is root-privileged to a path under /etc, so anything that is
+// not a plain file is refused first. A symlink here would redirect the write to
+// a target of someone else's choosing.
+func readManagedUnit(env *upgradeEnv) (string, error) {
+	body, _, err := readManagedUnitState(env)
+	return body, err
+}
+
+func readManagedUnitState(env *upgradeEnv) (string, os.FileInfo, error) {
+	info, err := env.lstat(env.unitPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("inspect service unit %s: %w", env.unitPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf("service unit %s is a symlink; refusing privileged write", env.unitPath)
+	}
+	if !info.Mode().IsRegular() {
+		return "", nil, fmt.Errorf("service unit %s is not a regular file; refusing privileged write", env.unitPath)
+	}
+	current, err := env.readFile(env.unitPath)
+	if err != nil {
+		return "", nil, fmt.Errorf("read service unit %s: %w", env.unitPath, err)
+	}
+	return string(current), info, nil
+}
+
+// unitServiceSetsDirective reports whether any of keys has a non-empty
+// assignment systemd would apply. systemd ignores an empty timeout assignment
+// rather than resetting an earlier one (checked with systemctl show on systemd
+// 261), so "TimeoutStopSec=" alone sets nothing and does not undo a prior value.
+func unitServiceSetsDirective(body string, keys ...string) bool {
+	for _, a := range unitServiceAssignments(body) {
+		for _, want := range keys {
+			if a.key == want && a.value != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// unitAssignment is one key=value setting from a unit's [Service] section.
+type unitAssignment struct {
+	key, value string
+}
+
+// unitServiceAssignments returns the [Service] assignments in the order systemd
+// reads them.
+func unitServiceAssignments(body string) []unitAssignment {
+	assignments, _ := scanServiceSection(body)
+	return assignments
+}
+
+// scanServiceSection reads a unit the way systemd.syntax(7) describes: a line
+// ending in a backslash continues onto the next with the backslash replaced by a
+// space, comment lines between continued lines are skipped, whitespace around the
+// key and value is ignored, and only an uncontinued line can open a section. The
+// section name is taken exactly as written, so "[ Service ]" is an unknown
+// section, as systemd treats it. It returns the [Service] assignments and the
+// index of the first physical line that opens an active [Service] section, or -1.
+//
+// Detection and insertion share this one scan. Reading physical lines instead
+// would take the tail of a continued Environment= value for a directive, or
+// insert after a "[Service]" that systemd reads as part of the previous value.
+func scanServiceSection(body string) ([]unitAssignment, int) {
+	var out []unitAssignment
+	header := -1
+	section := ""
+	logical := ""
+	continuing := false
+	bomSeen := false
+	for index, raw := range strings.Split(body, "\n") {
+		// systemd's config_parse() skips the first UTF-8 BOM at a line's start,
+		// even when earlier lines had no BOM:
+		// https://github.com/systemd/systemd/blob/v261/src/shared/conf-parser.c
+		// Keep the original bytes and physical line index for insertion.
+		if !bomSeen && strings.HasPrefix(raw, "\ufeff") {
+			raw = strings.TrimPrefix(raw, "\ufeff")
+			bomSeen = true
+		}
+		line := strings.TrimSpace(raw)
+		if line == "" && !continuing {
+			continue
+		}
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if !continuing && strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = line[1 : len(line)-1]
+			if section == "Service" && header < 0 {
+				header = index
+			}
+			continue
+		}
+		if strings.HasSuffix(line, "\\") {
+			logical += strings.TrimSuffix(line, "\\") + " "
+			continuing = true
+			continue
+		}
+		logical += line
+		continuing = false
+		out = appendServiceAssignment(out, section, logical)
+		logical = ""
+	}
+	// A continuation still open at the end of the file is applied as read.
+	return appendServiceAssignment(out, section, strings.TrimSpace(logical)), header
+}
+
+func appendServiceAssignment(out []unitAssignment, section, logical string) []unitAssignment {
+	if section != "Service" {
+		return out
+	}
+	key, value, found := strings.Cut(logical, "=")
+	if !found {
+		return out
+	}
+	return append(out, unitAssignment{key: strings.TrimSpace(key), value: strings.TrimSpace(value)})
+}
+
+// insertServiceDirective places line directly after the first header that
+// systemd reads as opening [Service], and reports false when there is none.
+func insertServiceDirective(body, line string) (string, bool) {
+	_, header := scanServiceSection(body)
+	if header < 0 {
+		return body, false
+	}
+	lines := strings.Split(body, "\n")
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:header+1]...)
+	out = append(out, line)
+	out = append(out, lines[header+1:]...)
+	return strings.Join(out, "\n"), true
 }
 
 // preflightUpgradeManagedConfig proves that the managed config remains valid

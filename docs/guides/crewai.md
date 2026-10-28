@@ -8,7 +8,7 @@ This guide covers both the `mcps=` DSL and the `MCPServerAdapter` approach.
 
 ```bash
 # 1. Install pipelock
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 
 # 2. Generate a config (or copy a preset)
@@ -218,11 +218,12 @@ networks:
 
 services:
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock:3.5.0
+    image: ghcr.io/luckypipewrench/pipelock:3.7.0
     networks:
       - pipelock-internal
       - pipelock-external
     command: ["run", "--listen", "0.0.0.0:8888", "--config", "/config/pipelock.yaml"]
+    stop_grace_period: 10m   # Receipt-group close at shutdown; Compose default is 10 s
     volumes:
       - ./pipelock.yaml:/config/pipelock.yaml:ro
     healthcheck:

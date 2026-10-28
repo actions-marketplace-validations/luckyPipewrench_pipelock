@@ -4,13 +4,12 @@
 package config
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"sort"
 	"strings"
 	"sync/atomic"
 
+	"github.com/luckyPipewrench/pipelock/internal/digestorigin"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
 
@@ -66,21 +65,31 @@ func (c *Config) CanonicalPolicyHash() string {
 		// holder; zero-value Config falls back to uncached computation.
 		return c.computeCanonicalPolicyHash()
 	}
-	if cached := c.canonicalHashCache.Load(); cached != nil {
-		if s, ok := cached.(string); ok {
-			return s
-		}
+	if cached, ok := c.canonicalHashCache.Load().(cachedPolicyHash); ok {
+		return cached.hash
 	}
 
-	h := c.computeCanonicalPolicyHash()
+	h := c.canonicalPolicyDigest()
 	c.canonicalHashCache.Store(h)
-	return h
+	return h.hash
+}
+
+// cachedPolicyHash is the cached canonical policy hash. It keeps the
+// digest's origin for the Config's lifetime, so a receipt stamped with this
+// Config's policy hash never has that hash scanned as content.
+type cachedPolicyHash struct {
+	hash   string
+	origin digestorigin.Digest
 }
 
 // computeCanonicalPolicyHash is CanonicalPolicyHash without the cache.
 // Exported only through the cached wrapper; kept separate so tests can
 // exercise the determinism guarantees on fresh Config values.
 func (c *Config) computeCanonicalPolicyHash() string {
+	return c.canonicalPolicyDigest().hash
+}
+
+func (c *Config) canonicalPolicyDigest() cachedPolicyHash {
 	view := c.policySemanticView()
 	data, err := json.Marshal(view)
 	if err != nil {
@@ -88,10 +97,10 @@ func (c *Config) computeCanonicalPolicyHash() string {
 		// (channels, functions, cycles). Fall back to the raw byte hash
 		// so the proxy stays up. Stale / non-canonical ph is a soft
 		// regression; a panicked proxy is not.
-		return c.Hash()
+		return cachedPolicyHash{hash: c.Hash()}
 	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	d := policyHashOrigin.Sum(data)
+	return cachedPolicyHash{hash: d.String(), origin: d}
 }
 
 // policySemanticView returns a shallow copy of Config with noise fields
@@ -120,6 +129,15 @@ type canonicalPolicyView struct {
 
 func (c *Config) policySemanticView() canonicalPolicyView {
 	view := *c
+	switch c.PromptInjectionMode() {
+	case ActionAllow:
+		enabled := false
+		view.PromptInjectionDetection = &PromptInjectionDetection{Enabled: &enabled}
+	case ActionWarn:
+		view.PromptInjectionDetection = &PromptInjectionDetection{Action: ActionWarn}
+	default:
+		view.PromptInjectionDetection = nil
+	}
 
 	// Transport structs (FetchProxy, ForwardProxy, WebSocketProxy,
 	// ReverseProxy) stay in the canonical view because they carry
@@ -223,6 +241,8 @@ func (c *Config) policySemanticView() canonicalPolicyView {
 	view.LicenseRevoked = false
 	view.LicenseRevocationReason = ""
 	view.LicenseAgentsFeature = false
+	view.LicenseDisabledAgents = nil
+	view.LicenseDisabledReason = ""
 
 	// Envelope signing key path - infrastructure, not policy. The key
 	// material itself is never read here (we only hold a path), but
@@ -241,6 +261,11 @@ func (c *Config) policySemanticView() canonicalPolicyView {
 	// scanned request; the tool-policy enabled flag, action, and rules stay in
 	// view because those do affect detection.
 	view.MCPToolPolicy.QuarantineDir = ""
+	// on_incomplete_check stays in view because it decides allow or block.
+	// An omitted value means warn, so both spellings hash the same.
+	if view.MCPToolPolicy.OnIncompleteCheck == ActionWarn {
+		view.MCPToolPolicy.OnIncompleteCheck = ""
+	}
 
 	// MCPDataClassLabels is a foundation-only config surface until the
 	// derivation path populates receipt fields. Exclude it from the semantic
@@ -266,23 +291,31 @@ func (c *Config) policySemanticView() canonicalPolicyView {
 	view.APIAllowlist = canonicalHostSet(view.APIAllowlist)
 	view.Internal = sortedCopy(view.Internal)
 	view.TrustedDomains = canonicalHostSet(view.TrustedDomains)
+	view.DestinationGrants = canonicalDestinationGrants(view.DestinationGrants)
+	// Declared credential-audience hosts are exact-match sets; order and case
+	// never change which destination receives a credential.
+	view.DLP.GitHubEnterpriseHosts = canonicalHostSet(view.DLP.GitHubEnterpriseHosts)
+	view.DLP.GitLabHosts = canonicalHostSet(view.DLP.GitLabHosts)
 	view.Taint.TrustedMCPServers = sortedCopy(view.Taint.TrustedMCPServers)
 	view.A2AScanning.TrustedAgentCardKeys = canonicalA2ATrustedCardKeys(view.A2AScanning.TrustedAgentCardKeys)
 	view.ResponseScanning.ExemptDomains = canonicalHostSet(view.ResponseScanning.ExemptDomains)
 	view.ResponseScanning.SizeExemptDomains = canonicalHostSet(view.ResponseScanning.SizeExemptDomains)
+	view.ResponseScanning.SizeExemptScanLimits = canonicalResponseSizeScanLimits(view.ResponseScanning.SizeExemptScanLimits)
 	view.ResponseScanning.UnscannablePassthrough = canonicalUnscannablePassthrough(view.ResponseScanning.UnscannablePassthrough)
 	view.ResponseScanning.AuthenticatedArtifacts = canonicalAuthenticatedArtifacts(view.ResponseScanning.AuthenticatedArtifacts)
 	view.ResponseScanning.MCPServers = canonicalMCPResponseServers(view.ResponseScanning.MCPServers)
+	view.MCPIdentities = canonicalMCPIdentities(view.MCPIdentities)
 	view.FetchProxy.Monitoring.QueryEntropyParamExclusions = canonicalQueryEntropyParamExclusions(view.FetchProxy.Monitoring.QueryEntropyParamExclusions)
+	view.FetchProxy.Monitoring.OAuthAuthorizationEndpoints = canonicalOAuthAuthorizationEndpoints(view.FetchProxy.Monitoring.OAuthAuthorizationEndpoints)
 	view.FetchProxy.Monitoring.PathEntropyExclusions = canonicalPathEntropyExclusions(view.FetchProxy.Monitoring.PathEntropyExclusions)
 	view.FetchProxy.Monitoring.Blocklist = canonicalHostSet(view.FetchProxy.Monitoring.Blocklist)
 	view.FetchProxy.Monitoring.SubdomainEntropyExclusions = canonicalHostSet(view.FetchProxy.Monitoring.SubdomainEntropyExclusions)
 	view.FetchProxy.Monitoring.QueryEntropyExclusions = canonicalHostSet(view.FetchProxy.Monitoring.QueryEntropyExclusions)
-	view.RequestBodyScanning.ContentEntropyExclusions = canonicalHostSet(view.RequestBodyScanning.ContentEntropyExclusions)
+	view.RequestBodyScanning.ContentEntropyExclusions = canonicalEntropyHostExclusions(view.RequestBodyScanning.ContentEntropyExclusions)
 	view.RequestBodyScanning.TrustedHosts = canonicalHostSet(view.RequestBodyScanning.TrustedHosts)
 	view.RequestBodyScanning.ContentEntropyWarnRoutes = canonicalRequestBodyEntropyWarnRoutes(view.RequestBodyScanning.ContentEntropyWarnRoutes)
 	view.RequestBodyScanning.SigV4CredentialRoutes = canonicalRequestBodySigV4CredentialRoutes(view.RequestBodyScanning.SigV4CredentialRoutes)
-	view.WebSocketProxy.ContentEntropyExclusions = canonicalHostSet(view.WebSocketProxy.ContentEntropyExclusions)
+	view.WebSocketProxy.ContentEntropyExclusions = canonicalEntropyHostExclusions(view.WebSocketProxy.ContentEntropyExclusions)
 	if view.Redaction.Enabled {
 		view.Redaction.AllowlistUnparseable = canonicalHostSet(view.Redaction.AllowlistUnparseable)
 	} else {
@@ -452,8 +485,8 @@ func canonicalRequestBodyEntropyWarnRoutes(entries []RequestBodyEntropyWarnRoute
 	}
 	sort.Slice(out, func(i, j int) bool {
 		a, b := out[i], out[j]
-		return a.Host+"\x00"+a.Path+"\x00"+strings.Join(a.Methods, "\x00")+"\x00"+strings.Join(a.ContentTypes, "\x00")+"\x00"+a.Owner+"\x00"+a.Reason+"\x00"+a.Expires <
-			b.Host+"\x00"+b.Path+"\x00"+strings.Join(b.Methods, "\x00")+"\x00"+strings.Join(b.ContentTypes, "\x00")+"\x00"+b.Owner+"\x00"+b.Reason+"\x00"+b.Expires
+		return a.Host+"\x00"+a.Path+"\x00"+a.PathPrefix+"\x00"+strings.Join(a.Methods, "\x00")+"\x00"+strings.Join(a.ContentTypes, "\x00")+"\x00"+a.Owner+"\x00"+a.Reason+"\x00"+a.Expires <
+			b.Host+"\x00"+b.Path+"\x00"+b.PathPrefix+"\x00"+strings.Join(b.Methods, "\x00")+"\x00"+strings.Join(b.ContentTypes, "\x00")+"\x00"+b.Owner+"\x00"+b.Reason+"\x00"+b.Expires
 	})
 	return out
 }
@@ -475,9 +508,8 @@ func canonicalMCPResponseServers(entries []MCPResponseServerTrust) []MCPResponse
 // canonicalPathEntropyExclusions keeps only the fields that change DETECTION
 // and drops the governance metadata. Scheme, host and path prefix decide
 // whether the path gate runs, so they belong in the policy hash a receipt
-// carries. Reason, owner and expiry are for the operator reading the config
-// later and must not move the hash, or editing a comment would look like a
-// policy change in the evidence.
+// carries. Expiry ends enforcement and belongs in identity. Reason and owner are
+// governance metadata and do not change the effective policy.
 func canonicalPathEntropyExclusions(entries []PathEntropyExclusion) []PathEntropyExclusion {
 	if len(entries) == 0 {
 		return nil
@@ -492,6 +524,7 @@ func canonicalPathEntropyExclusions(entries []PathEntropyExclusion) []PathEntrop
 			Scheme:     strings.ToLower(scheme),
 			Host:       strings.TrimSuffix(strings.ToLower(entry.Host), "."),
 			PathPrefix: entry.PathPrefix,
+			Expires:    entry.Expires,
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -502,7 +535,10 @@ func canonicalPathEntropyExclusions(entries []PathEntropyExclusion) []PathEntrop
 		if a.Host != b.Host {
 			return a.Host < b.Host
 		}
-		return a.PathPrefix < b.PathPrefix
+		if a.PathPrefix != b.PathPrefix {
+			return a.PathPrefix < b.PathPrefix
+		}
+		return a.Expires < b.Expires
 	})
 	return out
 }
@@ -518,10 +554,11 @@ func canonicalQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) 
 			scheme = QueryEntropyParamDefaultScheme
 		}
 		out[i] = QueryEntropyParamExclusion{
-			Scheme: strings.ToLower(scheme),
-			Host:   strings.TrimSuffix(strings.ToLower(entry.Host), "."),
-			Path:   entry.Path,
-			Param:  entry.Param,
+			Scheme:  strings.ToLower(scheme),
+			Host:    strings.TrimSuffix(strings.ToLower(entry.Host), "."),
+			Path:    entry.Path,
+			Param:   entry.Param,
+			Expires: entry.Expires,
 		}
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -535,7 +572,10 @@ func canonicalQueryEntropyParamExclusions(entries []QueryEntropyParamExclusion) 
 		if a.Path != b.Path {
 			return a.Path < b.Path
 		}
-		return a.Param < b.Param
+		if a.Param != b.Param {
+			return a.Param < b.Param
+		}
+		return a.Expires < b.Expires
 	})
 	return out
 }
@@ -590,6 +630,33 @@ func sortedCopy(s []string) []string {
 // canonicalHostSet returns a sorted, lowercase copy of a set-like host or host
 // pattern list. Host matching is case-insensitive, so case-only edits cannot
 // represent a different effective policy or change its canonical hash.
+// canonicalEntropyHostExclusions is canonicalHostSet for entries that may carry
+// an expiry. Plain entries reduce to exactly what canonicalHostSet produced, so
+// the policy hash of a config that has none of the mapping form is unchanged.
+func canonicalEntropyHostExclusions(entries []EntropyHostExclusion) []EntropyHostExclusion {
+	if len(entries) == 0 {
+		return nil
+	}
+	seen := make(map[EntropyHostExclusion]struct{}, len(entries))
+	out := make([]EntropyHostExclusion, 0, len(entries))
+	for _, e := range entries {
+		e.Host = strings.TrimSuffix(strings.ToLower(e.Host), ".")
+		// Construction and wire decoding can differ only in mapping provenance.
+		// Canonical identity follows the effective temporary form, not its origin.
+		e.mapped = e.temporary()
+		if _, ok := seen[e]; ok {
+			continue
+		}
+		seen[e] = struct{}{}
+		out = append(out, e)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		return a.Host+"\x00"+a.Expires+"\x00"+a.Owner+"\x00"+a.Reason < b.Host+"\x00"+b.Expires+"\x00"+b.Owner+"\x00"+b.Reason
+	})
+	return out
+}
+
 func canonicalHostSet(s []string) []string {
 	if len(s) == 0 {
 		return nil

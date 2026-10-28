@@ -169,7 +169,7 @@ func RunStandaloneInit() {
 		exitSandboxProcess(1)
 	}
 	policy = resolvedPolicy
-	llStatus, llErr := ApplyLandlock(policy)
+	llStatus, llErr := ApplyLandlock(policy, socketPath)
 	reportLayer(os.Stderr, llStatus, llErr)
 
 	// Set no_new_privs + seccomp (strict blocks clone3).
@@ -224,6 +224,8 @@ func RunStandaloneInit() {
 		exitSandboxProcess(1)
 	}
 
+	bridge.SetIdleTimeout(parseBridgeIdleTimeout(os.Getenv(bridgeIdleTimeoutEnv)))
+
 	bridgeErr := make(chan error, 1)
 	go func() { bridgeErr <- bridge.Serve(ctx) }()
 	defer bridge.Close()
@@ -241,7 +243,7 @@ func RunStandaloneInit() {
 		_, _ = fmt.Fprintf(os.Stderr, "[sandbox] launch outcome: REFUSED: %v\n", outcomeErr)
 		exitSandboxProcess(1)
 	}
-	reportAppliedLaunchOutcome(os.Stderr, outcome)
+	reportAppliedLaunchOutcome(os.Stderr, outcome, llStatus.Version)
 	_, _ = fmt.Fprintf(os.Stderr, "[sandbox] bridge proxy: %s → %s\n", bridge.Addr(), socketPath)
 
 	if useDeveloperEnvironment {
@@ -266,7 +268,7 @@ func RunStandaloneInit() {
 		"__PIPELOCK_SANDBOX_WORKSPACE", "__PIPELOCK_SANDBOX_COMMAND",
 		standaloneCommandJSONEnv,
 		sandboxSocketEnv, "__PIPELOCK_SANDBOX_EXTRA_ENV",
-		"__PIPELOCK_SANDBOX_POLICY", noNetNSEnvKey,
+		"__PIPELOCK_SANDBOX_POLICY", noNetNSEnvKey, bridgeIdleTimeoutEnv,
 		developerEnvironmentControlEnv,
 		standaloneGuardDeclarationEnv, standaloneGuardProfileEnv, standaloneGuardPolicyHashEnv,
 		guardStatusControlEnv,
@@ -327,7 +329,7 @@ func RunStandaloneInit() {
 		agentCmd.ExtraFiles = []*os.File{guardEnvironmentReader, guardStatus}
 	}
 
-	if err := agentCmd.Start(); err != nil {
+	if err := startSandboxTarget(agentCmd, llStatus); err != nil {
 		if guardEnvironmentReader != nil {
 			_ = guardEnvironmentReader.Close()
 			_ = guardEnvironmentWriter.Close()

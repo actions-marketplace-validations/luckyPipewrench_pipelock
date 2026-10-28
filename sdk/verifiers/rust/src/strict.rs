@@ -105,6 +105,17 @@ const SESSION_OPEN_KEYS: &[&str] = &[
     "posture_signer_key_id",
     "containment_nonce",
     "contained_uid",
+    "group_binding",
+];
+
+const GROUP_BINDING_KEYS: &[&str] = &[
+    "group_id",
+    "shard_index",
+    "session_id",
+    "open_manifest_sha256",
+    "signer_key",
+    "previous_group_id",
+    "previous_open_manifest_sha256",
 ];
 
 const SESSION_HEARTBEAT_KEYS: &[&str] = &[
@@ -174,6 +185,13 @@ fn reject_unknown_keys(obj: &Value, allowed: &[&str], object_name: &str) -> Resu
         None => return Ok(()),
     };
     for key in map.keys() {
+        if let Some(alias) = allowed.iter().find(|name| {
+            key.as_str() != **name && crate::util::fold_key(key) == crate::util::fold_key(name)
+        }) {
+            return Err(VerifierError::Invalid(format!(
+                "{key:?} aliases {alias:?} (case-insensitive) on {object_name}"
+            )));
+        }
         if !allowed.contains(&key.as_str()) {
             return Err(VerifierError::Invalid(format!(
                 "unknown field {key:?} on signed v1 {object_name} object"
@@ -214,6 +232,9 @@ pub fn validate_v1_receipt(receipt: &Value) -> Result<()> {
         if let Some(sc) = ar.get("session_control") {
             reject_unknown_keys(sc, SESSION_CONTROL_KEYS, "session_control")?;
             validate_child(sc, "open", SESSION_OPEN_KEYS, "session_open")?;
+            if let Some(open) = sc.get("open") {
+                validate_child(open, "group_binding", GROUP_BINDING_KEYS, "group_binding")?;
+            }
             validate_child(sc, "heartbeat", SESSION_HEARTBEAT_KEYS, "session_heartbeat")?;
             validate_child(sc, "close", SESSION_CLOSE_KEYS, "session_close")?;
         }

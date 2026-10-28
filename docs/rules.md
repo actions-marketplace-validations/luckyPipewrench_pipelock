@@ -21,10 +21,10 @@ Bundles are stored in `$XDG_DATA_HOME/pipelock/rules/` by default (typically `~/
 
 ## Installing a bundle through a Pipelock proxy
 
-A rules bundle is a list of detection patterns, so the bundle's own contents read as injection text to a response scanner. If `pipelock rules install` runs behind a Pipelock proxy whose `response_scanning.action` is `block` or `ask` — the `strict`, `hostile-model`, `claude-code`, and `cursor` presets — that proxy scans the bundle it is fetching and refuses to release it. A proxy left on the default `warn` logs the finding and passes the bundle through, but adaptive enforcement can upgrade a warn to a block, so the same install can start failing on a session that has escalated. When it is refused, the install fails with a 403 and the command reports which side made that decision:
+A rules bundle is a list of detection patterns, so the bundle's own contents read as injection text to a response scanner. If `pipelock rules install` runs behind a Pipelock proxy whose `response_scanning.action` is `block` or `ask` — the `strict`, `hostile-model`, `claude-code`, and `cursor` presets — that proxy scans the bundle it is fetching and refuses to release it. A proxy left on the default `warn` logs the finding and passes the bundle through, but adaptive enforcement can upgrade a warn to a block, so the same install can start failing on a session that has escalated. When it is refused, the install fails with a 403 and the command names the block-reason headers it saw without claiming to know who sent them:
 
 ```
-HTTP GET https://pipelab.org/rules/pipelock-community/bundle.yaml: status 403: blocked by Pipelock, not by the server (reason=prompt_injection, layer=response_scan)
+HTTP GET https://pipelab.org/rules/pipelock-community/bundle.yaml: status 403: the response carries Pipelock block-reason headers (reason=prompt_injection, layer=response_scan), which points to a Pipelock proxy in front of this fetch refusing to release the bundle rather than the registry being down; any server can send these headers, so confirm the refusal in that proxy's log
 ```
 
 The fix belongs in the **proxy's** config, not in the rules directory on the machine running the install. Name the exact artifact under `response_scanning.authenticated_artifacts`:
@@ -153,7 +153,7 @@ Pipelock separates rule-bundle load failures into two operator classes:
 - **Integrity failures:** bad signatures, missing or mismatched `bundle.lock`, bundle hash mismatch, malformed installed bundle content, expired bundles, signer/tier mismatch, and freshness rollback state tampering.
 - **Availability failures:** missing optional rules directory, bundle file read/stat failures, freshness lock failures, or a bundle that requires a newer engine feature.
 
-In `mode: strict`, an integrity failure for an installed bundle refuses startup unless `rules.allow_degraded: true` is explicitly set. The error names the bundle and class so the operator can verify or reinstall the bundle before retrying. Availability failures keep the process available but mark the bundle state degraded.
+In `mode: strict`, an integrity failure for an installed bundle refuses proxy startup, denies Claude Code, Cursor and Hermes hook calls, and fails `mcp scan` unless `rules.allow_degraded: true` is explicitly set. The error names the bundle and class so the operator can verify or reinstall the bundle before retrying. Availability failures keep the process available but mark the bundle state degraded.
 
 In non-strict modes, Pipelock starts with the remaining rules but emits a structured `rule_bundle_degraded` audit event and a startup warning. `/stats` reports degraded bundle count and names under `rule_bundles`; `/metrics` exposes `pipelock_rule_bundles_degraded`.
 
@@ -219,6 +219,7 @@ author: vendor-security
 description: "Internal detection patterns for Vendor Corp"
 min_pipelock: "2.2.0"
 tier: community
+key_id: "d1517306bb5a0e596b5f5de996cec329e3980cc0f3dbc6a252c661d1c49f023a"
 monotonic_version: 1
 published_at: "2026-04-16T00:00:00Z"
 expires_at: "2027-04-16T00:00:00Z"
@@ -244,7 +245,7 @@ authors should declare `required_features: ["checksum"]` and set
 `min_pipelock` to the oldest Pipelock release whose rule-bundle loader supports
 the `pattern.validator` field.
 
-`format_version: 1` bundles still load for backwards compatibility, but new bundles should use `format_version: 2` so they can declare `tier`, `required_features`, and freshness metadata. The v2 validation also requires `monotonic_version`, `published_at`, and `expires_at`.
+`format_version: 1` bundles still load for backwards compatibility, but new bundles should use `format_version: 2` so they can declare `tier`, `required_features`, and freshness metadata. The v2 validation also requires `key_id`, `monotonic_version`, `published_at`, and `expires_at`. `key_id` is the signing public key as 64 lowercase hex characters, and an install fails with `key_id must not be empty for v2+ bundles` without it. The value in the example is a placeholder; [Signing your bundle](#signing-your-bundle) shows how to get yours.
 
 ### Rule types
 
@@ -253,6 +254,8 @@ the `pattern.validator` field.
 | DLP pattern | `dlp` | `dlp.patterns` |
 | Injection pattern | `injection` | `response_scanning.patterns` |
 | Tool poison pattern | `tool-poison` | `mcp_tool_scanning` descriptions |
+
+Every bundle rule matches regardless of case. Pipelock adds `(?i)` to a rule regex that doesn't already turn it on, for all three rule types. For an injection rule that opens with a flag group such as `(?s)`, `i` joins that group (`(?is)`), and a leading group that clears it, such as `(?-i)`, is kept as written. Wrap a span in `(?-i:...)` when it must match exact case.
 
 Tool-poison rules with `scan_field: description` scan the tool's `description` and `description` fields nested in its input schema. Built-in scanning still covers every other agent-visible tool field, but those fields do not trigger description-scoped bundle rules.
 
@@ -278,13 +281,25 @@ release during ordinary pull-request checks.
 # Generate a keypair for your organization
 pipelock keygen my-org
 
-# Sign the bundle (uses the keystore at ~/.pipelock/)
+# Print the public key as 64-character hex
+tail -n 1 ~/.pipelock/agents/my-org/id_ed25519.pub | base64 -d | od -An -vtx1 | tr -d ' \n'; echo
+
+# Put that hex in the bundle's key_id, then sign the bundle (uses the keystore at ~/.pipelock/)
 pipelock sign bundle.yaml --agent my-org
 
 # Distribute: bundle.yaml + bundle.yaml.sig + your public key hex
 ```
 
-Users add your public key to their `trusted_keys` config to verify your bundles.
+`pipelock keygen` writes the public key file as two lines: a `pipelock-ed25519-public-v1` header and the key in base64. Both `key_id` and `trusted_keys[].public_key` take the hex form of the same key, and Pipelock doesn't convert the base64 for you: a base64 value in `trusted_keys` is rejected at config load with `public_key must be exactly 64 hex chars`. The `key_id` must match the key that signed the bundle, otherwise the install fails with a `key_id mismatch` error. Set `key_id` before you run `pipelock sign`, because the signature covers the whole file.
+
+Users add your public key to their `trusted_keys` config to verify your bundles:
+
+```yaml
+rules:
+  trusted_keys:
+    - name: "my-org"
+      public_key: "d1517306bb5a0e596b5f5de996cec329e3980cc0f3dbc6a252c661d1c49f023a"
+```
 
 ## Hosting
 

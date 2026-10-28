@@ -27,14 +27,14 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.25'
+          go-version: '1.26'
 
       - name: Debt report (warning-only)
         id: debt
         continue-on-error: true
         uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.13.2
+          version: v2.15.0
           skip-cache: true
           args: --default none --enable dupl --enable gocyclo --enable gocognit --enable maintidx --output.json.path=hardening-debt.json ./...
 

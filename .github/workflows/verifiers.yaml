@@ -1,13 +1,13 @@
 name: Verifiers
 
-# Gates the TypeScript and Rust reference verifiers under sdk/verifiers/.
+# Gates the reference verifiers and browser WASM chain parity harness.
 # The Go conformance suite under sdk/conformance/ is already gated by the
-# existing CI workflow's `test (1.25)` and `test (1.26)` aggregate jobs. This
-# file adds matching CI coverage for the non-Go reference verifiers. Changes
-# that break either one fail at the PR stage instead of merging silently.
+# existing CI workflow's `test (1.26)` and `test (1.27)` aggregate jobs. This
+# file adds matching CI coverage for the other verifier implementations.
+# Regressions fail at the PR stage instead of merging silently.
 #
-# Security note: no run: step in this workflow consumes untrusted
-# github.event.* input. Every command runs over repo-controlled paths.
+# Security note: run steps do not interpolate pull request text. The source
+# drift job accepts github.event.before only after it matches a commit id.
 
 on:
   push:
@@ -19,11 +19,16 @@ on:
       - 'go.work.sum'
       - 'cmd/pipelock/**'
       - 'cmd/pipelock-verifier/**'
+      - 'cmd/pipelock-verifier-wasm/**'
+      - 'deploy/wasm-verify/**'
+      - 'Makefile'
       - 'internal/**'
       - 'docs/specs/**'
       - 'sdk/verifiers/**'
       - 'sdk/audit-packet/**'
       - 'sdk/conformance/**'
+      - 'release/verifier-installers.json'
+      - 'scripts/release-verifier-install-gate.sh'
       - '.github/workflows/verifiers.yaml'
   pull_request:
     paths:
@@ -33,11 +38,16 @@ on:
       - 'go.work.sum'
       - 'cmd/pipelock/**'
       - 'cmd/pipelock-verifier/**'
+      - 'cmd/pipelock-verifier-wasm/**'
+      - 'deploy/wasm-verify/**'
+      - 'Makefile'
       - 'internal/**'
       - 'docs/specs/**'
       - 'sdk/verifiers/**'
       - 'sdk/audit-packet/**'
       - 'sdk/conformance/**'
+      - 'release/verifier-installers.json'
+      - 'scripts/release-verifier-install-gate.sh'
       - '.github/workflows/verifiers.yaml'
 
 concurrency:
@@ -48,10 +58,44 @@ permissions:
   contents: read
 
 jobs:
-  typescript:
-    name: TypeScript verifier
+  wasm-parity:
+    name: WASM verifier parity
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    steps:
+      - name: Checkout pipelock
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+
+      - name: Run WASM verifier parity harness
+        run: make test-wasm-verifier
+
+  typescript:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Retain the published engine floor until a verifier release raises it.
+          - node: '20'
+            name: TypeScript verifier (Node 20 compatibility)
+          - node: '22'
+            name: TypeScript verifier
+          - node: '24'
+            name: TypeScript verifier (Node 24)
     defaults:
       run:
         working-directory: sdk/verifiers/ts
@@ -61,9 +105,9 @@ jobs:
           persist-credentials: false
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node }}
           cache: 'npm'
           cache-dependency-path: sdk/verifiers/ts/package-lock.json
 
@@ -87,6 +131,35 @@ jobs:
           npm pack --dry-run --json > pack-manifest.json
           node -e "const pkg=require('./package.json'); const m=require('./pack-manifest.json')[0].files.map(f=>f.path); for (const need of ['dist/src/cli.js','dist/src/v0.schema.json']) { if(!m.includes(need)){ console.error('MISSING from npm package:',need); process.exit(1);} } if(pkg.bin?.['pipelock-verifier-ts']!=='dist/src/cli.js'){ console.error('bad bin mapping (npm strips a leading ./):',JSON.stringify(pkg.bin)); process.exit(1);} console.log('npm package contains CLI + bundled schema + valid bin');"
           rm -f pack-manifest.json
+
+  typescript-macos:
+    name: TypeScript directory paths (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: sdk/verifiers/ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: sdk/verifiers/ts/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify directory paths on a case-insensitive volume
+        run: |
+          npm run build
+          node --test dist/tests/pinned-directory.test.js
+        env:
+          PIPELOCK_REQUIRE_CASE_ALIAS: '1'
 
   rust:
     name: Rust verifier
@@ -192,12 +265,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: sdk/verifiers/ts/package-lock.json
 
@@ -239,13 +312,22 @@ jobs:
         # the conformance gate below, so no unpinned install command ever runs.
         run: pip install --require-hashes -r "$GITHUB_WORKSPACE/sdk/conformance/pyverify-requirements.txt"
 
+      - name: Test secret-egress conformance gate mechanics
+        run: python3 -m unittest discover -s sdk/conformance -p 'test_secret_egress_gate.py'
+
       - name: Run cross-language conformance gate
         env:
           GO_VERIFY: ${{ runner.temp }}/pipelock verify-receipt
+          # The standalone verifier already supports typed v2 receipt files;
+          # preserve the main CLI's existing single-v1-receipt legacy lane.
+          SECRET_EGRESS_GO_VERIFY: ${{ runner.temp }}/pipelock-verifier receipt --json
           TS_VERIFY: node ${{ github.workspace }}/sdk/verifiers/ts/dist/src/cli.js receipt
           RUST_VERIFY: ${{ github.workspace }}/sdk/verifiers/rust/target/release/pipelock-verifier-rs receipt
           # -P keeps the repo root off sys.path so only the pinned checkout is used.
           PY_VERIFY: python -P -m pipelock_verify
+          # New fixture-only kinds use the in-repo Python reference; preserve
+          # the separately pinned published verifier's legacy corpus gate.
+          SECRET_EGRESS_PY_VERIFY: python -P -m pipelock_aarp_verify receipt
           # Run the verifier from its pinned checkout without installing it.
           PYTHONPATH: ${{ github.workspace }}/_pyverify:${{ github.workspace }}/sdk/verifiers/python/src
           GO_PROVENANCE: ${{ runner.temp }}/pipelock-verifier provenance
@@ -276,12 +358,12 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
           cache-dependency-path: sdk/verifiers/ts/package-lock.json
 
@@ -335,6 +417,39 @@ jobs:
               raise SystemExit(f"Python v2 receipt verifier failed: {report}")
           PY
 
+      - name: Python receipt-chain ext link smoke
+        working-directory: sdk/verifiers/python
+        # The pytest suite is not run in CI, so pin the ext link-hash contract
+        # here: the Go-generated ext chain must verify with the Go root hash,
+        # and the copy whose linked ext bytes were edited must be rejected.
+        # The fixture's session is not a per-run session, so its close cannot
+        # prove the end; --allow-prefix keeps this check on the link bytes.
+        run: |
+          KEY=$(python -c 'import json; print(json.load(open("../../conformance/testdata/test-key.json"))["public_key_hex"])')
+          PYTHONPATH=src python -m pipelock_aarp_verify receipt \
+            ../../conformance/testdata/g1-ext-chain.jsonl --chain --key "$KEY" \
+            --allow-prefix --json > "$RUNNER_TEMP/python-ext-chain.json"
+          if PYTHONPATH=src python -m pipelock_aarp_verify receipt \
+            ../../conformance/testdata/g1-ext-tampered-invalid.jsonl --chain --key "$KEY" \
+            --json > "$RUNNER_TEMP/python-ext-tampered.json"; then
+            echo "Python verifier accepted a chain with edited ext link bytes" >&2
+            exit 1
+          fi
+          python - "$RUNNER_TEMP/python-ext-chain.json" "$RUNNER_TEMP/python-ext-tampered.json" <<'PY'
+          import json
+          import sys
+
+          want_root = "19805bc704923ef6a602abdfa3dc4982134997a69e3fff7a627b3f1805511d1b"
+          with open(sys.argv[1], encoding="utf-8") as fh:
+              valid = json.load(fh)
+          if valid.get("valid") is not True or valid.get("root_hash") != want_root:
+              raise SystemExit(f"Python ext chain verification diverged: {valid}")
+          with open(sys.argv[2], encoding="utf-8") as fh:
+              tampered = json.load(fh)
+          if tampered.get("valid") is not False or tampered.get("broken_at_seq") != 1:
+              raise SystemExit(f"Python ext tamper not rejected at seq 1: {tampered}")
+          PY
+
       - name: Run AARP cross-language gate
         env:
           # All four verifiers implement --svid; require four-way agreement on the
@@ -346,7 +461,46 @@ jobs:
           RUST_AARP: ${{ github.workspace }}/sdk/verifiers/rust/target/release/pipelock-verifier-rs aarp
           PYTHONPATH: ${{ github.workspace }}/sdk/verifiers/python/src
           PY_AARP: python -m pipelock_aarp_verify aarp
-        run: bash sdk/conformance/aarp-corpus-gate.sh
+        run: |
+          bash sdk/conformance/aarp-corpus-gate.sh
+          python sdk/conformance/key-artifact-gate.py
+
+  # A pull request checkout is the merge commit, so its first parent is the
+  # base. A main push compares with the previous tip, and only after that
+  # value is checked to be a commit id.
+  verifier-source-drift:
+    name: Verifier source drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout pipelock
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fail source drift that does not bump the verifier packages
+        env:
+          DRIFT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            parents="$(git rev-list --parents -n 1 HEAD)"
+            set -- $parents
+            if [ "$#" -lt 3 ]; then
+              echo "pull request checkout is not a merge commit" >&2
+              exit 1
+            fi
+            base="$2"
+          else
+            if ! [[ "${DRIFT_BEFORE:-}" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "push base is not a commit id" >&2
+              exit 1
+            fi
+            base="$DRIFT_BEFORE"
+          fi
+          git cat-file -e "${base}^{commit}"
+          scripts/release-verifier-install-gate.sh --source-drift-only --base "$base"
 
   # Containment direct-egress conformance gate: packages pipelock's
   # `contain verify` direct-egress probes (probe 8 — pipelock-agent must NOT
@@ -373,7 +527,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.26'
+          go-version: '1.27'
 
       - name: Run containment direct-egress conformance gate
         run: bash sdk/conformance/containment-gate.sh

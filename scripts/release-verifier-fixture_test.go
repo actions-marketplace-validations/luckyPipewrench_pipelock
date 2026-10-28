@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -601,6 +603,327 @@ func TestReleaseVerifierInstallGateRejectsTargetAllowlistingFake(t *testing.T) {
 	}
 }
 
+func TestReleaseVerifierSourceDriftRequiresBase(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	command := exec.CommandContext(t.Context(), "bash", filepath.Join(root, "scripts", "release-verifier-install-gate.sh"), // #nosec G204 -- executes the checked-in script copied under t.TempDir.
+		"--source-drift-only")
+	output, err := command.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "--source-drift-only requires --base") {
+		t.Fatalf("missing base error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftAllowsAnUnchangedTree(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err != nil {
+		t.Fatalf("unchanged tree failed: %v\n%s", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftRejectsARustOnlyEditWithoutAVersionBump(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	appendStagedFile(t, root, filepath.Join("sdk", "verifiers", "rust", "src", "main.rs"), "\n// rust-only edit\n")
+	commitReleaseVerifierFixture(t, root, "sdk/verifiers/rust/src/main.rs")
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err == nil || !strings.Contains(output, "without one new shared package version") {
+		t.Fatalf("unbumped rust source edit error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftRejectsASourceEditWithoutAVersionBump(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	appendStagedVerifierSource(t, root, "\n// sibling edit\n")
+	commitReleaseVerifierFixture(t, root, "sdk/verifiers/ts/src/types.ts")
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err == nil || !strings.Contains(output, "without one new shared package version") {
+		t.Fatalf("unbumped source edit error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftRejectsAPendingInventoryThatDoesNotBump(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	rewriteStagedVerifierInventory(t, root, func(inventory map[string]interface{}) {
+		inventory["release_blocked"] = true
+	})
+	appendStagedVerifierSource(t, root, "\n// pending but unbumped\n")
+	commitReleaseVerifierFixture(t, root, "sdk/verifiers/ts/src/types.ts", "release/verifier-installers.json")
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err == nil || !strings.Contains(output, "without one new shared package version") {
+		t.Fatalf("pending unbumped edit error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftRejectsABumpThatIsNotPendingPublication(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	bumpStagedVerifierPackages(t, root, adjacentVerifierVersion(t, root, 1), false)
+	appendStagedVerifierSource(t, root, "\n// versioned edit\n")
+	commitReleaseVerifierFixture(t, root,
+		"sdk/verifiers/ts/src/types.ts",
+		"sdk/verifiers/ts/package.json",
+		"sdk/verifiers/ts/package-lock.json",
+		"sdk/verifiers/rust/Cargo.toml",
+		"sdk/verifiers/rust/Cargo.lock",
+		"release/verifier-installers.json",
+	)
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err == nil || !strings.Contains(output, "not marked pending publication") {
+		t.Fatalf("unblocked bump error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftRejectsASharedDowngrade(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	bumpStagedVerifierPackages(t, root, adjacentVerifierVersion(t, root, -1), true)
+	appendStagedVerifierSource(t, root, "\n// downgraded edit\n")
+	commitReleaseVerifierFixture(t, root,
+		"sdk/verifiers/ts/src/types.ts",
+		"sdk/verifiers/ts/package.json",
+		"sdk/verifiers/ts/package-lock.json",
+		"sdk/verifiers/rust/Cargo.toml",
+		"sdk/verifiers/rust/Cargo.lock",
+		"release/verifier-installers.json",
+	)
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err == nil || !strings.Contains(output, "without one new shared package version") {
+		t.Fatalf("shared downgrade error = %v, output = %q", err, output)
+	}
+}
+
+func TestReleaseVerifierSourceDriftAcceptsAPendingSharedBump(t *testing.T) {
+	root := stageReleaseVerifierInventoryTest(t)
+	base := releaseVerifierFixtureHEAD(t, root)
+	bumpStagedVerifierPackages(t, root, adjacentVerifierVersion(t, root, 1), true)
+	appendStagedVerifierSource(t, root, "\n// versioned edit\n")
+	commitReleaseVerifierFixture(t, root,
+		"sdk/verifiers/ts/src/types.ts",
+		"sdk/verifiers/ts/package.json",
+		"sdk/verifiers/ts/package-lock.json",
+		"sdk/verifiers/rust/Cargo.toml",
+		"sdk/verifiers/rust/Cargo.lock",
+		"release/verifier-installers.json",
+	)
+	output, err := runReleaseVerifierSourceDrift(t, root, base)
+	if err != nil {
+		t.Fatalf("pending shared bump failed: %v\n%s", err, output)
+	}
+}
+
+func appendStagedVerifierSource(t *testing.T, root, suffix string) {
+	t.Helper()
+	appendStagedFile(t, root, filepath.Join("sdk", "verifiers", "ts", "src", "types.ts"), suffix)
+}
+
+func appendStagedFile(t *testing.T, root, relativePath, suffix string) {
+	t.Helper()
+	sourcePath := filepath.Join(root, relativePath)
+	source, err := os.ReadFile(sourcePath) // #nosec G304 -- fixed source path under t.TempDir.
+	if err != nil {
+		t.Fatalf("read staged source: %v", err)
+	}
+	if err := os.WriteFile(sourcePath, append(source, []byte(suffix)...), 0o600); err != nil {
+		t.Fatalf("write staged source: %v", err)
+	}
+}
+
+func stagedVerifierVersion(t *testing.T, root string) string {
+	t.Helper()
+	manifest, err := os.ReadFile(filepath.Join(root, "sdk", "verifiers", "rust", "Cargo.toml")) // #nosec G304 -- path is the staged fixture under t.TempDir.
+	if err != nil {
+		t.Fatalf("read staged rust manifest: %v", err)
+	}
+	for _, line := range strings.Split(string(manifest), "\n") {
+		if strings.HasPrefix(line, "version = \"") && strings.HasSuffix(line, "\"") {
+			return strings.TrimSuffix(strings.TrimPrefix(line, "version = \""), "\"")
+		}
+	}
+	t.Fatal("staged rust manifest has no version")
+	return ""
+}
+
+func adjacentVerifierVersion(t *testing.T, root string, delta int) string {
+	t.Helper()
+	parts := strings.Split(stagedVerifierVersion(t, root), ".")
+	if len(parts) != 3 {
+		t.Fatalf("staged version %q is not major.minor.patch", stagedVerifierVersion(t, root))
+	}
+	numbers := make([]int, 3)
+	for i, part := range parts {
+		number, err := strconv.Atoi(part)
+		if err != nil {
+			t.Fatalf("staged version component %q: %v", part, err)
+		}
+		numbers[i] = number
+	}
+	if delta >= 0 {
+		numbers[2] += delta
+		return formatVerifierVersion(numbers)
+	}
+	for i := 2; i >= 0; i-- {
+		if numbers[i] > 0 {
+			numbers[i]--
+			return formatVerifierVersion(numbers)
+		}
+	}
+	t.Fatal("staged version cannot move backward")
+	return ""
+}
+
+func formatVerifierVersion(numbers []int) string {
+	return strconv.Itoa(numbers[0]) + "." + strconv.Itoa(numbers[1]) + "." + strconv.Itoa(numbers[2])
+}
+
+func TestAdjacentVerifierVersionBorrowsFromAZeroPatch(t *testing.T) {
+	root := t.TempDir()
+	manifest := filepath.Join(root, "sdk", "verifiers", "rust", "Cargo.toml")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("version = \"1.2.0\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := adjacentVerifierVersion(t, root, -1); got != "1.1.0" {
+		t.Fatalf("downgrade from a zero patch = %s", got)
+	}
+	if got := adjacentVerifierVersion(t, root, 1); got != "1.2.1" {
+		t.Fatalf("forward from a zero patch = %s", got)
+	}
+}
+
+func bumpStagedVerifierPackages(t *testing.T, root, version string, releaseBlocked bool) {
+	t.Helper()
+	rewriteJSONFile(t, filepath.Join(root, "sdk", "verifiers", "ts", "package.json"), func(document map[string]interface{}) {
+		document["version"] = version
+	})
+	rewriteJSONFile(t, filepath.Join(root, "sdk", "verifiers", "ts", "package-lock.json"), func(document map[string]interface{}) {
+		document["version"] = version
+		packages, ok := document["packages"].(map[string]interface{})
+		if !ok {
+			t.Fatal("staged lockfile packages is not an object")
+		}
+		rootPackage, ok := packages[""].(map[string]interface{})
+		if !ok {
+			t.Fatal("staged lockfile root package is not an object")
+		}
+		rootPackage["version"] = version
+	})
+	current := stagedVerifierVersion(t, root)
+	if current != version {
+		replaceOnce(t, filepath.Join(root, "sdk", "verifiers", "rust", "Cargo.toml"), "version = \""+current+"\"", "version = \""+version+"\"")
+		replaceOnce(t, filepath.Join(root, "sdk", "verifiers", "rust", "Cargo.lock"), "name = \"pipelock-verifier-rs\"\nversion = \""+current+"\"", "name = \"pipelock-verifier-rs\"\nversion = \""+version+"\"")
+	}
+	rewriteStagedVerifierInventory(t, root, func(inventory map[string]interface{}) {
+		inventory["release_blocked"] = releaseBlocked
+		entries, ok := inventory["verifiers"].([]interface{})
+		if !ok {
+			t.Fatal("staged inventory has no verifiers array")
+		}
+		for _, language := range []string{"TypeScript", "Rust"} {
+			found := false
+			for _, entry := range entries {
+				record, ok := entry.(map[string]interface{})
+				if !ok || record["language"] != language {
+					continue
+				}
+				record["version"] = version
+				publisher := record["publisher"].(map[string]interface{})
+				publisher["source_ref"] = "verifier-v" + version
+				publisher["repository"] = "pipelab-org/pipelock"
+				if version == "0.6.5" {
+					publisher["repository"] = "luckyPipewrench/pipelock"
+					publisher["source_commit"] = "05179c855c4be2e9f06c305041a2be6b79626afa"
+				}
+				found = true
+			}
+			if !found {
+				t.Fatalf("staged inventory has no %s verifier entry", language)
+			}
+		}
+	})
+}
+
+func rewriteJSONFile(t *testing.T, path string, apply func(map[string]interface{})) {
+	t.Helper()
+	raw, err := os.ReadFile(path) // #nosec G304 -- path is a fixture file under t.TempDir.
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	var document map[string]interface{}
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatalf("decode %s: %v", path, err)
+	}
+	apply(document)
+	raw, err = json.Marshal(document)
+	if err != nil {
+		t.Fatalf("encode %s: %v", path, err)
+	}
+	if err := os.WriteFile(path, append(raw, '\n'), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func replaceOnce(t *testing.T, path, old, replacement string) {
+	t.Helper()
+	raw, err := os.ReadFile(path) // #nosec G304 -- path is a fixture file under t.TempDir.
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	updated := strings.Replace(string(raw), old, replacement, 1)
+	if updated == string(raw) {
+		t.Fatalf("%s did not contain %q", path, old)
+	}
+	if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func releaseVerifierFixtureHEAD(t *testing.T, root string) string {
+	t.Helper()
+	return strings.TrimSpace(runReleaseVerifierGit(t, root, "rev-parse", "HEAD"))
+}
+
+func commitReleaseVerifierFixture(t *testing.T, root string, paths ...string) {
+	t.Helper()
+	runReleaseVerifierGit(t, root, append([]string{"add"}, paths...)...)
+	runReleaseVerifierGit(t, root, "-c", "user.name=Pipelock Test", "-c", "user.email=test@pipelock.invalid", "commit", "--no-gpg-sign", "-m", "fixture edit")
+}
+
+func runReleaseVerifierGit(t *testing.T, root string, args ...string) string {
+	t.Helper()
+	gitHome := t.TempDir()
+	hooksDir := filepath.Join(gitHome, "empty-hooks")
+	if err := os.MkdirAll(hooksDir, 0o750); err != nil {
+		t.Fatalf("create empty hooks directory: %v", err)
+	}
+	gitArgs := append([]string{"-c", "core.hooksPath=" + hooksDir}, args...)
+	command := exec.CommandContext(t.Context(), "git", gitArgs...) // #nosec G204 -- arguments are fixed by this test.
+	command.Dir = root
+	command.Env = append(os.Environ(),
+		"HOME="+gitHome,
+		"GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_SYSTEM="+os.DevNull,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, output)
+	}
+	return string(output)
+}
+
+func runReleaseVerifierSourceDrift(t *testing.T, root, base string) (string, error) {
+	t.Helper()
+	command := exec.CommandContext(t.Context(), "bash", filepath.Join(root, "scripts", "release-verifier-install-gate.sh"), // #nosec G204 -- executes the checked-in script copied under t.TempDir.
+		"--source-drift-only", "--base", base)
+	output, err := command.CombinedOutput()
+	return string(output), err
+}
+
 func stageReleaseVerifierInventoryTest(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -622,6 +945,7 @@ func stageReleaseVerifierInventoryTest(t *testing.T) string {
 		"sdk/verifiers/ts/src/types.ts",
 		"sdk/verifiers/rust/Cargo.toml",
 		"sdk/verifiers/rust/Cargo.lock",
+		"sdk/verifiers/rust/src/main.rs",
 	}
 	for _, relativePath := range stagedPaths {
 		raw, err := os.ReadFile(filepath.Join(repoRoot, relativePath)) // #nosec G304 -- relativePath comes from the fixed list above.
@@ -673,4 +997,275 @@ func runReleaseVerifierInventory(t *testing.T, root string) (string, error) {
 		"--tag", "v3.4.0", "--inventory-only")
 	output, err := command.CombinedOutput()
 	return string(output), err
+}
+
+func TestReleaseVerifierPublisherBindings(t *testing.T) {
+	tests := []struct {
+		name, version, repository, workflow, environment, ref, commit, want string
+	}{
+		{name: "historical publisher", version: "0.6.5", repository: "luckyPipewrench/pipelock", ref: "verifier-v0.6.5", commit: "05179c855c4be2e9f06c305041a2be6b79626afa"},
+		{name: "new publisher", version: "0.6.6", repository: "pipelab-org/pipelock", ref: "verifier-v0.6.6", commit: "pending publication"},
+		{name: "historical new owner", version: "0.6.5", repository: "pipelab-org/pipelock", ref: "verifier-v0.6.5", commit: "05179c855c4be2e9f06c305041a2be6b79626afa", want: "unexpected TypeScript verifier publication contract"},
+		{name: "historical changed commit", version: "0.6.5", repository: "luckyPipewrench/pipelock", ref: "verifier-v0.6.5", commit: strings.Repeat("a", 40), want: "historical verifier source commit mismatch"},
+		{name: "future old owner", version: "0.6.6", repository: "luckyPipewrench/pipelock", ref: "verifier-v0.6.6", commit: "pending publication", want: "unexpected TypeScript verifier publication contract"},
+		{name: "wrong owner", version: "0.6.6", repository: "vendor/pipelock", ref: "verifier-v0.6.6", commit: "pending publication", want: "unexpected TypeScript verifier publication contract"},
+		{name: "wrong workflow", version: "0.6.6", repository: "pipelab-org/pipelock", workflow: ".github/workflows/other.yaml", ref: "verifier-v0.6.6", commit: "pending publication", want: "unexpected TypeScript verifier publication contract"},
+		{name: "wrong environment", version: "0.6.6", repository: "pipelab-org/pipelock", environment: "other", ref: "verifier-v0.6.6", commit: "pending publication", want: "unexpected TypeScript verifier publication contract"},
+		{name: "wrong ref", version: "0.6.6", repository: "pipelab-org/pipelock", ref: "main", commit: "pending publication", want: "verifier source ref does not match inventory version"},
+		{name: "unrecognized historical version", version: "0.5.0", repository: "luckyPipewrench/pipelock", ref: "verifier-v0.5.0", commit: strings.Repeat("a", 40), want: "unrecognized historical verifier publication version"},
+	}
+	// These are the peeled verifier-v<version> tags published before the
+	// repository transfer. Each exception must bind both its owner and commit.
+	for _, historical := range []struct{ version, commit string }{
+		{"0.2.0", "aec4376ecef307496fafcdf2a59cd628c089d61f"},
+		{"0.3.0", "a2bc6cb18d728841b0edd7f714aca67d234f2e52"},
+		{"0.3.1", "d794fb901796702dea0e7a4a62b36756f52efbc0"},
+		{"0.4.0", "6f3105b994249853908ec896bfb8513e9ca940c2"},
+		{"0.4.1", "21643163a71c6e43d8b914528dcf45e69b1ffb9e"},
+	} {
+		for _, variation := range []struct{ name, repository, commit, want string }{
+			{"published", "luckyPipewrench/pipelock", historical.commit, ""},
+			{"changed commit", "luckyPipewrench/pipelock", strings.Repeat("a", 40), "historical verifier source commit mismatch"},
+			{"changed owner", "pipelab-org/pipelock", historical.commit, "unexpected TypeScript verifier publication contract"},
+		} {
+			tests = append(tests, struct {
+				name, version, repository, workflow, environment, ref, commit, want string
+			}{
+				name: historical.version + " " + variation.name, version: historical.version,
+				repository: variation.repository, ref: "verifier-v" + historical.version,
+				commit: variation.commit, want: variation.want,
+			})
+		}
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := stageReleaseVerifierInventoryTest(t)
+			bumpStagedVerifierPackages(t, root, tt.version, true)
+			rewriteStagedVerifierInventory(t, root, func(inventory map[string]interface{}) {
+				for _, entry := range inventory["verifiers"].([]interface{}) {
+					record := entry.(map[string]interface{})
+					if record["language"] != "TypeScript" && record["language"] != "Rust" {
+						continue
+					}
+					publisher := record["publisher"].(map[string]interface{})
+					publisher["repository"] = tt.repository
+					publisher["source_ref"] = tt.ref
+					publisher["source_commit"] = tt.commit
+					if tt.workflow != "" {
+						publisher["workflow"] = tt.workflow
+					}
+					if tt.environment != "" {
+						publisher["environment"] = tt.environment
+					}
+				}
+			})
+			output, err := runReleaseVerifierInventory(t, root)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("publisher binding rejected: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(output, tt.want) {
+				t.Fatalf("error = %v, output = %q, want %q", err, output, tt.want)
+			}
+		})
+	}
+}
+
+func TestReleaseVerifierNPMAttestationToolchain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires bash")
+	}
+	for _, tt := range []struct {
+		version string
+		exit    int
+		want    string
+	}{
+		{version: "10.99.0", want: "need npm >= 11.12.0"},
+		{version: "11.11.99", want: "need npm >= 11.12.0"},
+		{version: "11.12.0"},
+		{version: "11.12.1"},
+		{version: "11.19.1"},
+		{version: "12.0.0"},
+		{version: "", want: "cannot parse npm version"},
+		{version: "11.12", want: "cannot parse npm version"},
+		{version: "11.12.0-beta.1", want: "cannot parse npm version"},
+		{version: "11.12.0\n12.0.0", want: "cannot parse npm version"},
+		{version: "11.12.0", exit: 1, want: "could not read npm version"},
+	} {
+		t.Run(tt.version+"/"+strconv.Itoa(tt.exit), func(t *testing.T) {
+			cmd := exec.CommandContext(t.Context(), "bash", "-c", `
+set -euo pipefail
+source ./release-verifier-install-gate-lib.sh
+npm() { printf '%s' "$TEST_NPM_VERSION"; return "$TEST_NPM_EXIT"; }
+require_npm_attestations
+`)
+			cmd.Env = append(os.Environ(), "TEST_NPM_VERSION="+tt.version, "TEST_NPM_EXIT="+strconv.Itoa(tt.exit))
+			output, err := cmd.CombinedOutput()
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("supported npm rejected: %v\n%s", err, output)
+				}
+			} else if err == nil || !strings.Contains(string(output), tt.want) {
+				t.Fatalf("error = %v, output = %q, want %q", err, output, tt.want)
+			}
+		})
+	}
+}
+
+func TestReleaseVerifierNPMProvenanceBindings(t *testing.T) {
+	for _, repository := range []string{"luckyPipewrench/pipelock", "pipelab-org/pipelock"} {
+		t.Run(repository, func(t *testing.T) {
+			version := "0.6.6"
+			commit := strings.Repeat("a", 40)
+			if repository == "luckyPipewrench/pipelock" {
+				version = "0.6.5"
+				commit = "05179c855c4be2e9f06c305041a2be6b79626afa"
+			}
+			ref := "verifier-v" + version
+			digest := bytes.Repeat([]byte{0x42}, 64)
+			integrity := "sha512-" + base64.StdEncoding.EncodeToString(digest)
+			tests := []struct {
+				name, field, value, want string
+			}{
+				{name: "matching provenance"},
+				{name: "unverified endpoint response", field: "report", value: "raw", want: "expected one verified npm package"},
+				{name: "missing verified package", field: "report", value: "missing", want: "expected one verified npm package"},
+				{name: "duplicate verified package", field: "report", value: "duplicate", want: "expected one verified npm package"},
+				{name: "wrong verified name", field: "verified-name", value: "@vendor/verifier-ts", want: "expected one verified npm package"},
+				{name: "wrong verified version", field: "verified-version", value: "0.1.0", want: "expected one verified npm package"},
+				{name: "missing verified bundles", field: "report", value: "no-bundles", want: "expected one npm SLSA provenance statement"},
+				{name: "invalid audit", field: "report", value: "invalid", want: "npm signature audit has invalid or missing signatures"},
+				{name: "missing audit signatures", field: "report", value: "missing-signatures", want: "npm signature audit has invalid or missing signatures"},
+				{name: "wrong owner", field: "repository", value: "https://github.com/vendor/pipelock", want: "npm provenance workflow mismatch"},
+				{name: "other official owner", field: "repository", value: "https://github.com/luckyPipewrench/pipelock", want: "npm provenance workflow mismatch"},
+				{name: "wrong workflow", field: "path", value: ".github/workflows/other.yaml", want: "npm provenance workflow mismatch"},
+				{name: "wrong ref", field: "ref", value: "refs/heads/main", want: "npm provenance workflow mismatch"},
+				{name: "wrong commit", field: "commit", value: strings.Repeat("b", 40), want: "npm provenance does not bind the pinned source commit"},
+				{name: "wrong source repository", field: "uri", value: "git+https://github.com/vendor/pipelock@refs/tags/" + ref, want: "npm provenance does not bind the pinned source commit"},
+				{name: "wrong source ref", field: "uri", value: "git+https://github.com/" + repository + "@refs/heads/main", want: "npm provenance does not bind the pinned source commit"},
+				{name: "wrong package digest", field: "digest", value: strings.Repeat("0", 128), want: "npm provenance subject does not bind the pinned package digest"},
+				{name: "wrong package version", field: "name", value: "pkg:npm/%40pipelock/verifier-ts@0.1.0", want: "npm provenance subject does not bind the pinned package digest"},
+			}
+			for _, tt := range tests {
+				t.Run(tt.name, func(t *testing.T) {
+					root := stageReleaseVerifierInventoryTest(t)
+					workflow := map[string]interface{}{"repository": "https://github.com/" + repository, "ref": "refs/tags/" + ref, "path": ".github/workflows/publish-verifiers.yaml"}
+					dependency := map[string]interface{}{"uri": "git+https://github.com/" + repository + "@refs/tags/" + ref, "digest": map[string]string{"gitCommit": commit}}
+					subject := map[string]interface{}{"name": "pkg:npm/%40pipelock/verifier-ts@" + version, "digest": map[string]string{"sha512": hex.EncodeToString(digest)}}
+					switch tt.field {
+					case "repository", "path", "ref":
+						value := tt.value
+						if tt.name == "other official owner" && repository == "luckyPipewrench/pipelock" {
+							value = "https://github.com/pipelab-org/pipelock"
+						}
+						workflow[tt.field] = value
+					case "commit":
+						dependency["digest"] = map[string]string{"gitCommit": tt.value}
+					case "uri":
+						dependency["uri"] = tt.value
+					case "digest":
+						subject["digest"] = map[string]string{"sha512": tt.value}
+					case "name":
+						subject["name"] = tt.value
+					}
+					statement := map[string]interface{}{
+						"predicateType": "https://slsa.dev/provenance/v1", "subject": []interface{}{subject},
+						"predicate": map[string]interface{}{"buildDefinition": map[string]interface{}{
+							"externalParameters": map[string]interface{}{"workflow": workflow}, "resolvedDependencies": []interface{}{dependency},
+						}},
+					}
+					payload, err := json.Marshal(statement)
+					if err != nil {
+						t.Fatal(err)
+					}
+					bundles := []interface{}{map[string]interface{}{
+						"bundle": map[string]interface{}{"dsseEnvelope": map[string]string{"payload": base64.StdEncoding.EncodeToString(payload)}},
+					}}
+					verified := map[string]interface{}{"name": "@pipelock/verifier-ts", "version": version, "attestationBundles": bundles}
+					report := map[string]interface{}{"invalid": []interface{}{}, "missing": []interface{}{}, "verified": []interface{}{verified}}
+					switch tt.field {
+					case "verified-name":
+						verified["name"] = tt.value
+					case "verified-version":
+						verified["version"] = tt.value
+					case "report":
+						switch tt.value {
+						case "raw":
+							report = map[string]interface{}{"attestations": bundles}
+						case "missing":
+							delete(report, "verified")
+						case "duplicate":
+							report["verified"] = []interface{}{verified, verified}
+						case "no-bundles":
+							delete(verified, "attestationBundles")
+						case "invalid":
+							report["invalid"] = []interface{}{map[string]string{"name": "@pipelock/verifier-ts"}}
+						case "missing-signatures":
+							report["missing"] = []interface{}{map[string]string{"name": "@pipelock/verifier-ts"}}
+						}
+					}
+					raw, err := json.Marshal(report)
+					if err != nil {
+						t.Fatal(err)
+					}
+					path := filepath.Join(root, "attestations.json")
+					if err := os.WriteFile(path, raw, 0o600); err != nil {
+						t.Fatal(err)
+					}
+					command := exec.CommandContext(t.Context(), "bash", "-c", `source "$1"; shift; verify_npm_provenance "$@"`, "test", // #nosec G204 -- fixed shell program; fixture values are separate positional arguments.
+						filepath.Join(root, "scripts", "release-verifier-install-gate-lib.sh"), version, integrity, ref, commit, repository, path)
+					output, err := command.CombinedOutput()
+					if tt.want == "" {
+						if err != nil {
+							t.Fatalf("provenance rejected: %v\n%s", err, output)
+						}
+					} else if err == nil || !strings.Contains(string(output), tt.want) {
+						t.Fatalf("error = %v, output = %q, want %q", err, output, tt.want)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestReleaseVerifierTaggedRepositoryBinding(t *testing.T) {
+	for _, repository := range []string{"luckyPipewrench/pipelock", "pipelab-org/pipelock"} {
+		t.Run(repository, func(t *testing.T) {
+			root := stageReleaseVerifierInventoryTest(t)
+			if repository != "pipelab-org/pipelock" {
+				replaceOnce(t, filepath.Join(root, "sdk", "verifiers", "ts", "package.json"), "git+https://github.com/pipelab-org/pipelock.git", "git+https://github.com/"+repository+".git")
+				replaceOnce(t, filepath.Join(root, "sdk", "verifiers", "rust", "Cargo.toml"), "https://github.com/pipelab-org/pipelock", "https://github.com/"+repository)
+				commitReleaseVerifierFixture(t, root, "sdk/verifiers/ts/package.json", "sdk/verifiers/rust/Cargo.toml")
+			}
+			commit := releaseVerifierFixtureHEAD(t, root)
+			for _, expected := range []string{repository, "vendor/pipelock"} {
+				command := exec.CommandContext(t.Context(), "bash", "-c", `source "$1"; shift; verify_tagged_verifier_repository "$@"`, "test", // #nosec G204 -- fixed shell program; paths and identities come from the test fixture.
+					filepath.Join(root, "scripts", "release-verifier-install-gate-lib.sh"), root, commit, expected)
+				output, err := command.CombinedOutput()
+				if expected == repository {
+					if err != nil {
+						t.Fatalf("tagged repository rejected: %v\n%s", err, output)
+					}
+				} else if err == nil || !strings.Contains(string(output), "tagged verifier package repository does not match publisher") {
+					t.Fatalf("mismatched repository error = %v, output = %q", err, output)
+				}
+			}
+		})
+	}
+}
+
+func TestReleaseVerifierTaggedRepositoryChecksEachManifest(t *testing.T) {
+	for _, manifest := range []string{"sdk/verifiers/ts/package.json", "sdk/verifiers/rust/Cargo.toml"} {
+		t.Run(manifest, func(t *testing.T) {
+			root := stageReleaseVerifierInventoryTest(t)
+			replaceOnce(t, filepath.Join(root, filepath.FromSlash(manifest)), "github.com/pipelab-org/pipelock", "github.com/vendor/pipelock")
+			commitReleaseVerifierFixture(t, root, manifest)
+			command := exec.CommandContext(t.Context(), "bash", "-c", `source "$1"; shift; verify_tagged_verifier_repository "$@"`, "test", // #nosec G204 -- fixed shell program; paths and identities come from the test fixture.
+				filepath.Join(root, "scripts", "release-verifier-install-gate-lib.sh"), root, releaseVerifierFixtureHEAD(t, root), "pipelab-org/pipelock")
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "tagged verifier package repository does not match publisher") {
+				t.Fatalf("manifest repository mismatch error = %v, output = %q", err, output)
+			}
+		})
+	}
 }

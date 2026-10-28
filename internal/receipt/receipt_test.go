@@ -301,7 +301,7 @@ func TestVerifyV1BytesWithKey_ExactBytesMutationCorpus(t *testing.T) {
 			name:       "truncated",
 			raw:        valid[:len(valid)-1],
 			keyHex:     expectedKey,
-			wantErrSub: "EOF",
+			wantErrSub: "EOF|unexpected end of JSON input",
 		},
 		{
 			name:       "null detail",
@@ -437,7 +437,7 @@ func TestVerifyV1BytesWithKey_ExactBytesMutationCorpus(t *testing.T) {
 			if err == nil {
 				t.Fatal("VerifyV1BytesWithKey error = nil, want rejection")
 			}
-			if !strings.Contains(err.Error(), tc.wantErrSub) {
+			if !errTextContainsAny(err, tc.wantErrSub) {
 				t.Fatalf("VerifyV1BytesWithKey error = %q, want substring %q", err, tc.wantErrSub)
 			}
 		})
@@ -737,6 +737,45 @@ func TestUnmarshalRejectsDuplicateKeys(t *testing.T) {
 	}
 }
 
+func TestUnmarshalRejectsConflictingFieldAlias(t *testing.T) {
+	for name, raw := range map[string]string{
+		"malformed":        `{`,
+		"invalid encoding": `{"version":"` + string([]byte{0xff}) + `"}`,
+		"exact duplicate":  `{"version":1,"version":2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := rejectReceiptAliases([]byte(raw)); err == nil {
+				t.Fatal("invalid receipt alias input accepted")
+			}
+		})
+	}
+	if err := rejectReceiptAliases([]byte("null")); err != nil {
+		t.Fatalf("null must reach the schema decoder: %v", err)
+	}
+	pub, priv := generateTestKey(t)
+	signed := signValidReceipt(t, priv)
+	raw, err := json.Marshal(signed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := strings.Replace(string(raw), `"action_record":{`, `"action_record":{"detected_patterns":[],`, 1)
+	for name, modified := range map[string][]byte{
+		"receipt version":       append([]byte(`{"VERSION":999,`), raw[1:]...),
+		"action verdict":        []byte(strings.Replace(string(raw), `"verdict":`, `"VERDICT":"block","verdict":`, 1)),
+		"legacy action verdict": []byte(strings.Replace(legacy, `"verdict":`, `"VERDICT":"block","verdict":`, 1)),
+	} {
+		t.Run(name, func(t *testing.T) {
+			parsed, err := Unmarshal(modified)
+			if err == nil {
+				if verifyErr := VerifyWithKey(parsed, hex.EncodeToString(pub)); verifyErr == nil {
+					t.Fatal("modified receipt with conflicting field alias verified")
+				}
+				t.Fatalf("field alias accepted: %+v", parsed)
+			}
+		})
+	}
+}
+
 // flipHexByte flips the first hex character in a hex string to produce
 // a different but still valid hex string.
 func flipHexByte(h string) string {
@@ -750,4 +789,17 @@ func flipHexByte(h string) string {
 		b[0] = 'f'
 	}
 	return string(b)
+}
+
+// errTextContainsAny reports whether err's text contains any "|"-separated
+// alternative in want. Go 1.27 reports truncated JSON as "unexpected end of
+// JSON input" where earlier releases said "EOF", so a truncation case lists
+// both spellings rather than pinning one toolchain's wording.
+func errTextContainsAny(err error, want string) bool {
+	for _, alt := range strings.Split(want, "|") {
+		if strings.Contains(err.Error(), alt) {
+			return true
+		}
+	}
+	return false
 }

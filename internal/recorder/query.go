@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/evidencename"
@@ -50,6 +51,14 @@ type QueryResult struct {
 }
 
 // QuerySession reads evidence files for a session and applies filters.
+//
+// QuerySession, QuerySessionResolved and the ListSessions family are bounded
+// DISPLAY readers for the dashboard, query and list commands. They enforce a
+// directory entry ceiling counted before the session is selected, a byte and
+// entry budget per shard, and report truncation instead of reading on. Those
+// budgets would refuse or truncate complete valid evidence, so write,
+// lifecycle, verification and anchoring code must use WalkSessionHistory
+// instead; a boundary test enforces that.
 func QuerySession(dir, sessionID string, filter *QueryFilter) (*QueryResult, error) {
 	location, err := ResolveEvidenceLocation(dir, "")
 	if err != nil {
@@ -60,6 +69,21 @@ func QuerySession(dir, sessionID string, filter *QueryFilter) (*QueryResult, err
 
 // QuerySessionResolved reads one already-resolved evidence location.
 func QuerySessionResolved(location EvidenceLocation, sessionID string, filter *QueryFilter) (*QueryResult, error) {
+	var entries []Entry
+	result, err := walkSessionResolved(location, sessionID, filter, func(e Entry) error {
+		if matchesFilter(e, filter) {
+			entries = append(entries, e)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	result.Entries = entries
+	return result, nil
+}
+
+func walkSessionResolved(location EvidenceLocation, sessionID string, filter *QueryFilter, consume func(Entry) error) (*QueryResult, error) {
 	dirEntries, dirTruncated, err := readEvidenceLocationDirectoryEntries(location, maxDirectoryEntries(filter))
 	if err != nil {
 		return nil, fmt.Errorf("reading evidence directory: %w", err)
@@ -86,6 +110,9 @@ func QuerySessionResolved(location EvidenceLocation, sessionID string, filter *Q
 		}
 		return filepath.Base(files[i]) < filepath.Base(files[j])
 	})
+	if err := evidencename.CheckNoDuplicateSeqStart(files); err != nil {
+		return nil, err
+	}
 
 	result := &QueryResult{
 		TotalFiles: len(files),
@@ -112,24 +139,28 @@ func QuerySessionResolved(location EvidenceLocation, sessionID string, filter *Q
 			maxBytes = remaining
 		}
 
-		entries, truncated, bytesRead, err := readEntriesAtEvidenceLocation(location, f, entryReadLimits{MaxEntries: maxEntries, MaxBytes: maxBytes})
+		// A shard holding another session's entry is refused whole, but only
+		// after the shard read itself succeeded, so a read error later in the
+		// shard still wins, as it did when the shard was read before checking.
+		var sessionErr error
+		count, truncated, bytesRead, err := walkBoundedEntriesAtEvidenceLocation(location, f, entryReadLimits{MaxEntries: maxEntries, MaxBytes: maxBytes}, func(e Entry) error {
+			if sessionErr == nil && e.SessionID != sessionID {
+				sessionErr = entrySessionError(e, sessionID)
+			}
+			return consume(e)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("reading %s: %w", filepath.Base(f), err)
 		}
 		result.FilesRead++
-		result.EntriesRead += len(entries)
+		result.EntriesRead += count
 		result.BytesRead += bytesRead
 		if truncated {
 			result.Truncated = true
 		}
 
-		for _, e := range entries {
-			if e.SessionID != sessionID {
-				return nil, fmt.Errorf("reading %s: entry seq %d session_id %q does not match requested session %q", filepath.Base(f), e.Sequence, e.SessionID, sessionID)
-			}
-			if matchesFilter(e, filter) {
-				result.Entries = append(result.Entries, e)
-			}
+		if sessionErr != nil {
+			return nil, fmt.Errorf("reading %s: %w", filepath.Base(f), sessionErr)
 		}
 
 		if result.Truncated {
@@ -252,6 +283,51 @@ func ParseEvidenceFilename(name string) (sessionID string, seqStart uint64, ok b
 	return evidencename.Parse(name)
 }
 
+// Names of the files the recorder and the receipt chain keep inside an
+// evidence directory besides the JSONL shards themselves. The chain-link and
+// anchor-state names are owned by the receipt and anchor packages, which this
+// package cannot import; parity tests in those packages fail if their names
+// stop being recognized here.
+const (
+	// RunWriterLockPrefix and RunWriterLockSuffix frame a run's lifetime lock.
+	RunWriterLockPrefix = "writer-"
+	RunWriterLockSuffix = ".lock"
+
+	chainLinkPrefix     = "chain-link-"
+	chainLinkSuffix     = ".json"
+	anchorStateMarker   = "anchor-state.json"
+	rawEscrowSuffix     = ".raw.enc"
+	rawEscrowNamePrefix = "evidence-"
+	rawEscrowNameMarker = "-raw-"
+)
+
+// IsRecorderOwnedFile reports whether name is a file the recorder or the
+// receipt chain writes into an evidence directory: a JSONL shard, a raw-escrow
+// sidecar, a restart continuity link, a run's lifetime writer lock, or the
+// anchor-state marker.
+//
+// A command that writes its own output into or beside an evidence directory
+// must refuse every one of these, because an atomic replace destroys evidence
+// another process wrote. It exists as ONE definition so the next file the
+// recorder learns to write is protected by adding it here, rather than by
+// finding every guard that listed the old names.
+func IsRecorderOwnedFile(name string) bool {
+	if _, _, ok := ParseEvidenceFilename(name); ok {
+		return true
+	}
+	switch {
+	case strings.HasPrefix(name, rawEscrowNamePrefix) && strings.Contains(name, rawEscrowNameMarker) && strings.HasSuffix(name, rawEscrowSuffix):
+		return true
+	case strings.HasPrefix(name, chainLinkPrefix) && strings.HasSuffix(name, chainLinkSuffix):
+		return true
+	case strings.HasPrefix(name, RunWriterLockPrefix) && strings.HasSuffix(name, RunWriterLockSuffix):
+		return true
+	case name == anchorStateMarker:
+		return true
+	}
+	return false
+}
+
 // extractSeqStart parses the numeric seqStart from an evidence filename.
 // Returns 0 if the filename cannot be parsed.
 func extractSeqStart(path string) uint64 {
@@ -289,4 +365,26 @@ func matchesFilter(e Entry, f *QueryFilter) bool {
 		return false
 	}
 	return true
+}
+
+// CheckEntrySessions refuses entries that are not all of session. A file
+// named for one session that holds another session's entries is not that
+// session's evidence, whatever its hash chain says.
+func CheckEntrySessions(entries []Entry, session string) error {
+	for _, e := range entries {
+		if e.SessionID != session {
+			return entrySessionError(e, session)
+		}
+	}
+	return nil
+}
+
+// EntrySessionError is the refusal CheckEntrySessions returns for the first
+// entry of another session, for callers that check entries one at a time.
+func EntrySessionError(e Entry, session string) error {
+	return entrySessionError(e, session)
+}
+
+func entrySessionError(e Entry, session string) error {
+	return fmt.Errorf("%w: entry seq %d session_id %q does not match requested session %q", ErrEvidenceRefused, e.Sequence, e.SessionID, session)
 }

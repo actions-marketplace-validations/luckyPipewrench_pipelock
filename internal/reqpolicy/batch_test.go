@@ -311,3 +311,25 @@ func TestUninspectableBatch(t *testing.T) {
 		t.Error("uninspectable batch off-route should not match")
 	}
 }
+
+func TestKeyAliasesBatch(t *testing.T) {
+	m := batchMatcher(t, deleteRule())
+	for _, raw := range []string{
+		`{"requests":[],"Requests":[{"method":"POST","url":"/sendMail"}]}`,
+		`{"Requests":[]}`,
+		`{"requests":[{"method":"GET","url":"/me","Url":"/sendMail"}]}`,
+		`{"requests":[{"method":"GET","Method":"POST","url":"/me"}]}`,
+	} {
+		if d, ok := m.EvaluateBatch(batchMeta(), []byte(raw)); ok || d.Action != config.ActionBlock {
+			t.Errorf("accepted alias: %s: %+v parsed=%v", raw, d, ok)
+		}
+	}
+}
+
+func TestBatchFreeFormKeysStayCaseSensitive(t *testing.T) {
+	m := batchMatcher(t, deleteRule())
+	raw := []byte(`{"requests":[{"method":"GET","url":"/read","custom":1,"CUSTOM":2,"body":{"variables":{"id":1,"ID":2}}}],"custom":1,"CUSTOM":2}`)
+	if d, ok := m.EvaluateBatch(batchMeta(), raw); !ok || d.Matched() {
+		t.Fatalf("free-form keys rejected: %+v parsed=%v", d, ok)
+	}
+}

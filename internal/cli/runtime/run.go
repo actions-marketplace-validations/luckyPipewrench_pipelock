@@ -53,7 +53,7 @@ func dlpWarnLogContext(wc scanner.DLPWarnContext) (audit.LogContext, error) {
 	switch wc.Transport {
 	case "connect":
 		return audit.NewConnectLogContext(wc.Target, wc.ClientIP, wc.RequestID, wc.Agent)
-	case "mcp_stdio", "mcp_http", "mcp_input", "mcp_http_listener", "mcp_ws":
+	case "mcp_stdio", "mcp_http", "mcp_http_upstream", "mcp_input", "mcp_http_listener", "mcp_ws":
 		method := wc.Method
 		if method == "" {
 			method = mcpAuditMethod
@@ -151,6 +151,11 @@ Examples:
 			}
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if mcpServerName != "" {
+				if err := config.ValidateMCPServerName(mcpServerName, "--mcp-server-name"); err != nil {
+					return err
+				}
+			}
 			opts := ServerOpts{
 				ConfigFile:              configFile,
 				Mode:                    mode,
@@ -175,11 +180,6 @@ Examples:
 
 			opts.AgentArgs = agentArgsAfterDash(args, cmd.ArgsLenAtDash())
 
-			srv, err := NewServer(opts)
-			if err != nil {
-				return err
-			}
-
 			// Context with signal handling for graceful shutdown. Uses
 			// cmd.Context() as parent so tests can inject a cancellable
 			// context.
@@ -189,6 +189,11 @@ Examples:
 				syscall.SIGTERM,
 			)
 			defer cancel()
+			opts.StartupVerification.Context = ctx
+			srv, err := NewServer(opts)
+			if err != nil {
+				return err
+			}
 
 			return srv.Start(ctx)
 		},
@@ -199,7 +204,7 @@ Examples:
 	cmd.Flags().StringVarP(&listen, "listen", "l", "", "listen address (default 127.0.0.1:8888)")
 	cmd.Flags().StringVar(&mcpListen, "mcp-listen", "", "MCP HTTP listener address (e.g. 0.0.0.0:8889)")
 	cmd.Flags().StringVar(&mcpUpstream, "mcp-upstream", "", "upstream MCP server URL for HTTP listener")
-	cmd.Flags().StringVar(&mcpServerName, "mcp-server-name", "", "stable identity for the MCP listener; enables per-server response trust and suppression via target 'mcp://<name>/response'")
+	cmd.Flags().StringVar(&mcpServerName, "mcp-server-name", "", "operator label for an unregistered MCP listener upstream; enables per-server response trust and suppression via target 'mcp://<name>/response'. An upstream registered in mcp_identities supplies its own verified name; an explicit name equal to a registered identity must match it")
 	cmd.Flags().StringVar(&mcpAuthTokenFile, "mcp-auth-token-file", "", "secure file containing the MCP listener bearer token")
 	cmd.Flags().StringArrayVar(&mcpAllowedOrigins, "mcp-allowed-origin", nil, "browser Origin allowed to call the MCP listener (repeatable, exact serialized origin)")
 	cmd.Flags().BoolVar(&mcpAllowUnauthenticated, "mcp-allow-unauthenticated", false, "explicitly allow a non-loopback MCP listener without authentication (network-policy-isolated deployments only)")
@@ -424,6 +429,11 @@ func RedactEndpoint(raw string) string {
 	if err != nil {
 		return "<invalid>"
 	}
+	if u.Opaque != "" {
+		// An opaque URL ("http:user:pass@host") keeps everything after the
+		// scheme in Opaque, credentials included, so none of it is shown.
+		return u.Scheme + ":<redacted>"
+	}
 	u.User = nil
 	u.RawQuery = ""
 	u.Fragment = ""
@@ -486,7 +496,7 @@ func ReloadPanicHandler(r any, sentryClient *plsentry.Client, logger *audit.Logg
 	if r == nil {
 		return
 	}
-	reloadErr := fmt.Errorf("scanner construction panic during config reload: %v", r)
+	reloadErr := fmt.Errorf("panic during config reload: %v", r)
 	if sentryClient != nil {
 		sentryClient.CaptureError(reloadErr)
 	}

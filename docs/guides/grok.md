@@ -4,6 +4,8 @@
 
 This guide does **not** add a `pipelock grok install` command. There is no automatic config rewriter for Grok. Forward-proxy env vars and manual MCP wrapping are both in scope; do not treat this page as env-only or as “MCP unsupported.”
 
+Run `pipelock discover` to inventory MCP entries in `~/.grok/config.toml` and see which configured commands are wrapped. With `--home`, it reads `.grok/config.toml` under the selected home directory. Use `--project /absolute/project/path` to read applicable `.grok/config.toml` files from the Git root to that working directory; the nearest same-name server replaces the lower definition entirely. Without `--home`, discovery includes the current directory. Project views carry `project_path`; the user-file view remains listed for launches elsewhere. Wrapped entries are **unconfirmed**, because plugins, compatibility sources, environment expansion, managed settings, and launch overrides are not resolved. See [discovery coverage](../cli/discover.md). The `via sops exec-env` sub-count includes only launchers whose literal inner command is verified as this Pipelock executable running `mcp proxy`. Those entries remain Unprotected because discovery cannot verify the outer `sops` launcher.
+
 ## Why Grok Needs an Agent Firewall
 
 | Workflow | What Grok accesses | What could go wrong |
@@ -33,8 +35,8 @@ Grok's enterprise docs load root certificates from the **OS trust store** (rustl
 Install Grok **before** exporting proxy env vars. With `pipelock run` already up, `curl`/`npm` install traffic would otherwise be forced through the proxy and can fail (or add install hosts to `NO_PROXY` / allow them in policy).
 
 ```bash
-# 1. Install pipelock (requires Go 1.25+)
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
@@ -44,16 +46,16 @@ curl -fsSL https://x.ai/cli/install.sh | bash
 
 # 3. Generate a config and start the forward proxy
 pipelock generate config --preset balanced -o pipelock.yaml
-# balanced presets ship forward_proxy.idle_timeout_seconds: 120; Grok SSE
-# idle defaults to 600s and xAI recommends proxy idle timeouts ≥ 10 minutes.
-# Raise it before starting the proxy (edit pipelock.yaml):
+# The balanced preset disables the forward proxy. Before starting Pipelock,
+# edit pipelock.yaml to enable it and allow long Grok SSE responses:
 #   forward_proxy:
+#     enabled: true
 #     idle_timeout_seconds: 600
-pipelock run --config pipelock.yaml &
+pipelock run --config pipelock.yaml --listen 127.0.0.1:18080 &
 
 # 4. Point Grok Build at Pipelock (CLI honors these env vars)
-export HTTPS_PROXY=http://127.0.0.1:8888
-export HTTP_PROXY=http://127.0.0.1:8888
+export HTTPS_PROXY=http://127.0.0.1:18080
+export HTTP_PROXY=http://127.0.0.1:18080
 export NO_PROXY=127.0.0.1,localhost
 
 # 5. Run Grok

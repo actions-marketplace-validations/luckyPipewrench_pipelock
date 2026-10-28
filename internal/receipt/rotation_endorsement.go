@@ -14,6 +14,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 
@@ -156,6 +157,7 @@ func rotationEndorsementDigest(e RotationEndorsement) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal rotation endorsement: %w", err)
 	}
+	canonical = jsonscan.NormalizeReplacementEscapes(canonical)
 	sum := sha256.Sum256(append([]byte(rotationEndorsementDomain), canonical...))
 	return sum[:], nil
 }
@@ -165,6 +167,9 @@ func rotationEndorsementDigest(e RotationEndorsement) ([]byte, error) {
 // security claim covered by the retiring key's signature.
 func UnmarshalRotationEndorsement(data []byte) (RotationEndorsement, error) {
 	if err := jsonscan.RejectDuplicateKeys(data); err != nil {
+		return RotationEndorsement{}, fmt.Errorf("unmarshal rotation endorsement: %w", err)
+	}
+	if err := rejectStructAliases(data, reflect.TypeFor[RotationEndorsement]()); err != nil {
 		return RotationEndorsement{}, fmt.Errorf("unmarshal rotation endorsement: %w", err)
 	}
 	var endorsement RotationEndorsement
@@ -183,9 +188,15 @@ func UnmarshalRotationEndorsement(data []byte) (RotationEndorsement, error) {
 }
 
 // LoadRotationEndorsementFile reads and strictly verifies one bounded
-// endorsement file for offline chain verification.
+// endorsement file for offline chain verification. The path is read as the
+// operating system opens it: symlinks are resolved before any lexical
+// cleaning, as every receipt verifier resolves it.
 func LoadRotationEndorsementFile(path string) (RotationEndorsement, error) {
-	file, err := os.Open(filepath.Clean(path)) // #nosec G304 -- explicit operator-supplied verification input.
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return RotationEndorsement{}, fmt.Errorf("read rotation endorsement: %w", err)
+	}
+	file, err := os.Open(filepath.Clean(resolved)) // #nosec G304 -- explicit operator-supplied verification input.
 	if err != nil {
 		return RotationEndorsement{}, fmt.Errorf("read rotation endorsement: %w", err)
 	}

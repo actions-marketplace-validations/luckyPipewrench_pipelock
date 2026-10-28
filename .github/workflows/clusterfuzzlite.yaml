@@ -15,10 +15,14 @@ on:
       - '.github/workflows/clusterfuzzlite.yaml'
 permissions:
   contents: read
+  actions: read
 jobs:
   PR:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Keep the 300s fuzz budget and allow time for per-target corpus lookup,
+    # image pulls, and builds. Restore the previous 30-minute job limit so
+    # artifact lookup overhead doesn't cancel fuzzing before every target runs.
+    timeout-minutes: 30
     concurrency:
       group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -31,11 +35,12 @@ jobs:
       - name: Build Fuzzers
         uses: google/clusterfuzzlite/actions/build_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
           language: go
       - name: Run Fuzzers
         uses: google/clusterfuzzlite/actions/run_fuzzers@884713a6c30a92e5e8544c39945cd7cb630abcd1 # v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           language: go
-          fuzz-seconds: 600
+          fuzz-seconds: 300
           mode: 'code-change'

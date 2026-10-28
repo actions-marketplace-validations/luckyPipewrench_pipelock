@@ -4,29 +4,38 @@
 package scanner
 
 import (
-	"sort"
-	"strings"
+	"regexp"
+	"regexp/syntax"
 )
 
-// responsePreFilter provides fast keyword-based pre-screening for response
-// pattern matching. Before running expensive regex against the full content,
-// it checks whether any literal keyword anchor from the pattern set appears
-// in the text. If no keywords are found, regex matching is skipped entirely.
+import "github.com/luckyPipewrench/pipelock/internal/config"
+
+// responsePreFilter applies necessary literal and distance conditions plus
+// bounded negative proofs before matching response patterns on the full text.
 //
-// This sits ahead of passes 1+2 (the primary bottleneck) and the opt-space
-// pass. Content-based, not position-based: no blind spots.
+// This sits ahead of passes 1+2 and the opt-space pass. Literal presence and
+// regex-derived distance conditions are necessary conditions, never limits on
+// which input positions the original matcher can inspect.
 //
 // Conservative: false positives (running regex unnecessarily) are fine.
-// False negatives (skipping regex when keywords exist) are not.
+// False negatives (skipping a real match) are not.
 type responsePreFilter struct {
-	// keywords maps lowercased keyword anchors to the pattern indices
-	// in the parent Scanner.responsePatterns slice that share that keyword.
-	keywords map[string][]int
+	gates           []*responseGate
+	proofs          []*responseSuffixProof
+	prefixes        []*responseSuffixProof
+	companionProofs [][]*responseSuffixProof
 
-	// alwaysRun holds indices of patterns with no extractable keyword.
-	// These are always evaluated regardless of content. Typically cheap
-	// patterns like the Pliny divider (short literal, fast regex failure).
+	// alwaysRun holds indices of patterns with no extractable keyword gate.
+	// A separate negative proof can still exclude these patterns.
 	alwaysRun []int
+}
+
+// A view is owned by one sequential response scan and keyed by exact input
+// bytes in its memo. It shares the gate's derived text across pattern groups.
+type responsePreFilterView struct {
+	folded, distance string
+	literals         responseLiteralMemo
+	ready            bool
 }
 
 // newResponsePreFilter builds a pre-filter from response patterns.
@@ -34,56 +43,103 @@ type responsePreFilter struct {
 // and leading alternation groups.
 func newResponsePreFilter(patterns []*compiledPattern) *responsePreFilter {
 	pf := &responsePreFilter{
-		keywords: make(map[string][]int),
+		gates:           make([]*responseGate, len(patterns)),
+		proofs:          make([]*responseSuffixProof, len(patterns)),
+		prefixes:        make([]*responseSuffixProof, len(patterns)),
+		companionProofs: make([][]*responseSuffixProof, len(patterns)),
 	}
 
 	for i, p := range patterns {
-		keywords := extractResponseKeywords(p.re.String())
-		if len(keywords) == 0 {
-			pf.alwaysRun = append(pf.alwaysRun, i)
-			continue
+		// Companion detectors need independent necessary conditions. A negative
+		// for the main expression alone must never skip the companion arms.
+		if p.name != externalDataTransferDirectivePatternName || p.re.String() != config.ExternalDataTransferDirectiveRegex {
+			tree, err := syntax.Parse(p.re.String(), syntax.Perl)
+			if err == nil {
+				pf.gates[i] = responseLiteralGate(tree)
+				pf.proofs[i] = newResponseSuffixProof(p.re)
+				if p.responseMemoRegexp != nil && p.responseMemoRegexp == p.re {
+					pf.prefixes[i] = newResponsePrefixProof(p.re)
+				}
+			}
+		} else if p.responseMemoRegexp != nil && p.responseMemoRegexp == p.re {
+			for _, re := range []*regexp.Regexp{p.re, externalTransferURLCandidateRE, externalTransferFileDirectiveRE} {
+				pf.companionProofs[i] = append(pf.companionProofs[i], newResponsePrefixProof(re))
+			}
 		}
-		for _, kw := range keywords {
-			lower := strings.ToLower(kw)
-			pf.keywords[lower] = append(pf.keywords[lower], i)
+		if pf.gates[i] == nil {
+			pf.alwaysRun = append(pf.alwaysRun, i)
 		}
 	}
 
 	return pf
 }
 
-// patternsToCheck returns the combined set of pattern indices that should
-// be evaluated: keyword-matched candidates plus alwaysRun patterns.
+// patternsToCheck returns pattern indices not excluded by gates or proofs.
 // Returns nil when no patterns need to run.
 func (pf *responsePreFilter) patternsToCheck(content string) []int {
-	lower := strings.ToLower(content)
-	var hits []int
-	seen := make(map[int]bool)
-	for kw, indices := range pf.keywords {
-		if strings.Contains(lower, kw) {
-			for _, idx := range indices {
-				if !seen[idx] {
-					seen[idx] = true
-					hits = append(hits, idx)
-				}
-			}
-		}
-	}
-	for _, idx := range pf.alwaysRun {
-		if !seen[idx] {
-			seen[idx] = true
-			hits = append(hits, idx)
-		}
-	}
-	sort.Ints(hits)
-	return hits
+	return pf.patternsToCheckWithMemo(content, nil)
 }
 
-// extractResponseKeywords extracts keyword anchors from a response pattern
-// regex. The shared syntax-tree extractor proves that every branch contains at
-// least one returned anchor; otherwise the pattern stays in alwaysRun.
-func extractResponseKeywords(regex string) []string {
-	return extractConservativeLiteralAnchors(regex, false)
+func (pf *responsePreFilter) patternsToCheckWithMemo(content string, cached *responsePreFilterView) []int {
+	if cached == nil {
+		cached = &responsePreFilterView{}
+	}
+	if !cached.ready {
+		cached.folded = responseSimpleFold(content)
+		cached.distance = responseDistanceText(cached.folded)
+		cached.ready = true
+	}
+	if cached.literals == nil && len(content) >= responseMemoMinBytes && len(content) <= responseMemoMaxBytes {
+		cached.literals = make(responseLiteralMemo)
+	}
+	folded, distanceText, literals := cached.folded, cached.distance, cached.literals
+	var view *responseFoldView
+	var forward *responseFoldView
+	hits := make([]int, 0, len(pf.gates))
+	for i, gate := range pf.gates {
+		if gate != nil && !gate.matchesWithMemo(content, folded, distanceText, literals) {
+			continue
+		}
+		if len(content) >= responseMemoMinBytes && len(content) <= responseMemoMaxBytes && i < len(pf.prefixes) && pf.prefixes[i] != nil {
+			if forward == nil {
+				forward = newResponseFoldView(content, folded)
+				forward.literals = literals
+			}
+			if pf.prefixes[i].provesEmpty(forward) {
+				continue
+			}
+		}
+		if len(content) >= responseMemoMinBytes && len(content) <= responseMemoMaxBytes && i < len(pf.companionProofs) && len(pf.companionProofs[i]) == 3 {
+			if forward == nil {
+				forward = newResponseFoldView(content, folded)
+				forward.literals = literals
+			}
+			allEmpty := true
+			for _, proof := range pf.companionProofs[i] {
+				if !proof.provesEmpty(forward) {
+					allEmpty = false
+					break
+				}
+			}
+			if allEmpty {
+				continue
+			}
+		}
+		// Small bodies already match cheaply. Bound the additional text and offset
+		// storage; every ineligible or inconclusive proof runs the ordinary matcher.
+		if len(content) >= responseMemoMinBytes && len(content) <= responseMemoMaxBytes && i < len(pf.proofs) && pf.proofs[i] != nil {
+			if view == nil {
+				// Folding is per rune and maps invalid bytes to U+FFFD, so the
+				// reversed fold equals the fold of the reversed text.
+				view = newResponseFoldView(reverseResponseText(content), reverseResponseText(folded))
+			}
+			if pf.proofs[i].provesEmpty(view) {
+				continue
+			}
+		}
+		hits = append(hits, i)
+	}
+	return hits
 }
 
 // hasEncodedRun checks whether content contains a contiguous run of

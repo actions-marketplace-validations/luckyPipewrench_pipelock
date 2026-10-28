@@ -1,4 +1,4 @@
-//go:build aix || (js && wasm) || (wasip1 && wasm)
+//go:build aix || (wasip1 && wasm)
 
 // Copyright 2026 Josh Waldrep
 // SPDX-License-Identifier: Apache-2.0
@@ -34,6 +34,10 @@ func validateEvidenceFileAccess() error {
 func lockEvidenceFileForWrite(_ *os.File) error {
 	return errEvidenceFileAccessUnsupported
 }
+
+func lockEvidenceAppend(_ *os.File) error { return errEvidenceFileAccessUnsupported }
+
+func unlockEvidenceAppend(_ *os.File) error { return errEvidenceFileAccessUnsupported }
 
 // unlockEvidenceFile rejects the unsupported lock lifecycle.
 func unlockEvidenceFile(_ *os.File) error {

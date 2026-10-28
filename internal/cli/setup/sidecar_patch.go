@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -29,6 +30,10 @@ const (
 	sidecarConfigVolume    = "pipelock-config"
 	sidecarConfigMount     = "/etc/pipelock"
 	sidecarConfigFile      = "pipelock.yaml"
+	proxyStateVolume       = "pipelock-state"
+	proxyStateHome         = "/var/lib/pipelock/state"
+	envXDGStateHome        = "XDG_STATE_HOME"
+	proxyRunAsUser         = 65534
 	sidecarMCPConfigVolume = "pipelock-mcp-config"
 	sidecarMCPConfigMount  = "/etc/pipelock/mcp"
 	sidecarMCPConfigFile   = "mcp.json"
@@ -55,6 +60,11 @@ const (
 	proxyMemoryRequest = "128Mi"
 	proxyCPULimit      = "500m"
 	proxyMemoryLimit   = "512Mi"
+
+	// proxyTerminationGracePeriodSeconds replaces Kubernetes' 30 s pod default:
+	// with receipts on, shutdown closes the receipt group, which can take
+	// minutes on a small CPU limit with a long history.
+	proxyTerminationGracePeriodSeconds = int64(cliutil.ServiceStopTimeout / time.Second)
 
 	managedTopologyAnnotation     = "pipelock.dev/topology"
 	managedProxyNameAnnotation    = "pipelock.dev/proxy-name"
@@ -600,8 +610,11 @@ func renderProxyDeployment(namespace, proxyName, image string, proxyLabels map[s
 					"labels": labelsToInterfaceMap(managedProxyResourceLabels(proxyLabels, "proxy")),
 				},
 				"spec": map[string]interface{}{
-					"automountServiceAccountToken": false,
+					"automountServiceAccountToken":  false,
+					"terminationGracePeriodSeconds": proxyTerminationGracePeriodSeconds,
 					"securityContext": map[string]interface{}{
+						"fsGroup":             proxyRunAsUser,
+						"fsGroupChangePolicy": "OnRootMismatch",
 						"seccompProfile": map[string]interface{}{
 							"type": "RuntimeDefault",
 						},
@@ -628,7 +641,11 @@ func renderProxyDeployment(namespace, proxyName, image string, proxyLabels map[s
 							"args":            args,
 							"imagePullPolicy": "IfNotPresent",
 							"ports":           ports,
+							"env": []interface{}{
+								map[string]interface{}{"name": envXDGStateHome, "value": proxyStateHome},
+							},
 							"volumeMounts": []interface{}{
+								map[string]interface{}{"name": proxyStateVolume, "mountPath": proxyStateHome},
 								map[string]interface{}{
 									"name":      sidecarConfigVolume,
 									"mountPath": sidecarConfigMount,
@@ -653,7 +670,7 @@ func renderProxyDeployment(namespace, proxyName, image string, proxyLabels map[s
 								"readOnlyRootFilesystem":   true,
 								"allowPrivilegeEscalation": false,
 								"runAsNonRoot":             true,
-								"runAsUser":                65534,
+								"runAsUser":                proxyRunAsUser,
 								"capabilities": map[string]interface{}{
 									"drop": []interface{}{"ALL"},
 								},
@@ -661,6 +678,7 @@ func renderProxyDeployment(namespace, proxyName, image string, proxyLabels map[s
 						},
 					},
 					"volumes": []interface{}{
+						map[string]interface{}{"name": proxyStateVolume, "emptyDir": map[string]interface{}{}},
 						map[string]interface{}{
 							"name": sidecarConfigVolume,
 							"configMap": map[string]interface{}{

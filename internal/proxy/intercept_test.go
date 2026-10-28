@@ -6,9 +6,11 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -33,9 +35,11 @@ import (
 	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
 	"github.com/luckyPipewrench/pipelock/internal/contract/runtime/contractruntimetest"
 	"github.com/luckyPipewrench/pipelock/internal/edition"
+	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/session"
@@ -291,8 +295,10 @@ func TestInterceptEmitReceiptOrBlockRequireReceiptsSyncFailureBlocks(t *testing.
 		t.Fatalf("status = %d, want %d", rr.Code, http.StatusForbidden)
 	}
 	assertMetricsContain(t, m, `pipelock_required_receipt_blocks_total{reason="durability",transport="connect"} 1`)
-	if err := rph.rec.Close(); err != nil {
-		t.Fatalf("recorder close: %v", err)
+	// The injected sync failure leaves the stream failed, so close
+	// refuses to sign a final checkpoint over it.
+	if err := rph.rec.Close(); !errors.Is(err, recorder.ErrDurabilityInherited) {
+		t.Fatalf("recorder close after a failed sync = %v, want the final checkpoint refused", err)
 	}
 }
 
@@ -855,15 +861,23 @@ func interceptAndRequestWithProxy(
 
 type interceptRequestOptions struct {
 	Upstream *httptest.Server
-	Cache    *certgen.CertCache
-	Pool     *x509.CertPool
-	Config   *config.Config
-	Scanner  *scanner.Scanner
-	Logger   *audit.Logger
-	Metrics  *metrics.Metrics
-	Request  *http.Request
-	Recorder session.Recorder
-	Proxy    *Proxy
+	// TargetHost and UpstreamRT let tests preserve the production authority
+	// while routing the socket to a local TLS server. Empty values retain the
+	// historical httptest-server behavior.
+	TargetHost string
+	TargetPort string
+	UpstreamRT http.RoundTripper
+	Cache      *certgen.CertCache
+	Pool       *x509.CertPool
+	Config     *config.Config
+	Scanner    *scanner.Scanner
+	Logger     *audit.Logger
+	Metrics    *metrics.Metrics
+	Request    *http.Request
+	Recorder   session.Recorder
+	Proxy      *Proxy
+	Agent      string
+	ActorAuth  envelope.ActorAuth
 }
 
 // interceptAndRequestWithRecorder is like interceptAndRequest but accepts a
@@ -876,6 +890,16 @@ func interceptAndRequestWithRecorder(t *testing.T, opts interceptRequestOptions)
 
 	host := opts.Upstream.Listener.Addr().(*net.TCPAddr).IP.String()
 	port := fmt.Sprintf("%d", opts.Upstream.Listener.Addr().(*net.TCPAddr).Port)
+	if opts.TargetHost != "" {
+		host = opts.TargetHost
+	}
+	if opts.TargetPort != "" {
+		port = opts.TargetPort
+	}
+	upstreamRT := opts.UpstreamRT
+	if upstreamRT == nil {
+		upstreamRT = opts.Upstream.Client().Transport
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -890,9 +914,11 @@ func interceptAndRequestWithRecorder(t *testing.T, opts interceptRequestOptions)
 			Metrics:    opts.Metrics,
 			ClientIP:   "10.0.0.1",
 			RequestID:  "test-req-1",
-			UpstreamRT: opts.Upstream.Client().Transport,
+			UpstreamRT: upstreamRT,
 			Recorder:   opts.Recorder,
 			Proxy:      opts.Proxy,
+			Agent:      opts.Agent,
+			ActorAuth:  opts.ActorAuth,
 		})
 	}()
 
@@ -1410,6 +1436,63 @@ func TestInterceptTunnel_BlocksCompressedResponse(t *testing.T) {
 	}
 }
 
+func TestInterceptTunnel_DecodesGzipResponseBeforeScanning(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{name: "ordinary widget", body: "window.SupportWidget = window.SupportWidget || function() {};", wantStatus: http.StatusOK},
+		{name: "injection remains blocked", body: testInjectionPayload, wantStatus: http.StatusForbidden},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+					t.Errorf("upstream Accept-Encoding = %q, want identity", got)
+				}
+				w.Header().Set("Content-Type", "application/javascript")
+				w.Header().Set("Content-Encoding", "gzip")
+				zw := gzip.NewWriter(w)
+				if _, err := io.WriteString(zw, tt.body); err != nil {
+					t.Errorf("write gzip body: %v", err)
+				}
+				if err := zw.Close(); err != nil {
+					t.Errorf("close gzip body: %v", err)
+				}
+			}))
+			defer upstream.Close()
+
+			cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+			cfg.ResponseScanning.Enabled = true
+			cfg.ResponseScanning.Action = config.ActionBlock
+			sc := scanner.MustNew(cfg)
+			t.Cleanup(sc.Close)
+
+			addr := upstream.Listener.Addr().String()
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+addr+"/widget", nil)
+			if err != nil {
+				t.Fatalf("new request: %v", err)
+			}
+			req.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
+
+			resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+			defer func() { _ = resp.Body.Close() }()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tt.wantStatus, got)
+			}
+			if tt.wantStatus == http.StatusOK && string(got) != tt.body {
+				t.Fatalf("decoded body = %q, want %q", got, tt.body)
+			}
+		})
+	}
+}
+
 func TestInterceptTunnel_OversizedResponseBlocked(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		// Write more than MaxResponseBytes (set to 1024 in setup).
@@ -1564,7 +1647,13 @@ func TestInterceptTunnel_HeaderDLPBlocked(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+	cache, pool, cfg, _, _, m := testInterceptSetup(t)
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	logger, err := audit.New("json", "file", auditPath, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	cfg.RequestBodyScanning.Enabled = true
 	cfg.RequestBodyScanning.ScanHeaders = true
 	cfg.RequestBodyScanning.Action = config.ActionBlock
@@ -1583,6 +1672,24 @@ func TestInterceptTunnel_HeaderDLPBlocked(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("status = %d, want 403 (header DLP should block)", resp.StatusCode)
+	}
+	auditBytes, err := os.ReadFile(filepath.Clean(auditPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocked map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(auditBytes), []byte("\n")) {
+		var event map[string]any
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatal(err)
+		}
+		if event["event"] == "blocked" && event["scanner"] == "header_dlp" {
+			blocked = event
+		}
+	}
+	if blocked == nil || blocked["header"] != "Authorization" || blocked["patterns"] == nil ||
+		bytes.Contains(auditBytes, []byte(secret)) {
+		t.Fatalf("blocked audit event must identify the header and pattern without exposing its value: %v", blocked)
 	}
 }
 
@@ -2197,7 +2304,7 @@ func TestInterceptTunnel_BodyDLPAuditMode(t *testing.T) {
 	t.Cleanup(func() { sc.Close() })
 
 	addr := upstream.Listener.Addr().String()
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	body := fmt.Sprintf(`{"data": "%s"}`, secret)
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://"+addr+"/api", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -2211,39 +2318,59 @@ func TestInterceptTunnel_BodyDLPAuditMode(t *testing.T) {
 	}
 }
 
+// In enforce mode a body prompt injection hard-blocks a non-provider
+// destination even with action warn. With enforce: false it follows the warn
+// action and is forwarded, the same as body DLP in audit mode.
 func TestInterceptTunnel_BodyPromptInjectionHardBlocksNonProviderWarnMode(t *testing.T) {
-	var upstreamHit atomic.Bool
-	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		upstreamHit.Store(true)
-		_, _ = fmt.Fprint(w, "unexpected")
-	}))
-	defer upstream.Close()
+	for _, tt := range []struct {
+		name       string
+		enforce    bool
+		wantStatus int
+		wantAction string
+	}{
+		{name: "enforced", enforce: true, wantStatus: http.StatusForbidden, wantAction: config.ActionBlock},
+		{name: "audit only", enforce: false, wantStatus: http.StatusOK, wantAction: config.ActionWarn},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var upstreamHit atomic.Bool
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				upstreamHit.Store(true)
+				_, _ = fmt.Fprint(w, "ok")
+			}))
+			defer upstream.Close()
 
-	cache, pool, cfg, _, logger, m := testInterceptSetup(t)
-	cfg.RequestBodyScanning.Enabled = true
-	cfg.RequestBodyScanning.Action = config.ActionWarn
-	cfg.RequestBodyScanning.MaxBodyBytes = 1024 * 1024
-	enforceOff := false
-	cfg.Enforce = &enforceOff
-	sc := scanner.MustNew(cfg)
-	t.Cleanup(func() { sc.Close() })
+			cache, pool, cfg, _, _, m := testInterceptSetup(t)
+			logger, logPath := newAuditModeLogger(t)
+			cfg.RequestBodyScanning.Enabled = true
+			cfg.RequestBodyScanning.Action = config.ActionWarn
+			cfg.RequestBodyScanning.MaxBodyBytes = 1024 * 1024
+			enforce := tt.enforce
+			cfg.Enforce = &enforce
+			sc := scanner.MustNew(cfg)
+			t.Cleanup(func() { sc.Close() })
 
-	addr := upstream.Listener.Addr().String()
-	body := trilingualPromptInjectionBody
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://"+addr+"/api", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
+			addr := upstream.Listener.Addr().String()
+			req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "https://"+addr+"/api", strings.NewReader(trilingualPromptInjectionBody))
+			req.Header.Set("Content-Type", "application/json")
 
-	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
-	defer func() { _ = resp.Body.Close() }()
+			resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+			defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("status = %d, want 403 (body prompt injection should hard block non-provider destination)", resp.StatusCode)
-	}
-	if got := resp.Header.Get(blockreason.HeaderReason); got != string(blockreason.PromptInjection) {
-		t.Fatalf("block reason = %q, want %s", got, blockreason.PromptInjection)
-	}
-	if upstreamHit.Load() {
-		t.Fatal("upstream received body prompt injection, want blocked before forwarding")
+			if resp.StatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			if tt.enforce {
+				if got := resp.Header.Get(blockreason.HeaderReason); got != string(blockreason.PromptInjection) {
+					t.Fatalf("block reason = %q, want %s", got, blockreason.PromptInjection)
+				}
+				if upstreamHit.Load() {
+					t.Fatal("upstream received body prompt injection, want blocked before forwarding")
+				}
+			} else if !upstreamHit.Load() {
+				t.Fatal("audit mode did not forward the request upstream")
+			}
+			assertInterceptInjectionRecord(t, logger, logPath, tt.wantAction)
+		})
 	}
 }
 
@@ -2391,6 +2518,9 @@ func TestInterceptTunnel_RedactionMetricUsesProfileLabel(t *testing.T) {
 		},
 		Limits: redact.DefaultLimits(),
 	}
+	// Audit mode blocks a core credential even when fully redacted, unless
+	// the destination is a trusted request-body host.
+	cfg.RequestBodyScanning.TrustedHosts = append(cfg.RequestBodyScanning.TrustedHosts, upstream.Listener.Addr().(*net.TCPAddr).IP.String())
 	sc := scanner.MustNew(cfg)
 	t.Cleanup(func() { sc.Close() })
 	proxy := testInterceptRedactProxyWithScanner(t, cfg, sc)
@@ -2604,7 +2734,7 @@ func TestInterceptTunnel_CompressedResponseBlockedViaRoundTripper(t *testing.T) 
 			StatusCode: http.StatusOK,
 			Header: http.Header{
 				"Content-Type":     []string{"application/json"},
-				"Content-Encoding": []string{"gzip"},
+				"Content-Encoding": []string{"identity", "gzip"},
 			},
 			Body: io.NopCloser(strings.NewReader("fake-gzip-payload")),
 		}, nil
@@ -2852,7 +2982,7 @@ func TestInterceptTunnel_URLScanAuditMode(t *testing.T) {
 	t.Cleanup(sc.Close)
 
 	addr := upstream.Listener.Addr().String()
-	secret := "AKIA" + "IOSFODNN7EXAMPLE"
+	secret := "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+addr+"/api?token="+secret, nil)
 
 	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
@@ -2863,9 +2993,8 @@ func TestInterceptTunnel_URLScanAuditMode(t *testing.T) {
 	}
 }
 
-func TestInterceptTunnel_CEEAdaptiveSignalRecording(t *testing.T) {
-	// Verify that CEE entropy budget exceedance on intercepted requests
-	// records adaptive enforcement signals via ceeRecordSignals.
+func TestInterceptTunnel_CEEEntropyDoesNotScore(t *testing.T) {
+	// Intercepted entropy warnings stay visible and do not raise the score.
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -2951,19 +3080,15 @@ func TestInterceptTunnel_CEEAdaptiveSignalRecording(t *testing.T) {
 	sessionKey := CeeSessionKey("", "10.0.0.1")
 	sess := sm.GetOrCreate(sessionKey)
 	score := sess.ThreatScore()
-	if score == 0 {
-		t.Fatal("expected non-zero threat score after CEE entropy signal, got 0 (adaptive signal not recorded)")
-	}
-	// SignalEntropyBudget is 2 points.
-	if score < 2.0 {
-		t.Errorf("expected threat score >= 2.0 (SignalEntropyBudget), got %.1f", score)
+	if score != 0 {
+		t.Errorf("entropy-only CEE warning raised threat score to %.1f", score)
 	}
 }
 
 // TestInterceptTunnel_CEEBlocked verifies that CEE with action=block inside
 // a TLS intercepted tunnel returns 403 when the entropy budget is exceeded.
-// The existing CEEAdaptiveSignalRecording test only covers warn mode; this
-// covers the block action path (intercept.go ~line 367).
+// The entropy warning test covers forwarding; this covers the configured
+// block action path.
 func TestInterceptTunnel_CEEBlocked(t *testing.T) {
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = fmt.Fprint(w, "ok")
@@ -3285,8 +3410,8 @@ func TestInterceptHandler_CEELiveEnableUsesCurrentPolicyGeneration(t *testing.T)
 	if sm == nil {
 		t.Fatal("live session manager is nil")
 	}
-	if got := sm.GetOrCreate("203.0.113.10").EscalationLevel(); got == 0 {
-		t.Fatal("live adaptive threshold was not applied to the CEE signal")
+	if got := sm.GetOrCreate("203.0.113.10").ThreatScore(); got != 0 {
+		t.Fatalf("live CEE entropy raised adaptive score to %.1f", got)
 	}
 }
 
@@ -3577,6 +3702,28 @@ func interceptWithRT(
 	req *http.Request,
 ) *http.Response {
 	t.Helper()
+	resp, err := interceptWithRTResult(t, cache, pool, cfg, sc, logger, m, rt, ic, req)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	return resp
+}
+
+// interceptWithRTResult is interceptWithRT for responses that may end before
+// their headers arrive, such as a stream aborted while still buffered.
+func interceptWithRTResult(
+	t *testing.T,
+	cache *certgen.CertCache,
+	pool *x509.CertPool,
+	cfg *config.Config,
+	sc *scanner.Scanner,
+	logger *audit.Logger,
+	m *metrics.Metrics,
+	rt http.RoundTripper,
+	ic *InterceptContext,
+	req *http.Request,
+) (*http.Response, error) {
+	t.Helper()
 
 	clientConn, proxyConn := net.Pipe()
 	t.Cleanup(func() { _ = clientConn.Close() })
@@ -3613,10 +3760,10 @@ func interceptWithRT(
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(tlsConn), req)
 	if err != nil {
-		t.Fatalf("read response: %v", err)
+		return nil, err
 	}
 	t.Cleanup(func() { _ = resp.Body.Close() })
-	return resp
+	return resp, nil
 }
 
 func TestInterceptTunnel_RequireReceiptsDurabilityFailureBlocksBeforeRoundTrip(t *testing.T) {
@@ -3660,8 +3807,10 @@ func TestInterceptTunnel_RequireReceiptsDurabilityFailureBlocksBeforeRoundTrip(t
 	}
 	assertMetricsContain(t, p.metrics, `pipelock_receipt_emit_failures_total{reason="sync"} 1`)
 	assertMetricsContain(t, p.metrics, `pipelock_required_receipt_blocks_total{reason="durability",transport="intercept"} 1`)
-	if err := rph.rec.Close(); err != nil {
-		t.Fatalf("recorder close: %v", err)
+	// The injected sync failure leaves the stream failed, so close
+	// refuses to sign a final checkpoint over it.
+	if err := rph.rec.Close(); !errors.Is(err, recorder.ErrDurabilityInherited) {
+		t.Fatalf("recorder close after a failed sync = %v, want the final checkpoint refused", err)
 	}
 }
 
@@ -4568,7 +4717,9 @@ func TestInterceptTunnel_A2AHeaderScanningBlocked(t *testing.T) {
 	t.Cleanup(func() { sc.Close() })
 
 	addr := upstream.Listener.Addr().String()
-	// A2A-Extensions header with a private IP URI triggers SSRF scanning.
+	// A metadata URI in A2A-Extensions must be denied. Generic header checks
+	// also inspect a single field line, so this proves the block, not which
+	// layer made it; the repeated-line tests isolate the A2A-Extensions scan.
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
 		"https://"+addr+"/message:send", strings.NewReader(`{"method":"tasks/send"}`))
 	req.Header.Set("Content-Type", "application/a2a+json")
@@ -4577,11 +4728,8 @@ func TestInterceptTunnel_A2AHeaderScanningBlocked(t *testing.T) {
 	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
 	defer func() { _ = resp.Body.Close() }()
 
-	// Block mode with metadata IP in A2A-Extensions: expect 403 if the scanner
-	// detects it, or 200 if the header format doesn't trigger. Either way the
-	// A2A header scanning code path is exercised.
-	if resp.StatusCode != http.StatusForbidden && resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 403 (blocked) or 200 (not detected), got unexpected code", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("status = %d, want 403 for a metadata URI in A2A-Extensions", resp.StatusCode)
 	}
 }
 
@@ -4777,6 +4925,52 @@ func TestInterceptTunnel_BodyEntropyWarnRecordsMetricAndForwards(t *testing.T) {
 		t.Fatalf("upstream body = %q, want %q", got, body)
 	}
 	assertInterceptMetric(t, m, `pipelock_body_entropy_hits_total{action="warn",agent=""} 1`)
+}
+
+// A body carrying both a blocking secret and a warn-level entropy finding must
+// name the secret in the block reason. The entropy warning rode along with the
+// request; reporting it as the cause sends the operator to the wrong scanner.
+func TestInterceptTunnel_BodyBlockNamesSecretOverEntropyWarning(t *testing.T) {
+	var upstreamHit atomic.Bool
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHit.Store(true)
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+
+	cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+	cfg.RequestBodyScanning.Enabled = true
+	cfg.RequestBodyScanning.Action = config.ActionBlock
+	cfg.RequestBodyScanning.ContentEntropyEnabled = true
+	cfg.RequestBodyScanning.ContentEntropyAction = config.ActionWarn
+	cfg.RequestBodyScanning.ContentEntropyThreshold = 4.5
+	cfg.RequestBodyScanning.ContentEntropyMinLength = 32
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(func() { sc.Close() })
+
+	key := "AKIA" + strings.Join([]string{"QR2S", "TUVW", "XYZ2", "3456"}, "")
+	body := `{"blob":"` + opaqueHighEntropyBodyValue() + `","note":"` + key + `"}`
+	addr := upstream.Listener.Addr().String()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		"https://"+addr+"/upload", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+	defer func() { _ = resp.Body.Close() }()
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403; body=%q", resp.StatusCode, string(respBody))
+	}
+	if upstreamHit.Load() {
+		t.Fatal("blocked request reached upstream")
+	}
+	if !strings.Contains(string(respBody), "AWS Access ID") {
+		t.Fatalf("block reason must name the secret pattern; body=%q", string(respBody))
+	}
+	if strings.Contains(string(respBody), "high entropy") {
+		t.Fatalf("block reason must not blame the entropy warning; body=%q", string(respBody))
+	}
 }
 
 func assertInterceptMetric(t *testing.T, m *metrics.Metrics, want string) {
@@ -5285,7 +5479,7 @@ func TestInterceptTunnel_ShieldOversizeTransportParity(t *testing.T) {
 }
 
 func TestInterceptTunnel_ShieldRewriteClearsBodyValidators(t *testing.T) {
-	body := []byte(`<html><head></head><body><script>fetch("chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef/manifest.json")</script></body></html>`)
+	body := []byte(`<html><head></head><body><a href="chrome-extension://abcdefghijklmnopqrstuvwxyzabcdef/page.html">extension</a></body></html>`)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("ETag", `"upstream-etag"`)
@@ -5336,13 +5530,13 @@ func TestInterceptTunnel_ShieldRewriteClearsBodyValidators(t *testing.T) {
 }
 
 func TestInterceptTunnel_SameLengthShieldRewriteClearsBodyValidators(t *testing.T) {
-	shimLen := len("<script>" + shield.ExtensionProbeShim + "</script>")
+	shimLen := len("<script>" + shield.FingerprintShim + "</script>")
 	extPrefix := "chrome-extension://"
 	if shimLen <= len(extPrefix) {
 		t.Fatalf("test invariant broken: shim length %d <= prefix length %d", shimLen, len(extPrefix))
 	}
 	extURL := extPrefix + strings.Repeat("a", shimLen-len(extPrefix))
-	body := []byte(`<html><head></head><body><script>fetch("` + extURL + `")</script></body></html>`)
+	body := []byte(`<html><head></head><body><a href="` + extURL + `">extension</a></body></html>`)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
 		w.Header().Set("ETag", `"upstream-etag"`)
@@ -5360,7 +5554,7 @@ func TestInterceptTunnel_SameLengthShieldRewriteClearsBodyValidators(t *testing.
 	cfg.BrowserShield.StripExtensionProbing = true
 	cfg.BrowserShield.StripHiddenTraps = false
 	cfg.BrowserShield.StripTrackingPixels = false
-	cfg.BrowserShield.InjectFingerprintShims = false
+	cfg.BrowserShield.InjectFingerprintShims = true
 	testLogger, _ := audit.New("json", "stdout", "", false, false)
 	p, err := New(cfg, testLogger, sc, m)
 	if err != nil {
@@ -5383,7 +5577,7 @@ func TestInterceptTunnel_SameLengthShieldRewriteClearsBodyValidators(t *testing.
 		t.Fatalf("test must exercise same-length rewrite: got body len %d, original %d", len(got), len(body))
 	}
 	if bytes.Equal(got, body) {
-		t.Fatal("intercept shield should rewrite the extension probe")
+		t.Fatal("intercept shield should rewrite the HTML extension URL")
 	}
 	if resp.Header.Get("ETag") != "" {
 		t.Fatalf("ETag should be cleared after same-length shield rewrite, got %q", resp.Header.Get("ETag"))
@@ -5468,5 +5662,107 @@ func TestInterceptAllowsAllowlistedGitPush(t *testing.T) {
 	}
 	if hits.Load() != 1 {
 		t.Fatalf("upstream hits = %d, want 1", hits.Load())
+	}
+}
+
+// TestInterceptTunnel_ExemptDomainKeepsEncodedBytes pins the byte-intact
+// contract for a trusted destination. Decoding used to run before the exempt
+// branch was reached, so a gzip download from a host the operator had
+// explicitly trusted arrived decoded, without its Content-Encoding, and
+// without the ETag, Digest and Content-MD5 validators that describe the
+// encoded form. A client verifying that download against its own manifest
+// then saw bytes that did not match.
+func TestInterceptTunnel_ExemptDomainKeepsEncodedBytes(t *testing.T) {
+	const plain = "trusted download payload"
+
+	var gzipped bytes.Buffer
+	zw := gzip.NewWriter(&gzipped)
+	if _, err := zw.Write([]byte(plain)); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	encoded := gzipped.Bytes()
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("ETag", `"encoded-etag"`)
+		w.Header().Set("Digest", "sha-256=encoded")
+		_, _ = w.Write(encoded)
+	}))
+	defer upstream.Close()
+
+	cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+	cfg.ResponseScanning.Enabled = true
+	cfg.ResponseScanning.Action = config.ActionBlock
+
+	host := upstream.Listener.Addr().(*net.TCPAddr).IP.String()
+	cfg.ResponseScanning.ExemptDomains = []string{host}
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(func() { sc.Close() })
+
+	addr := upstream.Listener.Addr().String()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "https://"+addr+"/artifact.bin", nil)
+	// Ask for the encoded form explicitly so the client does not transparently
+	// decompress it and hide what the proxy actually forwarded.
+	req.Header.Set("Accept-Encoding", "gzip")
+
+	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200 for exempt domain, got %d; body: %s", resp.StatusCode, body)
+	}
+	if got := resp.Header.Get("Content-Encoding"); got != "gzip" {
+		t.Errorf("Content-Encoding = %q, want %q: a trusted download must keep its encoding", got, "gzip")
+	}
+	for _, name := range []string{"ETag", "Digest"} {
+		if resp.Header.Get(name) == "" {
+			t.Errorf("%s was dropped; the validators describe the encoded body and must survive", name)
+		}
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if !bytes.Equal(body, encoded) {
+		t.Errorf("body was re-encoded: got %d bytes, want the original %d encoded bytes", len(body), len(encoded))
+	}
+}
+
+// TestInterceptTunnel_A2ARepeatedExtensionsHeaderBlocked proves every
+// A2A-Extensions field line is scanned: a clean first line must not hide a
+// blocked URI on a later line.
+func TestInterceptTunnel_A2ARepeatedExtensionsHeaderBlocked(t *testing.T) {
+	var reached atomic.Bool
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Store(true)
+		_, _ = fmt.Fprint(w, "should not reach")
+	}))
+	defer upstream.Close()
+
+	cache, pool, cfg, _, logger, m := testInterceptSetup(t)
+	cfg.A2AScanning.Enabled = true
+	cfg.A2AScanning.Action = config.ActionBlock
+	sc := scanner.MustNew(cfg)
+	t.Cleanup(func() { sc.Close() })
+
+	addr := upstream.Listener.Addr().String()
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		"https://"+addr+"/message:send", strings.NewReader(`{"method":"tasks/send"}`))
+	req.Header.Set("Content-Type", "application/a2a+json")
+	req.Header.Add("A2A-Extensions", "https://ext.example.com/v1")
+	req.Header.Add("A2A-Extensions", "file:///etc/passwd")
+
+	resp := interceptAndRequest(t, upstream, cache, pool, cfg, sc, logger, m, req)
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a blocked URI on a repeated A2A-Extensions line", resp.StatusCode)
+	}
+	if reached.Load() {
+		t.Fatal("request reached upstream despite a blocked repeated A2A-Extensions line")
 	}
 }

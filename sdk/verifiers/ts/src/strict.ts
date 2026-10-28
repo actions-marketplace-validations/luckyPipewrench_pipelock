@@ -19,7 +19,7 @@
 // verdict. Only v1 receipts are validated here; the v2 evidence_receipt_v2
 // shape has its own path.
 
-import { InvalidError } from "./util.js";
+import { foldKey, InvalidError } from "./util.js";
 
 const RECEIPT_KEYS = new Set(["version", "action_record", "signature", "signer_key", "ext"]);
 
@@ -103,6 +103,17 @@ const SESSION_OPEN_KEYS = new Set([
   "posture_signer_key_id",
   "containment_nonce",
   "contained_uid",
+  "group_binding",
+]);
+
+const GROUP_BINDING_KEYS = new Set([
+  "group_id",
+  "shard_index",
+  "session_id",
+  "open_manifest_sha256",
+  "signer_key",
+  "previous_group_id",
+  "previous_open_manifest_sha256",
 ]);
 
 const SESSION_HEARTBEAT_KEYS = new Set([
@@ -173,6 +184,9 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function rejectUnknownKeys(obj: unknown, allowed: Set<string>, objectName: string): void {
   if (!isPlainObject(obj)) return;
   for (const key of Object.keys(obj)) {
+    const alias = [...allowed].find((name) => key !== name && foldKey(key) === foldKey(name));
+    if (alias !== undefined)
+      throw new InvalidError(`${objectName}: ${key} aliases ${alias} (case-insensitive)`);
     if (!allowed.has(key)) {
       throw new InvalidError(`unknown field "${key}" on signed v1 ${objectName} object`);
     }
@@ -214,6 +228,9 @@ export function validateV1Receipt(receipt: unknown): void {
     if (isPlainObject(sc)) {
       rejectUnknownKeys(sc, SESSION_CONTROL_KEYS, "session_control");
       validateChild(sc, "open", SESSION_OPEN_KEYS, "session_open");
+      if (isPlainObject(sc.open)) {
+        validateChild(sc.open, "group_binding", GROUP_BINDING_KEYS, "group_binding");
+      }
       validateChild(sc, "heartbeat", SESSION_HEARTBEAT_KEYS, "session_heartbeat");
       validateChild(sc, "close", SESSION_CLOSE_KEYS, "session_close");
     }

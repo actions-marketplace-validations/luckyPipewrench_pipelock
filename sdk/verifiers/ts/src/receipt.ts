@@ -1,12 +1,18 @@
 // Copyright 2026 Pipelock contributors
 // SPDX-License-Identifier: Apache-2.0
 
-import { readFileSync } from "node:fs";
-import * as path from "node:path";
 import type { Receipt } from "./types.js";
-import { normalizeEvidenceReceipt, unpinnedReceiptBanner, verifyReceipt } from "./signing.js";
+import { secretEgressDecisionKind, validateSecretEgressSource } from "./secret-egress.js";
+import { unpinnedReceiptBanner, verifyReceipt } from "./signing.js";
 import { validateV1Receipt } from "./strict.js";
-import { decodeUTF8, parseJSON, rejectDuplicateKeys, resolveSignerKey } from "./util.js";
+import {
+  decodeUTF8,
+  parseJSON,
+  readVerifierBytes,
+  rejectDuplicateKeys,
+  resolveOperatorFilePath,
+  resolveSignerKey,
+} from "./util.js";
 
 export interface ReceiptReport {
   path: string;
@@ -26,15 +32,18 @@ export async function runReceipt(
   signerKey: string,
   allowUnpinned = false,
 ): Promise<ReceiptReport> {
-  const clean = path.normalize(pathname);
   const keyHex = resolveSignerKey(signerKey);
   const report: ReceiptReport = {
-    path: clean,
+    path: pathname,
     valid: false,
   };
   let text: string;
   try {
-    text = decodeUTF8(readFileSync(clean), "receipt json");
+    // A path that cannot be resolved is a failed verification with a report,
+    // like a file that cannot be read, not an exception out of the verifier.
+    const clean = resolveOperatorFilePath(pathname);
+    report.path = clean;
+    text = decodeUTF8(readVerifierBytes(clean), "receipt json");
   } catch (err) {
     report.error = (err as Error).message;
     return report;
@@ -49,6 +58,12 @@ export async function runReceipt(
     return report;
   }
   const receipt = parseJSON<Receipt>(text, "receipt json");
+  try {
+    validateSecretEgressSource(receipt, text);
+  } catch (err) {
+    report.error = (err as Error).message;
+    return report;
+  }
   // EV2-FU-1: reject unknown fields on a signed v1 receipt (the v2 evidence
   // receipt has its own schema). The only tolerated unknown surface is the
   // top-level ext bag.
@@ -61,10 +76,22 @@ export async function runReceipt(
     }
   }
   if (receipt.record_type === "evidence_receipt_v2") {
-    const payload = receipt.payload as { verdict?: string; transport?: string } | undefined;
-    report.action_id = receipt.event_id;
+    const payload = receipt.payload as
+      | {
+          verdict?: string;
+          transport?: string;
+          decision?: { action_id?: string; transport?: string };
+        }
+      | undefined;
+    report.action_id =
+      receipt.payload_kind === secretEgressDecisionKind
+        ? payload?.decision?.action_id
+        : receipt.event_id;
     report.verdict = payload?.verdict;
-    report.transport = payload?.transport;
+    report.transport =
+      receipt.payload_kind === secretEgressDecisionKind
+        ? payload?.decision?.transport
+        : payload?.transport;
     report.signer_key = keyHex;
     report.policy_hash = receipt.policy_hash;
     report.chain_seq = receipt.chain_seq;
@@ -78,7 +105,10 @@ export async function runReceipt(
   }
   try {
     if (keyHex === "" && receipt.record_type === "evidence_receipt_v2") {
-      normalizeEvidenceReceipt(receipt);
+      // With no pinned key the signature is still checked, against the
+      // receipt's own declared signer: an edit after signing fails. That
+      // proves nothing about who signed, so the receipt stays unpinned.
+      await verifyReceipt(receipt, declaredSignerKey(receipt));
       report.unpinned = true;
       report.error = unpinnedReceiptBanner;
       report.valid = allowUnpinned;
@@ -97,4 +127,13 @@ export async function runReceipt(
     }
   }
   return report;
+}
+
+function declaredSignerKey(receipt: Receipt): string {
+  const signature = receipt.signature;
+  if (typeof signature === "object" && signature !== null) {
+    const signer = (signature as Record<string, unknown>)["signer_key_id"];
+    if (typeof signer === "string") return signer.toLowerCase();
+  }
+  return "";
 }

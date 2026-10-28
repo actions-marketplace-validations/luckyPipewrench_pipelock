@@ -4,24 +4,44 @@
 package audit
 
 import (
-	"context"
-
+	"github.com/luckyPipewrench/pipelock/internal/eventcatalog"
 	scannerpkg "github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
 const (
 	// EventDLPWarn is emitted when a warn-mode DLP pattern matches.
 	// The match is informational only - no enforcement action is taken.
-	EventDLPWarn EventType = "dlp_warn"
+	EventDLPWarn EventType = eventcatalog.EventDLPWarn
 	// EventDLPCredentialAudienceAllow records the narrow compiled-in exception
 	// for a provider credential sent to its declared audience.
-	EventDLPCredentialAudienceAllow EventType = "dlp_credential_audience_allow" // #nosec G101 -- audit event identifier, not credential material
+	EventDLPCredentialAudienceAllow EventType = eventcatalog.EventDLPCredentialAudienceAllow // #nosec G101 -- audit event identifier, not credential material
+	EventDLPIssuerCookieAllow       EventType = eventcatalog.EventDLPIssuerCookieAllow       // #nosec G101 -- audit event identifier, not credential material
+	EventIssuerQueryAllow           EventType = eventcatalog.EventIssuerQueryAllow
 )
 
 // LogDLPWarn emits an audit event for a DLP pattern match in warn mode.
 // Transport identifies the scanning surface (e.g., "fetch", "forward", "mcp_input", "body").
 func (l *Logger) LogDLPWarn(ctx LogContext, patternName, severity, transport string) {
 	l.logDLPInformational(ctx, patternName, severity, transport, "warn", "warn")
+}
+
+// LogIssuerQueryAllow records a query entropy allowance without recording
+// the returned value or the URL that carried it.
+func (l *Logger) LogIssuerQueryAllow(ctx LogContext, destination string) {
+	e := newLogEntry(l.zl.Info(), EventIssuerQueryAllow).
+		str("pattern", "query_value_entropy").
+		str("surface", "url_query").
+		str("destination", destination).
+		str("mitre_technique", TechniqueForScanner(scannerpkg.ScannerEntropy)).
+		str("method", ctx.Method()).
+		optStr("client_ip", ctx.ClientIP()).
+		optStr("request_id", ctx.RequestID()).
+		correlationField(ctx.Correlation()).
+		agentField(ctx.Agent(), ctx.AgentAuth())
+	e.msg("query value allowed for observed issuer")
+	if l.emitter != nil {
+		l.emitEvent(string(EventIssuerQueryAllow), e.fields)
+	}
 }
 
 // LogDLPDropped records a DLP match deliberately left unenforced by policy.
@@ -36,11 +56,27 @@ func (l *Logger) LogDLPDropped(ctx LogContext, patternName, severity, surface, r
 // destination has already been parsed by the proxy-owned scanner path and
 // contains no credential material.
 func (l *Logger) LogDLPCredentialAudienceAllow(ctx LogContext, patternName, surface, destination string) {
+	l.logDLPAllowance(ctx, EventDLPCredentialAudienceAllow, patternName, surface, destination, "DLP credential allowed for declared audience")
+}
+
+// LogDLPIssuerCookieAllow records a returned cookie pair left out of header
+// DLP because the destination issued it. It names the pattern, the cookie
+// name and the destination; the cookie value is never recorded.
+func (l *Logger) LogDLPIssuerCookieAllow(ctx LogContext, patternName, cookieName, destination string) {
+	l.logDLPAllowanceWithCookie(ctx, EventDLPIssuerCookieAllow, patternName, cookieName, "header", destination, "DLP cookie allowed for observed issuer")
+}
+
+func (l *Logger) logDLPAllowance(ctx LogContext, event EventType, patternName, surface, destination, message string) {
+	l.logDLPAllowanceWithCookie(ctx, event, patternName, "", surface, destination, message)
+}
+
+func (l *Logger) logDLPAllowanceWithCookie(ctx LogContext, event EventType, patternName, cookieName, surface, destination, message string) {
 	technique := TechniqueForScanner(ScannerDLP)
 	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, ScannerDLP)
 
-	e := newLogEntry(l.zl.Info(), EventDLPCredentialAudienceAllow).
+	e := newLogEntry(l.zl.Info(), event).
 		str("pattern", patternName).
+		optStr("cookie", cookieName).
 		str("surface", surface).
 		str("destination", destination).
 		str("mitre_technique", technique).
@@ -50,17 +86,25 @@ func (l *Logger) LogDLPCredentialAudienceAllow(ctx LogContext, patternName, surf
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.ClientIP()).
 		optStr("request_id", ctx.RequestID()).
+		correlationField(ctx.Correlation()).
 		agentField(ctx.Agent(), ctx.AgentAuth())
-	e.msg("DLP credential allowed for declared audience")
+	e.msg(message)
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventDLPCredentialAudienceAllow), e.fields)
+		l.emitEvent(string(event), e.fields)
 	}
 }
 
 func (l *Logger) logDLPInformational(ctx LogContext, patternName, severity, surface, mode, reason string) {
 	technique := TechniqueForScanner(ScannerDLP)
 	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, ScannerDLP)
+	guidanceScanner := scannerpkg.ScannerDLP
+	switch surface {
+	case "header":
+		guidanceScanner = scannerpkg.AuditHeaderDLP
+	case "body":
+		guidanceScanner = scannerpkg.ScannerBodyDLP
+	}
 
 	e := newLogEntry(l.zl.Warn(), EventDLPWarn).
 		str("mode", mode).
@@ -68,7 +112,7 @@ func (l *Logger) logDLPInformational(ctx LogContext, patternName, severity, surf
 		str("severity", severity).
 		str("transport", surface).
 		str("reason", reason).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.ScannerDLP, patternName)).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(guidanceScanner, []string{patternName})).
 		str("mitre_technique", technique).
 		str("method", ctx.Method()).
 		optStr("url", loggedURL).
@@ -76,10 +120,11 @@ func (l *Logger) logDLPInformational(ctx LogContext, patternName, severity, surf
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.ClientIP()).
 		optStr("request_id", ctx.RequestID()).
+		correlationField(ctx.Correlation()).
 		agentField(ctx.Agent(), ctx.AgentAuth())
 	e.msg("DLP informational match")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventDLPWarn), e.fields)
+		l.emitEvent(string(EventDLPWarn), e.fields)
 	}
 }

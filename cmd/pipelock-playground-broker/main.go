@@ -77,11 +77,11 @@ const (
 	// guests are one Fly app and share app-level secrets, so a root stored
 	// here is delivered to every visitor VM. That sharing is what put the
 	// durable key on the guests before 2026-09-03. It survives only as the
-	// name checked when refusing to leak a root through SessionEnv.
+	// legacy alias rejected in broker and visitor environment guards.
 	envOrchestratorKey = "PLAYGROUND_ORCHESTRATOR_" + "KEY"
 	// envOrchestratorRoot is the broker-only name for the durable signing
-	// root. The guest entrypoint does not read it and refuses to boot if the
-	// guest-facing name is present at all.
+	// root. The guest entrypoint refuses to boot if either durable-root name is
+	// present, including this one inherited from an app-level secret.
 	envOrchestratorRoot = "PLAYGROUND_ORCHESTRATOR_" + "ROOT"
 
 	// warmPoolVMCodeBytes mirrors broker.vmInviteCodeBytes for warm-pool VM
@@ -201,7 +201,7 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: false,
 		Version:       cliutil.Version,
 	}
-	root.AddCommand(newServeCmd(), newArchiveReplayCmd())
+	root.AddCommand(newServeCmd(), newArchiveReplayCmd(), newReplayKitsCmd())
 	return root
 }
 
@@ -306,16 +306,12 @@ func buildArchiveVerifyKits(f *archiveReplayFlags, bundle []byte) ([]archiveKit,
 // created here under O_EXCL, so it can never delete a pre-existing artifact.
 func publishArchiveArtifacts(f *archiveReplayFlags, bundle []byte, kits []archiveKit) (err error) {
 	var created []string
-	var createdDir string
 	defer func() {
 		if err == nil {
 			return
 		}
 		for _, path := range created {
 			_ = os.Remove(path)
-		}
-		if createdDir != "" {
-			_ = os.Remove(createdDir)
 		}
 	}()
 
@@ -333,11 +329,25 @@ func publishArchiveArtifacts(f *archiveReplayFlags, bundle []byte, kits []archiv
 	if len(kits) == 0 {
 		return nil
 	}
-	kitDir := filepath.Clean(f.kitOutputDir)
+	return publishArchiveKitDirectory(f.kitOutputDir, kits)
+}
+
+// publishArchiveKitDirectory refuses existing paths and removes only files it
+// created if the complete set cannot be written.
+func publishArchiveKitDirectory(outputDir string, kits []archiveKit) (err error) {
+	kitDir := filepath.Clean(outputDir)
 	if err = os.Mkdir(kitDir, 0o750); err != nil {
 		return fmt.Errorf("create kit output directory: %w", err)
 	}
-	createdDir = kitDir
+	var created []string
+	defer func() {
+		if err != nil {
+			for _, path := range created {
+				_ = os.Remove(path)
+			}
+			_ = os.Remove(kitDir)
+		}
+	}()
 	for _, kit := range kits {
 		path := filepath.Join(kitDir, kit.name)
 		madeKit, kitErr := writeNewArchiveFile(path, kit.data)
@@ -345,8 +355,7 @@ func publishArchiveArtifacts(f *archiveReplayFlags, bundle []byte, kits []archiv
 			created = append(created, path)
 		}
 		if kitErr != nil {
-			err = kitErr
-			return err
+			return kitErr
 		}
 	}
 	return nil
@@ -567,6 +576,20 @@ func requiredEnvironmentNames(f *serveFlags) []string {
 	return slices.Compact(names)
 }
 
+// brokerVerifyKitBinaries names the verifier binaries packaged in the broker image.
+func brokerVerifyKitBinaries() playground.VerifyKitBinaries {
+	return playground.VerifyKitBinaries{
+		Linux:   "/usr/local/bin/pipelock-verifier-linux",
+		MacOS:   "/usr/local/bin/pipelock-verifier-macos",
+		Windows: "/usr/local/bin/pipelock-verifier-windows.exe",
+	}
+}
+
+// buildBrokerVerifyKit packages a retained live bundle with the shipped verifier.
+func buildBrokerVerifyKit(ctx context.Context, osName playground.VerifyKitOS, raw []byte) ([]byte, string, error) {
+	return playground.BuildLiveVerifyKitContext(ctx, osName, brokerVerifyKitBinaries().Path(osName), raw)
+}
+
 func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Server, http.Handler, func(context.Context), *broker.Pool, error) {
 	// Refuse before resolving any secret or contacting a provider: a broker
 	// holding the guest-facing signing variable would hand the durable root to
@@ -672,6 +695,7 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 	}
 
 	srv, err := broker.NewServer(broker.ServerConfig{
+		KitBuilder:         buildBrokerVerifyKit,
 		Leases:             lm,
 		WarmPool:           warmPool,
 		Gate:               gate,
@@ -727,9 +751,10 @@ func buildServer(ctx context.Context, out io.Writer, f *serveFlags) (*broker.Ser
 		return ids
 	}
 	reaper, err := broker.NewReaper(broker.ReaperConfig{
-		Provider:  provider,
-		ActiveIDs: activeIDsFn,
-		Log:       out,
+		Provider:            provider,
+		ActiveIDs:           activeIDsFn,
+		RetryFailedDestroys: lm.RetryFailedDestroys,
+		Log:                 out,
 	})
 	if err != nil {
 		return nil, nil, nil, nil, err
@@ -1025,9 +1050,8 @@ func validateAdminFlags(f *serveFlags) error {
 	return nil
 }
 
-// validateAdminListenScope rejects admin listen addresses that bind to public
-// or unspecified IPs unless the operator explicitly opts in with
-// --unsafe-admin-listen-public. Loopback and RFC1918/ULA/link-local are safe.
+// validateAdminListenScope permits plaintext admin credentials on loopback only
+// unless the operator explicitly opts in with --unsafe-admin-listen-public.
 func validateAdminListenScope(listen string, unsafePublic bool) error {
 	host, _, err := net.SplitHostPort(listen)
 	if err != nil {
@@ -1040,7 +1064,7 @@ func validateAdminListenScope(listen string, unsafePublic bool) error {
 		if unsafePublic {
 			return nil
 		}
-		return errors.New("--admin-listen binds to all interfaces (unspecified address); use a loopback/private address or pass --unsafe-admin-listen-public")
+		return errors.New("--admin-listen binds to all interfaces (unspecified address); use loopback or pass --unsafe-admin-listen-public")
 	}
 	addr, err := netip.ParseAddr(host)
 	if err != nil {
@@ -1052,28 +1076,21 @@ func validateAdminListenScope(listen string, unsafePublic bool) error {
 		if unsafePublic {
 			return nil
 		}
-		return fmt.Errorf("--admin-listen host %q is not a recognized private address; use a loopback/private address or pass --unsafe-admin-listen-public", host)
+		return fmt.Errorf("--admin-listen host %q is not loopback; use loopback or pass --unsafe-admin-listen-public", host)
 	}
 	if addr.IsUnspecified() {
 		if unsafePublic {
 			return nil
 		}
-		return errors.New("--admin-listen binds to all interfaces (unspecified address); use a loopback/private address or pass --unsafe-admin-listen-public")
+		return errors.New("--admin-listen binds to all interfaces (unspecified address); use loopback or pass --unsafe-admin-listen-public")
 	}
-	if isPrivateOrLoopback(addr) {
+	if addr.IsLoopback() {
 		return nil
 	}
 	if unsafePublic {
 		return nil
 	}
-	return fmt.Errorf("--admin-listen address %s is public; use a loopback/private address or pass --unsafe-admin-listen-public", addr)
-}
-
-// isPrivateOrLoopback returns true for loopback, link-local, RFC1918, and ULA
-// addresses — the address classes safe for an admin listener without explicit
-// opt-in.
-func isPrivateOrLoopback(addr netip.Addr) bool {
-	return addr.IsLoopback() || addr.IsPrivate() || addr.IsLinkLocalUnicast() || addr.IsLinkLocalMulticast()
+	return fmt.Errorf("--admin-listen address %s is not loopback; use loopback or pass --unsafe-admin-listen-public", addr)
 }
 
 func validateHumanGateFlags(f *serveFlags) error {
@@ -1804,22 +1821,27 @@ func (v *cfAccessVerifier) keySet(ctx context.Context) (*jose.JSONWebKeySet, err
 		return v.keys, nil
 	}
 
-	// Negative-cache: if a previous refetch failed and we have stale keys,
-	// serve them until nextRetry to avoid hammering the JWKS endpoint.
+	// A failed refresh may reuse keys for one fixed grace period after their
+	// original expiry. Retrying must never renew that trust deadline.
+	staleUntil := v.keysExp.Add(cfAccessNegativeCacheTTL)
 	if v.keys != nil && now.Before(v.nextRetry) {
-		v.keysExp = now.Add(cfAccessNegativeCacheTTL)
-		return v.keys, nil
+		if now.Before(staleUntil) {
+			return v.keys, nil
+		}
+		return nil, errors.New("access JWKS refresh unavailable")
 	}
 
 	keys, fetchErr := v.fetchKeys(ctx)
 	if fetchErr != nil {
-		// Fail-closed when there are no cached keys at all.
 		if v.keys == nil {
 			return nil, fetchErr
 		}
-		// Stale keys exist: serve them and set a negative-cache window.
 		v.nextRetry = now.Add(cfAccessNegativeCacheTTL)
-		v.keysExp = v.nextRetry
+		// Fail-closed when there are no cached keys at all.
+		if !now.Before(staleUntil) {
+			return nil, fetchErr
+		}
+		// Stale keys remain within their fixed grace period.
 		return v.keys, nil
 	}
 	v.keys = keys
@@ -2030,11 +2052,11 @@ func resolveSessionEnv(f *serveFlags) (map[string]string, error) {
 	return env, nil
 }
 
-// refuseGuestFacingRootSecret fails closed while the guest-facing signing-key
-// variable is set in the broker own environment. Broker and visitor VMs are
-// one Fly app and share app-level secrets, so a value under that name reaches
-// every guest and turns delegation off with no other signal. Refusing here
-// makes that deployment state impossible to hold silently.
+// refuseGuestFacingRootSecret fails closed while the retired guest-facing
+// signing-key variable is set in the broker's own environment. Broker and
+// visitor VMs are one Fly app and share app-level secrets, so a value under
+// that name reaches every guest and turns delegation off with no other signal.
+// Refusing here makes that deployment state impossible to hold silently.
 func refuseGuestFacingRootSecret() error {
 	if strings.TrimSpace(os.Getenv(envOrchestratorKey)) == "" {
 		return nil

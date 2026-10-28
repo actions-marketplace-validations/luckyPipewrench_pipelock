@@ -183,6 +183,7 @@ func writeMCPFileSentryConfig(t *testing.T, bestEffort bool, paths ...string) st
 
 func failFileSentryWatcher(t *testing.T, watchErr error) {
 	t.Helper()
+	requireNoLeakedRuns(t)
 	old := newFileSentryWatcher
 	newFileSentryWatcher = func(*config.FileSentry, filesentry.DLPScanner, filesentry.Lineage, func(error)) (filesentry.Watcher, error) {
 		return nil, watchErr
@@ -234,6 +235,10 @@ func TestMcpProxyCmd_FileSentryBestEffortRejectsInitializationFailure(t *testing
 	}
 }
 
+// mcpChildProcessDeadline covers launching and tearing down the re-executed,
+// race-instrumented test binary that serves as the MCP child on a loaded runner.
+const mcpChildProcessDeadline = 30 * time.Second
+
 func TestMcpProxyCmd_ReturnsFileSentryRuntimeFailure(t *testing.T) {
 	wantErr := errors.New("watch backend failed")
 	watcher := newGatedFileSentryWatcher(wantErr)
@@ -259,12 +264,17 @@ func TestMcpProxyCmd_ReturnsFileSentryRuntimeFailure(t *testing.T) {
 		os.Args[0],
 		"-test.run=TestMCPRuntimeHelperProcess$",
 	})
-	done := make(chan error, 1)
-	go func() { done <- cmd.Execute() }()
+	done := runJoined(t, ctx, func(runCtx context.Context) error {
+		cmd.SetContext(runCtx)
+		return cmd.Execute()
+	}, func() {
+		_ = inputW.Close()
+		_ = inputR.Close()
+	})
 
 	select {
 	case <-watcher.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(mcpChildProcessDeadline):
 		t.Fatal("file sentry watcher did not start after MCP child launch")
 	}
 	close(watcher.release)
@@ -277,7 +287,7 @@ func TestMcpProxyCmd_ReturnsFileSentryRuntimeFailure(t *testing.T) {
 		if !errors.Is(err, wantErr) {
 			t.Fatalf("mcp proxy error = %v, want file sentry runtime failure wrapping %v\nstderr:\n%s", err, wantErr, stderr.String())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(mcpChildProcessDeadline):
 		t.Fatal("mcp proxy did not return after file sentry runtime failure")
 	}
 }
@@ -305,12 +315,17 @@ func TestMcpProxyCmd_KeepsCleanCancellationNilWithFileSentry(t *testing.T) {
 		os.Args[0],
 		"-test.run=TestMCPRuntimeHelperProcess$",
 	})
-	done := make(chan error, 1)
-	go func() { done <- cmd.Execute() }()
+	done := runJoined(t, ctx, func(runCtx context.Context) error {
+		cmd.SetContext(runCtx)
+		return cmd.Execute()
+	}, func() {
+		_ = inputW.Close()
+		_ = inputR.Close()
+	})
 
 	select {
 	case <-watcher.started:
-	case <-time.After(5 * time.Second):
+	case <-time.After(mcpChildProcessDeadline):
 		t.Fatal("file sentry watcher did not start after MCP child launch")
 	}
 	cancel()
@@ -323,7 +338,7 @@ func TestMcpProxyCmd_KeepsCleanCancellationNilWithFileSentry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("mcp proxy error after clean cancellation = %v, want nil\nstderr:\n%s", err, stderr.String())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(mcpChildProcessDeadline):
 		t.Fatal("mcp proxy did not return after clean cancellation")
 	}
 }
@@ -593,7 +608,7 @@ func TestRecoverDeferredActionsBlocksPendingJournal(t *testing.T) {
 	}
 
 	var log bytes.Buffer
-	if err := recoverDeferredActions(manager, manager.JournalPath(), emitter, nil, runtimeTestPolicyHash, &log); err != nil {
+	if err := recoverDeferredActions(manager, manager.JournalPath(), mcp.MCPProxyOpts{ReceiptEmitter: emitter, PolicyHash: runtimeTestPolicyHash}, &log); err != nil {
 		t.Fatalf("recoverDeferredActions: %v", err)
 	}
 	pending, err = deferred.PendingJournal(manager.JournalPath())
@@ -666,7 +681,7 @@ func TestRecoverDeferredActionsRunsWithoutLiveManager(t *testing.T) {
 	}
 
 	var log bytes.Buffer
-	if err := recoverDeferredActions(nil, manager.JournalPath(), emitter, nil, runtimeTestPolicyHash, &log); err != nil {
+	if err := recoverDeferredActions(nil, manager.JournalPath(), mcp.MCPProxyOpts{ReceiptEmitter: emitter, PolicyHash: runtimeTestPolicyHash}, &log); err != nil {
 		t.Fatalf("recoverDeferredActions without manager: %v", err)
 	}
 	if err := rec.Close(); err != nil {
@@ -1615,102 +1630,102 @@ func TestParseHeaderFlags(t *testing.T) {
 		{
 			name:    "missing colon rejected",
 			input:   []string{"Authorization Bearer abc"},
-			wantErr: `--header "Authorization Bearer abc": expected 'Key: Value' format`,
+			wantErr: `--header: expected 'Key: Value' format`,
 		},
 		{
 			name:    "empty key rejected",
 			input:   []string{": value-only"},
-			wantErr: `--header ": value-only": key is empty`,
+			wantErr: `--header: key is empty`,
 		},
 		{
 			name:    "whitespace-only key rejected",
 			input:   []string{"   : value"},
-			wantErr: `--header "   : value": key is empty`,
+			wantErr: `--header: key is empty`,
 		},
 		{
 			name:    "key with space rejected",
 			input:   []string{"X Bad: value"},
-			wantErr: `--header "X Bad: value": key contains invalid characters`,
+			wantErr: `--header: key contains invalid characters`,
 		},
 		{
 			name:    "key with unicode rejected",
 			input:   []string{"X-\u2003Bad: value"},
-			wantErr: `--header "X-\u2003Bad: value": key contains invalid characters`,
+			wantErr: `--header: key contains invalid characters`,
 		},
 		{
 			name:    "value with crlf rejected",
 			input:   []string{"X-Test: ok\r\nX-Injected: yes"},
-			wantErr: "--header \"X-Test: ok\\r\\nX-Injected: yes\": value contains invalid characters",
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			name:    "value with control character rejected",
 			input:   []string{"X-Test: ok\x7f"},
-			wantErr: `--header "X-Test: ok\x7f": value contains invalid characters`,
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			name:    "value with unicode whitespace rejected",
 			input:   []string{"X-Test: ok\u2003hidden"},
-			wantErr: `--header "X-Test: ok\u2003hidden": value contains invalid characters`,
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			// Boundary case: TrimSpace previously stripped a trailing CRLF
 			// before validation ran. Catches that regression.
 			name:    "value ending with crlf rejected",
 			input:   []string{"X-Test: ok\r\n"},
-			wantErr: "--header \"X-Test: ok\\r\\n\": value contains invalid characters",
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			// Boundary case: leading unicode whitespace would be stripped by
 			// strings.TrimSpace, bypassing validHeaderValue.
 			name:    "value starting with unicode whitespace rejected",
 			input:   []string{"X-Test: \u2003ok"},
-			wantErr: `--header "X-Test: \u2003ok": value contains invalid characters`,
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			// Boundary case: trailing unicode whitespace, same reasoning.
 			name:    "value ending with unicode whitespace rejected",
 			input:   []string{"X-Test: ok\u2003"},
-			wantErr: `--header "X-Test: ok\u2003": value contains invalid characters`,
+			wantErr: `--header: value contains invalid characters`,
 		},
 		{
 			name:    "reserved Mcp-Session-Id rejected",
 			input:   []string{"Mcp-Session-Id: attacker-pinned"},
-			wantErr: `--header "Mcp-Session-Id: attacker-pinned": "Mcp-Session-Id" is managed by the MCP HTTP transport and cannot be overridden via --header`,
+			wantErr: `--header: "Mcp-Session-Id" is managed by the MCP HTTP transport and cannot be overridden via --header`,
 		},
 		{
 			name:    "reserved Mcp-Session-Id rejected case-insensitive",
 			input:   []string{"mcp-session-id: attacker-pinned"},
-			wantErr: `--header "mcp-session-id: attacker-pinned": "mcp-session-id" is managed by the MCP HTTP transport and cannot be overridden via --header`,
+			wantErr: `--header: "mcp-session-id" is managed by the MCP HTTP transport and cannot be overridden via --header`,
 		},
 		{
 			name:    "reserved Content-Type rejected",
 			input:   []string{"Content-Type: text/plain"},
-			wantErr: `--header "Content-Type: text/plain": "Content-Type" is managed by the MCP HTTP transport and cannot be overridden via --header`,
+			wantErr: `--header: "Content-Type" is managed by the MCP HTTP transport and cannot be overridden via --header`,
 		},
 		{
 			name:    "reserved Host rejected",
 			input:   []string{"Host: evil.example"},
-			wantErr: `--header "Host: evil.example": "Host" is managed by the MCP HTTP transport and cannot be overridden via --header`,
+			wantErr: `--header: "Host" is managed by the MCP HTTP transport and cannot be overridden via --header`,
 		},
 		{
 			name:    "duplicate authorization rejected",
 			input:   []string{"Authorization: Bearer first", "authorization: Bearer second"},
-			wantErr: `--header "authorization: Bearer second": duplicate header "Authorization" is ambiguous`,
+			wantErr: `--header: duplicate header "Authorization" is ambiguous`,
 		},
 		{
 			name:    "duplicate protocol version rejected",
 			input:   []string{"Mcp-Protocol-Version: 2025-03-26", "mcp-protocol-version: 2025-06-18"},
-			wantErr: `--header "mcp-protocol-version: 2025-06-18": duplicate header "Mcp-Protocol-Version" is ambiguous`,
+			wantErr: `--header: duplicate header "Mcp-Protocol-Version" is ambiguous`,
 		},
 		{
 			name:    "duplicate A2A version rejected",
 			input:   []string{"A2A-Version: 0.3", "a2a-version: 1.0"},
-			wantErr: `--header "a2a-version: 1.0": duplicate header "A2a-Version" is ambiguous`,
+			wantErr: `--header: duplicate header "A2a-Version" is ambiguous`,
 		},
 		{
 			name:    "duplicate A2A extensions rejected",
 			input:   []string{"A2A-Extensions: urn:one", "a2a-extensions: urn:two"},
-			wantErr: `--header "a2a-extensions: urn:two": duplicate header "A2a-Extensions" is ambiguous`,
+			wantErr: `--header: duplicate header "A2a-Extensions" is ambiguous`,
 		},
 	}
 
@@ -1930,8 +1945,10 @@ func runMCPProxyCommandWithInputAndCommand(t *testing.T, args []string, input st
 	cmd.SetIn(strings.NewReader(input))
 	cmd.SetArgs(args)
 
-	done := make(chan error, 1)
-	go func() { done <- cmd.Execute() }()
+	done := runJoined(t, ctx, func(runCtx context.Context) error {
+		cmd.SetContext(runCtx)
+		return cmd.Execute()
+	}, nil)
 
 	select {
 	case err := <-done:

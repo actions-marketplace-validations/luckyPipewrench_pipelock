@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/emitformat"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 )
 
@@ -109,6 +110,14 @@ const (
 const (
 	OriginPolicyRewrite = "rewrite"
 	OriginPolicyForward = "forward"
+)
+
+// WebSocket cross-message field budget: 0 selects
+// DefaultWebSocketCrossMessageFieldLimit. The maximum is the field tail
+// package's own ceiling, so a validated value is never clamped.
+const (
+	DefaultWebSocketCrossMessageFieldLimit = 512
+	MaxWebSocketCrossMessageFieldLimit     = extract.FieldTailMaxPathsLimit
 )
 
 // Header mode constants for request body scanning.
@@ -364,7 +373,16 @@ type RequestPolicyRule struct {
 	Route         RequestPolicyRoute          `yaml:"route"`
 	GraphQL       *RequestPolicyGraphQL       `yaml:"graphql,omitempty"`       // optional GraphQL operation predicate
 	Discriminator *RequestPolicyDiscriminator `yaml:"discriminator,omitempty"` // optional JSON discriminator-field predicate
+	Except        *RequestPolicyException     `yaml:"except,omitempty"`        // exact JSON values that exempt this block rule
 	Reason        string                      `yaml:"reason"`                  // operator-facing explanation (never logged with content)
+}
+
+// RequestPolicyException exempts a block only when an inspectable JSON object
+// contains one exact top-level string value. Missing, ambiguous, or unreadable
+// values never exempt the request.
+type RequestPolicyException struct {
+	Field  string   `yaml:"field"`
+	Values []string `yaml:"values"`
 }
 
 // RequestPolicyRoute selects which requests a rule applies to. An empty
@@ -421,6 +439,7 @@ type Config struct {
 	ResponseScanning         ResponseScanning        `yaml:"response_scanning"`
 	MCPInputScanning         MCPInputScanning        `yaml:"mcp_input_scanning"`
 	MCPToolScanning          MCPToolScanning         `yaml:"mcp_tool_scanning"`
+	MCPIdentities            []MCPIdentity           `yaml:"mcp_identities" json:"MCPIdentities,omitempty"`
 	MCPDataClassLabels       MCPDataClassLabels      `yaml:"mcp_data_class_labels" json:"-"`
 	MCPToolPolicy            MCPToolPolicy           `yaml:"mcp_tool_policy"`
 	Defer                    DeferConfig             `yaml:"defer"`
@@ -472,6 +491,10 @@ type Config struct {
 	LicenseFile              string                  `yaml:"license_file,omitempty"`                       // path to file containing the license token (read at startup)
 	LicenseCRLFile           string                  `yaml:"license_crl_file,omitempty" json:"-"`          // path to signed license revocation list (read at startup)
 	LicenseIntermediateFile  string                  `yaml:"license_intermediate_file,omitempty" json:"-"` // path to root-signed intermediate license-signing certificate
+
+	// Global wording policy; other scanner families remain independent.
+	PromptInjectionDetection *PromptInjectionDetection `yaml:"prompt_injection_detection,omitempty" json:",omitempty"`
+
 	// LicenseRequireIntermediate, when true, refuses any license that is not
 	// validated through a root-certified intermediate (the offline-root PKI
 	// tier). A *bool distinguishes omitted (nil -> env fallback, default false)
@@ -483,12 +506,13 @@ type Config struct {
 	// omitted / non-positive falls back to DefaultCRLMaxAge — a configured value
 	// can never DISABLE the freshness check. Excluded from the canonical policy
 	// hash: it is a license-trust knob, not effective request policy.
-	LicenseCRLMaxAge string   `yaml:"license_crl_max_age,omitempty" json:"-"`
-	LicensePublicKey string   `yaml:"license_public_key,omitempty"` // hex-encoded Ed25519 public key for license verification (dev builds only)
-	Internal         []string `yaml:"internal"`
-	TrustedDomains   []string `yaml:"trusted_domains"` // domains exempt from SSRF internal-IP check (wildcard supported)
-	SSRF             SSRF     `yaml:"ssrf"`
-	DNS              DNS      `yaml:"dns"`
+	LicenseCRLMaxAge  string             `yaml:"license_crl_max_age,omitempty" json:"-"`
+	LicensePublicKey  string             `yaml:"license_public_key,omitempty"` // hex-encoded Ed25519 public key for license verification (dev builds only)
+	Internal          []string           `yaml:"internal"`
+	TrustedDomains    []string           `yaml:"trusted_domains"` // domains exempt from SSRF internal-IP check (wildcard supported)
+	DestinationGrants []DestinationGrant `yaml:"destination_grants" json:"DestinationGrants,omitempty"`
+	SSRF              SSRF               `yaml:"ssrf"`
+	DNS               DNS                `yaml:"dns"`
 
 	// LicenseExpiresAt, LicenseIssuedAt, and LicenseTier are claims from the
 	// verified license token, populated at runtime. They are used for expiry
@@ -507,8 +531,17 @@ type Config struct {
 	// LicenseAgentsFeature is true only after runtime license verification
 	// accepted FeatureAgents. Core code uses this to avoid applying named-agent
 	// paid overrides when enterprise license hooks are absent.
-	LicenseAgentsFeature    bool   `yaml:"-" json:"-"`
-	LicenseIntermediateCert []byte `yaml:"-" json:"-"`
+	LicenseAgentsFeature bool `yaml:"-" json:"-"`
+	// LicenseDisabledAgents records the named agent profiles the license
+	// gate removed, keyed by profile name with the listeners each declared,
+	// and LicenseDisabledReason says why the gate removed them. Both are set
+	// only by the enterprise license gate and are never read from YAML.
+	// Validation consults them solely to name the real cause when another
+	// setting refers to a profile that was disabled; they never make a
+	// disabled profile count as declared.
+	LicenseDisabledAgents   map[string][]string `yaml:"-" json:"-"`
+	LicenseDisabledReason   string              `yaml:"-" json:"-"`
+	LicenseIntermediateCert []byte              `yaml:"-" json:"-"`
 	// LicenseIntermediateLoadError records a configured cert file that could
 	// not be loaded. LicenseIntermediateCert stays non-empty in that state so
 	// verification fails closed instead of silently downgrading to root-only.
@@ -550,6 +583,12 @@ type Config struct {
 	// Not serialized to YAML. Set by Load(), nil for Defaults().
 	rawBytes []byte `yaml:"-"`
 
+	// Load-time advisories only; never participate in effective policy identity.
+	mcpCompatibilityWarnings []Warning
+
+	// Expired scanner declarations retained only for lifecycle diagnostics.
+	lapsedScannerExceptions []Warning
+
 	// allowEphemeralListeners is test-only provenance for in-process runtime
 	// harnesses that need the kernel to choose collision-free ports. Operator
 	// YAML can never set it.
@@ -575,6 +614,9 @@ type Config struct {
 	// semantics as canonicalHashCache - a fresh holder is installed on
 	// Defaults(), Load(), and Clone().
 	canonicalRedactionKeyCache *canonicalHashCacheHolder `yaml:"-"`
+
+	// runtimeConfigDir anchors lazy credential reads to the config source.
+	runtimeConfigDir string `yaml:"-"`
 
 	// resolvedKillSwitchAPIToken stores the effective admin API token after
 	// runtime env/YAML resolution. It is deliberately unexported so env-sourced
@@ -714,6 +756,19 @@ type MCPToolScanning struct {
 	// ListenerDriftResetTarget is the stable listener identity a delegation
 	// must bind before it may re-baseline this upstream inventory.
 	ListenerDriftResetTarget string `yaml:"listener_drift_reset_target" json:"-"`
+	// AcknowledgedFindings are reviewed, expiring operator acknowledgments of
+	// every occurrence of one finding in one exact tool definition from one
+	// configured server. Omitted or empty acknowledges nothing.
+	AcknowledgedFindings []MCPAcknowledgedFinding `yaml:"acknowledged_findings" json:"AcknowledgedFindings,omitempty"`
+	// AcknowledgmentKey names the deployment-held secret that keys every
+	// acknowledgment's server_binding_hmac: "${ENV_VAR}" or
+	// "file:/absolute/path" (mode 0600 or stricter, no symlinks). A literal
+	// value is refused because it would sit beside the entries it protects.
+	// Required when acknowledged_findings is not empty.
+	AcknowledgmentKey string `yaml:"acknowledgment_key" json:"-"`
+	// AcknowledgmentKeyBytes is the key resolved and pinned during
+	// validation. Runtime builders must not resolve the source again.
+	AcknowledgmentKeyBytes []byte `yaml:"-" json:"-"`
 }
 
 // MCPDataClassLabels reserves the config surface for DLP-derived MCP receipt
@@ -764,6 +819,11 @@ type MCPToolPolicy struct {
 	RedirectProfiles      map[string]RedirectProfile      `yaml:"redirect_profiles,omitempty"`
 	DeferResolverProfiles map[string]DeferResolverProfile `yaml:"defer_resolver_profiles,omitempty" json:"defer_resolver_profiles,omitempty"`
 	QuarantineDir         string                          `yaml:"quarantine_dir,omitempty"`
+	// OnIncompleteCheck is the action when a rule's check cannot rule out a
+	// match (a long argument list, or a match only across separate commands):
+	// warn (default) or block. Either way the verdict names
+	// incomplete_pair_check.
+	OnIncompleteCheck string `yaml:"on_incomplete_check,omitempty" json:"on_incomplete_check,omitempty"`
 }
 
 // DeferConfig configures per-action held authorization for supported MCP
@@ -836,14 +896,38 @@ type ResponseScanning struct {
 	AskTimeoutSeconds              int                           `yaml:"ask_timeout_seconds"` // timeout for HITL prompt (default 30)
 	IncludeDefaults                *bool                         `yaml:"include_defaults"`    // nil/true: merge user patterns with defaults; false: user patterns only
 	Patterns                       []ResponseScanPattern         `yaml:"patterns"`
-	ExemptDomains                  []string                      `yaml:"exempt_domains"`                      // responses from these hosts skip injection scanning (DLP still applies)
-	SizeExemptDomains              []string                      `yaml:"size_exempt_domains"`                 // trusted hosts whose oversized responses get a larger bounded whole-buffer scan
-	SizeExemptScanMaxBytes         int                           `yaml:"size_exempt_scan_max_bytes"`          // per-response in-memory ceiling for over-cap size-exempt responses
-	SizeExemptScanMaxInflightBytes int                           `yaml:"size_exempt_scan_max_inflight_bytes"` // per-proxy-instance in-flight memory budget for size-exempt response scans
-	UnscannablePassthrough         []UnscannablePassthroughEntry `yaml:"unscannable_passthrough"`             // explicit audited stream-unscanned allowlist for opaque responses
-	AuthenticatedArtifacts         []AuthenticatedArtifactEntry  `yaml:"authenticated_artifacts"`             // exact signed artifacts the proxy may release after its own verification
-	SSEStreaming                   GenericSSEScanning            `yaml:"sse_streaming"`                       // generic text/event-stream inline scanning (LLM SSE)
-	MCPServers                     []MCPResponseServerTrust      `yaml:"mcp_servers"`                         // per-server MCP response trust overrides
+	ExemptDomains                  []string                      `yaml:"exempt_domains"`                                      // responses from these hosts skip injection scanning (DLP still applies)
+	SizeExemptDomains              []string                      `yaml:"size_exempt_domains"`                                 // trusted hosts whose oversized responses get a larger bounded whole-buffer scan
+	SizeExemptScanMaxBytes         int                           `yaml:"size_exempt_scan_max_bytes"`                          // per-response in-memory ceiling for over-cap size-exempt responses
+	SizeExemptScanLimits           []ResponseSizeScanLimit       `yaml:"size_exempt_scan_limits,omitempty" json:",omitempty"` // expiring exact-host ceilings; all response scans still run
+	SizeExemptScanMaxInflightBytes int                           `yaml:"size_exempt_scan_max_inflight_bytes"`                 // per-proxy-instance in-flight memory budget for size-exempt response scans
+	UnscannablePassthrough         []UnscannablePassthroughEntry `yaml:"unscannable_passthrough"`                             // explicit audited stream-unscanned allowlist for opaque responses
+	AuthenticatedArtifacts         []AuthenticatedArtifactEntry  `yaml:"authenticated_artifacts"`                             // exact signed artifacts the proxy may release after its own verification
+	SSEStreaming                   GenericSSEScanning            `yaml:"sse_streaming"`                                       // generic text/event-stream inline scanning (LLM SSE)
+	MCPServers                     []MCPResponseServerTrust      `yaml:"mcp_servers"`                                         // per-server MCP response trust overrides
+	CoreObserveExceptions          []CoreObserveException        `yaml:"core_observe_exceptions"`                             // declared, expiring per-host observe entries for one named core response pattern
+}
+
+// CoreObserveException declares that one exact host may OBSERVE, rather than
+// block on, one named immutable core response pattern.
+//
+// Observing never skips the scan. The pattern still runs on every
+// normalization pass, the finding is still recorded, and it is still emitted
+// as evidence with its own "core_observed" reason so an auditor can tell an
+// operator-declared floor observation from ordinary suppression. Only the
+// block is withheld, and only for the one pattern named here on the one host
+// named here.
+//
+// This is deliberately narrower than response_scanning.exempt_domains, which
+// stops scanning a host entirely. Every field below is required because a
+// relaxation of the immutable floor has to name who authorized it, why, and
+// when it ends.
+type CoreObserveException struct {
+	Host    string `yaml:"host"`    // exact host; wildcards refused
+	Pattern string `yaml:"pattern"` // exact core response pattern name
+	Reason  string `yaml:"reason"`  // required justification
+	Owner   string `yaml:"owner"`   // required accountable owner
+	Expires string `yaml:"expires"` // required future/present ISO date (YYYY-MM-DD)
 }
 
 // AuthenticatedArtifactEntry identifies one official signed rule artifact.
@@ -999,11 +1083,19 @@ type WebSocketProxy struct {
 	MaxConnectionSeconds     int    `yaml:"max_connection_seconds"`
 	IdleTimeoutSeconds       int    `yaml:"idle_timeout_seconds"`
 	OriginPolicy             string `yaml:"origin_policy"` // rewrite (default), forward, strip
+	// CrossMessageFieldLimit is the number of JSON fields per connection and
+	// direction whose trailing text is joined with the next text message.
+	// 0 selects DefaultWebSocketCrossMessageFieldLimit; the maximum is
+	// MaxWebSocketCrossMessageFieldLimit. A message that cannot be joined
+	// within this budget closes the connection. Omitted from the canonical
+	// policy view when 0, so the default leaves policy hashes unchanged.
+	CrossMessageFieldLimit int `yaml:"cross_message_field_limit" json:"CrossMessageFieldLimit,omitempty"`
 	// ContentEntropyExclusions lists trusted WebSocket destination hosts whose
 	// client-to-server text frames may legitimately carry opaque high-entropy
 	// content. The exemption applies only to per-message content entropy; body
 	// DLP, prompt-injection scanning, address protection, and CEE still run.
-	ContentEntropyExclusions []string `yaml:"content_entropy_exclusions"`
+	// Each entry is a host string or a {host, expires, reason, owner} mapping.
+	ContentEntropyExclusions []EntropyHostExclusion `yaml:"content_entropy_exclusions"`
 }
 
 // ReverseProxy configures a generic HTTP reverse proxy with body scanning.
@@ -1130,11 +1222,12 @@ type Monitoring struct {
 	// SubdomainEntropyExclusions for a path false positive: that list governs
 	// BOTH the path and subdomain gates, so it gives up a second detection.
 	// Ships with five document-sharing routes (Google Docs, Sheets, Slides,
-	// Forms and Drive file), because those carry an opaque service-issued file
-	// ID by construction and were otherwise blocked on a fresh install. A route
-	// enters the defaults on the vendor's PUBLISHED ROUTE SHAPE only, never on
-	// the identifier format, which Google documents as opaque. An operator's
-	// own list replaces the shipped set; an explicitly empty list removes it.
+	// Forms and Drive file) and Cloudflare's challenge route, because those
+	// carry opaque service-issued tokens by construction and were otherwise
+	// blocked on a fresh install. A route enters the defaults on the vendor's
+	// ROUTE SHAPE only, never on the identifier format. The scanner applies an
+	// operator's own list IN ADDITION to the shipped set; an explicitly empty
+	// list removes the shipped set.
 	PathEntropyExclusions []PathEntropyExclusion `yaml:"path_entropy_exclusions"`
 
 	// QueryEntropyParamExclusions lists exact HTTPS endpoint+parameter tuples
@@ -1149,6 +1242,22 @@ type Monitoring struct {
 	// attacker-named target. nil = enabled. Set false only for an endpoint whose
 	// contract legitimately carries private or blocklisted URLs in query strings.
 	ScanNestedURLs *bool `yaml:"scan_nested_urls"`
+
+	// OAuthAuthorizationEndpoints explicitly grants native authorization-code GET
+	// requests state/nonce entropy and HTTP loopback redirect descriptor relief.
+	// Empty by default; discovery alone never installs a grant.
+	OAuthAuthorizationEndpoints []OAuthAuthorizationEndpoint `yaml:"oauth_authorization_endpoints,omitempty" json:"OAuthAuthorizationEndpoints,omitempty"`
+}
+
+// OAuthAuthorizationEndpoint is an operator-authorized exact HTTPS endpoint.
+// The grant accepts opaque client-generated state/nonce values at this endpoint;
+// it does not establish that those values contain only random data.
+type OAuthAuthorizationEndpoint struct {
+	Host    string `yaml:"host"`
+	Path    string `yaml:"path"`
+	Reason  string `yaml:"reason,omitempty"`
+	Owner   string `yaml:"owner,omitempty"`
+	Expires string `yaml:"expires,omitempty"`
 }
 
 // QueryEntropyParamExclusion is a narrow query-value entropy exemption for one
@@ -1184,7 +1293,7 @@ type QueryEntropyParamExclusion struct {
 // that value back, can still use it to carry data; verify that is not possible
 // for a route before exempting it.
 type PathEntropyExclusion struct {
-	Scheme     string `yaml:"scheme,omitempty"` // https when unset; an entry never matches a scheme it does not name
+	Scheme     string `yaml:"scheme,omitempty"` // https when unset; http matches cleartext only
 	Host       string `yaml:"host"`             // exact host, or *.example.com
 	PathPrefix string `yaml:"path_prefix"`      // literal prefix of the normalized path, e.g. /document/d/
 	Reason     string `yaml:"reason,omitempty"` // why this route is exempt, for the operator reading it later
@@ -1200,20 +1309,32 @@ type DLP struct {
 	IncludeDefaults    *bool        `yaml:"include_defaults"`      // nil/true: merge user patterns with defaults; false: user patterns only
 	Patterns           []DLPPattern `yaml:"patterns"`
 	Action             string       `yaml:"action,omitempty"` // reserved - not yet implemented; rejected at validation
+	// GitHubEnterpriseHosts names exact GitHub Enterprise Server or GHE.com
+	// API hosts. They extend only the compiled GitHub token audiences.
+	// Public github.com API hosts stay compiled and are not listed here.
+	GitHubEnterpriseHosts []string `yaml:"github_enterprise_hosts,omitempty"`
+	// GitLabHosts names exact self-managed or Dedicated GitLab hosts. They
+	// extend only the compiled GitLab token audiences. gitlab.com stays compiled.
+	GitLabHosts []string `yaml:"gitlab_hosts,omitempty"`
 }
 
-// DLPPattern is a named regex pattern for detecting secrets in URLs.
+// DLPPattern is a named regex pattern for detecting secrets in URLs, request
+// bodies and headers, and other scanned outbound text.
 type DLPPattern struct {
-	Name                    string   `yaml:"name"`
-	Regex                   string   `yaml:"regex"`
-	Severity                string   `yaml:"severity"`            // critical, high, medium, low
-	Validator               string   `yaml:"validator,omitempty"` // post-match checksum: "luhn", "mod97", "aba"
-	ExemptDomains           []string `yaml:"exempt_domains"`      // domains where this pattern is not enforced
-	Action                  string   `yaml:"action,omitempty"`    // reserved - not yet implemented; rejected at validation
-	Bundle                  string   `yaml:"-"`                   // set by rules loader, not from YAML
-	BundleVersion           string   `yaml:"-"`                   // set by rules loader, not from YAML
-	Compiled                bool     `yaml:"-"`                   // true for patterns created in Defaults()
-	CredentialAudienceHosts []string `yaml:"-"`                   // compiled built-ins only; strict YAML rejects attempts to configure it
+	Name                                string   `yaml:"name"`
+	Regex                               string   `yaml:"regex"`
+	Severity                            string   `yaml:"severity"`            // critical, high, medium, low
+	Validator                           string   `yaml:"validator,omitempty"` // post-match checksum: "luhn", "mod97", "aba"
+	ExemptDomains                       []string `yaml:"exempt_domains"`      // domains where this pattern is not enforced
+	Action                              string   `yaml:"action,omitempty"`    // "" or "warn"; warn is refused for built-in patterns
+	Bundle                              string   `yaml:"-"`                   // set by rules loader, not from YAML
+	BundleVersion                       string   `yaml:"-"`                   // set by rules loader, not from YAML
+	Compiled                            bool     `yaml:"-"`                   // true for patterns created in Defaults()
+	CredentialAudienceHosts             []string `yaml:"-"`                   // compiled built-ins only; strict YAML rejects attempts to configure it
+	CredentialAudienceAuthorizationOnly bool     `yaml:"-"`                   // compiled built-ins only; restricts audience allowance to Authorization headers
+	CredentialAudienceCarrierMask       uint16   `yaml:"-"`                   // compiled built-ins only; which surfaces may carry the credential
+	CredentialAudienceGitHosts          []string `yaml:"-"`                   // compiled built-ins only; hosts of the git-over-HTTPS Basic rule
+	CredentialAudienceRegistryHosts     []string `yaml:"-"`                   // compiled built-ins only; hosts of the package-registry Basic or bearer rule
 	// CredentialURLWhitespaceGrammar is set only by the built-in default
 	// registry. It is runtime provenance, not an operator-facing setting.
 	CredentialURLWhitespaceGrammar bool `yaml:"-"`
@@ -1306,8 +1427,8 @@ type SessionProfiling struct {
 }
 
 // AdaptiveEnforcement configures per-session threat scoring with escalation.
-// Score accumulates from DLP near-misses and blocks. When threshold is exceeded,
-// the session's enforcement level escalates (audit->warn or warn->block).
+// Enforced findings accumulate score; warnings are observations without points.
+// Crossing a threshold applies the configured per-level enforcement upgrades.
 type AdaptiveEnforcement struct {
 	Enabled                   bool             `yaml:"enabled"`
 	EscalationThreshold       float64          `yaml:"escalation_threshold"`         // points before escalation
@@ -1367,9 +1488,9 @@ type A2AScanning struct {
 	Action                    string `yaml:"action"`                      // block, warn
 	ScanAgentCards            bool   `yaml:"scan_agent_cards"`            // Agent Card skill poisoning
 	DetectCardDrift           bool   `yaml:"detect_card_drift"`           // rug-pull detection on Agent Cards
-	SessionSmugglingDetection bool   `yaml:"session_smuggling_detection"` // contextId tracking
-	MaxContextMessages        int    `yaml:"max_context_messages"`        // per-context message cap (default 100)
-	MaxContexts               int    `yaml:"max_contexts"`                // total tracked contexts (default 1000)
+	SessionSmugglingDetection bool   `yaml:"session_smuggling_detection"` // reserved, not enforced: no transport tracks contextId
+	MaxContextMessages        int    `yaml:"max_context_messages"`        // reserved, not enforced (default 100)
+	MaxContexts               int    `yaml:"max_contexts"`                // reserved, not enforced (default 1000)
 	ScanRawParts              bool   `yaml:"scan_raw_parts"`              // decode text-like Part.raw
 	MaxRawSize                int    `yaml:"max_raw_size"`                // encoded size cap for Part.raw decode (default 1MB)
 
@@ -1409,32 +1530,40 @@ type A2ATrustedCardKey struct {
 // smuggled in Authorization/Cookie headers. CONNECT tunnels are out of scope
 // (TLS-encrypted, can't scan without MITM).
 type RequestBodyScanning struct {
-	Enabled                  bool                              `yaml:"enabled"`
-	Action                   string                            `yaml:"action"`                    // warn, block (no strip for bodies)
-	PatternActions           map[string]string                 `yaml:"pattern_actions"`           // per-DLP-pattern action override: warn or block; cannot downgrade core DLP
-	DisablePatterns          []string                          `yaml:"disable_patterns"`          // non-core DLP pattern names skipped by request body/header scanning
-	MaxBodyBytes             int                               `yaml:"max_body_bytes"`            // fail-closed above this limit
-	ScanHeaders              bool                              `yaml:"scan_headers"`              // scan request headers for DLP
-	HeaderMode               string                            `yaml:"header_mode"`               // "sensitive" (listed headers) or "all" (everything except ignore list)
-	SensitiveHeaders         []string                          `yaml:"sensitive_headers"`         // headers to scan in sensitive mode
-	IgnoreHeaders            []string                          `yaml:"ignore_headers"`            // headers to skip in all mode
-	ContentEntropyEnabled    bool                              `yaml:"content_entropy_enabled"`   // per-message opaque high-entropy body/frame detection
-	ContentEntropyAction     string                            `yaml:"content_entropy_action"`    // warn, block
-	ContentEntropyThreshold  float64                           `yaml:"content_entropy_threshold"` // Shannon entropy bits per character (0,8]; non-positive fails validation while enabled
-	ContentEntropyMinLength  int                               `yaml:"content_entropy_min_length"`
-	ContentEntropyExclusions []string                          `yaml:"content_entropy_exclusions"`  // host patterns exempt from per-message content entropy only
-	ContentEntropyWarnRoutes []RequestBodyEntropyWarnRoute     `yaml:"content_entropy_warn_routes"` // exact HTTPS routes where entropy findings warn; all other scanners remain enforced
-	SigV4CredentialRoutes    []RequestBodySigV4CredentialRoute `yaml:"sigv4_credential_routes"`     // exact HTTPS body routes allowed to carry structurally valid presigned URLs
-	TrustedHosts             []string                          `yaml:"trusted_hosts"`               // destinations where request-body injection findings and fully redacted critical DLP follow the configured action instead of hard blocking; scanning still runs
+	Enabled                   bool                              `yaml:"enabled"`
+	Action                    string                            `yaml:"action"`                                                                     // warn, block (no strip for bodies)
+	PatternActions            map[string]string                 `yaml:"pattern_actions"`                                                            // per-DLP-pattern action override: warn or block; cannot downgrade core DLP
+	DisablePatterns           []string                          `yaml:"disable_patterns"`                                                           // non-core DLP pattern names skipped by request body/header scanning
+	MaxBodyBytes              int                               `yaml:"max_body_bytes"`                                                             // fail-closed above this limit
+	ScanHeaders               bool                              `yaml:"scan_headers"`                                                               // scan request headers for DLP
+	IssuerBoundSessionCookies bool                              `yaml:"issuer_bound_session_cookies" json:"issuer_bound_session_cookies,omitempty"` // default true; skip cookie pairs returned to their intercepted HTTPS issuer
+	HeaderMode                string                            `yaml:"header_mode"`                                                                // "sensitive" (listed headers) or "all" (everything except ignore list)
+	SensitiveHeaders          []string                          `yaml:"sensitive_headers"`                                                          // headers to scan in sensitive mode
+	IgnoreHeaders             []string                          `yaml:"ignore_headers"`                                                             // headers to skip in all mode
+	ContentEntropyEnabled     bool                              `yaml:"content_entropy_enabled"`                                                    // per-message opaque high-entropy body/frame detection
+	ContentEntropyAction      string                            `yaml:"content_entropy_action"`                                                     // warn, block
+	ContentEntropyThreshold   float64                           `yaml:"content_entropy_threshold"`                                                  // Shannon entropy bits per character (0,8]; non-positive fails validation while enabled
+	ContentEntropyMinLength   int                               `yaml:"content_entropy_min_length"`
+	ContentEntropyExclusions  []EntropyHostExclusion            `yaml:"content_entropy_exclusions"`  // host patterns (string, or mapping with expires) exempt from per-message content entropy only
+	ContentEntropyWarnRoutes  []RequestBodyEntropyWarnRoute     `yaml:"content_entropy_warn_routes"` // exact-path or path-prefix HTTPS routes where entropy findings warn; all other scanners remain enforced
+	SigV4CredentialRoutes     []RequestBodySigV4CredentialRoute `yaml:"sigv4_credential_routes"`     // exact HTTPS body routes allowed to carry structurally valid presigned URLs
+	TrustedHosts              []string                          `yaml:"trusted_hosts"`               // destinations where request-body injection findings and fully redacted critical DLP follow the configured action instead of hard blocking; scanning still runs
 }
 
 // RequestBodyEntropyWarnRoute is a narrow, expiring operator exception for
 // legitimate opaque uploads. It changes only request-body entropy findings
-// from block to warn on one exact HTTPS destination. Content-Type is an
+// from block to warn on one HTTPS destination. Content-Type is an
 // operator-intent constraint, not proof that attacker-controlled bytes are safe.
+//
+// A route names exactly one of Path (one exact canonical path, non-textual
+// content types only) or PathPrefix (a path-segment prefix, for service-issued
+// routes with a per-request segment; textual content types are allowed because
+// the payloads such routes exist for are textual). Either way only entropy
+// findings downgrade: DLP and every other scanner stay enforced.
 type RequestBodyEntropyWarnRoute struct {
 	Host         string   `yaml:"host"`
-	Path         string   `yaml:"path"`
+	Path         string   `yaml:"path,omitempty"`
+	PathPrefix   string   `yaml:"path_prefix,omitempty" json:"path_prefix,omitempty"`
 	ContentTypes []string `yaml:"content_types"`
 	Methods      []string `yaml:"methods,omitempty"`
 	Reason       string   `yaml:"reason"`
@@ -1503,18 +1632,27 @@ func (f CrossRequestFragments) ResolvedMaxSessions() int {
 }
 
 // KillSwitch configures the emergency deny-all kill switch.
-// When active, all requests are rejected except health/metrics endpoints
-// and allowlisted IPs. Six activation sources (config, API, Conductor remote
-// kill, Conductor stale bundle, SIGUSR1, sentinel file) are OR-composed: any
-// one active means the kill switch is engaged.
+// When active, all requests are rejected except the exemptions below, which
+// only the HTTP front door honors: health_exempt, metrics_exempt and
+// api_exempt cover Pipelock's own /health and /metrics paths and its
+// kill-switch and session admin routes under /api/v1 (on the main port only
+// when the API has no separate port) on a request made to Pipelock itself
+// (never on proxied traffic), and
+// allowlist_ips covers HTTP, forward-proxy and intercepted CONNECT requests by
+// client IP (not during uncertain Conductor apply). MCP transports, the raw
+// reverse proxy and established relay connections ignore every exemption.
+// Seven activation sources (config, API, Conductor remote
+// kill, Conductor stale bundle, uncertain Conductor apply, SIGUSR1, sentinel
+// file) are OR-composed: any one active means the kill switch is engaged.
 type KillSwitch struct {
 	Enabled       bool     `yaml:"enabled"`
 	SentinelFile  string   `yaml:"sentinel_file"`
 	Message       string   `yaml:"message"`
 	HealthExempt  *bool    `yaml:"health_exempt"`
 	MetricsExempt *bool    `yaml:"metrics_exempt"`
-	APIExempt     *bool    `yaml:"api_exempt"` // exempt /api/v1/* from kill switch (default true)
+	APIExempt     *bool    `yaml:"api_exempt"` // exempt kill-switch and session admin routes under /api/v1 (default true)
 	APIToken      string   `yaml:"api_token"`
+	APITokenFile  string   `yaml:"api_token_file" json:",omitempty"`
 	APIListen     string   `yaml:"api_listen"` // separate listen address for kill switch API (e.g. "0.0.0.0:9090")
 	AllowlistIPs  []string `yaml:"allowlist_ips"`
 }
@@ -1566,6 +1704,15 @@ type EmitConfig struct {
 	Syslog     SyslogConfig    `yaml:"syslog"`
 	OTLP       OTLPConfig      `yaml:"otlp"`
 	Forwarder  ForwarderConfig `yaml:"forwarder" json:"-"`
+
+	// CorrelationHeader names one client request header whose value is
+	// copied into emitted events as correlation_id for the request it came
+	// from. Empty disables it. The value is attacker-influenced, so it is
+	// length-capped, charset-checked and DLP-scanned before use, and omitted
+	// on any failure. It never enters signed receipts or other evidence
+	// formats. json:"-" because it is a telemetry-output knob with no effect
+	// on detection or enforcement, like Filter above.
+	CorrelationHeader string `yaml:"correlation_header" json:"-"`
 }
 
 // ForwarderConfig configures the Enterprise durable SIEM HTTP forwarder.
@@ -1647,9 +1794,10 @@ type SyslogConfig struct {
 	Format      string `yaml:"format" json:"-"` // json (default), cef, or ocsf
 }
 
-// MCPWSListener configures the MCP WebSocket listener for inbound connections.
-// When the MCP proxy is running in listener mode with a ws:// or wss:// upstream,
-// this controls origin validation and connection limits for inbound WS clients.
+// MCPWSListener holds reserved settings for an inbound MCP WebSocket listener.
+// The current CLI has no such listener: mcp proxy rejects --listen with a ws://
+// or wss:// upstream, which runs only in stdio mode. The fields are validated
+// and defaulted at load but no runtime path reads them.
 type MCPWSListener struct {
 	AllowedOrigins []string `yaml:"allowed_origins"` // additional browser origins to allow (loopback always allowed)
 	MaxConnections int      `yaml:"max_connections"` // max concurrent inbound WS connections (default 100)
@@ -1762,24 +1910,34 @@ type BudgetConfig struct {
 
 // FlightRecorder configures the tamper-evident evidence recording system.
 type FlightRecorder struct {
-	Enabled                    bool                         `yaml:"enabled"`
-	Dir                        string                       `yaml:"dir"`
-	CheckpointInterval         int                          `yaml:"checkpoint_interval"`                   // entries between signed checkpoints (default 1000)
-	RetentionDays              int                          `yaml:"retention_days"`                        // auto-expire raw sidecars after N days (0=forever)
-	Redact                     bool                         `yaml:"redact"`                                // DLP on evidence before commit (default true)
-	SignCheckpoints            bool                         `yaml:"sign_checkpoints"`                      // Ed25519 sign checkpoints (default true)
-	MaxEntriesPerFile          int                          `yaml:"max_entries_per_file"`                  // rotate files (default 10000)
-	FileMode                   os.FileMode                  `yaml:"file_mode" json:"-"`                    // evidence file permissions: 0600, 0640, or 0660 (default 0600)
-	RawEscrow                  bool                         `yaml:"raw_escrow"`                            // encrypted raw detail sidecar (default false)
-	EscrowPublicKey            string                       `yaml:"escrow_public_key"`                     // X25519 public key for raw escrow encryption
-	SigningKeyPath             string                       `yaml:"signing_key_path"`                      // Ed25519 private key for checkpoint signing and action receipts
-	RequireReceipts            bool                         `yaml:"require_receipts"`                      // fail closed when a required receipt cannot be emitted (default false)
-	RequireContainmentEvidence bool                         `yaml:"require_containment_evidence" json:"-"` // require a verified containment posture binding before signed receipts start (default false; restart-only)
-	PostureSignerKey           string                       `yaml:"posture_signer_key" json:"-"`           // pinned Ed25519 public key or public-key file for required containment evidence
-	PostureSignerPublicKey     ed25519.PublicKey            `yaml:"-" json:"-"`                            // parsed at validation; runtime must not reopen PostureSignerKey
-	Completeness               FlightRecorderCompleteness   `yaml:"completeness" json:"-"`                 // restart-only evidence completeness knobs
-	EvidenceHealth             FlightRecorderEvidenceHealth `yaml:"evidence_health" json:"-"`              // process-local evidence health monitoring
-	Anchor                     FlightRecorderAnchor         `yaml:"anchor" json:"-"`                       // optional runtime receipt-chain anchoring
+	Enabled                     bool                         `yaml:"enabled"`
+	Dir                         string                       `yaml:"dir"`
+	ReceiptChains               int                          `yaml:"receipt_chains" json:"-"`                  // independent signed receipt chains (0=legacy default of 1; restart-only)
+	CheckpointInterval          int                          `yaml:"checkpoint_interval"`                      // entries between signed checkpoints (default 1000)
+	RetentionDays               int                          `yaml:"retention_days"`                           // auto-expire raw sidecars after N days (0=forever)
+	Redact                      bool                         `yaml:"redact"`                                   // DLP on evidence before commit (default true)
+	SignCheckpoints             bool                         `yaml:"sign_checkpoints"`                         // Ed25519 sign checkpoints (default true)
+	MaxEntriesPerFile           int                          `yaml:"max_entries_per_file"`                     // rotate files (default 10000)
+	FileMode                    os.FileMode                  `yaml:"file_mode" json:"-"`                       // evidence file permissions: 0600, 0640, or 0660 (default 0600)
+	RawEscrow                   bool                         `yaml:"raw_escrow"`                               // encrypted raw detail sidecar (default false)
+	EscrowPublicKey             string                       `yaml:"escrow_public_key"`                        // X25519 public key for raw escrow encryption
+	SigningKeyPath              string                       `yaml:"signing_key_path"`                         // Ed25519 private key for checkpoint signing and action receipts
+	ReceiptGroupPriorSignerKeys []string                     `yaml:"receipt_group_prior_signer_keys" json:"-"` // explicitly trusted prior group signers for key rotation
+	RequireReceipts             bool                         `yaml:"require_receipts"`                         // fail closed when a required receipt cannot be emitted (default false)
+	RequireContainmentEvidence  bool                         `yaml:"require_containment_evidence" json:"-"`    // require a verified containment posture binding before signed receipts start (default false; restart-only)
+	PostureSignerKey            string                       `yaml:"posture_signer_key" json:"-"`              // pinned Ed25519 public key or public-key file for required containment evidence
+	PostureSignerPublicKey      ed25519.PublicKey            `yaml:"-" json:"-"`                               // parsed at validation; runtime must not reopen PostureSignerKey
+	Completeness                FlightRecorderCompleteness   `yaml:"completeness" json:"-"`                    // restart-only evidence completeness knobs
+	EvidenceHealth              FlightRecorderEvidenceHealth `yaml:"evidence_health" json:"-"`                 // process-local evidence health monitoring
+	Anchor                      FlightRecorderAnchor         `yaml:"anchor" json:"-"`                          // optional runtime receipt-chain anchoring
+}
+
+// ReceiptChainCount resolves the legacy omitted/zero setting to one chain.
+func (f FlightRecorder) ReceiptChainCount() int {
+	if f.ReceiptChains == 0 {
+		return 1
+	}
+	return f.ReceiptChains
 }
 
 // EvidenceProvenance configures the private operator-owned material needed to
@@ -2009,11 +2167,10 @@ type MediationEnvelope struct {
 
 	// SignatureExpires is the per-signature lifetime emitted by the
 	// outbound signer (Go duration string, e.g. "5m"). Empty falls
-	// back to the verifier's replay-cache window so the cache always
-	// outlives the signature. The validator rejects values larger
-	// than verify_inbound.replay_cache.window because a longer-lived
-	// signature would be replayable after its nonce was evicted from
-	// the cache.
+	// back to the verifier's replay-cache window. The validator caps
+	// this value at verify_inbound.replay_cache.window to bound the
+	// emitted lifetime. Replay protection retains each nonce through
+	// its signed expiry plus skew and refuses new nonces at capacity.
 	SignatureExpires string `yaml:"signature_expires"`
 
 	// ActorFormat controls emitted envelope actor values and inbound
@@ -2178,8 +2335,8 @@ type BrowserShield struct {
 	Strictness             string   `yaml:"strictness"`               // minimal|standard|aggressive
 	MaxShieldBytes         int      `yaml:"max_shield_bytes"`         // size limit for shielding
 	OversizeAction         string   `yaml:"oversize_action"`          // block|scan_head|warn
-	ExemptDomains          []string `yaml:"exempt_domains"`           // hostnames only (validated, no paths)
-	StripExtensionProbing  bool     `yaml:"strip_extension_probing"`  // strip chrome-extension:// + runtime shims
+	ExemptDomains          []string `yaml:"exempt_domains"`           // hostnames skipping Shield rewriting only; no partial-response bypass (validated, no paths)
+	StripExtensionProbing  bool     `yaml:"strip_extension_probing"`  // strip chrome-extension:// URLs; no script is injected
 	StripHiddenTraps       bool     `yaml:"strip_hidden_traps"`       // strip hidden DOM elements with instructions
 	StripTrackingPixels    bool     `yaml:"strip_tracking_pixels"`    // strip 1x1 images and beacon calls
 	InjectFingerprintShims bool     `yaml:"inject_fingerprint_shims"` // canvas/WebGL/audio defense shims

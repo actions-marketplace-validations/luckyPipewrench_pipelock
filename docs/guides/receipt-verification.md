@@ -79,7 +79,8 @@ exit code 1 means invalid, malformed, or unpinned without `--allow-unpinned`.
 ## Verifying a Fleet Receipt Report
 
 Fleet Receipt Reports are DSSE envelopes wrapping an in-toto Statement v1
-payload with the `fleet-receipt/v1` predicate. They summarize a fleet's
+payload with a versioned fleet-receipt predicate. New reports use `fleet-receipt/v2`;
+the verifier also accepts archived `fleet-receipt/v1` reports. They summarize a fleet's
 included signed audit batches and carry the mediated-fraction completeness
 metric. They do not claim non-bypass; they prove the signed report's source set
 and arithmetic for mediated actions inside that source set.
@@ -152,14 +153,23 @@ FLEET RECEIPT OK: fleet-receipt.dsse.json
   Source batches:   12
   Total actions:    481
   Mediated fraction: 1
+  Continuity:       cross_session_continuity_unproven (receiver observations unavailable)
 ```
 
 Without `--key`, the verifier can check structure and self-consistency only. It
 prints `FLEET RECEIPT UNPINNED` and exits non-zero unless `--allow-unpinned` is
 passed.
 
-See [Fleet Receipt Report v1](../specs/fleet-receipt-v1.md) for the wire
-format.
+Fleet reports use v2 by default so independent recorder runs and v3 writers can
+reuse sequence numbers within one window. Use `--report-version 1` when a v1
+consumer is required; its original overlap checks still apply, and it refuses
+a window in which a follower has batches from more than one recorder run,
+because v1 can't record which run each batch came from. Update older
+verifiers before producing v2. The report signer attests to payload-derived run
+grouping; offline L1 does not replay those payloads or prove an honest restart.
+See [the v2 contract](../specs/fleet-receipt-v2.md) and
+[v2 verification](../specs/fleet-receipt-v2-verification.md) for the v2 wire
+format, and [Fleet Receipt Report v1](../specs/fleet-receipt-v1.md) for v1.
 
 ## Verifying a receipt chain
 
@@ -167,11 +177,13 @@ Pass a flight recorder JSONL file (or `--chain DIR` for a multi-file chain that
 spans restarts or rotations for one recorder session/writer stream) and pin the
 trusted key:
 
+The `evidence-proxy-0.jsonl` filenames in the historical examples below are legacy samples. A current process writes `evidence-proxy.run.<id>-0.jsonl`. A file argument checks only that shard; use `--chain DIR --session proxy.run.<id>` to check every shard of one run, or omit `--session` to check every run and link in the directory.
+
 ```bash
 pipelock verify-receipt evidence-proxy-0.jsonl --key 70b991eb...
 ```
 
-Output on success:
+Output when a terminal signed session close proves the selected action-chain endpoint:
 
 ```text
 CHAIN VALID: evidence-proxy-0.jsonl
@@ -191,36 +203,54 @@ Chain verification checks:
   v3.1 bound-genesis `g1:<sha256>` value derived from the signed
   `session_open` record.
 - Each subsequent receipt's `chain_prev_hash` equals the SHA-256 hash of
-  the previous receipt's canonical JSON.
+  the previous receipt's canonical JSON. When the previous receipt carries a
+  top-level `ext` member, that JSON ends with `"ext":` followed by the ext
+  value's source bytes, compacted and HTML-escaped the way Go's
+  `encoding/json` re-encodes raw JSON, with key order, number spelling, and
+  escape spelling kept as written. An explicit `"ext": null` is included; an
+  absent `ext` adds nothing. Editing `ext` after the next receipt links it
+  breaks the chain. Adding or removing whitespace between JSON tokens does
+  not, but whitespace inside a string value is part of the value.
 - Signed v1 objects reject unknown fields. Only the unsigned top-level `ext`
-  object may carry advisory forward-compatible metadata, and it never
-  contributes to a verified claim.
+  object may carry advisory forward-compatible metadata. The signature never
+  covers it and its value never contributes to a verified claim; only its
+  bytes join the chain link hash.
+- In a flight-recorder file, the chain is the `action_receipt` subsequence.
+  `evidence_receipt` entries form a separate signed chain. Every verifier checks both chains when both are present. A file with only `evidence_receipt` entries is verified as an EvidenceReceipt v2 chain.
 
-By default, this verifies the receipt subsequence only. To verify every present
-flight-recorder entry as well, use `--whole-recorder`; that mode rejects an unknown
-entry type or recorder hash-chain break, verifies the receipt-chain commitment in a
-`transcript_root`, and returns non-zero for an unsealed recorder. After a signing-key
-rotation, the root covers the final signing segment while verification checks every
-trusted segment and its rotation continuity. The seal does not cover the trailing
-checkpoint the recorder writes after it; any other entry after the seal is reported as
-INCOMPLETE, because the seal never committed to it. Entries that are not receipts
-(decisions, captures) are authenticated only through signed checkpoints: each one signs
-the chain hash of everything before it, and `--whole-recorder` verifies those signatures
-against the pinned keys and reports the anchor state. The seal itself must be covered
-by a signed checkpoint, which is the trailing checkpoint the recorder writes after the
-root; a recorder where no signed checkpoint follows the seal (checkpoints absent,
-unsigned, or the trailing one missing) is refused, because a rewrite could have
-stripped or removed it while an older checkpoint still verifies. If the recorder really
-runs with `flight_recorder.sign_checkpoints: false`, or its last entry filled a shard so
-no trailing checkpoint was written, pass `--allow-unanchored-seal` to accept it, and the
-output then states which entries are hash-linked but not authenticated.
+Receipt mode verifies both signed receipt subsequences and checks the recorder hash chain when recorder metadata is present. Historical receipt-only wrappers have no outer chain to check; mixed receipt-only and recorder entries are refused. Add `--whole-recorder` to authenticate the outer boundary with a `transcript_root` and its trailing signed checkpoint.
+
+A valid receipt prefix prints `VALID PREFIX, END UNPROVEN` and exits 3. Exit 0 requires proof of the endpoint for the declared scope: a terminal signed `session_close` binding the final head, sequence, and count; a whole-recorder transcript root covered by its trailing signed checkpoint (both only in a per-run session); a complete receipt-group close; or an independently known final receipt hash or sequence supplied with `--expect-head` or `--expect-seq`. A signer key establishes trust in the signer, not the endpoint. Restart links and recovery seals don't prove an end.
+
+A run's EvidenceReceipt v2 chain has no terminal record, so in receipt-chain mode a single-chain recorder run that recorded v2 receipts reports `VALID PREFIX, END UNPROVEN` and exits 3 even after a clean shutdown. A directory written with `flight_recorder.receipt_chains` above 1 is checked as a receipt group instead, and a closed group that verifies exits 0 with `GROUP_VALID`. Verify a recorder directory with `pipelock verify-receipt --chain <dir> --whole-recorder`, which proves the end from the run's transcript root. The standalone `pipelock-verifier`, the TypeScript and Rust verifiers, and the in-repository Python reference verifier have no whole-recorder mode; with them, pin the end with `--expect-head` or `--expect-seq` from an independently retained head, or accept the prefix explicitly with `--allow-prefix`. The published PyPI package `pipelock-verify` 0.4.1 has none of these options. It checks only the ActionReceipt v1 chain in a recorder file, has no end proof, and exits 0 when that chain verifies, so its result doesn't replace `--whole-recorder`.
+
+Pipelock has recorded each run under its own per-run session (`<base>.run.<id>`) since v3.6.0. Older releases recorded every run under one shared session such as `proxy` and resumed that chain after each restart, so a close or seal there doesn't show that nothing came after it. Those chains exit 3. In receipt-chain mode, pin the endpoint with `--expect-head` or `--expect-seq`. Under `--whole-recorder` a receipt pin can't authenticate the recorder entries, so it never proves the end there; use `--allow-prefix` to accept the prefix.
+
+`--allow-prefix` accepts a valid prefix with exit 0 while keeping the same prefix label in text and JSON. It never accepts invalid evidence or a mismatching endpoint pin. In mixed v1/v2 input, both chains need end proof; an endpoint pin applies to the v2 chain. Directory verification requires proof for every selected run. It doesn't prove that no run is missing: deleting a whole run together with its restart link file isn't detected. Select one run with `--session` before supplying a pin when several runs are present.
+
+With `--whole-recorder`, unsealed runs are listed under `INCOMPLETE RUNS` and return exit 3 unless `--allow-prefix` is set. Add `--require-seal` to make a missing seal invalid evidence (exit 1), even with `--allow-prefix`. Receipt-only pins don't authenticate unsigned recorder entries, so whole-recorder success still requires its signed outer boundary.
+
+`--json` exposes `integrity`, `end_proof` (`proven` and the evidence checked), `scope`, and `status`. Signer trust remains separate in the chain reports. The scope is `receipt_chain`, `whole_recorder`, `receipt_group`, or `chain_set`.
+
+Full chain verification with `--chain DIR` or `--whole-recorder` is for a recorder that isn't being written while it's verified. Stop the writer first, or verify an atomic filesystem snapshot of the recorder directory. A plain copy taken while the writer is still running can capture shards at different moments, so a clean result on it proves the integrity of what was copied, not that the recorder's full evidence was checked. Concurrent modification is detected on a best-effort basis: a shard or `chain-link-*.json` file that is added, removed, replaced, or resized, or a link file whose bytes change, fails the result with `RECORDER CHANGED DURING VERIFICATION` instead of a verdict on the evidence. A same-size in-place rewrite of a shard by a process with write access to the evidence directory is outside what an offline verifier can rule out. To check a live recorder, run `pipelock evidence doctor DIR`, which checks link files and chain structure and tolerates a recorder that is still being written.
+
+After signing-key rotation, the root covers the final signing segment while verification checks every trusted segment and rotation continuity.
+
+The seal doesn't cover the trailing checkpoint written after it. Any other entry after the seal is reported as `INCOMPLETE` because the seal didn't commit to it.
+
+Signed checkpoints authenticate entries that aren't receipts, such as decisions and captures. Each checkpoint signs the chain hash of all earlier entries; `--whole-recorder` verifies these signatures against the pinned keys and reports the anchor state.
+
+The seal must be covered by the signed checkpoint written after the root. By default, verification refuses when no signed checkpoint follows the seal, since an older checkpoint doesn't prove the seal was included.
+
+If `flight_recorder.sign_checkpoints` is `false`, or the last entry filled a shard so no trailing checkpoint was written, pass `--allow-unanchored-seal` to inspect the recorder. Its endpoint remains unproven, and it exits 3 unless `--allow-prefix` is also set. The output identifies entries that are hash-linked but not authenticated.
 
 As with a single receipt, an unpinned chain run (no `--key`) prints
 `CHAIN UNPINNED` and exits non-zero unless you pass `--allow-unpinned`; pinning
 the key is what proves the chain came from a signer you trust.
 
 If any check fails, the output reports which sequence number broke the chain.
-In a directory shared by concurrent writer processes, a `chain_prev_hash`
+Current writers use separate per-run sessions, even in a shared directory.
+In older evidence from writers sharing one session, a `chain_prev_hash`
 mismatch can be caused by a recorder fork rather than by after-the-fact
 tampering. Run `pipelock evidence doctor DIR` to surface the structural damage
 for investigation. The doctor reports symptoms such as duplicate sequence
@@ -229,29 +259,29 @@ match their recorded hash. Those symptoms narrow the cause but do not by
 themselves establish it: a fork and a crafted edit can present the same
 structure.
 
+### Verifying a recovery seal
+
+When a run starts after recovering a torn predecessor shard, its signed `recovery_seal` claim uses the same `chain-link-<predecessor>.json` slot as a continuous `ChainLink` v1. Run `pipelock verify-receipt --chain DIR --key KEY` to verify the directory. The verifier checks the seal against the retained damaged bytes, the complete recorder prefix, and the successor's signed `session_open`. It reports `attested_discontinuity` separately from a continuous link and still exits nonzero because the evidence contains damage.
+
+`pipelock evidence doctor DIR` checks the seal's signature and placement but doesn't decide whether its signing key is trusted. A missing seal leaves the successor unlinked. A tampered seal, changed shard, or seal placed against a different run fails binding checks. Older strict verifiers reject the new claim format rather than treating it as a continuous link. See the [recovery seal v1 specification](../specs/evidence-recovery-seal-v1.md) for the wire format and limits of this attestation.
+
 ### Falsify a captured record
 
 The runnable [receipt verification example](../../examples/receipt-verify/README.md)
 captures a blocked request, verifies it with a pinned key, then in step 5 changes
 the blocked receipt's `detail.action_record.verdict` from `block` to `allow`.
-The verifier fails closed (exit 1) with this output shape from an actual run:
+The verifier refuses the modified capture (exit 1) with a recorder hash mismatch. The next step changes the standalone receipt and requires a signature failure. The captured-file check produces this output excerpt:
 
 ```text
-CHAIN BROKEN: /tmp/.../evidence-proxy-0.tampered.jsonl
-  Error:    seq 2: signature: signature verification failed
-  Broke at: seq 2
+CHAIN BROKEN: /tmp/.../tampered/evidence-proxy.run.<id>-0.jsonl
+  Error:    recorder entry hash chain: entry seq 0: hash mismatch: ...
 ```
 
-Receipt-chain verification authenticates the signed `action_record` (including
-the action, policy hash, verdict, target, and chain linkage), not the outer
-flight-recorder hash chain. An entry's `seq` and `summary` are not checked in
-this mode. Its `type` is not signed, but it does select whether the entry is
-extracted as an action receipt; unknown types fail closed. Changing an outer
-field is therefore not a tamper demonstration for receipt-chain verification.
+Receipt-chain verification authenticates the signed `action_record`, including the action, policy hash, verdict, target, and chain linkage. It also checks the outer recorder hash chain when present, but unsigned outer fields don't gain signer authentication from hash linkage alone. An entry's `type` selects which receipt chain is extracted; unknown types fail closed. Changing a signed receipt field demonstrates a signature failure even if an editor recomputes the outer hashes.
 
 ### Compacting an over-cap recorder directory
 
-Evidence readers refuse a session with more than 256 JSONL shards or an individual shard above 8 MiB. Stop the recorder before running the offline compaction ceremony. The compactor has its own bounded reader for legacy oversized shards, so a normal `pipelock evidence doctor` run isn't a prerequisite.
+The display readers (`evidence view`, `evidence serve`, query and the dashboard) refuse a session with more than 256 JSONL shards or an individual shard above 8 MiB. `verify-receipt`, including `--whole-recorder` and `--group`, reads a session's complete history without those display limits, and so do receipt group close, successor creation and automatic anchoring. Their native AEL verification still has the [256 MiB run-stream limit](#receipt-groups-with-multiple-chains) described below. Compaction only keeps the display surfaces usable. Stop the recorder and isolate the selected session as described below before running the offline compaction ceremony. The compactor has its own bounded reader for legacy oversized shards, so a normal `pipelock evidence doctor` run isn't a prerequisite.
 
 ```bash
 sudo systemctl stop pipelock.service
@@ -259,8 +289,9 @@ sudo pipelock evidence compact \
   --receipt-dir /var/lib/pipelock/recorder \
   --session proxy \
   --key /etc/pipelock/keys/flight-recorder-signing.key.pub
-sudo systemctl start pipelock.service
 ```
+
+`proxy` is the session older binaries wrote. Current binaries record one chain per process run, so pass the over-cap run session instead, for example `--session proxy.run.<id>`. The compactor requires its input directory to contain only that run's shards: `--session` does not filter a mixed directory. While the recorder is stopped, make a backup of the entire directory, then move every other run's shards and all link files to a separate, protected sibling directory. Check that only the selected run's shards remain before running compaction. After compaction, move the isolated files back into the active directory without replacing any compacted shard, verify the restored run directory and restart continuity, then start the recorder with `sudo systemctl start pipelock.service`. Retain both the full backup and the compactor's archive until verification succeeds. If the isolated files include raw-escrow sidecars, preserve them in the backup and restore them with the same names; the compactor cannot process sidecars in its input directory.
 
 The command refuses to run while a recorder holds the directory lock. It accepts oversized legacy input and uses bounded record memory. It verifies the trusted recorder hash chain, checkpoint signatures, and signed v1 or v2 receipts before and after compaction. It copies each JSONL record line without changing its bytes and keeps every replacement shard at or below the 8 MiB read limit. Linux installs the new active directory with one atomic exchange. The original directory then becomes a timestamped sibling archive with SHA-256 digests and byte mappings.
 
@@ -289,6 +320,39 @@ Exit code 0 means the analysis ran and the per-writer chain was not classified B
 LIMITED and UNVERIFIED are successful analyses. Exit code 1 means broken
 completeness evidence, an unpinned non-empty chain without
 `--allow-unpinned`, or another verifier failure.
+
+### Receipt groups with multiple chains
+
+Set `flight_recorder.receipt_chains` to 2–32 to enable signed receipt groups. The Go, TypeScript, Rust, and in-repository Python verifiers check the complete group with pinned signer keys. The published PyPI package `pipelock-verify` 0.4.1 verifies the ActionReceipt v1 chain in each shard file, but not the EvidenceReceipt v2 chain or the group; use `pipelock verify-receipt`, `pipelock-verifier`, `@pipelock/verifier-ts` 0.6.5 or `pipelock-verifier-rs` 0.6.5 for group evidence. The default of one chain keeps the existing single-chain format.
+
+With `flight_recorder.receipt_chains > 1`, one process writes several independent run sessions. A signed group opening lists their exact session IDs and signer. Each shard has its own signed `session_open`, action and evidence receipts, `session_close`, transcript root, and final checkpoint. The signed group close names every final shard head. A restarted process writes a new group and a signed transition to its predecessor.
+
+Before a restarted proxy listens, it verifies a closed terminal group's shards against their signed opening and close, including the recorder hash chain, checkpoint signatures, ActionReceipt v1 and EvidenceReceipt v2 chains, transcript roots and native AEL heads. Required transitions also verify their predecessor heads. An unclosed terminal group or transition predecessor requires a verified complete prefix and proof that its writer is gone, with a recovery seal for a torn tail. Other sessions in the directory retain whole-v1-chain verification against the pinned keys. Native AEL inventory verifies signed run ownership and each run's present complete records, requiring a signed native close when the recorder run is complete. Historical inventory-only sessions don't gain checkpoint-signature or v2-chain verification from this startup check.
+
+Startup shares proofs within that restart and verifies independent shards in parallel, bounded by the shard membership and Go's `GOMAXPROCS`. Restart time still grows with the amount of recorded history, including history before an empty successor. While verification reads bytes or authenticates records, `pipelock run` reports progress to systemd through `EXTEND_TIMEOUT_USEC`, using the 90-second startup budget that `contain install` writes as `TimeoutStartSec`. The first extension is sent as soon as work is observed. Further extensions are spaced at least 45 seconds (half the budget) apart and sent only while progress was observed. A failure to send an extension is logged once and disables further extensions, after which systemd enforces its own start timeout. A verifier that stops progressing for 90 seconds permanently loses extension eligibility. Pipelock sends `READY=1` only after verification and listener binding. Without a systemd notification socket, startup performs the same verification without sending progress notifications.
+
+The group ID is the 32-character hex value in `receipt-group-<group-id>-open.json`. Verify that ID against the evidence directory and pin every trusted signer key involved in a rotation:
+
+```bash
+pipelock verify-receipt --chain /var/lib/pipelock/evidence --group <group-id> --key old.pub --key new.pub
+pipelock-verifier chain /var/lib/pipelock/evidence --dir --group <group-id> --key old.pub --key new.pub
+```
+
+`GROUP_VALID` means the listed shards, signed close, and any required predecessor transition verified. Each shard's ActionReceipt v1 chain and EvidenceReceipt v2 chain both verify against the group signer, and every other session in the directory (a neighbor group, the predecessor, or a legacy run) is checked as a whole v1 chain against the pinned keys, not only its `session_open`. An unclosed predecessor is checked over its complete prefix, including every checkpoint signature and both receipt chains, with or without a recovery seal, and only once its writer is provably gone: the run's `writer-<session>.lock` file must exist and no live writer may hold it, so a missing lock file or a live writer is `GROUP_INVALID`. The Go, TypeScript, Rust, and in-repository Python verifiers return the same verdict on these checks, with one limitation: Node has no `flock`, so the TypeScript verifier reads `/proc/locks` and trusts it only in the initial PID namespace (the kernel filters that file by PID namespace). Inside a container it returns `GROUP_INVALID` for an unclosed predecessor; verify such a group with the Go, Rust or in-repository Python verifier. `GROUP_INCOMPLETE` means the opening has no signed close; it is not a complete evidence verdict. `GROUP_INCOMPLETE` makes no group authenticity claim; only `GROUP_VALID` does. `GROUP_INVALID` means a required file or binding failed verification. The group check exits nonzero for both incomplete and invalid results. A single shard can verify while another is missing, so a shard result must not be used as a group verdict. An independent copy of the opening digest is needed to detect an entire first or final group withheld from the directory.
+
+Every native AEL run claimed by a pinned signed `session_open` has its present newline-terminated records authenticated against that signer, including when the recorder tail is open or truncated. A final fragment without a newline is ignored as a torn live write, even when it is valid JSON or the file has no complete line yet. The same rule applies to receipt entries in group verification. A torn tail alone leaves an open group incomplete; a bad newline-terminated record makes the group invalid. An open neighbor is reported explicitly. A signed recovery seal separately checks damaged final bytes before it can attach; those bytes do not become group entries. A completed recorder run also requires the signed native AEL close. Every native AEL line is limited to 1 MiB including its newline, blank lines included, in all four verifiers. The Python verifier holds each other session it checks in memory, so it refuses a session larger than 1 GiB as `GROUP_INVALID` and names the Go verifier, which streams those sessions. Evidence filenames use the last dash to separate session from sequence; nonnumeric or overflowing sequence suffixes map to zero, and two names for one session and sequence are invalid.
+
+Each native AEL run stream is limited to 256 MiB in the Go, TypeScript, Rust, and in-repository Python verifiers, and the writer doesn't stop before that limit. A run whose stream passes it can't publish a close that verification accepts, Go verification reports `native AEL stream exceeds 256 MiB`, and with `flight_recorder.receipt_chains` above 1 a restart over that run is refused with the same error before it publishes a successor. A single-chain restart starts a new run and leaves the old one unverifiable. In a 200,000-request run across eight chains the largest native stream was about 28 MB, which puts the limit near 1.9 million requests for that workload; other shard counts and event mixes reach it at different counts. With `flight_recorder.receipt_chains` above 1 under sustained load, restart Pipelock on a schedule that keeps each run well inside the figure you measure for your own traffic.
+
+Group verification compares directory entry names and file metadata before and after reading the evidence, including native AEL files. It also checks the signatures and hashes of evidence it reads. The directory comparison does not hash every file twice: a concurrent rewrite that preserves both size and modification time may escape that change check. Verify a stable snapshot of the evidence directory when another process could modify it.
+
+The native AEL manifest names the recorder and public key that verification reads. Extra files inside an AEL run directory are outside that manifest and aren't verified evidence; a valid group verdict says nothing about their contents.
+
+Changing the key file while a multi-chain proxy runs closes the old group under its existing key and stops the process for a supervisor restart. If the close fails, the old group remains incomplete. The restarted process opens its successor under the new key. A restarted Guard or MCP process that no longer holds the old private key cannot create a late close for the predecessor.
+
+`pipelock evidence doctor` checks individual recorder chains but does not verify group completeness; it exits nonzero when group artifacts are present and directs you to `verify-receipt --chain` with trusted keys. `pipelock evidence compact` refuses a group directory because rewriting one shard would invalidate the signed group. Epoch inspection and pin verification also refuse grouped evidence. Keep the complete directory intact for group verification. Automatic receipt anchoring is available only with one chain; a multi-chain configuration that enables it is rejected. Manual single-chain receipt anchoring refuses a grouped directory as well.
+
+The dashboard's session evidence and trust views refuse directories containing receipt groups. Use `verify-receipt --chain` with trusted keys for a group verdict; a dashboard view of one shard cannot establish that the whole group is complete.
 
 ### Chains that rotated the signing key
 
@@ -341,6 +405,10 @@ The `--key` flag is required for transcript roots: the root is only
 meaningful if every receipt in the selected writer chain was verified against a
 trusted key.
 
+For a directory with one run chain, `transcript-root --chain DIR` selects that
+run. If the directory has several run chains, pass `--session` with the exact
+run ID. A transcript root summarizes one chain, not the whole directory.
+
 When verifying a file-based evidence capture, `transcript-root` derives the
 `SessionID` from the first entry in the file rather than the `--session`
 flag (which still controls the session ID for directory-based chain scans).
@@ -349,14 +417,48 @@ rather than silently printing a valid-looking root, so scripts can trust an
 exit-0 status to mean receipts were present and the selected writer chain
 verified.
 
+`verify-receipt --chain DIR --whole-recorder` checks every run chain. A clean
+report describes one chain: `--clean-report` selects a lone run, and requires
+`--session` when several runs are present. An empty report is an error.
+
+New clean reports use `schema_version: pipelock.clean_report.v2`. The
+[v2 schema](../evidence/clean-report-v2.schema.json) requires `integrity`,
+`end_proof`, `scope`, and `status`, along with `verification_mode`, `chain`, and
+`actions`. `pinned_provenance` means the signer matched an operator-supplied key;
+`unpinned_structural` means `--allow-unpinned` accepted a self-consistent chain
+without signer provenance. `CHAIN UNPINNED` requires valid integrity and a proven
+end. An open prefix keeps `VALID PREFIX, END UNPROVEN` and returns 3 after writing
+the report. `--allow-prefix` changes that exit to 0 while preserving the status.
+
+Readers must dispatch by `schema_version` and reject unknown versions. Historical
+`pipelock.clean_report.v1` reports still use the unchanged
+[v1 schema](../evidence/clean-report-v1.schema.json), which has no top-level
+integrity or endpoint fields and rejects extended reports. Do not infer end proof
+from v1 reports. For older reports with no verification mode, treat signer trust
+as unknown and require re-verification before accepting provenance.
+
 ## Anchoring receipts
 
 `pipelock anchor receipts` verifies a receipt chain with pinned signer keys,
 writes the verified chain head to an anchor backend, and emits an anchor bundle
 for later offline verification.
 
+The `--out` path must name a file inside the receipt directory. Relative paths are resolved from that directory; absolute paths outside it are rejected.
+
+With `--dir`, anchoring selects a lone run chain automatically. If the
+directory holds several runs, pass `--session` with the exact run ID; each
+anchor bundle covers one chain.
+
+Before it submits anything, `anchor receipts` checks the checkpoint against the
+anchor state already recorded in the directory. A checkpoint that is already
+anchored, or that conflicts with a recorded one at the same coverage, is refused
+before the backend is contacted. A remote log entry can't be withdrawn, so the
+refusal comes first.
+
 The local backend is deterministic test/development plumbing, not an
 operator-independent witness:
+
+Local anchor appends require file sync before returning a proof. If the log has a torn final write, the next submission preserves that file and continues the verified complete prefix in a numbered `.segment-` file beside it. Keep those files together for local proof verification. Reading the damaged file directly still reports a torn tail; an invalid complete entry or hash link stops submissions.
 
 ```bash
 pipelock anchor receipts /var/lib/pipelock/evidence \
@@ -399,6 +501,46 @@ pipelock-verifier independent /var/lib/pipelock/evidence \
   --rekor-log-key /etc/pipelock/keys/rekor-log.pub
 ```
 
+With `--dir` and no `--session`, `pipelock-verifier independent` reads the session
+the bundle anchored, which is the run ID for a per-run chain. Pass `--session` to
+read a different one.
+
+An anchor bundle covers the receipts that existed when it was made. The live
+chain keeps growing, so `pipelock-verifier independent` recomputes the checkpoint
+over the first `receipt_count` receipts. A chain shorter than the bundle claims
+fails.
+
+Receipts after the anchored prefix are not ignored. The verifier checks them as
+a chain (hash linkage and signatures under the `--key` values you supplied) and
+exits non-zero if the tail is broken, for example a tampered or re-signed
+receipt. When the tail verifies, the verdict stays valid, the OK line names the
+split (`receipts 0..2 of 5 anchored, 3..4 chain-verified`), and stderr carries a
+note that the later receipts are chain-verified but not anchored.
+
+With `--json` the verdict adds three fields next to the existing ones:
+
+| Field | Meaning |
+|-------|---------|
+| `covered_receipts` | Leading receipts the anchor commits to. |
+| `chain_length` | Receipts supplied to the verifier. |
+| `tail_chain_verified` | `true` when receipts after the anchored prefix exist and verified as a chain. |
+
+The tail is only chain-verified: a holder of the signing key can forge it, and
+no anchor vouches for it. By default that still counts as valid. To treat it as
+a failure, the way the dashboard treats a stale anchor, add
+`--require-full-coverage`: verification then exits non-zero with `valid: false`
+whenever `covered_receipts` is less than `chain_length`. A fully anchored chain
+is unaffected.
+
+```bash
+pipelock-verifier independent /var/lib/pipelock/evidence \
+  --dir --session agent-a \
+  --bundle /var/lib/pipelock/evidence/agent-a.rekor-anchor.json \
+  --key /etc/pipelock/keys/flight-recorder-signing.key.pub \
+  --rekor-log-key /etc/pipelock/keys/rekor-log.pub \
+  --require-full-coverage
+```
+
 Honest limit: anchoring narrows post-anchor omission and tampering windows, but
 it does not prove real-time truth by whoever held the receipt signing key and
 does not prove traffic outside the mediated boundary did not happen.
@@ -437,11 +579,14 @@ Pipelock does not currently verify that this key differs from the receipt
 signing key.
 
 Anchoring is fail-degraded, not a traffic gate. An unavailable log, unreadable
-entry key, invalid chain, or write failure increments
+entry key, invalid chain, write failure, or a non-Rekor backend proof that
+fails its own verification right after submission (never persisted) increments
 `pipelock_evidence_auto_anchor_failures_total`, records the last error in the
-`/stats` evidence-health JSON, and prints a `CRITICAL` line to stderr. Proxy
-traffic and receipt emission continue without waiting for the retry, which runs
-on a later pass. Successful markers feed the `anchoring_fresh` evidence-health
+`/stats` evidence-health JSON, and prints a `CRITICAL` line to stderr. Rekor
+proofs are the one exception: the runtime holds no Rekor log public key, so
+they are recorded unverified and checked only offline, with
+`pipelock-verifier independent --rekor-log-key`. Proxy traffic and receipt
+emission continue without waiting for the retry, which runs on a later pass. Successful markers feed the `anchoring_fresh` evidence-health
 diagnostic and anchor-lag metrics. They do not award an AEL grade. The deprecated
 `current_ael` surface is unavailable because a live process cannot independently
 grade its own evidence.
@@ -450,7 +595,9 @@ The log operator determines the ceiling of the proof. A self-hosted Rekor log
 adds tamper evidence and durability, but it is not independent from its
 operator. A public log can provide an independent witness, but it publishes
 checkpoint metadata and may impose rate limits. Pipelock deliberately chooses
-neither for you.
+neither for you. Re-submitting an already-logged checkpoint reuses the
+existing Rekor entry recovered from the `409` conflict response's `Location`
+header, rather than failing the retry.
 
 For hermetic development, configure the deterministic local backend instead:
 
@@ -494,13 +641,106 @@ Receipt 2:  chain_seq=2, chain_prev_hash=sha256(receipt_1)
 ...
 ```
 
-Inserting, removing, or modifying any receipt in that writer stream breaks the
-chain at that point. Current releases do not reject a deployment where multiple
-pipelock processes share one recorder directory; if they race and choose the
-same next sequence, the directory can fork and become structurally
-unverifiable. `pipelock evidence doctor DIR` reports duplicate sequence values,
+Inserting, removing, or modifying a receipt breaks the affected writer chain. Current writers use separate process-run sessions, with restart links between runs; parallel chains within one process use signed group lifecycle records. Historical shared-session forks remain damaged evidence and are not repaired by upgrading. `pipelock evidence doctor DIR` reports duplicate sequence values,
 conflicting `prev_hash` values, receipt-chain collisions, missing genesis, and
 gaps without modifying the directory.
+
+## Receipt content boundary
+
+With `flight_recorder.redact: true`, Pipelock scans what a receipt says, not
+the cryptography that proves it. Each receipt kind (v1 action receipts, v2
+evidence receipts, session controls, transcript roots, receipt group gates and
+signed decision records) classifies every field. Chain hashes, signatures,
+signer keys, nonces, timestamps and IDs that Pipelock generated are never
+scanned, so a signature or chain head that happens to resemble a rule-bundle
+pattern cannot refuse receipts. The same holds for the random suffix of a run
+session (`<base>.run.<suffix>`) and for a policy hash Pipelock computed from its
+configuration. A request ID the proxy minted (`req-` followed by a UUID that
+carries this process's proof) is generated too. An ID, hash or session suffix a
+caller supplied is scanned like any other content, even when it has the same
+shape as a generated one.
+
+Content is scanned alone, as a joined value list, as reassembled fragments,
+and as structured JSON.
+
+Reassembly joins client-influenced parts: content values and member names
+Pipelock did not declare, with a repeated value counted once per occurrence.
+Exact producer constants and retained operator values stay scanned alone, in
+the joined value list and as structured JSON. In reassembly they carry no
+client fragment, so they never combine with each other and do not widen the
+client search, but each may stand as one piece between client fragments, in
+any position, because a credential can contain a fixed word (a host name
+holding the principal "local", for example). A fixed value repeated in a
+receipt counts once. For v1 action receipts the fixed values are the emitter's
+configured principal and default actor, the `anonymous` actor Pipelock
+records when a request names no usable agent, the recorder session base in a session opener,
+the fixed session-control targets, recognized transport labels and recognized
+decision layer names. An agent override that differs from the configured
+actor, or an unrecognized transport or layer label, is a client part. For v2
+receipts, recognized payload-kind, action-type, transport, verdict and
+decision-source labels are fixed, and so are the principal and actor when they
+are the values the emitter was configured with; arbitrary payload values are
+client parts. Unknown fields and caller-chosen member names are always client
+parts.
+
+The decision text Pipelock formats for a receipt (the v1 `pattern` and the v2
+`payload.rule_id`, such as `status=200 bytes=2 reason=complete`) is scanned
+alone, in the joined value list and as structured JSON, but is not a
+reassembly piece. It interpolates values, so it has no fixed vocabulary, and as
+a piece it would multiply the search on every receipt.
+
+The recorder's derived mirror fields take the same role: they repeat detail
+content with fixed formatting, so each may stand as one piece but is not a
+client fragment. Unattested mirror fields are client parts. A split that
+needs two or more fixed values as separate pieces is outside the bound, as is
+a split that needs a constant the receipt does not carry as text (an enum
+value that is dropped from the scanned content, such as a reversibility label).
+So is a split between the decision text and a field it does not sit next to
+in field order. Field order is the receipt's member names sorted at each level,
+with nested objects in place and dropped values skipped. On a v1 outcome
+receipt the decision text sits between `layer` and `principal`.
+
+Reassembly follows field order, skipping unrelated parts. It tries every order
+of 2 or 3 parts and the reverse order of 4. A receipt of at most 20 client
+parts runs that full search when the combinations would build at most 4 MiB of
+text, and is refused whole when they would build more. A receipt with more
+client parts is ordinary evidence, so width alone doesn't refuse it. Pipelock
+then runs every pair, in both orders, when that work and the number of
+combinations stay inside those same limits, and every order of 3 when those fit
+too. The combinations that hold one fixed value run at the widest of those
+sizes that fits the same limits. The receipt is refused whole when even the
+pairs don't fit. A secret split into five or more pieces, into four pieces in
+any order other than forward or reverse, or into three pieces on a receipt too
+wide for the 3-part search, is outside that bound and isn't reassembled. Joins
+of 4 run only on a receipt of at most 20 client parts.
+
+Before signing:
+
+- A matching content field (target, pattern, agent label and similar) is
+  redacted, and the receipt is signed and recorded as usual.
+- A matching identity field, a match that spans fields, or content beyond the
+  scan bounds refuses that one receipt with `receipt content rejected`. The
+  error names the field and pattern, never the value. The chain does not
+  advance, and the next clean receipt succeeds.
+- Transcript roots, session controls, group gates and signed decision records
+  are never redacted. A match refuses them, and no seal or success is reported.
+
+The recorder entry's `type`, `event_kind`, `transport` and `summary` are
+derived from the signed receipt and checked at write time. Its `session_id`
+must be a session the recorder acquired. The session's operator base is
+scanned once, when the recorder acquires it, and a match refuses the
+acquisition with `receipt content rejected`.
+
+Content that every receipt carries (principal, actor, a policy hash Pipelock did
+not compute, and the session base) is checked at startup, at reload and when a
+receipt group or a Guard run activates. A match refuses the configuration with
+`configuration content trips the receipt detector`. Guard refuses the run even
+when `require_receipts` is off. A refused reload keeps the previous
+configuration.
+
+Each recorder keeps the detector it was started with for its whole life. A
+reload replaces the request scanner but not the receipt detector, so retained
+content is always checked against the detector that will scan the receipts.
 
 ## Resume and rotation integrity
 
@@ -529,14 +769,18 @@ would have produced broken or forgeable per-writer chains at restart.
 **Signing-key rotation no longer bricks a writer chain.** Earlier builds
 resumed by hard-verifying the persisted tail against the *current* signing key,
 so any legitimate operator key rotation orphaned that writer chain and failed
-every subsequent emit. The emitter now recognizes a tail that is self-valid
-under a *different* embedded key as a rotation and opens a new chain segment for
-that writer: its first receipt links to the prior tail hash and carries a
-`KeyTransition` marker, so the boundary is provable and that writer chain stays
-offline-verifiable across the switch (see
+every subsequent emit. When a configuration reload replaces the signing key,
+the new emitter opens a new chain segment for that writer: its first receipt
+links to the prior tail hash and carries a `KeyTransition` marker, so the
+boundary is provable and that writer chain stays offline-verifiable across the
+switch (see
 [Chains that rotated the signing key](#chains-that-rotated-the-signing-key)).
-A tail whose own signature is invalid still fails closed, so a forged tail
-cannot force a silent chain reset that hides history.
+The rotation is accepted only from a key this process itself loaded to sign
+receipts earlier in the run. A tail signed by any other key, even one whose signature is valid
+under the key embedded in it, is refused rather than vouched for, and the
+emitter fails closed with an error naming that key; since every run begins a new
+recorder session, such a tail means the evidence directory was altered. A tail
+whose own signature is invalid still fails closed as before.
 
 ## Standalone `pipelock-verifier` CLI
 
@@ -574,7 +818,12 @@ After chain re-verification, its `lifecycle` line reports the lifecycle status
 and reason, such as `LIMITED (abnormal_end)` when a valid in-flight chain has
 no signed `session_close`. That status does not change the packet's integrity
 verdict. With `--offline`, the report says lifecycle was not assessed because
-it did not re-read the receipt chain.
+it did not re-read the receipt chain. The Go, Rust, and TypeScript
+verifiers emit `verdict: schema_checked_trust_unverified`, `trusted: false`,
+and `valid: false` in this mode, and their CLIs exit nonzero. This means only
+the packet schema was checked; the packet-authored verdict was not verified.
+Upgrade JSON consumers and CI jobs to treat this status as untrusted and
+require full chain verification for an authenticated verdict.
 
 For EvidenceReceipt v2, `--key` pins the trusted Ed25519 receipt-signing public
 key. Without `--key`, the verifier can check structure, hash linkage, sequence
@@ -583,8 +832,7 @@ checked because v2 receipts do not embed public keys.
 
 **A valid chain is not a complete chain.** Structure, linkage, sequence, and
 signatures are all satisfied by any prefix of a chain, so a file with its
-trailing entries removed still verifies. The verifier reports this as
-`completeness: not proven` and returns `head_verified: false` in `--json`
+trailing entries removed still passes the integrity check. The CLI reports `VALID PREFIX, END UNPROVEN`, exits 3 by default, and returns `end_proof.proven: false` and `head_verified: false` in `--json`
 output. Pass `--expect-head` with the receipt hash of the entry the chain should
 end on to close it: a truncated or forked chain is then rejected, and the report
 reads `completeness: head verified`. Source that hash from trusted context
@@ -594,8 +842,7 @@ entries can rewrite an unsigned value stored beside them.
 
 The standalone binary reads the same Audit Packet v0 schema and receipt signing
 conventions as the in-tree `pipelock verify-receipt` subcommand, plus the
-EvidenceReceipt v2 schema used by learn-and-lock. It returns exit 0 for valid
-evidence, exit 1 for invalid evidence, exit 2 for runtime errors, and exit 64
+EvidenceReceipt v2 schema used by learn-and-lock. For chain verification it returns exit 0 only with a proven end, exit 3 for a valid prefix with an unproven end, and exit 1 for invalid evidence. `--allow-prefix` accepts exit 3 as exit 0 while retaining the prefix status. Other commands retain their contracts. It returns exit 2 for runtime errors, and exit 64
 for CLI usage errors. Use this binary in post-incident review and nightly audit
 jobs.
 
@@ -611,13 +858,17 @@ surface that fits your downstream audit pipeline:
 | Go (in-tree reference) | `sdk/audit-packet/` and `cmd/pipelock-verifier/` | Server-side audit pipelines, CI workflows, EvidenceReceipt v2 receipt/chain verification |
 | TypeScript | [`sdk/verifiers/ts/`](../../sdk/verifiers/ts/) | Node-based audit / SIEM, browser-side evidence inspection |
 | Rust | [`sdk/verifiers/rust/`](../../sdk/verifiers/rust/) | Embedded use, audit-platform sidecars, no-runtime environments |
-| Python (companion) | [`pipelock-verify-python`](https://github.com/luckyPipewrench/pipelock-verify-python) | Python-based audit pipelines and Jupyter analysis. Verifies ActionReceipt v1 chains and individual EvidenceReceipt v2 envelopes; install from PyPI as `pipelock-verify`. |
+| Python (companion) | [`pipelock-verify-python`](https://github.com/luckyPipewrench/pipelock-verify-python) | Python-based audit pipelines and Jupyter analysis. Verifies ActionReceipt v1 chains and individual EvidenceReceipt v2 envelopes; install from PyPI as `pipelock-verify`. It doesn't verify receipt groups or chain end proof. |
 | Browser wasm (Go implementation) | `cmd/pipelock-verifier-wasm/` | In-browser receipt and chain verification without treating wasm as an independent fifth implementation |
+
+The browser group verifier accepts ZIP bundles up to 8 MiB compressed and 32 MiB uncompressed, with a 32 MiB limit per entry. Larger bundles report `GROUP_INCOMPLETE` with an unsupported-size message. Use a host verifier for those bundles; host native AEL streams have a 256 MiB file limit.
 
 The TypeScript and Rust verifiers ship with their own test suites that
 exercise the canonical vectors from the Go schema package, so a schema
 change that breaks any verifier fails the release before the tag. The
 verifier-CI workflow runs these tests on every PR.
+
+For TypeScript and Rust CLI directory verification, `--dir` defaults to the legacy `proxy` session. Pass `--session-id proxy.run.<id>` for a full run chain, using the full ID from its evidence filename. A direct JSONL file argument checks only that shard.
 
 ## Audit Packet v0 schema
 

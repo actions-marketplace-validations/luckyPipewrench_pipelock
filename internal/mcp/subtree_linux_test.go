@@ -12,10 +12,12 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 func TestKillAdoptedDescendants_PreservesProtectedDirectChild(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(10*time.Second))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sleep", "30")
@@ -48,8 +50,9 @@ func TestKillAdoptedDescendants_PreservesProtectedDirectChild(t *testing.T) {
 		t.Fatalf("signaling protected child after cleanup: %v", err)
 	}
 	select {
-	case <-waitDone:
-	case <-time.After(5 * time.Second):
+	case err := <-waitDone:
+		t.Logf("goroutine result: %v", err)
+	case <-time.After(testwait.Deadline(5 * time.Second)):
 		t.Fatal("protected child did not exit after test cleanup SIGTERM")
 	}
 }

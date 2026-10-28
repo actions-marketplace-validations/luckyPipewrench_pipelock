@@ -30,8 +30,8 @@ connection.
 ## Quick Start
 
 ```bash
-# 1. Install pipelock (requires Go 1.25+)
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
@@ -52,6 +52,12 @@ pipelock assess finalize assessment-*/
 ```
 
 `pipelock codex install` discovers Codex's MCP server entries in `~/.codex/config.toml`, rewrites each one to launch through `pipelock mcp proxy`, and is idempotent — re-running it on an already-installed setup is a no-op. Add or remove an MCP server via `codex mcp add/remove` as usual, then re-run `pipelock codex install` to wrap any new entries.
+
+The installer registers stdio environment variables by name in Codex's `mcp_servers.<name>.env_vars` list and forwards those names with Pipelock's `--env KEY`. Export each variable in the environment running setup and Codex. For an existing literal `env` entry, the exported value must match the configured value; otherwise installation stops with an error naming the server and the variable, before it changes any server. This applies to ordinary settings as well as credentials. Removal and rollback also use names only. A server whose `env_vars` list has any entry other than a name or `{ name = "...", source = "local" }`, such as a remote source or an object without a source, is left unchanged: installation skips it with a reason and removal refuses it when it is wrapped, so wrap or unwrap that server in `config.toml` by hand. Environment values are never passed to `codex mcp add`. When Codex is launched from an IDE, desktop launcher or systemd, put those names and their values in that launcher's environment using its profile or an EnvironmentFile. Load values from a secret store or file rather than typing them on a command line, where shell history can retain them.
+
+The name-only list is defined in the [Codex configuration reference](https://developers.openai.com/codex/config-reference/). The installer updates `config.toml` atomically with private file permissions (`0600` on Unix). Updating a whitelist preserves unrelated TOML settings but normalizes formatting and removes comments. `CODEX_HOME` selects the Codex configuration directory when set.
+
+Run `pipelock discover` to inventory the MCP entries in that TOML file and see which configured commands are wrapped. With `--home`, it reads `.codex/config.toml` under the selected home directory. When `CODEX_HOME` is set, Codex keeps its servers in `$CODEX_HOME/config.toml`, and `discover` reads that file too, unless `--home` is given. Entries with `enabled = false` are still listed and counted: Codex merges config layers, so a trusted project's `.codex/config.toml` setting `enabled = true`, or a `-c mcp_servers.<name>.enabled=true` override, starts them again. `pipelock codex install` skips disabled entries, so wrap one by hand from `pipelock discover --generate` or remove it. Discovery reads `.codex/config.toml` for registered trusted projects and applies those fields over the user configuration. Untrusted project files are ignored. Use `--project /absolute/project/path` for a specific working directory, including nested project layers. Project views carry `project_path`; the user-file view remains listed for launches elsewhere. Profiles, plugins, managed settings, and CLI overrides are not resolved. Wrapped entries are **unconfirmed**, because finding a wrapper in these files cannot establish what a client launches. See [discovery coverage](../cli/discover.md).
 
 The installer validates and embeds an absolute Pipelock config path when you pass
 `--config`, or when a secure config is discovered through `PIPELOCK_CONFIG`,
@@ -241,21 +247,18 @@ codex mcp add test-fs -- pipelock mcp proxy --config pipelock.yaml -- npx -y @mo
 
 ### Environment variables not passing through
 
-Codex passes environment variables via `codex mcp add --env` or the
-`env_vars` field in `config.toml`. Make sure proxy variables are available:
+Codex's `mcp add --env` takes `KEY=VALUE`, which exposes the value to process-command-line readers. Use the `env_vars` whitelist in `config.toml` instead, and export the variables before starting Codex. For example, this entry inherits `API_KEY` into the wrapper and forwards it by name to the MCP child:
 
-```bash
-codex mcp add my-server --env HTTPS_PROXY --env HTTP_PROXY \
-  -- pipelock mcp proxy --config balanced.yaml -- your-server
+```toml
+[mcp_servers.my-server]
+command = "pipelock"
+args = ["mcp", "proxy", "--config", "/home/you/pipelock.yaml", "--env", "API_KEY", "--", "my-mcp-server"]
+env_vars = ["API_KEY"]
 ```
 
-Or pass specific env vars through pipelock:
+`pipelock codex install` creates the whitelist when wrapping an existing stdio server. If a literal value exists only in the server's `env` table, export that value in the environment running setup and Codex before retrying.
 
-```bash
-codex mcp add my-server \
-  -- pipelock mcp proxy --config balanced.yaml --env API_KEY \
-  -- my-mcp-server
-```
+Pipelock refuses requests to pass code-loading and other blocked names into the child at startup. Setting them on the wrapper doesn't pass them into its filtered child environment. Proxy variables supplied to the wrapper aren't inherited by the MCP child. See [child environment restrictions](sandbox.md#child-environment-restrictions) for the shared list and supported operator choices.
 
 ### Checking what Codex MCP servers are configured
 
@@ -273,6 +276,8 @@ pipelock codex install --config "$PWD/pipelock.yaml" --dry-run
 pipelock codex remove --dry-run
 pipelock codex remove
 ```
+
+Re-running install after upgrading Pipelock also recovers and re-wraps an older Pipelock-authored registration using the current binary's invocation shape; a registration it cannot safely normalize is refused with a message naming it, and nothing is changed.
 
 The installer replaces each server registration and attempts to restore the
 previous registration if that replacement fails. If it reports that rollback

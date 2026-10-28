@@ -15,10 +15,11 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
 const testMediaBlockReason = "test"
@@ -291,13 +292,40 @@ func TestApplyMediaPolicy_AudioVideoAllowed(t *testing.T) {
 func TestApplyMediaPolicy_ParseErrorFailsClosed(t *testing.T) {
 	t.Parallel()
 	cfg := config.Defaults()
-	// Wrong prefix - media.StripMetadata returns ErrInvalidJPEG.
-	v := applyMediaPolicy(cfg, "image/jpeg", []byte{0x00, 0x01, 0x02, 0x03})
+	// Valid JPEG signature followed by a truncated marker. This is malformed
+	// media, not a declared-type/actual-bytes mismatch.
+	v := applyMediaPolicy(cfg, "image/jpeg", []byte{0xFF, 0xD8, 0xFF, 0xE0})
 	if !v.Blocked {
 		t.Fatal("malformed jpeg must be blocked (fail-closed)")
 	}
 	if !strings.Contains(v.BlockReason, "parse error") {
 		t.Errorf("block reason = %q, want parse error", v.BlockReason)
+	}
+}
+
+func TestApplyMediaPolicy_EmptyImagePasses(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	for _, body := range [][]byte{nil, {}} {
+		v := applyMediaPolicy(cfg, "image/png", body)
+		if v.Blocked {
+			t.Fatalf("empty image response blocked: %s", v.BlockReason)
+		}
+		if v.StripResult != nil {
+			t.Fatal("empty image response must not enter metadata surgery")
+		}
+	}
+}
+
+func TestApplyMediaPolicy_SignatureMismatchIsDiagnosed(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	v := applyMediaPolicy(cfg, "image/png", []byte{0x00, 0x01})
+	if !v.Blocked {
+		t.Fatal("declared PNG with non-PNG bytes must be blocked")
+	}
+	if !strings.Contains(v.BlockReason, `declared image type "image/png" does not match response bytes (bytes look like application/octet-stream)`) {
+		t.Errorf("block reason = %q, want declared-type mismatch", v.BlockReason)
 	}
 }
 
@@ -461,15 +489,6 @@ func TestForwardHTTP_MediaPolicyBlocksAudio(t *testing.T) {
 	}
 }
 
-// fakeMediaLogger records LogMediaExposure calls for assertion.
-type fakeMediaLogger struct {
-	calls []audit.MediaExposureInfo
-}
-
-func (f *fakeMediaLogger) LogMediaExposure(_ audit.LogContext, info audit.MediaExposureInfo) {
-	f.calls = append(f.calls, info)
-}
-
 // TestLogMediaExposureIfPresent_EmitsWithTransport verifies that a verdict
 // carrying an exposure payload produces exactly one LogMediaExposure call
 // and the transport tag is passed through unchanged. Also checks that nil
@@ -484,29 +503,30 @@ func TestLogMediaExposureIfPresent_EmitsWithTransport(t *testing.T) {
 			Format:      "jpeg",
 		},
 	}
-	logger := &fakeMediaLogger{}
+	logger, sink := newCorrelationAuditLogger(t)
 	actx, err := audit.NewHTTPLogContext(http.MethodGet, "https://example.com/x.jpg", "127.0.0.1", "req-media-1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	logMediaExposureIfPresent(logger, actx, v, "reverse")
-	if len(logger.calls) != 1 {
-		t.Fatalf("calls = %d, want 1", len(logger.calls))
+	events := sink.eventsSnapshot()
+	if len(events) != 1 {
+		t.Fatalf("events = %d, want 1", len(events))
 	}
-	if logger.calls[0].Transport != "reverse" {
-		t.Errorf("Transport = %q, want reverse", logger.calls[0].Transport)
+	if got := events[0].Fields["transport"]; got != "reverse" {
+		t.Errorf("transport = %v, want reverse", got)
 	}
-	if logger.calls[0].Format != "jpeg" {
-		t.Errorf("Format = %q, want jpeg", logger.calls[0].Format)
+	if got := events[0].Fields["format"]; got != "jpeg" {
+		t.Errorf("format = %v, want jpeg", got)
 	}
 }
 
 func TestLogMediaExposureIfPresent_NoExposureNoCall(t *testing.T) {
 	t.Parallel()
-	logger := &fakeMediaLogger{}
+	logger, sink := newCorrelationAuditLogger(t)
 	logMediaExposureIfPresent(logger, audit.LogContext{}, MediaPolicyVerdict{MediaType: "text/html"}, "forward")
-	if len(logger.calls) != 0 {
-		t.Errorf("nil exposure produced %d calls, want 0", len(logger.calls))
+	if events := sink.eventsSnapshot(); len(events) != 0 {
+		t.Errorf("nil exposure produced %d events, want 0", len(events))
 	}
 }
 
@@ -898,36 +918,65 @@ func TestReverseProxy_MediaPolicyBlocksCompressedSpoofWhenScanningDisabled(t *te
 }
 
 func TestReverseProxy_MediaSniffPreservesShortChunkedStream(t *testing.T) {
+	// Formerly asserted TTFB through unbuffered passthrough when
+	// response_scanning.enabled=false. The core floor still has to inspect
+	// this JSON, so reverse buffers like forward and intercept. Headers wait
+	// for the complete body; the pin is that injection in that chunked body
+	// is still blocked.
 	cfg := reverseTestConfig()
 	cfg.ResponseScanning.Enabled = false
 	cfg.BrowserShield.Enabled = false
-	release := make(chan struct{})
-	defer close(release)
-	firstChunkSent := make(chan struct{})
 
 	proxy := reverseTestSetup(t, cfg, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
 		_, _ = w.Write([]byte("{\"event\":\"start\"}\n"))
-		w.(http.Flusher).Flush()
-		close(firstChunkSent)
-		<-release
+		if flusher != nil {
+			flusher.Flush()
+		}
+		_, _ = w.Write([]byte("{\"note\":\"" + corePayloadForFloor + "\"}\n"))
 	})
 
-	done := make(chan int, 1)
-	go func() {
-		resp := testGet(t, proxy.URL+"/stream")
-		defer func() { _ = resp.Body.Close() }()
-		done <- resp.StatusCode
-	}()
-	<-firstChunkSent
-	select {
-	case code := <-done:
-		if code != http.StatusOK {
-			t.Errorf("status = %d, want 200", code)
+	resp := testGet(t, proxy.URL+"/stream")
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode == http.StatusOK && strings.Contains(string(body), corePayloadForFloor) {
+		t.Fatalf("core injection reached the client in a chunked JSON body with the optional layer off")
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected the core floor to block with 403, got %d body=%q", resp.StatusCode, string(body))
+	}
+}
+
+func TestReverseProxy_MediaSniffShortChunkedStreamCleanStillFlows(t *testing.T) {
+	const clean = "{\"event\":\"start\"}\n{\"note\":\"quarterly totals\"}\n"
+	cfg := reverseTestConfig()
+	cfg.ResponseScanning.Enabled = false
+	cfg.BrowserShield.Enabled = false
+
+	proxy := reverseTestSetup(t, cfg, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		_, _ = w.Write([]byte("{\"event\":\"start\"}\n"))
+		if flusher != nil {
+			flusher.Flush()
 		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("client did not receive headers after the upstream flushed a complete short chunk")
+		_, _ = w.Write([]byte("{\"note\":\"quarterly totals\"}\n"))
+	})
+
+	resp := testGet(t, proxy.URL+"/stream")
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK || string(body) != clean {
+		t.Fatalf("ordinary chunked JSON was not served: status=%d body=%q", resp.StatusCode, string(body))
 	}
 }
 
@@ -993,5 +1042,169 @@ func TestCanonicalContentType(t *testing.T) {
 				t.Errorf("canonicalContentType(%q) = %q, want %q", tt.in, got, tt.want)
 			}
 		})
+	}
+}
+
+// The reverse proxy calls applyMediaPolicy with a NIL body on purpose, so that
+// declared audio and video can be refused without reading the stream. An
+// empty-body exemption placed before those decisions therefore turns a refusal
+// into an allow, which is how declared audio started returning 200 on the
+// reverse path while the forward and fetch paths (which pass the bytes they
+// read) kept returning 403. Ordering is the invariant here, so assert the
+// verdict for a nil body of each media class rather than the code's shape.
+func TestApplyMediaPolicy_NilBodyStillRefusesAudioVideo(t *testing.T) {
+	cfg := config.Defaults()
+
+	for _, tt := range []struct {
+		name        string
+		contentType string
+		wantBlocked bool
+	}{
+		{"nil audio body is refused", "audio/mpeg", true},
+		{"nil video body is refused", "video/mp4", true},
+		{"nil image body is allowed, nothing to parse", "image/png", false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			verdict := applyMediaPolicy(cfg, tt.contentType, nil)
+			if verdict.Blocked != tt.wantBlocked {
+				t.Errorf("applyMediaPolicy(%s, nil).Blocked = %v, want %v (reason %q)",
+					tt.contentType, verdict.Blocked, tt.wantBlocked, verdict.BlockReason)
+			}
+		})
+	}
+}
+
+// relabeledWebP is a WebP body a CDN served under an image/png Content-Type.
+func relabeledWebP() []byte {
+	return append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+}
+
+func TestApplyMediaPolicy_RelabeledAllowedRasterPasses(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	if !cfg.MediaPolicy.ImageTypeAllowed("image/webp") {
+		t.Fatal("precondition: policy allows image/webp")
+	}
+	body := relabeledWebP()
+	v := applyMediaPolicy(cfg, "image/png", body)
+	if v.Blocked {
+		t.Fatalf("WebP served as image/png blocked: %s", v.BlockReason)
+	}
+	if string(v.Body) != string(body) {
+		t.Fatal("relabeled WebP body changed")
+	}
+}
+
+func TestApplyMediaPolicy_RelabeledRasterStillRefusedWhenNotAllowedOrNotRaster(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg"}
+	if v := applyMediaPolicy(cfg, "image/png", relabeledWebP()); !v.Blocked || !strings.Contains(v.BlockReason, "bytes look like image/webp") {
+		t.Fatalf("WebP served as PNG with WebP disallowed: blocked=%v %q", v.Blocked, v.BlockReason)
+	}
+	cfg = config.Defaults()
+	for name, body := range map[string][]byte{
+		"html": []byte("<!DOCTYPE html><html><body>x</body></html>"),
+		"svg":  []byte(`<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg"><script>x()</script></svg>`),
+	} {
+		if v := applyMediaPolicy(cfg, "image/png", body); !v.Blocked {
+			t.Fatalf("%s served as image/png was forwarded", name)
+		}
+	}
+}
+
+func TestApplyMediaPolicy_RelabeledTypeIsForwarded(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp", "image/x-icon"}
+	v := applyMediaPolicy(cfg, "image/png", relabeledWebP())
+	if v.Blocked || v.Relabeled != "image/webp" || v.MediaType != "image/webp" {
+		t.Fatalf("verdict = blocked:%v relabeled:%q mt:%q", v.Blocked, v.Relabeled, v.MediaType)
+	}
+	h := http.Header{"Content-Type": {"image/png"}}
+	applyRelabeledContentType(h, v)
+	if got := h.Get("Content-Type"); got != "image/webp" {
+		t.Fatalf("forwarded Content-Type = %q, want image/webp", got)
+	}
+	// Short WHATWG prefixes that any payload can start with stay refused.
+	for name, body := range map[string][]byte{
+		"webp prefix + svg": append([]byte("RIFF\x00\x00\x00\x00WEBPVP"), []byte(`<svg xmlns="http://www.w3.org/2000/svg"><script>x()</script></svg>`)...),
+		"gif prefix + html": []byte("GIF89a<html><body>x</body></html>"),
+		"bmp prefix + html": []byte("BM<html><body>x</body></html>"),
+		"ico sig + script":  append([]byte{0, 0, 1, 0}, []byte("<script>x()</script>")...),
+	} {
+		if v := applyMediaPolicy(cfg, "image/png", body); !v.Blocked || v.Relabeled != "" {
+			t.Fatalf("%s served as image/png: blocked=%v relabeled=%q", name, v.Blocked, v.Relabeled)
+		}
+	}
+}
+
+// TestFetchEndpoint_PublishesRelabeledType proves the fetch JSON names the
+// type the bytes prove, not the upstream's mislabel.
+func TestFetchEndpoint_PublishesRelabeledType(t *testing.T) {
+	body := relabeledWebP()
+	backend := newIPv4Server(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write(body)
+	}))
+	defer backend.Close()
+
+	cfg := config.Defaults()
+	cfg.FetchProxy.TimeoutSeconds = 5
+	cfg.Internal = nil
+	cfg.SSRF.IPAllowlist = []string{"127.0.0.0/8", "::1/128"}
+	cfg.APIAllowlist = nil
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	p, err := New(cfg, audit.NewNop(), scanner.MustNew(cfg), metrics.New())
+	if err != nil {
+		t.Fatalf("proxy.New: %v", err)
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+backend.URL+"/icon.png", nil)
+	w := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/fetch", p.handleFetch)
+	mux.ServeHTTP(w, req)
+
+	var resp FetchResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode FetchResponse: %v (body=%s)", err, w.Body.String())
+	}
+	if resp.Blocked || !strings.HasPrefix(resp.ContentType, "image/webp") {
+		t.Fatalf("fetch published blocked=%v reason=%q content_type=%q, want image/webp", resp.Blocked, resp.BlockReason, resp.ContentType)
+	}
+}
+
+// With metadata stripping off, nothing parses the bytes, so a disallowed
+// format served under an allowed raster label must still be refused by its
+// proven header rather than admitted under the declared type.
+func TestApplyMediaPolicy_RelabeledDisallowedBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg"}
+	if cfg.MediaPolicy.ImageTypeAllowed("image/webp") || cfg.MediaPolicy.ShouldStripImageMetadata() {
+		t.Fatal("precondition: WebP disallowed and stripping off")
+	}
+	v := applyMediaPolicy(cfg, "image/png", relabeledWebP())
+	if !v.Blocked || !strings.Contains(v.BlockReason, "image/webp") {
+		t.Fatalf("disallowed WebP labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
+	}
+	if v := applyMediaPolicy(cfg, "image/png", buildValidPNG(nil)); v.Blocked {
+		t.Fatalf("positive control: honest PNG blocked with stripping off: %s", v.BlockReason)
+	}
+}
+
+func TestApplyMediaPolicy_ICOUnderPNGLabelBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/x-icon"}
+	ico := append([]byte{0, 0, 1, 0, 1, 0}, make([]byte, 32)...)
+	if v := applyMediaPolicy(cfg, "image/png", ico); !v.Blocked || !strings.Contains(v.BlockReason, "image/x-icon") {
+		t.Fatalf("ICO labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
 	}
 }

@@ -226,21 +226,34 @@ func runCursorHook(cmd *cobra.Command, configFile string) error {
 
 	// Merge community rules into config before building scanner.
 	// Keep stdout JSON contract intact; warnings go to stderr.
-	reportBundleLoadResult(cmd.ErrOrStderr(), rules.MergeIntoConfig(cfg, cliutil.Version))
+	if err := reportBundleLoadResult(cmd.ErrOrStderr(), cfg, rules.MergeIntoConfig(cfg, cliutil.Version)); err != nil {
+		writeResponse(stdout, cursorResponse{Permission: decisionDeny, UserMessage: "pipelock: " + err.Error()})
+		return nil
+	}
 
-	// Build scanner and policy.
-	sc, err := scanner.New(cfg)
+	// Build action from payload.
+	action := payloadToAction(payload)
+
+	// Build scanner and policy. A shell command is code about to run, so its
+	// scanner treats an environment lookup assignment as code, not a credential.
+	sc, err := scanner.NewWithOptions(cfg, scanner.Options{ToolCommandEnvLookups: action.Kind == decide.EventShellExecution})
 	if err != nil {
 		return fmt.Errorf("create scanner: %w", err)
 	}
 	defer sc.Close()
 	pc := policy.New(cfg.MCPToolPolicy)
-
-	// Build action from payload.
-	action := payloadToAction(payload)
+	// The agent's file tools act on this host, so a submitted path is also
+	// matched by the file it resolves to here.
+	pc.EnableLocalPathIdentity()
+	// A relative path in the payload is relative to the session's directory,
+	// which is the payload's cwd and not necessarily this process's.
+	if filepath.IsAbs(payload.CWD) {
+		pc.AddLocalPathBases(payload.CWD)
+	}
 
 	// Decide.
 	decision := decide.Decide(cmd.Context(), cfg, sc, pc, action)
+	logIncompleteCheck(cmd, decision)
 
 	// Map to Cursor response.
 	resp := cursorResponse{

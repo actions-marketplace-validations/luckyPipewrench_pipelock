@@ -7,7 +7,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,11 @@ type DLPMatch struct {
 	Contributors [][]byte
 }
 
+// IsInspectionLimit preserves the refusal class on contributor-aware evidence.
+func (m DLPMatch) IsInspectionLimit() bool {
+	return (TextDLPMatch{PatternName: m.PatternName}).IsInspectionLimit()
+}
+
 // MaxFragmentSourceRequestIDBytes bounds provenance metadata independently of
 // caller behavior. It matches the MCP capture RPC-ID ceiling; keeping the
 // guard here prevents another FragmentAppend caller from turning a small
@@ -38,16 +45,44 @@ const (
 )
 
 // fragment holds a single outbound payload chunk with its arrival time.
+// continuity is empty for a stream whose bytes are one secret. A non-empty
+// value joins only with fragments that carry the same identity, so unrelated
+// leaves that share a retention stream cannot sit between two halves.
 type fragment struct {
 	data            []byte
 	at              time.Time
 	sourceRequestID []byte
+	continuity      []byte
 }
 
 // sessionBuffer accumulates outbound fragments for a single session.
 type sessionBuffer struct {
-	fragments  []fragment
-	totalBytes int
+	streamID     string
+	groupMembers map[string]struct{}
+	fragments    []fragment
+	storage      []fragment
+	totalBytes   int
+}
+
+// appendFragmentReusingStorage keeps the active descriptors contiguous and in
+// their original order. Front eviction can leave reusable capacity before the
+// active slice; compact into that capacity only when the tail fills. Payload
+// and request-ID bytes are immutable, and scan snapshots own descriptor copies.
+// Callers hold the FragmentBuffer lock.
+func appendFragmentReusingStorage(active, storage []fragment, next fragment) ([]fragment, []fragment) {
+	if len(active) == cap(active) {
+		// After a large trim, let normal append replace the oversized backing
+		// array instead of retaining historical high-water capacity forever.
+		if len(storage) > len(active) && len(storage)-len(active) <= len(active) {
+			n := copy(storage, active)
+			clear(storage[n:])
+			active = storage[:n]
+		} else {
+			active = append(active, next)
+			return active, active[:cap(active)]
+		}
+	}
+	return append(active, next), storage
 }
 
 // MaxPathPositions is the largest URL path depth that CEE tracks. It bounds
@@ -67,6 +102,7 @@ type pathPositionBuffer struct {
 	initial    []byte
 	varied     bool
 	fragments  []fragment
+	storage    []fragment
 	totalBytes int
 }
 
@@ -100,6 +136,7 @@ type FragmentAppendResult struct {
 // DLP patterns synchronously. This guarantees pre-forward detection: a request
 // that completes a split secret is blocked before egress. Thread-safe.
 type FragmentBuffer struct {
+	cleanMemo    fragmentCleanMemo
 	mu           sync.Mutex
 	maxBytes     int // per-session byte cap
 	maxSessions  int // global owner cap (new identities are denied at capacity)
@@ -227,17 +264,30 @@ func (fb *FragmentBuffer) AppendAndScanOwnedInGroup(ctx context.Context, owner i
 	var snapshot []fragment
 	fb.mu.Lock()
 	fb.maybeCleanupLocked(time.Now())
-	result := fb.appendWithSnapshotLocked(owner.Key(), group.Key(), streamKey.Key(), payload, nil, &snapshot)
+	result := fb.appendWithSnapshotLocked(owner.Key(), group.Key(), streamKey.Key(), FragmentPiece{Data: payload}, nil, &snapshot)
 	fb.mu.Unlock()
-	return result, scanFragmentsForSecrets(ctx, sc, snapshot)
+	return result, fb.scanBatchWithCleanMemo(ctx, sc, snapshot, fragmentStreamKindData+streamKey.Key())
+}
+
+// FragmentPiece is one leaf inside a stream. Continuity is the identity that
+// reassembly must keep contiguous. Empty Continuity means the piece joins
+// every other empty-continuity fragment in the stream, which is the legacy
+// single-payload behavior. Pieces with the same continuity in one append are
+// stored as one fragment, even when another leaf sits between them, so a
+// single request cannot look like a cross-request match.
+type FragmentPiece struct {
+	Continuity []byte
+	Data       []byte
 }
 
 // FragmentAppend identifies one stream carried by a request. Streams can share
 // a retention group without allowing one field to evict another before scanning.
+// When Pieces is non-empty it is the stream contents and Payload is ignored.
 type FragmentAppend struct {
 	Group   identitykey.CEEStream
 	Stream  identitykey.CEEStream
 	Payload []byte
+	Pieces  []FragmentPiece
 	// SourceRequestID is an optional opaque request identity. The ledger retains
 	// it only when it is non-empty and no larger than
 	// MaxFragmentSourceRequestIDBytes. Legacy or oversized identities do not
@@ -274,7 +324,11 @@ func (fb *FragmentBuffer) AppendAndScanOwnedBatch(ctx context.Context, owner ide
 	var result FragmentAppendResult
 	appended := 0
 	for i, item := range appends {
-		result = fb.appendSnapshotLocked(owner.Key(), item.Group.Key(), item.Stream.Key(), item.Payload, item.SourceRequestID, &snapshots[i])
+		if len(item.Pieces) > 0 {
+			result = fb.appendPiecesSnapshotLocked(owner.Key(), item.Group.Key(), item.Stream.Key(), item.Pieces, item.SourceRequestID, &snapshots[i])
+		} else {
+			result = fb.appendSnapshotLocked(owner.Key(), item.Group.Key(), item.Stream.Key(), FragmentPiece{Data: item.Payload}, item.SourceRequestID, &snapshots[i])
+		}
 		if result != (FragmentAppendResult{}) {
 			break
 		}
@@ -288,8 +342,8 @@ func (fb *FragmentBuffer) AppendAndScanOwnedBatch(ctx context.Context, owner ide
 		return result, nil
 	}
 	matches := make([][]DLPMatch, len(snapshots))
-	for i, snapshot := range snapshots {
-		matches[i] = scanFragmentsForSecrets(ctx, sc, snapshot)
+	for i, item := range appends {
+		matches[i] = fb.scanBatchWithCleanMemo(ctx, sc, snapshots[i], fragmentStreamKindData+item.Stream.Key())
 	}
 	return FragmentAppendResult{}, matches
 }
@@ -298,19 +352,64 @@ func (fb *FragmentBuffer) AppendAndScanOwnedBatch(ctx context.Context, owner ide
 // after any due cleanup, so callers that must decide something about existing
 // buffer contents can do so atomically with the append itself.
 func (fb *FragmentBuffer) appendLocked(owner, group, streamKey string, payload []byte) FragmentAppendResult {
-	return fb.appendWithSnapshotLocked(owner, group, streamKey, payload, nil, nil)
+	return fb.appendWithSnapshotLocked(owner, group, streamKey, FragmentPiece{Data: payload}, nil, nil)
 }
 
-func (fb *FragmentBuffer) appendWithSnapshotLocked(owner, group, streamKey string, payload, sourceRequestID []byte, snapshot *[]fragment) FragmentAppendResult {
-	result := fb.appendSnapshotLocked(owner, group, streamKey, payload, sourceRequestID, snapshot)
+func (fb *FragmentBuffer) appendWithSnapshotLocked(owner, group, streamKey string, piece FragmentPiece, sourceRequestID []byte, snapshot *[]fragment) FragmentAppendResult {
+	result := fb.appendSnapshotLocked(owner, group, streamKey, piece, sourceRequestID, snapshot)
 	if result == (FragmentAppendResult{}) {
 		fb.retainStreamLocked(owner, streamKey)
 	}
 	return result
 }
 
-func (fb *FragmentBuffer) appendSnapshotLocked(owner, group, streamKey string, payload, sourceRequestID []byte, snapshot *[]fragment) FragmentAppendResult {
-	streamID := fragmentStreamID(fragmentStreamKindData, streamKey)
+func (fb *FragmentBuffer) appendPiecesSnapshotLocked(owner, group, streamKey string, pieces []FragmentPiece, sourceRequestID []byte, snapshot *[]fragment) FragmentAppendResult {
+	merged := mergeFragmentPieces(pieces)
+	var result FragmentAppendResult
+	for _, piece := range merged {
+		result = fb.appendSnapshotLocked(owner, group, streamKey, piece, sourceRequestID, nil)
+		if result != (FragmentAppendResult{}) {
+			return result
+		}
+	}
+	if snapshot != nil {
+		if sb := fb.sessions[streamKey]; sb != nil {
+			*snapshot = fb.activeFragmentsLocked(sb.fragments)
+		}
+	}
+	return FragmentAppendResult{}
+}
+
+func mergeFragmentPieces(pieces []FragmentPiece) []FragmentPiece {
+	merged := make([]FragmentPiece, 0, len(pieces))
+	index := make(map[string]int, len(pieces))
+	for _, piece := range pieces {
+		if len(piece.Data) == 0 {
+			continue
+		}
+		key := string(piece.Continuity)
+		if at, ok := index[key]; ok {
+			merged[at].Data = append(merged[at].Data, piece.Data...)
+			continue
+		}
+		index[key] = len(merged)
+		merged = append(merged, FragmentPiece{
+			Continuity: append([]byte(nil), piece.Continuity...),
+			Data:       append([]byte(nil), piece.Data...),
+		})
+	}
+	return merged
+}
+
+func (fb *FragmentBuffer) appendSnapshotLocked(owner, group, streamKey string, piece FragmentPiece, sourceRequestID []byte, snapshot *[]fragment) FragmentAppendResult {
+	sb, exists := fb.sessions[streamKey]
+	streamID := ""
+	if sb != nil {
+		streamID = sb.streamID
+	}
+	if streamID == "" {
+		streamID = fragmentStreamID(fragmentStreamKindData, streamKey)
+	}
 	// Normalized once here so everything below can assume a non-empty owner:
 	// a caller that keeps one stream per client passes no owner, and that
 	// stream is then its own identity.
@@ -320,31 +419,35 @@ func (fb *FragmentBuffer) appendSnapshotLocked(owner, group, streamKey string, p
 	if group == "" {
 		group = streamID
 	}
-	sb, exists := fb.sessions[streamKey]
 	if !exists {
 		if !fb.canAdmitOwnerLocked(owner) {
 			return FragmentAppendResult{CapacityExceeded: true}
 		}
-		sb = &sessionBuffer{}
+		sb = &sessionBuffer{streamID: streamID}
 		fb.sessions[streamKey] = sb
 		fb.trackOwnerStreamLocked(owner, group, streamID)
+		sb.groupMembers = fb.owners[owner].budgets[group]
 	} else if !fb.streamOwnedByLocked(streamID, owner) {
 		return FragmentAppendResult{OwnerMismatch: true}
 	}
 
 	// Copy payload to prevent caller mutation of buffered data.
-	copied := make([]byte, len(payload))
-	copy(copied, payload)
+	copied := append([]byte(nil), piece.Data...)
+	var continuity []byte
+	if len(piece.Continuity) > 0 {
+		continuity = append([]byte(nil), piece.Continuity...)
+	}
 	var requestID []byte
 	if len(copied) > 0 && len(sourceRequestID) > 0 && len(sourceRequestID) <= MaxFragmentSourceRequestIDBytes {
 		requestID = append([]byte(nil), sourceRequestID...)
 	}
 
 	now := time.Now()
-	sb.fragments = append(sb.fragments, fragment{
+	sb.fragments, sb.storage = appendFragmentReusingStorage(sb.fragments, sb.storage, fragment{
 		data:            copied,
 		at:              now,
 		sourceRequestID: requestID,
+		continuity:      continuity,
 	})
 	sb.totalBytes += len(copied)
 	if snapshot != nil {
@@ -356,13 +459,16 @@ func (fb *FragmentBuffer) appendSnapshotLocked(owner, group, streamKey string, p
 }
 
 func (fb *FragmentBuffer) retainStreamLocked(owner, streamKey string) {
-	streamID := fragmentStreamID(fragmentStreamKindData, streamKey)
-	if owner == "" {
-		owner = streamID
-	}
 	sb := fb.sessions[streamKey]
 	if sb == nil {
 		return // another stream's shared budget already evicted this stream
+	}
+	streamID := sb.streamID
+	if streamID == "" {
+		streamID = fragmentStreamID(fragmentStreamKindData, streamKey)
+	}
+	if owner == "" {
+		owner = streamID
 	}
 	// Evict oldest fragments until within per-session byte cap.
 	// A single fragment larger than maxBytes is truncated to maxBytes.
@@ -376,8 +482,13 @@ func (fb *FragmentBuffer) retainStreamLocked(owner, streamKey string) {
 		sb.fragments[0].data = sb.fragments[0].data[len(sb.fragments[0].data)-fb.maxBytes:]
 		sb.totalBytes = fb.maxBytes
 	}
-	// The per-stream cap above bounds one stream; this bounds the identity that
-	// owns it, which is the unit the ledger admits.
+	// The per-stream cap also bounds a singleton budget group. Shared groups
+	// need the same group-budget enforcement as enforceOwnerBudgetLocked below.
+	// Keep the membership map, never its size: another request can add a
+	// sibling stream to the group while this stream remains live.
+	if sb.groupMembers != nil && len(sb.groupMembers) <= 1 {
+		return
+	}
 	fb.enforceOwnerBudgetLocked(owner, streamID)
 }
 
@@ -476,13 +587,10 @@ func (fb *FragmentBuffer) streamBytesLocked(streamID string) int {
 	return 0
 }
 
-// enforceOwnerBudgetLocked keeps one identity's retained bytes within the
-// configured cap by evicting its OWN oldest fragment until it fits. Evicting
-// within an identity is the same trade the per-stream cap already makes, and
-// the newest bytes are kept because they are the ones most likely to complete
-// a split secret. It never touches another identity's evidence: a fragment
-// dropped from a stranger's stream could let a later request complete a secret
-// in an emptied stream and pass uninspected.
+// enforceOwnerBudgetLocked keeps the stream's budget group within the configured
+// cap by evicting its oldest fragments. Independent groups retain their own caps.
+// The newest bytes are kept because they are the ones most likely to complete a
+// split secret. It never touches another group's evidence.
 func (fb *FragmentBuffer) enforceOwnerBudgetLocked(owner, streamID string) {
 	state := fb.owners[owner]
 	if state == nil {
@@ -505,9 +613,9 @@ func (fb *FragmentBuffer) enforceOwnerBudgetLocked(owner, streamID string) {
 	}
 }
 
-// evictOldestOwnerFragmentLocked drops the single oldest fragment held by one
-// identity and reports whether anything was removed. A false return means the
-// identity holds nothing further that can be released, which stops the caller
+// evictOldestOwnerFragmentLocked drops the single oldest fragment in the budget
+// group and reports whether anything was removed. A false return means the
+// group holds nothing further that can be released, which stops the caller
 // from spinning.
 func (fb *FragmentBuffer) evictOldestOwnerFragmentLocked(members map[string]struct{}) bool {
 	var (
@@ -555,7 +663,7 @@ func (fb *FragmentBuffer) ScanForSecrets(ctx context.Context, sessionKey identit
 	}
 	fragments := fb.activeFragmentsLocked(sb.fragments)
 	fb.mu.Unlock()
-	return scanFragmentsForSecrets(ctx, sc, fragments)
+	return fb.scanBatchWithCleanMemo(ctx, sc, fragments, fragmentStreamKindData+sessionKey.Key())
 }
 
 // AppendPathSegments records a URL path as bounded, position-aware CEE state.
@@ -581,22 +689,23 @@ func (fb *FragmentBuffer) AppendPathSegmentsForSession(streamKey identitykey.CEE
 // identity. Path state shares that identity's ledger slot with any sibling
 // JSON or raw streams rather than competing with them one key at a time.
 func (fb *FragmentBuffer) AppendPathSegmentsOwned(owner identitykey.CEEIdentity, streamKey identitykey.CEEStream, segments [][]byte) FragmentAppendResult {
-	return fb.appendPathSegmentsWithSnapshot(owner, streamKey, segments, nil)
+	return fb.appendPathSegmentsWithSnapshot(owner, streamKey, segments, nil, nil)
 }
 
 // AppendAndScanPathSegmentsOwned inspects each completed position before the
 // shared path retention budget evicts its earlier fragments.
 func (fb *FragmentBuffer) AppendAndScanPathSegmentsOwned(ctx context.Context, owner identitykey.CEEIdentity, streamKey identitykey.CEEStream, segments [][]byte, sc *Scanner) (FragmentAppendResult, []DLPMatch) {
 	var snapshots [][]fragment
-	result := fb.appendPathSegmentsWithSnapshot(owner, streamKey, segments, &snapshots)
+	var snapshotKeys []string
+	result := fb.appendPathSegmentsWithSnapshot(owner, streamKey, segments, &snapshots, &snapshotKeys)
 	var matches []DLPMatch
-	for _, fragments := range snapshots {
-		matches = append(matches, scanFragmentsForSecrets(ctx, sc, fragments)...)
+	for i, fragments := range snapshots {
+		matches = append(matches, fb.scanBatchWithCleanMemo(ctx, sc, fragments, snapshotKeys[i])...)
 	}
 	return result, matches
 }
 
-func (fb *FragmentBuffer) appendPathSegmentsWithSnapshot(owner identitykey.CEEIdentity, streamKey identitykey.CEEStream, segments [][]byte, snapshots *[][]fragment) FragmentAppendResult {
+func (fb *FragmentBuffer) appendPathSegmentsWithSnapshot(owner identitykey.CEEIdentity, streamKey identitykey.CEEStream, segments [][]byte, snapshots *[][]fragment, snapshotKeys *[]string) FragmentAppendResult {
 	if streamKey.Owner() != owner {
 		return FragmentAppendResult{OwnerMismatch: true}
 	}
@@ -664,9 +773,10 @@ func (fb *FragmentBuffer) appendPathSegmentsWithSnapshot(owner identitykey.CEEId
 		fb.appendPathFragmentLocked(ps, pb, segment)
 	}
 	if snapshots != nil {
-		for _, pb := range ps.positions {
+		for position, pb := range ps.positions {
 			if fragments := fb.activeFragmentsLocked(pb.fragments); len(fragments) >= minFragmentsForMatch {
 				*snapshots = append(*snapshots, fragments)
+				*snapshotKeys = append(*snapshotKeys, fragmentStreamKindPath+streamKey.Key()+"\x00"+strconv.Itoa(position))
 			}
 		}
 	}
@@ -678,7 +788,7 @@ func (fb *FragmentBuffer) appendPathSegmentsWithSnapshot(owner identitykey.CEEId
 
 func (fb *FragmentBuffer) appendPathFragmentLocked(ps *pathSessionBuffer, pb *pathPositionBuffer, payload []byte) {
 	copied := append([]byte(nil), payload...)
-	pb.fragments = append(pb.fragments, fragment{data: copied, at: time.Now()})
+	pb.fragments, pb.storage = appendFragmentReusingStorage(pb.fragments, pb.storage, fragment{data: copied, at: time.Now()})
 	pb.totalBytes += len(copied)
 	ps.totalBytes += len(copied)
 }
@@ -696,16 +806,18 @@ func (fb *FragmentBuffer) ScanPathForSecrets(ctx context.Context, sessionKey ide
 	}
 
 	streams := make([][]fragment, 0, len(ps.positions))
-	for _, pb := range ps.positions {
+	var streamKeys []string
+	for position, pb := range ps.positions {
 		if fragments := fb.activeFragmentsLocked(pb.fragments); len(fragments) >= minFragmentsForMatch {
 			streams = append(streams, fragments)
+			streamKeys = append(streamKeys, fragmentStreamKindPath+sessionKey.Key()+"\x00"+strconv.Itoa(position))
 		}
 	}
 	fb.mu.Unlock()
 
 	var matches []DLPMatch
-	for _, fragments := range streams {
-		matches = append(matches, scanFragmentsForSecrets(ctx, sc, fragments)...)
+	for i, fragments := range streams {
+		matches = append(matches, fb.scanBatchWithCleanMemo(ctx, sc, fragments, streamKeys[i])...)
 	}
 	return matches
 }
@@ -722,6 +834,57 @@ func (fb *FragmentBuffer) activeFragmentsLocked(fragments []fragment) []fragment
 }
 
 func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragment) []DLPMatch {
+	groups := fragmentContinuityGroups(fragments)
+	if len(groups) <= 1 {
+		if len(groups) == 0 {
+			return nil
+		}
+		return scanOneFragmentContinuity(ctx, sc, groups[0])
+	}
+	var matches []DLPMatch
+	for _, group := range groups {
+		matches = append(matches, scanOneFragmentContinuity(ctx, sc, group)...)
+	}
+	return matches
+}
+
+// fragmentContinuityGroups keeps the legacy stream as one group. A stream
+// that carries path identity is scanned once per identity, in first-seen
+// order, so a sibling leaf cannot interrupt a split value.
+func fragmentContinuityGroups(fragments []fragment) [][]fragment {
+	if len(fragments) == 0 {
+		return nil
+	}
+	keyed := false
+	for _, item := range fragments {
+		if len(item.continuity) > 0 {
+			keyed = true
+			break
+		}
+	}
+	if !keyed {
+		return [][]fragment{fragments}
+	}
+	index := make(map[string]int)
+	groups := make([][]fragment, 0)
+	for _, item := range fragments {
+		key := string(item.continuity)
+		at, ok := index[key]
+		if !ok {
+			index[key] = len(groups)
+			groups = append(groups, nil)
+			at = len(groups) - 1
+		}
+		groups[at] = append(groups[at], item)
+	}
+	return groups
+}
+
+func scanOneFragmentContinuity(ctx context.Context, sc *Scanner, fragments []fragment) []DLPMatch {
+	return scanOneFragmentContinuityMemo(ctx, sc, fragments, nil, "")
+}
+
+func scanOneFragmentContinuityMemo(ctx context.Context, sc *Scanner, fragments []fragment, memo *fragmentCleanMemo, stream string) []DLPMatch {
 	if len(fragments) < minFragmentsForMatch {
 		return nil
 	}
@@ -741,8 +904,22 @@ func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragm
 		ranges = append(ranges, fragmentRange{start: start, end: len(buf), normalized: normalized, fragment: f})
 	}
 
-	result := sc.ScanTextForDLP(ctx, string(buf))
-	if result.Clean && len(result.InformationalMatches) == 0 {
+	text := string(buf)
+	key := fragmentCleanKey{scanner: sc, stream: stream, continuity: string(fragments[0].continuity)}
+	if memo != nil && memo.lookup(key, text) {
+		return nil
+	}
+	result := sc.ScanTextForDLP(ctx, text)
+	if result.Clean && len(result.Matches) == 0 && len(result.InformationalMatches) == 0 {
+		if memo != nil {
+			memo.store(key, text)
+		}
+		return nil
+	}
+
+	result.Matches = slices.DeleteFunc(result.Matches, func(m TextDLPMatch) bool { return m.IsInformational() })
+	if len(result.Matches) == 0 {
+		// Warnings were emitted by the joined scan. Do not memoize them.
 		return nil
 	}
 
@@ -752,6 +929,12 @@ func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragm
 	// via DLPWarnHook inside ScanTextForDLP. Including them would cause
 	// CEE callers to treat informational warn matches as enforcement signals.
 	var matches []DLPMatch
+	// Image excision splices decoded bytes into the scanned text, so match
+	// offsets no longer line up with fragment ranges. Map positions back
+	// through the removed image spans instead.
+	if excised, decoded, removed := stripVerifiedImageDataURLSpans(text, true); len(removed) > 0 {
+		return imageSplicedFragmentMatches(ctx, sc, excised, decoded, removed, ranges, result.Matches)
+	}
 	complete := completeFragmentOccurrences(ctx, sc, ranges)
 	patternSet := make(map[string]struct{}, len(result.Matches))
 	patternNames := make([]string, 0, len(result.Matches))
@@ -780,7 +963,7 @@ func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragm
 			var rawTargets []TextDLPMatch
 			invalidTargetFound := false
 			for _, match := range maskedResult.Matches {
-				if match.PatternName != patternName {
+				if match.PatternName != patternName || match.IsInformational() {
 					continue
 				}
 				span := match.Span()
@@ -792,7 +975,7 @@ func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragm
 			}
 			for _, match := range rawTargets {
 				span := match.Span()
-				if spanIsWithinOneFragment(ranges, span.ByteStart, span.ByteEnd) {
+				if spanIsWithinOneFragment(ranges, span.ByteStart, span.ByteEnd) && spanHoldsRule(ctx, sc, masked, span.ByteStart, span.ByteEnd, match.PatternName) {
 					if maskFragmentOccurrence(masked, span.ByteStart, span.ByteEnd) {
 						remasked = true
 					} else {
@@ -801,6 +984,14 @@ func scanFragmentsForSecrets(ctx context.Context, sc *Scanner, fragments []fragm
 						matches = append(matches, DLPMatch{PatternName: match.PatternName})
 						crossed = true
 					}
+					continue
+				}
+				if spanIsWithinOneFragment(ranges, span.ByteStart, span.ByteEnd) {
+					// The span claims one request but its bytes do not match
+					// the rule there: the scanner rewrote text before recording
+					// positions. The location is unknown, so report the rule.
+					matches = append(matches, DLPMatch{PatternName: match.PatternName})
+					crossed = true
 					continue
 				}
 				matches = appendCrossFragmentMatch(matches, match, ranges, len(buf))
@@ -853,6 +1044,128 @@ type fragmentOccurrence struct {
 	end   int
 }
 
+// imageSplicedFragmentMatches attributes joined-window findings after image
+// excision has rewritten the text. Excision only removes byte ranges and
+// appends decoded image bytes after the surrounding text, so a position in the
+// surrounding text maps back to the original exactly. For each rule, a match
+// that maps inside one fragment is blanked in place and the window rescanned,
+// so a whole copy cannot hide a split copy. A match in the decoded image bytes,
+// or one without a raw position, has no original location and is reported.
+func imageSplicedFragmentMatches(ctx context.Context, sc *Scanner, excised, decoded string, removed []textByteSpan, ranges []fragmentRange, joined []TextDLPMatch) []DLPMatch {
+	// Scanner spans are in DLP-normalized coordinates. If normalizing the
+	// surrounding text would move bytes, positions cannot be trusted, so
+	// every joined rule is reported without attribution.
+	if normalized, stable := normalizeFragmentForDLP([]byte(excised)); !stable || string(normalized) != excised {
+		return unattributedFragmentMatches(joined)
+	}
+	window := excised
+	if len(decoded) > 0 {
+		window = excised + "\n" + decoded
+	}
+	toOriginal := func(pos int, isEnd bool) int {
+		shift := 0
+		for _, gap := range removed {
+			at := pos + shift
+			if gap.start < at || (!isEnd && gap.start == at) {
+				shift += gap.end - gap.start
+				continue
+			}
+			break
+		}
+		return pos + shift
+	}
+	var matches []DLPMatch
+	reported := make(map[string]struct{})
+	budget := maxImageSpliceRescansTotal
+	for _, first := range joined {
+		name := first.PatternName
+		if _, ok := reported[name]; ok {
+			continue
+		}
+		reported[name] = struct{}{}
+		masked := []byte(window)
+		for attempt := 0; ; attempt++ {
+			// Each single-request copy costs a full rescan. Bound the work and
+			// report the rule rather than loop on attacker-supplied copies.
+			if attempt == maxImageSpliceRescans || budget == 0 {
+				matches = append(matches, DLPMatch{PatternName: name})
+				break
+			}
+			budget--
+			var target *TextDLPMatch
+			rescanned := sc.ScanTextForDLPQuiet(ctx, string(masked)).Matches
+			if len(decoded) > 0 {
+				// Decoded image bytes make the combined window cease to be JSON.
+				// Keep the surrounding document's typed runs in the rescan too.
+				rescanned = append(rescanned, sc.ScanJSONCardRuns(ctx, string(masked[:len(excised)]))...)
+			}
+			for _, m := range rescanned {
+				if m.PatternName == name && !m.IsInformational() {
+					target = &m
+					break
+				}
+			}
+			if target == nil {
+				// The joined scan found this rule. If the first rescan does
+				// not, or the scan was cut short, keep the finding.
+				if attempt == 0 || ctx.Err() != nil {
+					matches = append(matches, DLPMatch{PatternName: name})
+				}
+				break
+			}
+			span := target.Span()
+			if target.Encoded != "" || span.ViewLabel != ViewDLPNormalized || span.ByteStart < 0 || span.ByteStart >= span.ByteEnd || span.ByteEnd > len(excised) {
+				matches = append(matches, DLPMatch{PatternName: name})
+				break
+			}
+			origStart, origEnd := toOriginal(span.ByteStart, false), toOriginal(span.ByteEnd, true)
+			if !spanHoldsRule(ctx, sc, masked, span.ByteStart, span.ByteEnd, name) {
+				// The span does not hold the rule where it points, so its
+				// position cannot name contributors. Report it unattributed.
+				matches = append(matches, DLPMatch{PatternName: name})
+				break
+			}
+			if !spanIsWithinOneFragment(ranges, origStart, origEnd) {
+				matches = append(matches, DLPMatch{
+					PatternName:  name,
+					Contributors: contributorsForSpan(ranges, origStart, origEnd),
+				})
+				break
+			}
+			// Blank only the first byte: the match no longer starts there, but
+			// an overlapping occurrence that crosses a boundary keeps its bytes.
+			if !maskFragmentOccurrence(masked, span.ByteStart, span.ByteStart+1) {
+				matches = append(matches, DLPMatch{PatternName: name})
+				break
+			}
+		}
+	}
+	return matches
+}
+
+// maxImageSpliceRescans bounds per-rule rescans on the image-excision path,
+// and maxImageSpliceRescansTotal bounds them across all rules in one window.
+// Reaching either reports the rule instead of scanning further.
+const (
+	maxImageSpliceRescans      = 8
+	maxImageSpliceRescansTotal = 24
+)
+
+// unattributedFragmentMatches reports each distinct joined rule once with no
+// contributor attribution.
+func unattributedFragmentMatches(joined []TextDLPMatch) []DLPMatch {
+	var matches []DLPMatch
+	seen := make(map[string]struct{})
+	for _, m := range joined {
+		if _, ok := seen[m.PatternName]; ok {
+			continue
+		}
+		seen[m.PatternName] = struct{}{}
+		matches = append(matches, DLPMatch{PatternName: m.PatternName})
+	}
+	return matches
+}
+
 func completeFragmentOccurrences(ctx context.Context, sc *Scanner, ranges []fragmentRange) map[string][]fragmentOccurrence {
 	complete := make(map[string][]fragmentOccurrence)
 	for _, r := range ranges {
@@ -886,6 +1199,27 @@ func appendCrossFragmentMatch(matches []DLPMatch, match TextDLPMatch, ranges []f
 		PatternName:  match.PatternName,
 		Contributors: contributorsForSpan(ranges, span.ByteStart, span.ByteEnd),
 	})
+}
+
+// spanHoldsRule reports whether the bytes at a scanner span match the rule by
+// themselves. The scanner rewrites text before recording positions (image
+// excision, documentation-placeholder redaction, normalization), so a span can
+// point at the wrong bytes. Only a span that still matches where it points may
+// be treated as one request's own copy; anything else is reported.
+func spanHoldsRule(ctx context.Context, sc *Scanner, buf []byte, start, end int, rule string) bool {
+	if start < 0 || end > len(buf) || start >= end {
+		return false
+	}
+	// The rule must match the whole candidate, not a shorter piece inside it,
+	// or a partial match could stand in for a credential that crosses requests.
+	candidateLen := end - start
+	for _, m := range sc.ScanTextForDLPQuiet(ctx, string(buf[start:end])).Matches {
+		span := m.Span()
+		if m.PatternName == rule && span.ViewLabel == ViewDLPNormalized && span.ByteStart == 0 && span.ByteEnd == candidateLen {
+			return true
+		}
+	}
+	return false
 }
 
 func spanIsWithinOneFragment(ranges []fragmentRange, start, end int) bool {
@@ -1098,6 +1432,10 @@ func (fb *FragmentBuffer) Close() {
 	}
 	fb.mu.Lock()
 	defer fb.mu.Unlock()
+	fb.cleanMemo.mu.Lock()
+	clear(fb.cleanMemo.entries)
+	fb.cleanMemo.bytes = 0
+	fb.cleanMemo.mu.Unlock()
 	fb.sessions = make(map[string]*sessionBuffer)
 	fb.pathSessions = make(map[string]*pathSessionBuffer)
 	fb.owners = make(map[string]*ownerState)
@@ -1210,4 +1548,70 @@ func (fb *FragmentBuffer) cleanupLocked(now time.Time) {
 			fb.deletePathStreamLocked(key)
 		}
 	}
+}
+
+// A memo entry certifies only a warning-free full scan of identical normalized
+// text within one buffer, stream, continuity and immutable scanner generation.
+type fragmentCleanKey struct {
+	scanner            *Scanner
+	stream, continuity string
+}
+type fragmentCleanMemo struct {
+	mu                         sync.Mutex
+	entries                    map[fragmentCleanKey]string
+	bytes, limit, hits, misses int
+}
+
+func (m *fragmentCleanMemo) lookup(key fragmentCleanKey, text string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if prior, ok := m.entries[key]; ok && prior == text {
+		m.hits++
+		return true
+	}
+	m.misses++
+	return false
+}
+
+func (m *fragmentCleanMemo) store(key fragmentCleanKey, text string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(text) > m.limit || m.limit <= 0 {
+		return
+	}
+	if m.entries == nil {
+		m.entries = make(map[fragmentCleanKey]string)
+	}
+	if prior, ok := m.entries[key]; ok {
+		m.bytes -= len(prior) + len(key.stream) + len(key.continuity)
+		delete(m.entries, key)
+	}
+	cost := len(text) + len(key.stream) + len(key.continuity)
+	if cost > m.limit {
+		return
+	}
+	if m.bytes+cost > m.limit {
+		clear(m.entries)
+		m.bytes = 0
+	}
+	m.entries[key] = text
+	m.bytes += cost
+}
+
+func (fb *FragmentBuffer) scanBatchWithCleanMemo(ctx context.Context, sc *Scanner, fragments []fragment, stream string) []DLPMatch {
+	fb.mu.Lock()
+	limit := 4 * fb.maxBytes
+	fb.mu.Unlock()
+	fb.cleanMemo.mu.Lock()
+	fb.cleanMemo.limit = limit
+	if fb.cleanMemo.bytes > limit {
+		clear(fb.cleanMemo.entries)
+		fb.cleanMemo.bytes = 0
+	}
+	fb.cleanMemo.mu.Unlock()
+	var matches []DLPMatch
+	for _, group := range fragmentContinuityGroups(fragments) {
+		matches = append(matches, scanOneFragmentContinuityMemo(ctx, sc, group, &fb.cleanMemo, stream)...)
+	}
+	return matches
 }

@@ -7,6 +7,8 @@ JSON bundle with `--out`. The published schema is
 populated structural fixture at
 [`sdk/anchor-bundle/example.json`](../../sdk/anchor-bundle/example.json).
 
+The `--out` path must resolve to a file under the receipt directory. Relative paths are resolved from that directory, and absolute paths outside it are rejected.
+
 ## Stability status
 
 **Experimental compatibility notice:** This document and `v1.json` describe the
@@ -86,7 +88,7 @@ does not make the overall format Rekor-specific.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `root_hash` | hexadecimal string | Merkle-tree root. Rekor verification requires it to match `proof.log_root_hash`. |
-| `log_index` | uint64 | Entry position within the tree covered by this inclusion proof. In sharded Rekor logs it can differ from the global entry position in `proof.log_index`. |
+| `log_index` | uint64 | Entry position within the tree covered by this inclusion proof. In sharded Rekor logs it can differ from the global entry position in `proof.log_index`. Verification requires `inclusion_proof.log_index ≤ proof.log_index` and `< tree_size`. |
 | `tree_size` | uint64 | Size of the tree covered by the proof. |
 | `hashes` | string array | Merkle audit-path hashes. |
 | `checkpoint` | string | Signed Rekor checkpoint text. |
@@ -97,9 +99,15 @@ Schema validation proves only that a document has the expected JSON shape. A
 valid anchor verification additionally requires:
 
 1. the receipt chain to verify under keys the relying party trusts;
-2. the recomputed receipt checkpoint to match `checkpoint`;
+2. the receipt checkpoint, recomputed over the first `receipt_count` receipts of the chain, to match `checkpoint`. Receipts written after the anchor are not covered by it, but they are not ignored: the verifier checks them as a chain (hash linkage and signatures under the trusted keys) and a break there makes the verdict invalid. A chain shorter than `receipt_count`, or one whose first `receipt_count` receipts differ, fails;
 3. top-level `backend` to match `proof.backend`; and
 4. the selected backend verifier to authenticate and validate the proof.
+
+Receipts after the anchored prefix are chain-verified only, under whatever keys
+the relying party supplied. A holder of the signing key can forge them, so no
+anchor vouches for them. A verifier reports how much of the chain the anchor
+covers (`covered_receipts` of `chain_length`) and may offer a strict mode that
+rejects any unanchored receipt.
 
 Successful anchoring constrains undetected rewriting or omission after the
 anchored point. It does not prove that receipt timestamps are truthful, that the

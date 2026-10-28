@@ -11,6 +11,7 @@ import (
 	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -63,7 +64,7 @@ var (
 type CapturedScenario struct {
 	Scenario     Scenario
 	Receipts     []receipt.Receipt
-	EvidenceFile string // recorder JSONL the verifier reads (evidence-proxy-0.jsonl)
+	EvidenceFile string // recorder JSONL the verifier reads (one process run)
 	SignerKeyHex string // ed25519 public key hex
 	PolicyHash   string // "sha256:"-labeled canonical policy hash; action receipts carry the raw form of the same digest
 	RootHash     string // chain root hash after the final receipt
@@ -360,8 +361,10 @@ func drivePoisonedMCPTool(sc *scanner.Scanner, emitter *receipt.Emitter, policyH
 		mcptransport.NewStdioWriter(&out),
 		&logs,
 		nil,
+		// ack-exempt: fixed replay configuration with no real transport binding.
 		mcp.MCPProxyOpts{
-			Scanner:        sc,
+			Scanner: sc,
+			// ack-exempt: fixed diagnostic configuration with no configured server identity.
 			ToolCfg:        &tools.ToolScanConfig{Action: config.ActionBlock},
 			ReceiptEmitter: emitter,
 			Transport:      TransportMCPStdio,
@@ -422,12 +425,29 @@ func driveFragmentedWebSocket(ctx context.Context, h http.Handler) error {
 	if err := writeMaskedFrame(conn, true, ws.OpContinuation, []byte(secret[8:]+`"}`)); err != nil {
 		return fmt.Errorf("write final WebSocket fragment: %w", err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	if _, _, readErr := wsutil.ReadServerData(conn); readErr == nil {
+	// Only the proxy's policy close proves the block. A timeout means the
+	// decision was not observed yet, so it must not count as blocked.
+	// The dialer stops watching ctx once the handshake succeeds, so the read
+	// must also honor the capture deadline that bounds this scenario.
+	readDeadline := time.Now().Add(fragmentedBlockDeadline)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(readDeadline) {
+		readDeadline = ctxDeadline
+	}
+	_ = conn.SetReadDeadline(readDeadline)
+	_, _, readErr := wsutil.ReadServerData(conn)
+	if readErr == nil {
 		return fmt.Errorf("fragmented secret unexpectedly reached WebSocket backend")
+	}
+	var closed wsutil.ClosedError
+	if !errors.As(readErr, &closed) || closed.Code != ws.StatusPolicyViolation {
+		return fmt.Errorf("fragmented secret: want policy-violation close, got %w", readErr)
 	}
 	return nil
 }
+
+// fragmentedBlockDeadline leaves room for fragment reassembly and scanning
+// under the race detector on a loaded runner.
+const fragmentedBlockDeadline = 15 * time.Second
 
 func writeMaskedFrame(conn net.Conn, fin bool, opcode ws.OpCode, payload []byte) error {
 	mask := ws.NewMask()
@@ -567,9 +587,15 @@ func newWebSocketEchoBackend() *httptest.Server {
 
 // singleEvidenceFile returns the lone evidence JSONL file the recorder wrote.
 func singleEvidenceFile(dir string) (string, error) {
-	matches, err := filepath.Glob(filepath.Join(dir, "evidence-proxy-*.jsonl"))
+	matches, err := filepath.Glob(filepath.Join(dir, "evidence-proxy.run.*-*.jsonl"))
 	if err != nil {
 		return "", fmt.Errorf("globbing evidence: %w", err)
+	}
+	if len(matches) == 0 {
+		matches, err = filepath.Glob(filepath.Join(dir, "evidence-proxy-*.jsonl"))
+		if err != nil {
+			return "", fmt.Errorf("globbing legacy evidence: %w", err)
+		}
 	}
 	if len(matches) != 1 {
 		return "", fmt.Errorf("expected exactly one evidence file, found %d in %s", len(matches), dir)

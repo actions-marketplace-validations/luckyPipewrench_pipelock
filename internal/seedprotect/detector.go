@@ -35,6 +35,9 @@ type tokenSpan struct {
 	word  string
 	start int
 	end   int
+	// segment counts the seed boundaries (isSeedBoundary) before this token.
+	// A phrase window must start and end in the same segment.
+	segment int
 }
 
 // Detect scans text for BIP-39 seed phrases. Returns all matches found.
@@ -55,7 +58,17 @@ func Detect(text string, minWords int, verifyChecksum bool) []SeedMatch {
 // DetectSpans scans text for BIP-39 seed phrases and returns byte offsets for
 // each phrase. It uses the same checksum semantics as Detect.
 func DetectSpans(text string, minWords int, verifyChecksum bool) []SeedSpan {
-	tokens := tokenizeWithSpans(text)
+	// No window can match with fewer tokens than the smallest phrase length
+	// searched below. Every token is a non-empty field between separators,
+	// so too few fields rules a match out before any word is normalized.
+	if !hasRawFields(text, max(minWords, validLengths[0])) {
+		return nil
+	}
+	return detectSpansInTokens(tokenizeWithSpans(text), minWords, verifyChecksum)
+}
+
+// detectSpansInTokens is DetectSpans after tokenization.
+func detectSpansInTokens(tokens []tokenSpan, minWords int, verifyChecksum bool) []SeedSpan {
 	if len(tokens) < minWords {
 		return nil
 	}
@@ -71,6 +84,9 @@ func DetectSpans(text string, minWords int, verifyChecksum bool) []SeedSpan {
 		for start := 0; start <= len(tokens)-wantLen; start++ {
 			if !IsWord(tokens[start].word) {
 				continue // early bail: first word not BIP-39
+			}
+			if tokens[start].segment != tokens[start+wantLen-1].segment {
+				continue // window crosses a quote or bracket boundary
 			}
 			if !allBIP39(tokens[start : start+wantLen]) {
 				continue
@@ -103,6 +119,13 @@ func DetectSpans(text string, minWords int, verifyChecksum bool) []SeedSpan {
 // numbered or bulleted backups. Broadening this closes the "split words with a
 // glyph the tokenizer ignores" evasion class.
 //
+// The query delimiters ? & = and the escape character \ also separate, and so
+// does every seed boundary rune (see isSeedBoundary). BIP-39 English words are
+// lowercase a-z only, so splitting on punctuation can never cut a real word.
+// The separator set is a superset of the scanner's text-segment delimiters
+// (scanner.isTextDLPEncodingDelimiter); a parity test in the scanner package
+// fails if the two drift.
+//
 // "." is deliberately NOT a separator: the request-body scanner joins distinct
 // JSON field values with "." (proxy.bodyDLPJoinSeparator) so cross-field DLP
 // works without merging tokens. Treating "." as intra-phrase here would let the
@@ -113,30 +136,98 @@ func isSeedSeparator(r rune) bool {
 		return true
 	}
 	switch r {
-	case ',', '_', '/', '|', ';', ':', '•', '·':
+	case ',', '_', '/', '|', ';', ':', '•', '·', '?', '&', '=', '\\':
 		return true
 	default:
-		return false
+		return isSeedBoundary(r)
 	}
+}
+
+// asciiSeedSeparator caches isSeedSeparator for ASCII, built by calling it.
+var asciiSeedSeparator = func() (table [utf8.RuneSelf]bool) {
+	for r := range rune(utf8.RuneSelf) {
+		table[r] = isSeedSeparator(r)
+	}
+	return table
+}()
+
+// isSeedSeparatorFast is isSeedSeparator with an ASCII lookup.
+func isSeedSeparatorFast(r rune) bool {
+	if r >= 0 && r < utf8.RuneSelf {
+		return asciiSeedSeparator[r]
+	}
+	return isSeedSeparator(r)
+}
+
+// isSeedBoundary reports quoting and enclosing punctuation. A boundary splits
+// tokens like a separator, so a quote glued to the first or last word no
+// longer hides a phrase serialized as a JSON string (MCP arguments, request
+// bodies, receipts). It also ends the phrase: no match window spans a
+// boundary. Before these runes split tokens, the glued quote kept adjacent
+// JSON fields apart; without the boundary rule, raw JSON such as
+// `...ten words"},"name":"write_file"` lets a structural key and value
+// complete a checksum-valid mnemonic.
+//
+// The Unicode open/close (Ps, Pe) and initial/final quote (Pi, Pf) categories
+// cover curly quotes, guillemets, CJK corner brackets, and fullwidth brackets.
+// Fullwidth quote, apostrophe, and grave accent are listed explicitly: they
+// are not in those categories, and NFKC folding to ASCII happens per token,
+// after splitting.
+func isSeedBoundary(r rune) bool {
+	switch r {
+	case '"', '\'', '`', '<', '>', '＂', '＇', '｀':
+		return true
+	default:
+		return unicode.In(r, unicode.Ps, unicode.Pe, unicode.Pi, unicode.Pf)
+	}
+}
+
+// hasRawFields reports whether text splits into at least want non-empty
+// fields under tokenizeWithSpans's separators. The token count never exceeds
+// the field count, because appendTokenSpan keeps a subset of these fields.
+func hasRawFields(text string, want int) bool {
+	if want <= 0 {
+		return true
+	}
+	fields := 0
+	start := 0
+	for i := 0; i < len(text); {
+		r, size := utf8.DecodeRuneInString(text[i:])
+		if isSeedSeparatorFast(r) {
+			if start < i {
+				fields++
+				if fields >= want {
+					return true
+				}
+			}
+			start = i + size
+		}
+		i += size
+	}
+	return start < len(text) && fields+1 >= want
 }
 
 // tokenize splits text into lowercase words using seed phrase separators.
 func tokenizeWithSpans(text string) []tokenSpan {
 	tokens := make([]tokenSpan, 0, 16)
 	start := 0
+	segment := 0
 	for i := 0; i < len(text); {
 		r, size := utf8.DecodeRuneInString(text[i:])
-		if isSeedSeparator(r) {
-			appendTokenSpan(&tokens, text, start, i)
+		if isSeedSeparatorFast(r) {
+			appendTokenSpan(&tokens, text, start, i, segment)
 			start = i + size
+			if isSeedBoundary(r) {
+				segment++
+			}
 		}
 		i += size
 	}
-	appendTokenSpan(&tokens, text, start, len(text))
+	appendTokenSpan(&tokens, text, start, len(text), segment)
 	return tokens
 }
 
-func appendTokenSpan(tokens *[]tokenSpan, text string, start, end int) {
+func appendTokenSpan(tokens *[]tokenSpan, text string, start, end, segment int) {
 	if start >= end {
 		return
 	}
@@ -152,9 +243,10 @@ func appendTokenSpan(tokens *[]tokenSpan, text string, start, end int) {
 		return
 	}
 	*tokens = append(*tokens, tokenSpan{
-		word:  word,
-		start: start,
-		end:   end,
+		word:    word,
+		start:   start,
+		end:     end,
+		segment: segment,
 	})
 }
 

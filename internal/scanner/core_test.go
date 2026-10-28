@@ -340,7 +340,7 @@ func TestCore_SSRFLiteral_ConfigMismatch_APIAllowlisted(t *testing.T) {
 		t.Fatal("expected core SSRF to block 10.0.0.1")
 	}
 	if result.Class != ClassConfigMismatch {
-		t.Errorf("expected ClassConfigMismatch for api_allowlisted IP, got %q", result.Class)
+		t.Errorf("expected ClassConfigMismatch for api_allowlisted IP, got %d", result.Class)
 	}
 	// The hint reaches the blocked agent via X-Pipelock-Hint, so it must be the
 	// terse reason, never the ssrf.ip_allowlist operator knob (confused deputy).
@@ -385,7 +385,7 @@ func TestCore_SSRFLiteral_ConfigMismatch_CanonicalIPNeverAllows(t *testing.T) {
 				t.Fatalf("scanner = %q, want %q", result.Scanner, ScannerCoreSSRF)
 			}
 			if result.Class != ClassConfigMismatch {
-				t.Fatalf("class = %q, want equivalent-IP config mismatch", result.Class)
+				t.Fatalf("class = %d, want equivalent-IP config mismatch", result.Class)
 			}
 		})
 	}
@@ -1030,8 +1030,8 @@ func TestResponsePatterns_MemoryPersistenceDirectiveRegexParity(t *testing.T) {
 	}
 	for surface, got := range surfaces {
 		t.Run(surface, func(t *testing.T) {
-			if got != config.MemoryPersistenceDirectiveRegex {
-				t.Errorf("regex drifted from config.MemoryPersistenceDirectiveRegex")
+			if got != config.MemoryPersistenceEffectiveRegex {
+				t.Errorf("regex drifted from config.MemoryPersistenceEffectiveRegex")
 			}
 		})
 	}
@@ -1070,7 +1070,7 @@ func TestResponsePatterns_LocalizedSystemPromptDisclosureRegexParity(t *testing.
 		name  string
 		regex string
 	}{
-		{name: "Spanish System Prompt Disclosure", regex: config.SpanishSystemPromptDisclosureRegex},
+		{name: "Spanish System Prompt Disclosure", regex: config.SpanishSystemPromptDisclosureEffectiveRegex},
 		{name: "Cross-Lingual System Prompt Disclosure", regex: config.CrossLingualSystemPromptDisclosureRegex},
 	}
 	for _, tc := range tests {
@@ -1124,8 +1124,8 @@ func TestResponsePatterns_SilentCredentialHandlingRegexParity(t *testing.T) {
 	t.Parallel()
 
 	for _, path := range []string{"../../configs/balanced.yaml", "../../configs/strict.yaml"} {
-		if got := yamlResponsePatternRegex(t, path, "Silent Credential Handling"); got != config.SilentCredentialHandlingRegex {
-			t.Errorf("%s drifted from config.SilentCredentialHandlingRegex", path)
+		if got := yamlResponsePatternRegex(t, path, "Silent Credential Handling"); got != config.SilentCredentialHandlingEffectiveRegex {
+			t.Errorf("%s drifted from config.SilentCredentialHandlingEffectiveRegex", path)
 		}
 	}
 }

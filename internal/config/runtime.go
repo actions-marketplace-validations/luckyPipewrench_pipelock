@@ -3,7 +3,10 @@
 
 package config
 
-import "os"
+import (
+	"os"
+	"slices"
+)
 
 // RuntimeMode selects which runtime-time defaults ResolveRuntime applies.
 // It is an explicit CLI-surface value: the same loaded Config can produce
@@ -129,7 +132,9 @@ func (c *Config) ResolveRuntime(opts RuntimeResolveOpts) (*Config, ResolveRuntim
 	clone := c.Clone()
 	var info ResolveRuntimeInfo
 
-	clone.resolveKillSwitchAPIToken()
+	if clone.KillSwitch.APITokenFile == "" {
+		clone.resolveKillSwitchAPIToken()
+	}
 
 	if opts.Mode.NeedsResponseScanningFallback() && !clone.ResponseScanning.Enabled {
 		// MCP proxy mode re-enables default response scanning if the
@@ -199,10 +204,10 @@ func (c *Config) EffectiveKillSwitchAPITokenConfigured() bool {
 
 // applyMCPAutoEnable flips MCP scanning sections on when the operator did
 // not explicitly configure them. A section counts as unconfigured when
-// Enabled is false AND Action is empty (ApplyDefaults sets Action only
-// when Enabled is true, so an empty Action with Enabled false indicates
-// an unset YAML section rather than an explicit disable). Tool policy also
-// requires len(Rules)==0 for the same reason. Each auto-enable branch
+// Enabled is false AND Action is empty. YAML and programmatic
+// configs use the same convention: false plus
+// a nonempty action disables, while the zero value permits defaults.
+// Tool policy also requires len(Rules)==0. Each auto-enable branch
 // records its decision on info so callers can print operator-facing
 // log messages without replicating the predicate.
 func applyMCPAutoEnable(c *Config, defaultToolPolicyRules func() []ToolPolicyRule, info *ResolveRuntimeInfo) {
@@ -224,8 +229,8 @@ func applyMCPAutoEnable(c *Config, defaultToolPolicyRules func() []ToolPolicyRul
 
 // applyToolScanningAutoEnable flips MCP tool-definition scanning on when the
 // operator left it unconfigured (Enabled false and Action empty - see
-// applyMCPAutoEnable's doc comment for why that combination means unset
-// rather than an explicit disable). Split out of applyMCPAutoEnable so
+// applyMCPAutoEnable's doc comment for the load-time normalization and
+// programmatic config convention). Split out of applyMCPAutoEnable so
 // RuntimeMCPScan can auto-enable tool scanning without also auto-enabling the
 // request-side sections (input scanning, tool policy) it has no request path
 // to enforce.
@@ -262,6 +267,21 @@ func (c *Config) Clone() *Config {
 		return nil
 	}
 	clone := *c
+	if c.PromptInjectionDetection != nil {
+		p := *c.PromptInjectionDetection
+		if p.Enabled != nil {
+			enabled := *p.Enabled
+			p.Enabled = &enabled
+		}
+		clone.PromptInjectionDetection = &p
+	}
+	clone.lapsedScannerExceptions = slices.Clone(c.lapsedScannerExceptions)
+	clone.FetchProxy.Monitoring.PathEntropyExclusions = slices.Clone(c.FetchProxy.Monitoring.PathEntropyExclusions)
+	clone.FetchProxy.Monitoring.QueryEntropyParamExclusions = slices.Clone(c.FetchProxy.Monitoring.QueryEntropyParamExclusions)
+	clone.FetchProxy.Monitoring.OAuthAuthorizationEndpoints = slices.Clone(c.FetchProxy.Monitoring.OAuthAuthorizationEndpoints)
+	clone.RequestBodyScanning.ContentEntropyExclusions = slices.Clone(c.RequestBodyScanning.ContentEntropyExclusions)
+	clone.WebSocketProxy.ContentEntropyExclusions = slices.Clone(c.WebSocketProxy.ContentEntropyExclusions)
+	clone.DestinationGrants = append([]DestinationGrant(nil), c.DestinationGrants...)
 
 	// The field is a *canonicalHashCacheHolder so the struct copy above
 	// duplicated the pointer, not the atomic.Value (atomic.Value forbids
@@ -282,14 +302,32 @@ func (c *Config) Clone() *Config {
 	if c.LicenseIntermediateCert != nil {
 		clone.LicenseIntermediateCert = append([]byte(nil), c.LicenseIntermediateCert...)
 	}
+	if c.LicenseDisabledAgents != nil {
+		clone.LicenseDisabledAgents = make(map[string][]string, len(c.LicenseDisabledAgents))
+		for name, listeners := range c.LicenseDisabledAgents {
+			clone.LicenseDisabledAgents[name] = append([]string(nil), listeners...)
+		}
+	}
+	if c.MCPToolScanning.AcknowledgmentKeyBytes != nil {
+		clone.MCPToolScanning.AcknowledgmentKeyBytes = append([]byte(nil), c.MCPToolScanning.AcknowledgmentKeyBytes...)
+	}
 	if c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey != nil {
 		clone.MCPToolScanning.ListenerDriftResetAuthorityPublicKey = append([]byte(nil), c.MCPToolScanning.ListenerDriftResetAuthorityPublicKey...)
 	}
 	if c.FlightRecorder.PostureSignerPublicKey != nil {
 		clone.FlightRecorder.PostureSignerPublicKey = append([]byte(nil), c.FlightRecorder.PostureSignerPublicKey...)
 	}
+	if c.FlightRecorder.ReceiptGroupPriorSignerKeys != nil {
+		clone.FlightRecorder.ReceiptGroupPriorSignerKeys = append([]string(nil), c.FlightRecorder.ReceiptGroupPriorSignerKeys...)
+	}
 
 	clone.DLP.Patterns = cloneDLPPatterns(c.DLP.Patterns)
+	if c.DLP.GitHubEnterpriseHosts != nil {
+		clone.DLP.GitHubEnterpriseHosts = append([]string(nil), c.DLP.GitHubEnterpriseHosts...)
+	}
+	if c.DLP.GitLabHosts != nil {
+		clone.DLP.GitLabHosts = append([]string(nil), c.DLP.GitLabHosts...)
+	}
 	clone.ResponseScanning.Patterns = cloneResponseScanPatterns(c.ResponseScanning.Patterns)
 	// ExemptDomains is a reload-sensitive exemption surface: operators
 	// remove entries via hot-reload and ValidateReload warns when the
@@ -302,6 +340,9 @@ func (c *Config) Clone() *Config {
 	}
 	if c.ResponseScanning.SizeExemptDomains != nil {
 		clone.ResponseScanning.SizeExemptDomains = append([]string(nil), c.ResponseScanning.SizeExemptDomains...)
+	}
+	if c.ResponseScanning.SizeExemptScanLimits != nil {
+		clone.ResponseScanning.SizeExemptScanLimits = append([]ResponseSizeScanLimit(nil), c.ResponseScanning.SizeExemptScanLimits...)
 	}
 	if c.ResponseScanning.UnscannablePassthrough != nil {
 		clone.ResponseScanning.UnscannablePassthrough = cloneUnscannablePassthrough(c.ResponseScanning.UnscannablePassthrough)
@@ -318,6 +359,7 @@ func (c *Config) Clone() *Config {
 	if c.Taint.TrustedMCPServers != nil {
 		clone.Taint.TrustedMCPServers = append([]string(nil), c.Taint.TrustedMCPServers...)
 	}
+	clone.MCPIdentities = cloneMCPIdentities(c.MCPIdentities)
 	if c.Containment.MetricsExposure != nil {
 		exposure := *c.Containment.MetricsExposure
 		exposure.AllowedSourceCIDRs = append([]string(nil), c.Containment.MetricsExposure.AllowedSourceCIDRs...)
@@ -325,6 +367,9 @@ func (c *Config) Clone() *Config {
 	}
 	if c.Containment.LoopbackServices != nil {
 		clone.Containment.LoopbackServices = append([]ContainmentLoopbackService(nil), c.Containment.LoopbackServices...)
+	}
+	if c.Containment.PublishedServices != nil {
+		clone.Containment.PublishedServices = append([]ContainmentPublishedService(nil), c.Containment.PublishedServices...)
 	}
 	clone.MCPToolPolicy.Rules = cloneToolPolicyRules(c.MCPToolPolicy.Rules)
 	// Deep-copy the follower audience-labels map so a runtime caller that
@@ -362,10 +407,16 @@ func cloneDLPPatterns(src []DLPPattern) []DLPPattern {
 	for i := range src {
 		dst[i] = src[i]
 		if src[i].ExemptDomains != nil {
-			dst[i].ExemptDomains = append([]string(nil), src[i].ExemptDomains...)
+			dst[i].ExemptDomains = slices.Clone(src[i].ExemptDomains)
 		}
 		if src[i].CredentialAudienceHosts != nil {
-			dst[i].CredentialAudienceHosts = append([]string(nil), src[i].CredentialAudienceHosts...)
+			dst[i].CredentialAudienceHosts = slices.Clone(src[i].CredentialAudienceHosts)
+		}
+		if src[i].CredentialAudienceGitHosts != nil {
+			dst[i].CredentialAudienceGitHosts = slices.Clone(src[i].CredentialAudienceGitHosts)
+		}
+		if src[i].CredentialAudienceRegistryHosts != nil {
+			dst[i].CredentialAudienceRegistryHosts = slices.Clone(src[i].CredentialAudienceRegistryHosts)
 		}
 	}
 	return dst

@@ -135,6 +135,8 @@ const (
 )
 
 type routeSpec struct {
+	navKey           string
+	navLabel         string // Nonempty only for routes shown in navigation.
 	pattern          string
 	feature          string
 	forbiddenMessage string
@@ -148,31 +150,21 @@ type navRouteSpec struct {
 	pattern string
 }
 
-var dashboardNavRouteSpecs = []navRouteSpec{
-	{key: "overview", label: "Overview", pattern: "/overview"},
-	{key: "evidence", label: "Evidence", pattern: "/evidence"},
-	{key: "exemptions", label: "Exemptions", pattern: "/exemptions"},
-	{key: "agents", label: "Agents", pattern: "/agents"},
-	{key: "budgets", label: "Budgets", pattern: "/budgets"},
-	{key: "trust-keys", label: "Trust & Keys", pattern: "/trust-keys"},
-	{key: "fleet", label: "Fleet", pattern: "/fleet"},
-	{key: "workbench", label: "Workbench", pattern: "/workbench"},
-	{key: "incident", label: "Incident", pattern: "/incident"},
-}
-
 var (
 	dashboardRouteSpecList = []routeSpec{
-		evidenceRouteSpec("/overview", func(d *dashboardHandler) http.Handler {
+		evidenceRouteSpec("/overview", "overview", "Overview", func(d *dashboardHandler) http.Handler {
 			return http.HandlerFunc(d.handleOverview)
 		}),
-		evidenceRouteSpec("/", func(d *dashboardHandler) http.Handler {
+		evidenceRouteSpec("/", "overview", "", func(d *dashboardHandler) http.Handler {
 			return http.HandlerFunc(d.handleOverview)
 		}),
-		evidenceRouteSpec("/evidence", func(d *dashboardHandler) http.Handler {
+		evidenceRouteSpec("/evidence", "evidence", "Evidence", func(d *dashboardHandler) http.Handler {
 			return http.HandlerFunc(d.handleIndex)
 		}),
 		{
 			pattern:          "/exemptions",
+			navKey:           "exemptions",
+			navLabel:         "Exemptions",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionExemptionsRead,
@@ -182,6 +174,7 @@ var (
 		},
 		{
 			pattern:          "/session/",
+			navKey:           "evidence",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionEvidenceRead,
@@ -191,6 +184,8 @@ var (
 		},
 		{
 			pattern:          "/agents",
+			navKey:           "agents",
+			navLabel:         "Agents",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionAgentsRead,
@@ -200,6 +195,7 @@ var (
 		},
 		{
 			pattern:          "/agent/",
+			navKey:           "agents",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionAgentsRead,
@@ -209,6 +205,8 @@ var (
 		},
 		{
 			pattern:          "/budgets",
+			navKey:           "budgets",
+			navLabel:         "Budgets",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionBudgetsRead,
@@ -218,6 +216,8 @@ var (
 		},
 		{
 			pattern:          "/trust-keys",
+			navKey:           "trust-keys",
+			navLabel:         "Trust & Keys",
 			feature:          license.FeatureAgents,
 			forbiddenMessage: agentsFeatureForbidden,
 			permission:       PermissionTrustKeysRead,
@@ -227,6 +227,8 @@ var (
 		},
 		{
 			pattern:          "/fleet",
+			navKey:           "fleet",
+			navLabel:         "Fleet",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionFleetRead,
@@ -236,6 +238,7 @@ var (
 		},
 		{
 			pattern:          "/fleet/",
+			navKey:           "fleet",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionFleetRead,
@@ -245,6 +248,8 @@ var (
 		},
 		{
 			pattern:          "/workbench",
+			navKey:           "workbench",
+			navLabel:         "Workbench",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionSignedActionRead,
@@ -254,6 +259,7 @@ var (
 		},
 		{
 			pattern:          "/workbench/",
+			navKey:           "workbench",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionSignedActionRead,
@@ -263,6 +269,8 @@ var (
 		},
 		{
 			pattern:          "/incident",
+			navKey:           "incident",
+			navLabel:         "Incident",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionIncidentRead,
@@ -272,6 +280,7 @@ var (
 		},
 		{
 			pattern:          "/incident/",
+			navKey:           "incident",
 			feature:          license.FeatureFleet,
 			forbiddenMessage: fleetFeatureForbidden,
 			permission:       PermissionIncidentRead,
@@ -280,12 +289,14 @@ var (
 			},
 		},
 	}
-	dashboardRouteSpecsByPattern = routeSpecsByPattern(dashboardRouteSpecList)
+	dashboardNavRouteSpecs = navRouteSpecs(dashboardRouteSpecList)
 )
 
-func evidenceRouteSpec(pattern string, handler func(*dashboardHandler) http.Handler) routeSpec {
+func evidenceRouteSpec(pattern, navKey, navLabel string, handler func(*dashboardHandler) http.Handler) routeSpec {
 	return routeSpec{
 		pattern:          pattern,
+		navKey:           navKey,
+		navLabel:         navLabel,
 		feature:          license.FeatureAgents,
 		forbiddenMessage: agentsFeatureForbidden,
 		permission:       PermissionEvidenceRead,
@@ -293,12 +304,14 @@ func evidenceRouteSpec(pattern string, handler func(*dashboardHandler) http.Hand
 	}
 }
 
-func routeSpecsByPattern(specs []routeSpec) map[string]routeSpec {
-	out := make(map[string]routeSpec, len(specs))
+func navRouteSpecs(specs []routeSpec) []navRouteSpec {
+	var nav []navRouteSpec
 	for _, spec := range specs {
-		out[spec.pattern] = spec
+		if spec.navLabel != "" {
+			nav = append(nav, navRouteSpec{key: spec.navKey, label: spec.navLabel, pattern: spec.pattern})
+		}
 	}
-	return out
+	return nav
 }
 
 func dashboardRouteSpecs() []routeSpec {
@@ -781,44 +794,29 @@ func (d *dashboardHandler) navContext(r *http.Request, cache *routeAuthorization
 		ActiveLabel: navLabel(active),
 		ScriptNonce: scriptNonce,
 	}
-	for _, navSpec := range dashboardNavRouteSpecs {
-		route, ok := dashboardRouteSpecsByPattern[navSpec.pattern]
-		if !ok || !d.authorizeRoute(r, route, cache).allowed() {
+	for _, route := range dashboardRouteSpecList {
+		if route.navLabel == "" || !d.authorizeRoute(r, route, cache).allowed() {
 			continue
 		}
 		nav.Entries = append(nav.Entries, NavEntry{
-			Key:    navSpec.key,
-			Label:  navSpec.label,
-			Path:   navSpec.pattern,
-			Active: navSpec.key == active,
+			Key:    route.navKey,
+			Label:  route.navLabel,
+			Path:   route.pattern,
+			Active: route.navKey == active,
 		})
 	}
 	return nav
 }
 
 func activeNavKey(path string) string {
-	switch {
-	case path == "/", path == "/overview":
-		return "overview"
-	case path == "/evidence", strings.HasPrefix(path, "/session/"):
-		return "evidence"
-	case path == "/exemptions":
-		return "exemptions"
-	case path == "/agents", strings.HasPrefix(path, "/agent/"):
-		return "agents"
-	case path == "/budgets":
-		return "budgets"
-	case path == "/trust-keys":
-		return "trust-keys"
-	case path == "/fleet", strings.HasPrefix(path, "/fleet/"):
-		return "fleet"
-	case path == "/workbench", strings.HasPrefix(path, "/workbench/"):
-		return "workbench"
-	case path == "/incident", strings.HasPrefix(path, "/incident/"):
-		return "incident"
-	default:
-		return ""
+	for _, spec := range dashboardRouteSpecList {
+		// The root handler is a ServeMux fallback, but only the root URL
+		// activates Overview. Detail prefixes retain their parent page key.
+		if path == spec.pattern || (spec.pattern != "/" && strings.HasSuffix(spec.pattern, "/") && strings.HasPrefix(path, spec.pattern)) {
+			return spec.navKey
+		}
 	}
+	return ""
 }
 
 func navLabel(key string) string {
@@ -856,7 +854,7 @@ func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request
 	}
 	page, err := d.model.Overview(r.Context(), rawAllowedFromContext(r))
 	if err != nil {
-		http.Error(w, "could not build overview", http.StatusInternalServerError)
+		writeEvidenceReadError(w, err, "could not build overview")
 		return
 	}
 	page.Nav = navFromContext(r)
@@ -867,6 +865,14 @@ func (d *dashboardHandler) handleOverview(w http.ResponseWriter, r *http.Request
 	}
 	w.Header().Set("Content-Type", contentTypeHTML)
 	_, _ = w.Write(buf.Bytes())
+}
+
+func writeEvidenceReadError(w http.ResponseWriter, err error, fallback string) {
+	if errors.Is(err, errReceiptGroupNeedsVerification) {
+		http.Error(w, "receipt group evidence requires group verification; run pipelock verify-receipt with --chain set to the evidence directory and --key set to a trusted public key", http.StatusConflict)
+		return
+	}
+	http.Error(w, fallback, http.StatusInternalServerError)
 }
 
 func (d *dashboardHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -880,7 +886,7 @@ func (d *dashboardHandler) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	sessions, err := d.model.Sessions()
 	if err != nil {
-		http.Error(w, "could not read evidence sessions", http.StatusInternalServerError)
+		writeEvidenceReadError(w, err, "could not read evidence sessions")
 		return
 	}
 
@@ -1189,7 +1195,7 @@ func (d *dashboardHandler) handleTrustKeys(w http.ResponseWriter, r *http.Reques
 	}
 	page, err := d.model.TrustKeys()
 	if err != nil {
-		http.Error(w, "could not audit trust and keys", http.StatusInternalServerError)
+		writeEvidenceReadError(w, err, "could not audit trust and keys")
 		return
 	}
 	page.Nav = navFromContext(r)
@@ -1220,7 +1226,7 @@ func (d *dashboardHandler) handleSession(w http.ResponseWriter, r *http.Request)
 	selected := rest
 	sessions, err := d.model.Sessions()
 	if err != nil {
-		http.Error(w, "could not read evidence sessions", http.StatusInternalServerError)
+		writeEvidenceReadError(w, err, "could not read evidence sessions")
 		return
 	}
 	d.render(w, r, sessions, selected, rawAllowedFromContext(r))
@@ -1280,7 +1286,7 @@ func (d *dashboardHandler) render(w http.ResponseWriter, r *http.Request, sessio
 	if selected != "" {
 		evidence, err := d.model.Session(selected)
 		if err != nil {
-			http.Error(w, "could not read selected evidence", http.StatusInternalServerError)
+			writeEvidenceReadError(w, err, "could not read selected evidence")
 			return
 		}
 		// Fail closed: strip destinations and signed payloads in Go before

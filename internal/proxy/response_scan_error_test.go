@@ -92,7 +92,7 @@ func TestResponseScanCancellationIsAnErrorAcrossHTTPHandlers(t *testing.T) {
 	}
 }
 
-func TestResponseScanCancellationIsAnErrorForReverseAndWebSocket(t *testing.T) {
+func TestResponseScanCancellationDispositionByTransport(t *testing.T) {
 	for _, transport := range []string{"reverse", "websocket"} {
 		t.Run(transport, func(t *testing.T) {
 			cfg := testScannerConfig()
@@ -138,17 +138,17 @@ func TestResponseScanCancellationIsAnErrorForReverseAndWebSocket(t *testing.T) {
 				p.receiptEmitterPtr.Store(rph.emitter)
 				relay := &wsRelay{proxy: p, cfg: cfg, scanner: sc, scanText: true, clientConn: discardConn{}, upstreamConn: discardConn{}, targetURL: "ws://api.vendor.example/events", hostname: "api.vendor.example"}
 				payload, blocked := relay.enforceUpstreamTextPayload(ctx, logger, []byte("ordinary content"), true)
-				if !blocked || payload != nil {
+				if blocked || payload != nil {
 					t.Fatalf("websocket payload=%q blocked=%v", payload, blocked)
 				}
 			}
 			if transport == "websocket" {
-				// WebSocket frames do not have a response-capture observer;
-				// their durable outcome is recorded by the receipt emitter.
-				r := rph.requireReceipt(t, "response_scan_error")
-				if r.ActionRecord.Verdict != config.ActionBlock {
-					t.Fatalf("scan error receipt verdict = %q", r.ActionRecord.Verdict)
+				// Cancellation ends the relay without a policy finding. The
+				// handler records the connection's terminal outcome separately.
+				if receipts := rph.findReceipts(t); len(receipts) != 0 || logs.Len() != 0 {
+					t.Fatalf("cancelled WebSocket scan produced findings: receipts=%d logs=%s", len(receipts), logs.String())
 				}
+				return
 			} else {
 				assertScanErrorEvidence(t, obs, rph)
 			}
@@ -414,6 +414,59 @@ func TestSSEScanErrorUsesErrorEvidenceAfterHeadersCommitted(t *testing.T) {
 	}
 }
 
+func TestA2ASSEInspectionBoundsUseErrorEvidence(t *testing.T) {
+	for _, transport := range []string{"forward", "intercept"} {
+		for name, body := range map[string]string{
+			"depth":     strings.Repeat(`{"payload":`, 65) + `{"text":"hello"}` + strings.Repeat("}", 65),
+			"duplicate": `{"text":"hello","text":"goodbye"}`,
+			"invalid":   `{"text":`,
+		} {
+			t.Run(transport+"/"+name, func(t *testing.T) {
+				cfg := testScannerConfig()
+				cfg.Internal = nil
+				cfg.DNS.HostOverrides = map[string][]string{"api.vendor.example": {"93.184.216.34"}}
+				cfg.DLP.ScanEnv = false
+				enforce := false
+				cfg.Enforce = &enforce
+				cfg.A2AScanning.Enabled = true
+				cfg.A2AScanning.Action = config.ActionWarn
+				cfg.RequestBodyScanning.Enabled = false
+				cfg.ResponseScanning.SSEStreaming.Action = config.ActionWarn
+				cfg.FlightRecorder.RequireReceipts = true
+				sc := scanner.MustNew(cfg)
+				t.Cleanup(sc.Close)
+				m := metrics.New()
+				p, err := New(cfg, audit.NewNop(), sc, m)
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(p.Close)
+				rph := newReceiptProxyHelperWithMetrics(t, m)
+				p.receiptEmitterPtr.Store(rph.emitter)
+				rt := forwardBoundaryRoundTripper(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": {"text/event-stream"}}, Body: io.NopCloser(strings.NewReader("data: " + body + "\n\n")), Request: r}, nil
+				})
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "http://api.vendor.example/message", strings.NewReader(`{"text":"hello"}`))
+				req.Header.Set("Content-Type", "application/a2a+json")
+				w := httptest.NewRecorder()
+				if transport == "forward" {
+					p.client = &http.Client{Transport: rt}
+					p.handleForwardHTTP(w, req)
+					assertMetricsContain(t, m, `pipelock_scanner_hits_total{agent="_default",scanner="response_scan_error"} 1`)
+				} else {
+					h := newInterceptHandler(&InterceptContext{TargetHost: "api.vendor.example", TargetPort: "443", Config: cfg, Scanner: sc, Logger: audit.NewNop(), Metrics: m, ClientIP: "192.0.2.1", RequestID: "a2a-inspection-error", Proxy: p}, rt)
+					h.ServeHTTP(w, req)
+					assertMetricsContain(t, m, `pipelock_tls_response_blocked_total{reason="response_scan_error"} 1`)
+				}
+				if w.Code != http.StatusOK || w.Body.Len() != 0 {
+					t.Fatal("incomplete event changed committed status or released bytes")
+				}
+				assertCommittedSSEScanErrorEvidence(t, rph)
+			})
+		}
+	}
+}
+
 func assertCommittedSSEScanErrorEvidence(t *testing.T, rph *receiptProxyHelper) {
 	t.Helper()
 	var errorReceipt, outcome receipt.Receipt
@@ -514,13 +567,20 @@ func TestForwardSSEContextCancellationIsNotScanError(t *testing.T) {
 		t.Fatalf("status = %d, want upstream status %d", w.Code, http.StatusOK)
 	}
 	assertMetricsNotContain(t, m, `pipelock_scanner_hits_total{agent="_default",scanner="response_scan_error"} 1`)
+	foundCancelled := false
 	for _, r := range rph.findReceipts(t) {
+		if r.ActionRecord.DecisionPhase == receipt.DecisionPhaseOutcome && strings.Contains(r.ActionRecord.Pattern, "reason="+receiptReasonSSEStreamCancelled) {
+			foundCancelled = true
+		}
 		if r.ActionRecord.Layer == "response_scan_error" {
 			t.Fatalf("ordinary context cancellation emitted scan-error receipt: %+v", r.ActionRecord)
 		}
 		if r.ActionRecord.DecisionPhase == receipt.DecisionPhaseOutcome && strings.Contains(r.ActionRecord.Pattern, "reason=response_scan_error") {
 			t.Fatalf("ordinary context cancellation emitted scan-error outcome: %+v", r.ActionRecord)
 		}
+	}
+	if !foundCancelled {
+		t.Fatalf("missing %s outcome", receiptReasonSSEStreamCancelled)
 	}
 }
 

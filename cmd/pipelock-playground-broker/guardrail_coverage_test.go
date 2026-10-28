@@ -79,6 +79,7 @@ func TestBuildImagesOnlyVMDoesNotRequireViewer(t *testing.T) {
 		"PLAYGROUND_REGISTRY=registry.example/playground",
 		"PLAYGROUND_UI_DIR=",
 		"PLAYGROUND_PUSH=",
+		"PLAYGROUND_ALLOW_DIRTY=1",
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -89,9 +90,72 @@ func TestBuildImagesOnlyVMDoesNotRequireViewer(t *testing.T) {
 		t.Fatalf("read docker log: %v", err)
 	}
 	logText := string(logBytes)
-	if !strings.Contains(logText, "Dockerfile") || strings.Contains(logText, "Dockerfile.broker") || strings.Contains(logText, " run ") {
+	// The provenance check runs its own context export first, so match the VM
+	// recipe itself rather than any line that mentions a Dockerfile.
+	if !strings.Contains(logText, "-f deploy/fly-playground/Dockerfile -t registry.example/playground:vm-") || strings.Contains(logText, "Dockerfile.broker") || strings.Contains(logText, " run ") {
 		t.Fatalf("VM-only docker calls = %q", logText)
 	}
+}
+
+func TestPlaygroundBuildProvenanceScripts(t *testing.T) {
+	cmd := exec.CommandContext(t.Context(), "bash", "../../deploy/fly-playground/test-build-provenance.sh")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("playground provenance scripts: %v\n%s", err, output)
+	}
+	if !strings.Contains(string(output), "PASS: clean/dirty build provenance and live drift checks") {
+		t.Fatalf("provenance test output = %q", output)
+	}
+}
+
+// Fly app-level secrets are inherited by visitor VMs outside the broker's
+// explicit machine environment. The VM entrypoint is the final backstop and
+// must reject both names ever used for the durable signing root before boot.
+func TestVisitorEntrypointRejectsDurableRootAliases(t *testing.T) {
+	entrypoint := filepath.Join("..", "..", "deploy", "fly-playground", "entrypoint.sh")
+	baseEnv := make([]string, 0, len(os.Environ()))
+	for _, item := range os.Environ() {
+		if strings.HasPrefix(item, envOrchestratorKey+"=") || strings.HasPrefix(item, envOrchestratorRoot+"=") {
+			continue
+		}
+		baseEnv = append(baseEnv, item)
+	}
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{name: envOrchestratorKey, value: "sentinel-value-must-not-appear"},
+		{name: envOrchestratorKey + "_empty", value: ""},
+		{name: envOrchestratorRoot, value: "sentinel-value-must-not-appear"},
+		{name: envOrchestratorRoot + "_empty", value: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := strings.TrimSuffix(tc.name, "_empty")
+			cmd := exec.CommandContext(t.Context(), "sh", entrypoint) // #nosec G204 -- fixed repository script path assembled portably for this test
+			cmd.Env = append(baseEnv, name+"="+tc.value)
+			output, err := cmd.CombinedOutput()
+			if err == nil {
+				t.Fatalf("entrypoint accepted durable root alias %s", name)
+			}
+			if !strings.Contains(string(output), "FATAL: "+name+" is set on this guest") {
+				t.Fatalf("entrypoint output = %q, want refusal naming %s", output, name)
+			}
+			if strings.Contains(string(output), "sentinel-value-must-not-appear") {
+				t.Fatalf("entrypoint leaked the durable root value: %q", output)
+			}
+		})
+	}
+	t.Run("clean_environment_reaches_later_boot_check", func(t *testing.T) {
+		cmd := exec.CommandContext(t.Context(), "sh", entrypoint) // #nosec G204 -- fixed repository script path assembled portably for this test
+		cmd.Env = append(baseEnv, "PLAYGROUND_AGENT_USER=pipelock-entrypoint-test-user-does-not-exist")
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			t.Fatal("entrypoint unexpectedly completed with a nonexistent agent user")
+		}
+		if strings.Contains(string(output), "durable signing root") || strings.Contains(string(output), "FATAL: PLAYGROUND_ORCHESTRATOR_") {
+			t.Fatalf("clean environment stopped at the durable-root guard: %q", output)
+		}
+	})
 }
 
 // A malformed root must fail closed. Serving with an unusable signing root

@@ -741,10 +741,31 @@ func TestVerificationParsersRejectIncompleteSafetyEvidence(t *testing.T) {
 			env.workspacePaths = []string{"/workspace"}
 		})
 		probes := probesForEnv(env)
-		if len(probes) != len(allProbes())+1 ||
-			probes[len(probes)-2].name != "workspace_access" || probes[len(probes)-2].n != 15 ||
-			probes[len(probes)-1].name != "private_tmp_isolation" || probes[len(probes)-1].n != 16 {
+		if len(probes) != len(allProbes())+1 {
 			t.Fatalf("probes = %v", probes)
+		}
+		// Assert each probe by NAME and NUMBER, and assert workspace_access
+		// lands immediately before private_tmp_isolation. Indexing from the end
+		// silently re-points every time a probe is appended, which is how this
+		// assertion drifted once already.
+		byName := func(name string) (int, probe) {
+			for i, p := range probes {
+				if p.name == name {
+					return i, p
+				}
+			}
+			t.Fatalf("probe %q missing from %v", name, probes)
+			return -1, probe{}
+		}
+		wsIdx, ws := byName("workspace_access")
+		tmpIdx, tmp := byName("private_tmp_isolation")
+		_, caExport := byName("pipelock_ca_export_current")
+		_, browser := byName(probeBrowserCATrust)
+		if ws.n != 15 || tmp.n != 16 || caExport.n != 19 || browser.n != probeBrowserCATrustNum {
+			t.Fatalf("probe numbers drifted: %v", probes)
+		}
+		if tmpIdx != wsIdx+1 {
+			t.Fatalf("workspace_access must be inserted directly before private_tmp_isolation: %v", probes)
 		}
 	})
 
@@ -952,4 +973,18 @@ func TestVerificationParsersRejectIncompleteSafetyEvidence(t *testing.T) {
 			t.Fatalf("output = %q, code = %d, error = %v", output, code, err)
 		}
 	})
+}
+
+func TestProbesForEnvNilStatKeepsDisplayDefault(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "pipelock.yaml")
+	if err := os.WriteFile(configPath, []byte("containment:\n  display: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := &probeEnv{configPath: configPath, stat: nil}
+	for _, p := range probesForEnv(env) {
+		if p.name == "agent_display" {
+			return
+		}
+	}
+	t.Fatal("nil stat omitted the Xvfb-default agent_display probe")
 }

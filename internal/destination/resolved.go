@@ -72,7 +72,7 @@ func FirstFloorHit(addrs []ResolvedAddr) (ResolvedAddr, bool) {
 func FirstInternalHit(addrs []ResolvedAddr, cidrs []*net.IPNet, allowlisted func(net.IP) bool) (ResolvedAddr, bool) {
 	for _, a := range addrs {
 		for _, cidr := range cidrs {
-			if cidr == nil || !cidr.Contains(a.IP) {
+			if cidr == nil || !ContainsAnySSRFForm(cidr, a.IP) {
 				continue
 			}
 			if allowlisted != nil && allowlisted(a.IP) {
@@ -82,4 +82,19 @@ func FirstInternalHit(addrs []ResolvedAddr, cidrs []*net.IPNet, allowlisted func
 		}
 	}
 	return ResolvedAddr{}, false
+}
+
+// AllUnspecified reports whether a non-empty resolved set holds only the
+// unspecified address (0.0.0.0 or ::), the answer DNS filters give for a
+// blocked name.
+func AllUnspecified(addrs []ResolvedAddr) bool {
+	if len(addrs) == 0 {
+		return false
+	}
+	for _, a := range addrs {
+		if a.IP == nil || !a.IP.IsUnspecified() {
+			return false
+		}
+	}
+	return true
 }

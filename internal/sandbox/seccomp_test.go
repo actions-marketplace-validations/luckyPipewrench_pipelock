@@ -17,11 +17,16 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const seccompTestEnv = "__SANDBOX_SECCOMP_TEST"
+
+// The kernel never permits clearing an inherited no_new_privs bit, so that
+// environment cannot construct the missing-prerequisite migration case.
+const seccompPrerequisiteInheritedExit = 77
 
 // seccompChildTimeout bounds each re-exec'd helper child so a wedged child fails
 // its own test in seconds instead of riding out the 10m package timeout and
@@ -38,6 +43,14 @@ func init() {
 }
 
 func runSeccompTestChild(op string) {
+	if op == "prerequisite-denied" {
+		runSeccompPrerequisiteDeniedChild()
+		return
+	}
+	if op == "prerequisite-other-thread" || op == "prerequisite-other-thread-strict" {
+		runSeccompPrerequisiteThreadChild(op == "prerequisite-other-thread-strict")
+		return
+	}
 	// Apply no_new_privs + seccomp filter.
 	if err := SetNoNewPrivs(); err != nil {
 		_, _ = os.Stderr.WriteString("no_new_privs: " + err.Error() + "\n")
@@ -207,6 +220,124 @@ func runSeccompTestChild(op string) {
 	}
 }
 
+// runSeccompPrerequisiteThreadChild holds two distinct OS threads alive so the
+// installing thread cannot inherit the other thread's no_new_privs bit. This
+// deterministically exercises migration between a caller's prerequisite and
+// filter installation, without relying on scheduler load or user namespaces.
+func runSeccompPrerequisiteThreadChild(strict bool) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	inherited, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "read inherited no_new_privs: %v\n", err)
+		os.Exit(2)
+	}
+	if inherited == 1 {
+		_, _ = fmt.Fprintln(os.Stdout, "inherited no_new_privs cannot be cleared for the migration proof")
+		os.Exit(seccompPrerequisiteInheritedExit)
+	}
+	ready := make(chan error, 1)
+	checkFilter := make(chan struct{})
+	checked := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+		ready <- SetNoNewPrivs()
+		<-checkFilter
+		checked <- unix.Setns(-1, 0)
+	}()
+	if err := <-ready; err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "other thread no_new_privs: %v\n", err)
+		os.Exit(2)
+	}
+	nnp, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+	if err != nil || nnp != 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "installing thread no_new_privs = %d, %v; want 0\n", nnp, err)
+		os.Exit(2)
+	}
+	// With an invalid descriptor, the kernel reports EBADF before filtering.
+	// EPERM after installation must therefore come from our syscall filter.
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EBADF) {
+		_, _ = fmt.Fprintf(os.Stderr, "unfiltered setns = %v; want EBADF\n", err)
+		os.Exit(2)
+	}
+	status, err := ApplySeccomp(strict)
+	if err != nil || !status.Active {
+		_, _ = fmt.Fprintf(os.Stderr, "cross-thread seccomp: active=%v err=%v reason=%s\n", status.Active, err, status.Reason)
+		os.Exit(2)
+	}
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EPERM) {
+		_, _ = fmt.Fprintf(os.Stderr, "installing thread setns = %v; want EPERM\n", err)
+		os.Exit(1)
+	}
+	close(checkFilter)
+	if err := <-checked; !errors.Is(err, unix.EPERM) {
+		_, _ = fmt.Fprintf(os.Stderr, "other thread setns = %v; want EPERM\n", err)
+		os.Exit(1)
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "seccomp active on both threads")
+	os.Exit(0)
+}
+
+func TestSeccomp_PrerequisiteOnInstallingThread(t *testing.T) {
+	for _, op := range []string{"prerequisite-other-thread", "prerequisite-other-thread-strict"} {
+		t.Run(op, func(t *testing.T) {
+			out, code := runSeccompChild(t, op)
+			if code == seccompPrerequisiteInheritedExit {
+				t.Skip(strings.TrimSpace(out))
+			}
+			if code != 0 || strings.TrimSpace(out) != "seccomp active on both threads" {
+				t.Fatalf("cross-thread prerequisite proof exited %d: %s", code, out)
+			}
+		})
+	}
+}
+
+func runSeccompPrerequisiteDeniedChild() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if err := SetNoNewPrivs(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "prepare prerequisite denial: %v\n", err)
+		os.Exit(2)
+	}
+	// Deny only attempts to set no_new_privs, leaving filter installation and
+	// the setns control available. This makes the real prerequisite fail even
+	// though this thread already has the bit needed to install a filter.
+	filter := []unix.SockFilter{
+		bpfLoad(offsetNR),
+		bpfJumpEq(unix.SYS_PRCTL, 0, 3),
+		bpfLoad(offsetArgs0),
+		bpfJumpEq(unix.PR_SET_NO_NEW_PRIVS, 0, 1),
+		bpfRet(unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)),
+		bpfRet(unix.SECCOMP_RET_ALLOW),
+	}
+	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]} // #nosec G115 -- fixed small filter
+	failedThread, _, errno := unix.Syscall(unix.SYS_SECCOMP,
+		unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC,
+		uintptr(unsafe.Pointer(&prog)), // #nosec G103 -- seccomp syscall ABI
+	)
+	if errno != 0 || failedThread != 0 {
+		_, _ = fmt.Fprintf(os.Stderr, "prepare prerequisite denial filter: thread=%d errno=%v\n", failedThread, errno)
+		os.Exit(2)
+	}
+	status, err := ApplySeccomp()
+	if status.Active || !errors.Is(err, unix.EPERM) || !strings.Contains(status.Reason, "no_new_privs") {
+		_, _ = fmt.Fprintf(os.Stderr, "denied prerequisite: active=%v err=%v reason=%s\n", status.Active, err, status.Reason)
+		os.Exit(1)
+	}
+	if err := unix.Setns(-1, 0); !errors.Is(err, unix.EBADF) {
+		_, _ = fmt.Fprintf(os.Stderr, "filter installed after denied prerequisite: setns = %v; want EBADF\n", err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func TestSeccomp_PrerequisiteFailureRefusesFilter(t *testing.T) {
+	if out, code := runSeccompChild(t, "prerequisite-denied"); code != 0 {
+		t.Fatalf("denied prerequisite proof exited %d: %s", code, out)
+	}
+}
+
 func runSeccompChild(t *testing.T, op string) (string, int) {
 	t.Helper()
 	if runtime.GOOS != osLinux {
@@ -329,21 +460,21 @@ func TestBuildSeccompFilter_NonEmpty(t *testing.T) {
 
 func TestBuildSeccompFilter_StrictBlocksClone3(t *testing.T) {
 	strict := buildSeccompFilter(true)
-	// In strict mode, clone3 should return EPERM.
-	// Scan filter for a JEQ matching SYS_CLONE3 followed by RET EPERM.
+	// In strict mode, clone3 should return ENOSYS.
+	// Scan filter for a JEQ matching SYS_CLONE3 followed by RET ENOSYS.
 	foundClone3Deny := false
 	for i := 0; i < len(strict)-1; i++ {
 		insn := strict[i]
 		next := strict[i+1]
 		isJEQ := insn.Code == (unix.BPF_JMP|0x10|unix.BPF_K) && insn.K == unix.SYS_CLONE3
-		isDeny := next.Code == (unix.BPF_RET|unix.BPF_K) && next.K == (unix.SECCOMP_RET_ERRNO|uint32(unix.EPERM))
+		isDeny := next.Code == (unix.BPF_RET|unix.BPF_K) && next.K == (unix.SECCOMP_RET_ERRNO|uint32(unix.ENOSYS))
 		if isJEQ && isDeny {
 			foundClone3Deny = true
 			break
 		}
 	}
 	if !foundClone3Deny {
-		t.Error("strict filter should deny clone3 with EPERM")
+		t.Error("strict filter should deny clone3 with ENOSYS")
 	}
 
 	// Best-effort should allow clone3.
@@ -411,6 +542,52 @@ func TestCloneNewMask_IncludesAllNamespaceFlags(t *testing.T) {
 	for _, f := range nonNamespaceFlags {
 		if cloneNewMask&f.val != 0 {
 			t.Errorf("cloneNewMask includes non-namespace %s (0x%08x)", f.name, f.val)
+		}
+	}
+}
+
+// A legacy path-based syscall and its *at successor reach the same Landlock
+// hooks, so the filter must treat them alike. Allowing only one form breaks
+// runtimes whose libc picks the other (glibc on x86_64 issues mkdir, unlink,
+// rename and access directly) without making the sandbox any tighter.
+func TestAllowedSyscalls_LegacyFormsMatchAtSiblings(t *testing.T) {
+	allowed := allowedSyscalls()
+	set := make(map[uint32]bool, len(allowed))
+	for _, nr := range allowed {
+		set[nr] = true
+	}
+
+	pairs := []struct {
+		legacy, sibling string
+		legacyNR, atNR  uint32
+	}{
+		{"access", "faccessat", unix.SYS_ACCESS, unix.SYS_FACCESSAT},
+		{"open", "openat", unix.SYS_OPEN, unix.SYS_OPENAT},
+		{"creat", "openat", unix.SYS_CREAT, unix.SYS_OPENAT},
+		{"stat", "newfstatat", unix.SYS_STAT, unix.SYS_NEWFSTATAT},
+		{"lstat", "newfstatat", unix.SYS_LSTAT, unix.SYS_NEWFSTATAT},
+		{"getdents", "getdents64", unix.SYS_GETDENTS, unix.SYS_GETDENTS64},
+		{"mkdir", "mkdirat", unix.SYS_MKDIR, unix.SYS_MKDIRAT},
+		{"rmdir", "unlinkat", unix.SYS_RMDIR, unix.SYS_UNLINKAT},
+		{"unlink", "unlinkat", unix.SYS_UNLINK, unix.SYS_UNLINKAT},
+		{"rename", "renameat", unix.SYS_RENAME, unix.SYS_RENAMEAT},
+		{"chmod", "fchmodat", unix.SYS_CHMOD, unix.SYS_FCHMODAT},
+		{"chown", "fchownat", unix.SYS_CHOWN, unix.SYS_FCHOWNAT},
+		{"lchown", "fchownat", unix.SYS_LCHOWN, unix.SYS_FCHOWNAT},
+		{"link", "linkat", unix.SYS_LINK, unix.SYS_LINKAT},
+		{"symlink", "symlinkat", unix.SYS_SYMLINK, unix.SYS_SYMLINKAT},
+		{"readlink", "readlinkat", unix.SYS_READLINK, unix.SYS_READLINKAT},
+		{"epoll_create", "epoll_create1", unix.SYS_EPOLL_CREATE, unix.SYS_EPOLL_CREATE1},
+	}
+	for _, p := range pairs {
+		if set[p.legacyNR] != set[p.atNR] {
+			t.Errorf("%s allowed=%v but %s allowed=%v; legacy and *at forms must match",
+				p.legacy, set[p.legacyNR], p.sibling, set[p.atNR])
+		}
+		// Parity alone would pass if both forms were dropped, which
+		// reintroduces the EPERM failures for glibc programs.
+		if !set[p.legacyNR] {
+			t.Errorf("%s must be allowed", p.legacy)
 		}
 	}
 }

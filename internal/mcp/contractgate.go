@@ -27,6 +27,7 @@ const (
 )
 
 type mcpContractGateOutput struct {
+	upstreamDenial     mcpDenialAudit
 	Verdict            string
 	LiveVerdict        string
 	PolicySources      []string
@@ -69,12 +70,20 @@ func evaluateMCPUpstreamGate(ctx context.Context, upstreamURL string, opts MCPPr
 	return evaluateMCPUpstreamGateForMethod(ctx, upstreamURL, http.MethodPost, opts)
 }
 
-func evaluateMCPUpstreamGateForMethod(ctx context.Context, upstreamURL, method string, opts MCPProxyOpts) (mcpContractGateOutput, error) {
+func evaluateMCPUpstreamGateForMethod(ctx context.Context, upstreamURL, method string, opts MCPProxyOpts) (out mcpContractGateOutput, err error) {
 	loader := opts.contractLoader()
 	gateURL := mcpUpstreamGateURL(upstreamURL)
 	var scanResult scanner.Result
 	var scannerVerdict string
 	var scannerMatched bool
+	// Retain the existing scanner result for audit only. The gate continues to
+	// evaluate exactly the same result and contract precedence as before.
+	defer func() {
+		if err == nil && out.Verdict == config.ActionBlock && out.WinningSource == contractruntime.WinningSourceScanner && scannerMatched {
+			out.upstreamDenial = mcpInputBlockAudit(InputVerdict{URLFindings: []scanner.Result{scanResult}})
+		}
+	}()
+
 	sc := opts.scanner()
 	if sc != nil {
 		scanResult = sc.Scan(ctx, gateURL)
@@ -347,7 +356,7 @@ func mcpScannerBlockReason(verdict InputVerdict, policyVerdict policy.Verdict, c
 	case len(verdict.Inject) > 0:
 		return blockreason.PromptInjection
 	case len(verdict.URLFindings) > 0:
-		return mcpURLBlockReason(verdict.URLFindings[0].Scanner)
+		return mcpURLBlockReason(verdict.URLFindings[0])
 	case policyVerdict.Matched:
 		return blockreason.ToolPolicyDeny
 	case chainMatched:
@@ -357,8 +366,11 @@ func mcpScannerBlockReason(verdict InputVerdict, policyVerdict policy.Verdict, c
 	}
 }
 
-func mcpURLBlockReason(scannerLabel string) blockreason.Reason {
-	switch scannerLabel {
+func mcpURLBlockReason(result scanner.Result) blockreason.Reason {
+	if scanner.IsQueryEntropyResult(result) {
+		return blockreason.QueryEntropy
+	}
+	switch result.Scanner {
 	case scanner.ScannerScheme:
 		return blockreason.SchemeBlocked
 	case scanner.ScannerBlocklist:
@@ -406,6 +418,15 @@ func mcpContractBlockReason(gate mcpContractGateOutput) blockreason.Reason {
 	}
 	return blockreason.ParseError
 }
+
+// Receipt attribution for calls the live upstream contract gate refuses. The
+// layer matches the listener's contract block decision; the reasons separate a
+// denial from a gate that could not be evaluated.
+const (
+	mcpContractReceiptLayer           = "mcp_contract"
+	mcpContractDeniedReason           = "contract_upstream_denied"
+	mcpContractEvaluationFailedReason = "contract_upstream_evaluation_failed"
+)
 
 func mcpWithContractReceipt(opts receipt.EmitOpts, gate mcpContractGateOutput) receipt.EmitOpts {
 	if gate.Resolved == nil && gate.ActiveManifestHash == "" && gate.ContractHash == "" {

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 )
@@ -72,6 +73,7 @@ func v2DecisionFromOpts(opts receipt.EmitOpts) (proxydecision.Decision, bool) {
 		d.PolicySources = []string{proxydecision.SourceScanner}
 		d.RuleID = opts.Pattern
 	}
+	d.RuleID = opts.PromptInjectionPattern(d.RuleID)
 	return d, true
 }
 
@@ -80,6 +82,11 @@ func withReceiptPolicyHash(opts receipt.EmitOpts, canonicalHash string) receipt.
 		opts.PolicyHash = canonicalHash
 	}
 	return opts
+}
+
+func withReceiptConfig(opts receipt.EmitOpts, cfg *config.Config) receipt.EmitOpts {
+	opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+	return receipt.WithPromptInjectionMode(opts, cfg.PromptInjectionMode())
 }
 
 // killSwitchLayer is the EmitOpts.Layer label used by kill-switch block sites
@@ -152,7 +159,8 @@ func emitV2(ptr *atomic.Pointer[proxydecision.Emitter], opts receipt.EmitOpts, l
 
 // emitRequiredV2 is the fail-closed variant for RequireReceipts paths. Once a
 // v1 sibling has been durably recorded, a configured v2 emitter must either
-// record the proxy_decision or surface why it could not.
+// durably record the proxy_decision or surface why it could not. A buffered
+// Emit would let the request proceed before the v2 line reached the disk.
 func emitRequiredV2(ptr *atomic.Pointer[proxydecision.Emitter], opts receipt.EmitOpts, logErr func(error)) error {
 	if ptr == nil {
 		return nil
@@ -163,14 +171,13 @@ func emitRequiredV2(ptr *atomic.Pointer[proxydecision.Emitter], opts receipt.Emi
 	}
 	d, ok := v2DecisionFromOpts(opts)
 	if !ok {
-		err := fmt.Errorf("%w: could not derive v2 decision action_id=%s transport=%s target=%q",
-			errV2ReceiptEmit, opts.ActionID, opts.Transport, opts.Target)
+		err := fmt.Errorf("%w: could not derive v2 decision", errV2ReceiptEmit)
 		if logErr != nil {
 			logErr(err)
 		}
 		return err
 	}
-	if err := e.Emit(d); err != nil {
+	if err := e.EmitDurable(d); err != nil {
 		if logErr != nil {
 			logErr(err)
 		}
@@ -190,12 +197,15 @@ func logV2EmitFailure(logger *audit.Logger, opts receipt.EmitOpts, err error) {
 		return
 	}
 	logger.LogError(audit.NewRequestLogContext(opts.RequestID),
-		fmt.Errorf("emit v2 proxy_decision action_id=%s verdict=%s layer=%s transport=%s: %w",
-			opts.ActionID, opts.Verdict, opts.Layer, opts.Transport, err))
+		fmt.Errorf("emit v2 proxy_decision verdict=%s phase=%s layer=%s failure=%s",
+			receiptVerdictLabel(opts.Verdict), receiptPhaseLabel(opts.DecisionPhase), receiptLayerLabel(opts.Layer), receiptFailureClass(err)))
 }
 
 // emitV2Receipt dual-emits the v2 proxy_decision for opts on the main proxy.
 func (p *Proxy) emitV2Receipt(opts receipt.EmitOpts) error {
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		return p.emitGroupV2Receipt(group, opts, false)
+	}
 	return emitV2(&p.v2EmitterPtr, opts, func(err error) {
 		recordV2ReceiptEmitFailure(p.metrics)
 		logV2EmitFailure(p.logger, opts, err)
@@ -203,8 +213,36 @@ func (p *Proxy) emitV2Receipt(opts receipt.EmitOpts) error {
 }
 
 func (p *Proxy) emitRequiredV2Receipt(opts receipt.EmitOpts) error {
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		return p.emitGroupV2Receipt(group, opts, true)
+	}
 	return emitRequiredV2(&p.v2EmitterPtr, opts, func(err error) {
 		recordV2ReceiptEmitFailure(p.metrics)
 		logV2EmitFailure(p.logger, opts, err)
 	})
+}
+
+func (p *Proxy) emitGroupV2Receipt(group *receiptGroupRuntime, opts receipt.EmitOpts, required bool) error {
+	emitter, err := group.v2Emitter(opts)
+	if err == nil {
+		var decision proxydecision.Decision
+		var ok bool
+		decision, ok = v2DecisionFromOpts(opts)
+		if !ok {
+			if !required {
+				return nil
+			}
+			err = errors.New("could not derive v2 receipt decision")
+		} else if required {
+			err = emitter.EmitDurable(decision)
+		} else {
+			err = emitter.Emit(decision)
+		}
+	}
+	if err != nil {
+		recordV2ReceiptEmitFailure(p.metrics)
+		logV2EmitFailure(p.logger, opts, err)
+		return fmt.Errorf("%w: %w", errV2ReceiptEmit, err)
+	}
+	return nil
 }

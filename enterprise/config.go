@@ -271,7 +271,7 @@ func EnforceLicenseGate(c *config.Config) {
 		_, _ = fmt.Fprintf(os.Stderr, "WARNING: agents: section requires a license key. "+
 			"Multi-agent profiles disabled. Single-agent protection is active.\n"+
 			"Get a license key at https://pipelab.org/pricing\n")
-		stripNamedAgents(c)
+		stripNamedAgents(c, "no license key is configured")
 		return
 	}
 
@@ -281,7 +281,7 @@ func EnforceLicenseGate(c *config.Config) {
 		_, _ = fmt.Fprintf(os.Stderr, "WARNING: no license public key available. "+
 			"Set license_public_key in config or build with embedded key.\n"+
 			"Multi-agent profiles disabled.\n")
-		stripNamedAgents(c)
+		stripNamedAgents(c, "no license public key is available")
 		return
 	}
 
@@ -289,13 +289,13 @@ func EnforceLicenseGate(c *config.Config) {
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "WARNING: license CRL validation failed: %v\n"+
 			"Multi-agent profiles disabled. Single-agent protection is active.\n", err)
-		stripNamedAgents(c)
+		stripNamedAgents(c, fmt.Sprintf("license CRL validation failed: %v", err))
 		return
 	}
 	if c.LicenseIntermediateLoadError != "" {
 		_, _ = fmt.Fprintf(os.Stderr, "WARNING: license intermediate validation failed: %s\n"+
 			"Multi-agent profiles disabled. Single-agent protection is active.\n", c.LicenseIntermediateLoadError)
-		stripNamedAgents(c)
+		stripNamedAgents(c, "license intermediate validation failed: "+c.LicenseIntermediateLoadError)
 		return
 	}
 
@@ -321,7 +321,7 @@ func EnforceLicenseGate(c *config.Config) {
 				c.LicenseRevocationReason = revoked.Reason
 			}
 		}
-		stripNamedAgents(c)
+		stripNamedAgents(c, fmt.Sprintf("license verification failed: %v", err))
 		return
 	}
 
@@ -329,7 +329,7 @@ func EnforceLicenseGate(c *config.Config) {
 	if !lic.HasFeature(license.FeatureAgents) {
 		_, _ = fmt.Fprintf(os.Stderr, "WARNING: license %s does not include the 'agents' feature.\n"+
 			"Multi-agent profiles disabled.\n", lic.ID)
-		stripNamedAgents(c)
+		stripNamedAgents(c, fmt.Sprintf("license %s does not include the agents feature", lic.ID))
 		return
 	}
 
@@ -375,9 +375,21 @@ func loadLicenseCRL(c *config.Config, pubKey ed25519.PublicKey) (*license.CRL, b
 
 // stripNamedAgents removes all agent profiles except _default.
 // The _default profile provides single-agent protection (free tier)
-// and must survive license gate rejection.
-func stripNamedAgents(c *config.Config) {
+// and must survive license gate rejection. It records each removed
+// profile's listeners and the reason, so a setting that refers to a
+// removed profile can be refused with the license cause rather than as
+// an undeclared reference.
+func stripNamedAgents(c *config.Config, reason string) {
 	c.LicenseAgentsFeature = false
+	disabled := make(map[string][]string, len(c.Agents))
+	for name, profile := range c.Agents {
+		if name == "_default" {
+			continue
+		}
+		disabled[name] = append([]string(nil), profile.Listeners...)
+	}
+	c.LicenseDisabledAgents = disabled
+	c.LicenseDisabledReason = reason
 	def, hasDefault := c.Agents["_default"]
 	if hasDefault {
 		c.Agents = map[string]config.AgentProfile{"_default": def}
@@ -405,7 +417,8 @@ func resolvePublicKey(c *config.Config) ed25519.PublicKey {
 
 // MergeAgentProfile creates a new Config by deep-merging profile overrides
 // into a deep copy of the base config. The base config is not modified.
-// If profile is nil, a deep copy of base is returned with no modifications.
+// A nil profile adds no overrides. The YAML round-trip still strips compiled
+// audience hosts, and the restore below puts those hosts back.
 //
 // This is the implementation behind edition.MergeAgentProfileFunc.
 func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*config.Config, error) {
@@ -415,7 +428,7 @@ func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*conf
 	}
 
 	if profile == nil {
-		return merged, nil
+		profile = &config.AgentProfile{}
 	}
 
 	if profile.Mode != "" {
@@ -501,6 +514,12 @@ func MergeAgentProfile(base *config.Config, profile *config.AgentProfile) (*conf
 		}
 	}
 
+	// deepCopyConfig uses a YAML round-trip, which necessarily strips the
+	// yaml-excluded audience metadata even when this profile does not override
+	// DLP at all. Restore exact shipped pattern identities after every profile
+	// merge; custom same-name patterns remain ineligible.
+	config.RestoreBuiltInCredentialAudienceHosts(merged.DLP.Patterns)
+
 	return merged, nil
 }
 
@@ -566,6 +585,8 @@ func deepCopyConfig(cfg *config.Config) (*config.Config, error) {
 	}
 	out.LicenseIntermediateCert = licenseIntermediateCert
 	out.LicenseIntermediateLoadError = licenseIntermediateLoadError
+	out.CopyMCPCompatibilityWarningsFrom(cfg)
+	out.CopyScannerExceptionDiagnosticsFrom(cfg)
 	// LicenseAgentsFeature is a runtime-derived bit (yaml:"-"), so the
 	// marshal/unmarshal round-trip above drops it. It must be preserved or the
 	// per-agent scanner built from the merged config would treat a licensed

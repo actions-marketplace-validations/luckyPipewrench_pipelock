@@ -5,6 +5,7 @@ package contain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
 // Extra coverage for the install step builders that hit error / undo paths
@@ -122,7 +125,7 @@ func TestStepWritePipelockConfig_CopiesFromSource(t *testing.T) {
 	}
 	dst := filepath.Join(env.configDir, "pipelock.yaml")
 	got, _ := os.ReadFile(dst) //nolint:gosec // tmpdir-scoped test path
-	if string(got) != "mode: balanced\nmetrics_listen: 127.0.0.1:9091\n" {
+	if string(got) != "mode: balanced\nmetrics_listen: 127.0.0.1:9091\ncontainment:\n  filesystem:\n    mode: enforce\n" {
 		t.Errorf("dst: %q", got)
 	}
 }
@@ -227,6 +230,54 @@ func TestStepWaitPipelockReadyUsesInstallBudget(t *testing.T) {
 	}
 }
 
+func TestInstallDoorwayReadinessRequiresNamespaceHealth(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		code int
+		err  error
+	}{
+		{name: "healthy doorway"},
+		{name: "host TCP alone", code: 7},
+		{name: "namespace probe could not run", err: errors.New("systemd-run failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, runner, out := newFakeEnv(t)
+			env.curlPath = "/custom/bin/curl"
+			hostDialed := false
+			env.dialCtx = func(context.Context, string, string, time.Duration) (net.Conn, error) {
+				hostDialed = true
+				return &fakeConn{}, nil
+			}
+			probe := &probeEnv{agentUserName: env.agentUserName, port: env.proxyPort, curlPath: env.curlPath}
+			args := namespaceProbeSystemdRunArgs(probe, []string{
+				env.curlPath, "--noproxy", "*", "--connect-timeout", "2", "--max-time", "5",
+				"--silent", "--show-error", "--fail", "http://127.0.0.1:8888/health",
+			})
+			command := argvFor(systemdRunPath, args...)
+			runner.on(command, "doorway unavailable", tc.code, tc.err)
+			_, err := runSteps(t.Context(), env, out, []step{stepInstallNetworkNamespace(), stepWaitPipelockReady()})
+			if !hostDialed || !fakeRunnerCalled(runner, command) {
+				t.Fatalf("readiness did not check host and namespace: %v", runner.calls)
+			}
+			if tc.code == 0 && tc.err == nil {
+				if err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), "installed proxy doorway failed readiness") {
+				t.Fatalf("readiness = %v, want namespace health failure", err)
+			}
+			if _, statErr := os.Stat(env.proxyForwarderSocketPath); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("namespace install not rolled back: %v", statErr)
+			}
+			if !strings.Contains(out.String(), "undo install-agent-network-namespace") {
+				t.Fatalf("missing rollback: %s", out)
+			}
+		})
+	}
+}
+
 func TestStepChownToProxy_CallsChownPerFile(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	if err := os.MkdirAll(env.configDir, 0o750); err != nil {
@@ -288,8 +339,21 @@ func TestStepStopUserService_StopsWhenActive(t *testing.T) {
 	}
 }
 
+func seedProspectiveServiceBinary(t *testing.T, env *installEnv) {
+	t.Helper()
+	body, err := env.readFile(env.pipelockBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.pipelockTarget, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env.preflightBinaryHash = mustHashFile(t, env, env.pipelockTarget)
+}
+
 func TestStepEnableSystemUnit_SkipsWhenActive(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-enabled", "pipelock"), "enabled\n", 0, nil)
@@ -314,6 +378,7 @@ func TestStepEnableSystemUnit_RestartsActiveServiceAfterRuntimeChange(t *testing
 	} {
 		t.Run(changed.name, func(t *testing.T) {
 			env, runner, _ := newFakeEnv(t)
+			seedProspectiveServiceBinary(t, env)
 			changed.apply(env)
 			runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 			runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
@@ -333,6 +398,7 @@ func TestStepEnableSystemUnit_RestartsActiveServiceAfterRuntimeChange(t *testing
 
 func TestStepEnableSystemUnit_ActiveDisabledChangeEnablesAndRestarts(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	env.serviceBinaryChanged = true
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
@@ -352,6 +418,7 @@ func TestStepEnableSystemUnit_ActiveDisabledChangeEnablesAndRestarts(t *testing.
 
 func TestStepEnableSystemUnit_ActiveDisabledReportsEnableFailure(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	env.serviceBinaryChanged = true
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
@@ -603,6 +670,69 @@ func TestChangedRuntimeArtifacts_RollbackRestoresAndRestartsPriorService(t *test
 	})
 }
 
+func TestStepInstallPipelockBinaryQuiescesAndRestoresManagedDoorways(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	if err := os.WriteFile(filepath.Clean(env.pipelockTarget), []byte("old binary"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	declared := config.ContainmentLoopbackService{Host: "127.0.0.1", Port: 9200}
+	if err := os.MkdirAll(filepath.Dir(env.loopbackForwarderInvPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	inv, err := json.Marshal(desiredLoopbackForwarders([]config.ContainmentLoopbackService{declared}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.loopbackForwarderInvPath, inv, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	units, err := managedNamespaceRuntimeUnits(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range units {
+		runner.on(argvFor("systemctl", "is-enabled", unit.name), "enabled\n", 0, nil)
+		runner.on(argvFor("systemctl", "is-active", unit.name), "active\n", 0, nil)
+	}
+
+	step := stepInstallPipelockBinary()
+	if applied, err := step.apply(context.Background(), env); err != nil || !applied {
+		t.Fatalf("apply = (%t, %v), want changed", applied, err)
+	}
+	for _, unit := range units {
+		if !fakeRunnerCalled(runner, "systemctl reset-failed "+unit.name) {
+			t.Fatalf("successful replacement did not reset failed state for %s: %v", unit.name, runner.calls)
+		}
+		if unit.socketActivated {
+			if fakeRunnerCalled(runner, "systemctl start "+unit.name) {
+				t.Fatalf("socket-activated service %s was started without its socket", unit.name)
+			}
+			continue
+		}
+		if !fakeRunnerCalled(runner, "systemctl start "+unit.name) {
+			t.Fatalf("successful replacement did not restore active unit %s: %v", unit.name, runner.calls)
+		}
+	}
+	if err := step.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+
+	for _, unit := range units {
+		if !fakeRunnerCalled(runner, "systemctl reset-failed "+unit.name) {
+			t.Fatalf("rollback did not reset failed state for %s: %v", unit.name, runner.calls)
+		}
+		if unit.socketActivated {
+			if fakeRunnerCalled(runner, "systemctl start "+unit.name) {
+				t.Fatalf("socket-activated service %s was started without its socket", unit.name)
+			}
+			continue
+		}
+		if !fakeRunnerCalled(runner, "systemctl start "+unit.name) {
+			t.Fatalf("rollback did not restore active unit %s: %v", unit.name, runner.calls)
+		}
+	}
+}
+
 func assertRestoredFileAndRestart(t *testing.T, path, want string, runner *fakeRunner) {
 	t.Helper()
 	got, err := os.ReadFile(filepath.Clean(path))
@@ -628,6 +758,7 @@ func runnerSawSystemctl(runner *fakeRunner, args ...string) bool {
 
 func TestStepEnableSystemUnit_EnablesWhenActiveButDisabled(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-enabled", "pipelock"), "disabled\n", 1, nil)
@@ -652,6 +783,7 @@ func TestStepEnableSystemUnit_EnablesWhenActiveButDisabled(t *testing.T) {
 
 func TestStepEnableSystemUnit_EnablesWhenInactive(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	s := stepEnableSystemUnit()
 	if _, err := s.apply(context.Background(), env); err != nil {
 		t.Fatalf("apply: %v", err)
@@ -686,6 +818,7 @@ func TestStepEnableSystemUnit_UndoDisables(t *testing.T) {
 
 func TestStepEnableSystemUnit_UndoRestoresPreviouslyEnabledInactive(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "inactive\n", 3, nil)
 	runner.on(argvFor(testSystemctl, "is-enabled", "pipelock"), "enabled\n", 0, nil)
@@ -719,6 +852,7 @@ func TestStepEnableSystemUnit_UndoRestoresPreviouslyEnabledInactive(t *testing.T
 
 func TestStepEnableSystemUnit_UndoRestoresPreviouslyActiveDisabled(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	seedProspectiveServiceBinary(t, env)
 	runner.on(argvFor(testSystemctl, "daemon-reload"), "", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-active", "pipelock"), "active\n", 0, nil)
 	runner.on(argvFor(testSystemctl, "is-enabled", "pipelock"), "disabled\n", 1, nil)
@@ -750,12 +884,22 @@ func TestStepEnableSystemUnit_UndoRestoresPreviouslyActiveDisabled(t *testing.T)
 	}
 }
 
-func TestStepExportPipelockCA_SkipsWhenAlreadyPresent(t *testing.T) {
+func TestStepExportPipelockCA_RefreshesExistingExportAfterRotation(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	current := testPEMCA(t)
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		runner.mu.Lock()
+		runner.calls = append(runner.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+		runner.mu.Unlock()
+		if name == testSudoCmd && containsArg(args, "show-ca") {
+			return current, 0, nil
+		}
+		return "", 0, nil
+	}
 	if err := os.MkdirAll(filepath.Dir(env.caExportPath), 0o750); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	if err := os.WriteFile(env.caExportPath, []byte("CA"), 0o600); err != nil {
+	if err := os.WriteFile(env.caExportPath, []byte("stale export"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	s := stepExportPipelockCA()
@@ -763,23 +907,65 @@ func TestStepExportPipelockCA_SkipsWhenAlreadyPresent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if applied {
-		t.Errorf("expected skip when ca.pem present")
+	if !applied {
+		t.Fatal("expected refreshed CA export after rotation")
 	}
-	if len(runner.calls) != 0 {
-		t.Errorf("no shell-out expected, got %v", runner.calls)
+	got, err := os.ReadFile(env.caExportPath)
+	if err != nil {
+		t.Fatalf("read refreshed export: %v", err)
+	}
+	if string(got) != current {
+		t.Fatalf("CA export = %q, want current proxy CA", got)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("show-ca calls = %d, want 2", len(runner.calls))
+	}
+}
+
+func TestStepExportPipelockCA_FailsIfCurrentCAChangesDuringExport(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	first := testPEMCA(t)
+	second := testPEMCA(t)
+	if first == second {
+		t.Fatal("test CA rotation did not produce distinct material")
+	}
+	calls := 0
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		runner.mu.Lock()
+		runner.calls = append(runner.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+		runner.mu.Unlock()
+		if name == testSudoCmd && containsArg(args, "show-ca") {
+			calls++
+			if calls == 1 {
+				return first, 0, nil
+			}
+			return second, 0, nil
+		}
+		return "", 0, nil
+	}
+
+	applied, err := stepExportPipelockCA().apply(context.Background(), env)
+	if err == nil || !strings.Contains(err.Error(), "does not match the selected Pipelock CA") {
+		t.Fatalf("CA changed during export: applied=%t err=%v", applied, err)
+	}
+	if applied {
+		t.Fatal("CA export must not report success when the current CA changed")
+	}
+	if calls != 2 {
+		t.Fatalf("show-ca calls = %d, want 2", calls)
 	}
 }
 
 func TestStepExportPipelockCA_ExportsViaSudo(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
 	// Stub show-ca to return a PEM.
+	current := testPEMCA(t)
 	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
 		runner.mu.Lock()
 		runner.calls = append(runner.calls, fakeCall{name: name, args: append([]string(nil), args...)})
 		runner.mu.Unlock()
 		if name == testSudoCmd && containsArg(args, "show-ca") {
-			return testPEMCA(t), 0, nil
+			return current, 0, nil
 		}
 		return "", 0, nil
 	}
@@ -787,11 +973,165 @@ func TestStepExportPipelockCA_ExportsViaSudo(t *testing.T) {
 	if _, err := s.apply(context.Background(), env); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
-	if len(runner.calls) != 1 {
-		t.Fatalf("expected 1 call, got %v", runner.calls)
+	if len(runner.calls) != 2 {
+		t.Fatalf("expected 2 calls, got %v", runner.calls)
 	}
 	if runner.calls[0].name != testSudoCmd {
 		t.Errorf("expected sudo, got %s", runner.calls[0].name)
+	}
+}
+
+func newCAExportStepEnv(t *testing.T) (*installEnv, *fakeRunner, step, string, string) {
+	t.Helper()
+	env, runner, _ := newFakeEnv(t)
+	previous := testPEMCA(t)
+	current := testPEMCA(t)
+	if previous == current {
+		t.Fatal("test CA material must differ")
+	}
+	if err := os.MkdirAll(filepath.Dir(env.caExportPath), 0o750); err != nil {
+		t.Fatalf("mkdir CA export directory: %v", err)
+	}
+	if err := os.WriteFile(env.caExportPath, []byte(previous), 0o600); err != nil {
+		t.Fatalf("write existing CA export: %v", err)
+	}
+	env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+		runner.mu.Lock()
+		runner.calls = append(runner.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+		runner.mu.Unlock()
+		if name == testSudoCmd && containsArg(args, "show-ca") {
+			return current, 0, nil
+		}
+		return "", 0, nil
+	}
+	return env, runner, stepExportPipelockCA(), previous, current
+}
+
+func assertCAExportStepPositiveControl(t *testing.T) {
+	t.Helper()
+	env, runner, step, _, current := newCAExportStepEnv(t)
+	applied, err := step.apply(context.Background(), env)
+	if err != nil || !applied {
+		t.Fatalf("positive CA export apply = %t, %v", applied, err)
+	}
+	got, err := os.ReadFile(env.caExportPath)
+	if err != nil || string(got) != current {
+		t.Fatalf("positive CA export = %q, %v; want current proxy CA", got, err)
+	}
+	if len(runner.calls) != 2 {
+		t.Fatalf("positive CA export show-ca calls = %d, want 2", len(runner.calls))
+	}
+}
+
+func TestStepExportPipelockCAFailurePathsPreserveRollbackState(t *testing.T) {
+	t.Run("positive control refreshes and rechecks the export", func(t *testing.T) {
+		assertCAExportStepPositiveControl(t)
+	})
+
+	t.Run("write error restores the prior export", func(t *testing.T) {
+		assertCAExportStepPositiveControl(t)
+		env, _, step, previous, _ := newCAExportStepEnv(t)
+		originalWrite := env.writeFile
+		env.writeFile = func(path string, contents []byte, mode os.FileMode) error {
+			if path == env.caExportPath {
+				return errors.New("write denied")
+			}
+			return originalWrite(path, contents, mode)
+		}
+
+		applied, err := step.apply(context.Background(), env)
+		if err == nil || !strings.Contains(err.Error(), "write current Pipelock CA export") || !strings.Contains(err.Error(), "write denied") {
+			t.Fatalf("write failure = applied %t, err %v", applied, err)
+		}
+		if applied {
+			t.Fatal("write failure reported a completed CA export")
+		}
+		got, readErr := os.ReadFile(env.caExportPath)
+		if readErr != nil || string(got) != previous {
+			t.Fatalf("CA export after failed write = %q, %v; want restored previous export", got, readErr)
+		}
+	})
+
+	t.Run("post-write read error restores the prior export", func(t *testing.T) {
+		assertCAExportStepPositiveControl(t)
+		env, _, step, previous, _ := newCAExportStepEnv(t)
+		originalRead := env.readFile
+		reads := 0
+		env.readFile = func(path string) ([]byte, error) {
+			if path == env.caExportPath {
+				reads++
+				if reads == 3 {
+					return nil, errors.New("post-write read denied")
+				}
+			}
+			return originalRead(path)
+		}
+
+		applied, err := step.apply(context.Background(), env)
+		if err == nil || !strings.Contains(err.Error(), "read exported Pipelock CA") || !strings.Contains(err.Error(), "post-write read denied") {
+			t.Fatalf("post-write read failure = applied %t, err %v", applied, err)
+		}
+		if applied || reads != 3 {
+			t.Fatalf("post-write read failure applied=%t reads=%d, want false and 3", applied, reads)
+		}
+		// The write already landed before this failure, so the step must put the
+		// PREVIOUS export back rather than leave bytes it could not verify. This
+		// used to assert the new bytes survived, which recorded the fail-open as
+		// the expected behavior.
+		got, readErr := os.ReadFile(env.caExportPath)
+		if readErr != nil || string(got) != previous {
+			t.Fatalf("CA export after rejected read = %q, %v; want the prior export restored", got, readErr)
+		}
+	})
+
+	t.Run("fresh CA read error leaves a recoverable backup", func(t *testing.T) {
+		assertCAExportStepPositiveControl(t)
+		env, runner, step, previous, current := newCAExportStepEnv(t)
+		showCACalls := 0
+		env.runCmd = func(_ context.Context, name string, args ...string) (string, int, error) {
+			runner.mu.Lock()
+			runner.calls = append(runner.calls, fakeCall{name: name, args: append([]string(nil), args...)})
+			runner.mu.Unlock()
+			if name == testSudoCmd && containsArg(args, "show-ca") {
+				showCACalls++
+				if showCACalls == 2 {
+					return "", 0, errors.New("fresh CA read denied")
+				}
+				return current, 0, nil
+			}
+			return "", 0, nil
+		}
+
+		applied, err := step.apply(context.Background(), env)
+		if err == nil || !strings.Contains(err.Error(), "read current Pipelock CA after export") || !strings.Contains(err.Error(), "fresh CA read denied") {
+			t.Fatalf("fresh CA read failure = applied %t, err %v", applied, err)
+		}
+		if applied || showCACalls != 2 {
+			t.Fatalf("fresh CA read failure applied=%t show-ca calls=%d, want false and 2", applied, showCACalls)
+		}
+		got, readErr := os.ReadFile(env.caExportPath)
+		if readErr != nil || string(got) != previous {
+			t.Fatalf("CA export after rejected fresh read = %q, %v; want the prior export restored", got, readErr)
+		}
+	})
+}
+
+func TestStepExportPipelockCAUndoRestoresPriorExport(t *testing.T) {
+	env, _, step, previous, current := newCAExportStepEnv(t)
+	applied, err := step.apply(context.Background(), env)
+	if err != nil || !applied {
+		t.Fatalf("apply = %t, %v", applied, err)
+	}
+	updated, readErr := os.ReadFile(env.caExportPath)
+	if readErr != nil || string(updated) != current {
+		t.Fatalf("updated CA export = %q, %v; want current CA", updated, readErr)
+	}
+	if err := step.undo(context.Background(), env); err != nil {
+		t.Fatalf("undo: %v", err)
+	}
+	restored, readErr := os.ReadFile(env.caExportPath)
+	if readErr != nil || string(restored) != previous {
+		t.Fatalf("restored CA export = %q, %v; want prior export", restored, readErr)
 	}
 }
 
@@ -858,6 +1198,7 @@ func TestStepWriteLaunchWrapper_IdempotentAndUndoable(t *testing.T) {
 
 func TestStepInstallNFTRules_UndoDropsTable(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	env.nftTableMutatedByInstall = true // this attempt loaded the table
 	s := stepInstallNFTRules()
 	if err := s.undo(context.Background(), env); err != nil {
 		t.Fatalf("undo: %v", err)
@@ -936,7 +1277,10 @@ func TestRollbackApplied_HandlesUndoFailureNonFatally(t *testing.T) {
 		},
 	}
 	// applied[0] was first; rollbackApplied walks in reverse: boom then ok.
-	rollbackApplied(context.Background(), env, out, applied)
+	err := rollbackApplied(context.Background(), env, out, applied)
+	if err == nil || !strings.Contains(err.Error(), "undo boom") || !strings.Contains(err.Error(), "kaboom") {
+		t.Fatalf("rollbackApplied error = %v, want the failed undo named", err)
+	}
 	got := out.String()
 	if !strings.Contains(got, "[FAIL] undo boom") {
 		t.Errorf("missing fail line for boom: %q", got)
@@ -948,7 +1292,9 @@ func TestRollbackApplied_HandlesUndoFailureNonFatally(t *testing.T) {
 
 func TestRollbackApplied_HandlesEmptySliceAsNoop(t *testing.T) {
 	env, _, out := newFakeEnv(t)
-	rollbackApplied(context.Background(), env, out, nil)
+	if err := rollbackApplied(context.Background(), env, out, nil); err != nil {
+		t.Fatalf("empty rollback: %v", err)
+	}
 	if out.Len() != 0 {
 		t.Errorf("expected no output: %q", out.String())
 	}
@@ -957,7 +1303,9 @@ func TestRollbackApplied_HandlesEmptySliceAsNoop(t *testing.T) {
 func TestRollbackApplied_SkipsStepsWithNilUndo(t *testing.T) {
 	env, _, out := newFakeEnv(t)
 	applied := []step{{name: "nostep", desc: "nostep", undo: nil}}
-	rollbackApplied(context.Background(), env, out, applied)
+	if err := rollbackApplied(context.Background(), env, out, applied); err != nil {
+		t.Fatalf("nil-undo rollback: %v", err)
+	}
 	if !strings.Contains(out.String(), "[SKIP] undo nostep") {
 		t.Errorf("expected skip line: %q", out.String())
 	}
@@ -1262,16 +1610,26 @@ func TestCleanupActions_PropagateSystemctlFailures(t *testing.T) {
 		{
 			name: "credential guard disable",
 			run: func(env *installEnv, runner *fakeRunner) error {
+				// Undo acts only on a guard this attempt wrote, so apply first.
+				step := stepWriteCredentialGuard()
+				if _, err := step.apply(context.Background(), env); err != nil {
+					t.Fatal(err)
+				}
 				unit := filepath.Base(env.guardPathUnit)
 				runner.on(argvFor(testSystemctl, "disable", "--now", unit), "access denied", 1, nil)
-				return stepWriteCredentialGuard().undo(context.Background(), env)
+				return step.undo(context.Background(), env)
 			},
 		},
 		{
 			name: "credential guard daemon reload",
 			run: func(env *installEnv, runner *fakeRunner) error {
+				// Undo acts only on a guard this attempt wrote, so apply first.
+				step := stepWriteCredentialGuard()
+				if _, err := step.apply(context.Background(), env); err != nil {
+					t.Fatal(err)
+				}
 				runner.on(argvFor(testSystemctl, "daemon-reload"), "connection refused", 1, nil)
-				return stepWriteCredentialGuard().undo(context.Background(), env)
+				return step.undo(context.Background(), env)
 			},
 		},
 		{
@@ -1602,5 +1960,87 @@ func TestRenderCredentialGuardServiceDisablesStartRateLimit(t *testing.T) {
 	}
 	if !strings.Contains(unit, "Type=oneshot") {
 		t.Fatalf("credential guard should remain a oneshot:\n%s", unit)
+	}
+}
+
+// TestStepExportPipelockCARestoresPriorExportOnPostWriteFailure pins the
+// failure DIRECTION of the CA export. Every check in this step runs after the
+// file has already been mutated, and the step reports didApply=false when one
+// of them fails, so runSteps will not roll it back. Without an inline restore a
+// failed install replaces a good export with an unverified one, and on a host
+// whose wrappers still read that path it is the file clients go on trusting.
+//
+// The existing failure-path tests assert the error text and that apply reported
+// no change; none of them read the file back, which is why this direction was
+// not covered.
+func TestStepExportPipelockCARestoresPriorExportOnPostWriteFailure(t *testing.T) {
+	prior := "-----BEGIN CERTIFICATE-----\nPRIOR-EXPORT\n-----END CERTIFICATE-----\n"
+
+	for _, tc := range []struct {
+		name  string
+		calls []string
+	}{
+		// Second read differs from the first: a rotation raced the export.
+		{name: "current CA changed during export", calls: []string{testPEMCA(t), prior}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _, _ := newFakeEnv(t)
+			if err := os.WriteFile(env.caExportPath, []byte(prior), modeCAReadable); err != nil {
+				t.Fatalf("seed prior export: %v", err)
+			}
+			call := 0
+			env.runCmd = func(context.Context, string, ...string) (string, int, error) {
+				out := tc.calls[call%len(tc.calls)]
+				call++
+				return out, 0, nil
+			}
+
+			applied, err := stepExportPipelockCA().apply(context.Background(), env)
+			if err == nil {
+				t.Fatal("expected the post-write verification to fail")
+			}
+			if applied {
+				t.Fatalf("apply reported didApply=true on a failure: %v", err)
+			}
+
+			got, rerr := os.ReadFile(env.caExportPath)
+			if rerr != nil {
+				t.Fatalf("read export after failed apply: %v", rerr)
+			}
+			if string(got) != prior {
+				t.Fatalf("failed export did not restore the prior CA.\n got: %q\nwant: %q", got, prior)
+			}
+		})
+	}
+}
+
+// The proxy persists runtime state (issuer-bound cookie evidence) under the
+// XDG state home. Under ProtectSystem=strict the service can write only its
+// ReadWritePaths, so the state home must be set inside one of them; the
+// service user's home is not writable and saves there would silently fail.
+func TestRenderSystemUnit_StateHomeIsWritable(t *testing.T) {
+	env, _, _ := newFakeEnv(t)
+	body := renderSystemUnit(env)
+	var stateHome string
+	var writable []string
+	for _, line := range strings.Split(body, "\n") {
+		if v, ok := strings.CutPrefix(line, "Environment=XDG_STATE_HOME="); ok {
+			stateHome = v
+		}
+		if v, ok := strings.CutPrefix(line, "ReadWritePaths="); ok {
+			writable = append(writable, strings.Fields(v)...)
+		}
+	}
+	if stateHome == "" {
+		t.Fatalf("system unit sets no XDG_STATE_HOME:\n%s", body)
+	}
+	inside := false
+	for _, dir := range writable {
+		if stateHome == dir || strings.HasPrefix(stateHome, strings.TrimSuffix(dir, "/")+"/") {
+			inside = true
+		}
+	}
+	if !inside {
+		t.Fatalf("XDG_STATE_HOME %q is outside ReadWritePaths %v", stateHome, writable)
 	}
 }

@@ -244,7 +244,7 @@ func TestAutoAnchorRestartAfterKeyRotationUsesReceiptCountAndPreservesBundles(t 
 		t.Fatalf("recorder.New B: %v", err)
 	}
 	t.Cleanup(func() { _ = recB.Close() })
-	emitterB := receipt.NewEmitter(receipt.EmitterConfig{Recorder: recB, PrivKey: privB, ConfigHash: "rotation-b", Principal: "tester", Actor: "runtime-test", Metrics: m})
+	emitterB := receipt.NewEmitter(receipt.EmitterConfig{Recorder: recB, PrivKey: privB, ConfigHash: "rotation-b", Principal: "tester", Actor: "runtime-test", Metrics: m, PriorSignerKeys: []string{fmt.Sprintf("%x", privA.Public().(ed25519.PublicKey))}})
 	if emitterB == nil || emitterB.InitError() != nil {
 		t.Fatalf("NewEmitter B = %v, init err = %v", emitterB, emitterB.InitError())
 	}
@@ -307,7 +307,7 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		live := newAutoAnchorTestRig(t)
 		emitAutoAnchorReceipt(t, live.emitter, "https://api.vendor.example/live")
 		backend := &countingAnchorBackend{}
-		live.monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return foreignReceipts, nil }
+		live.monitor.walkFn = walkAutoAnchorTestReceipts(foreignReceipts)
 		live.monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) { return backend, nil }
 
 		live.monitor.runPass()
@@ -339,7 +339,7 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		receipts[transitionIndex] = tampered
 		backend := &countingAnchorBackend{}
 		monitor := newAutoAnchorMonitor(rec, m, func() *receipt.Emitter { return emitter }, func() *config.Config { return cfg }, logs)
-		monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return receipts, nil }
+		monitor.walkFn = walkAutoAnchorTestReceipts(receipts)
 		monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) { return backend, nil }
 
 		monitor.runPass()
@@ -363,6 +363,25 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		if _, err := autoAnchorTrustedKeys(grafted, emitter.SignerKeyHex()); err == nil || !strings.Contains(err.Error(), "not authorized by the live head") {
 			t.Fatalf("grafted prefix trust derivation err = %v, want backward-trust rejection", err)
 		}
+		// The oracle above is the old backward walk; the production streaming
+		// verifier must reject the same graft on its own.
+		verifier, err := receipt.NewHeadTrustedVerifier(emitter.SignerKeyHex(), 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = verifier.Close() }()
+		var walkErr error
+		for _, r := range grafted {
+			if walkErr = verifier.Add(r); walkErr != nil {
+				break
+			}
+		}
+		if walkErr == nil {
+			_, _, walkErr = verifier.Finish()
+		}
+		if walkErr == nil {
+			t.Fatal("production streaming verifier accepted a grafted foreign prefix")
+		}
 	})
 
 	t.Run("spliced_foreign_segment_refused_before_submit", func(t *testing.T) {
@@ -378,7 +397,7 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		spliced = append(spliced, receipts[boundary:]...)
 		backend := &countingAnchorBackend{}
 		monitor := newAutoAnchorMonitor(rec, m, func() *receipt.Emitter { return emitter }, func() *config.Config { return cfg }, logs)
-		monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return spliced, nil }
+		monitor.walkFn = walkAutoAnchorTestReceipts(spliced)
 		monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) { return backend, nil }
 
 		monitor.runPass()
@@ -386,7 +405,7 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		if backend.submits.Load() != 0 {
 			t.Fatalf("spliced chain submit calls = %d, want 0", backend.submits.Load())
 		}
-		assertAutoAnchorStats(t, m, 1, 0, 1, "not authorized by the live head")
+		assertAutoAnchorStats(t, m, 1, 0, 1, "unexpected seq 0 without a key_transition boundary")
 	})
 
 	t.Run("truncated_rotated_prefix_refused_before_submit", func(t *testing.T) {
@@ -394,7 +413,7 @@ func TestAutoAnchorRotatedChainTrustDerivation(t *testing.T) {
 		truncated := append([]receipt.Receipt(nil), receipts[autoAnchorRotationBoundary(t, receipts):]...)
 		backend := &countingAnchorBackend{}
 		monitor := newAutoAnchorMonitor(rec, m, func() *receipt.Emitter { return emitter }, func() *config.Config { return cfg }, logs)
-		monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return truncated, nil }
+		monitor.walkFn = walkAutoAnchorTestReceipts(truncated)
 		monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) { return backend, nil }
 
 		monitor.runPass()
@@ -973,7 +992,7 @@ func TestAutoAnchorSeedRejectsUnbackedManualMarkerOutrankingAuto(t *testing.T) {
 	}
 
 	restarted := newAutoAnchorMonitor(trig.recorder, trig.metrics, func() *receipt.Emitter { return trig.emitter }, func() *config.Config { return trig.cfg }, trig.logs)
-	if err := restarted.seed(time.Now().UTC(), snapshot, trig.emitter.SignerKeyHex()); err != nil {
+	if err := restarted.seed(time.Now().UTC(), snapshot, trig.emitter); err != nil {
 		t.Fatalf("seed with forged manual marker: %v", err)
 	}
 	if restarted.lastReceiptCount != anchored.ReceiptCount || restarted.lastFinalSeq != anchored.FinalSeq {
@@ -1137,7 +1156,7 @@ func TestReadAnchorStateForSessionFallsBackFromTornLatestPointer(t *testing.T) {
 		t.Fatal("emitter health snapshot unavailable")
 	}
 	restarted := newAutoAnchorMonitor(trig.recorder, trig.metrics, func() *receipt.Emitter { return trig.emitter }, func() *config.Config { return trig.cfg }, trig.logs)
-	if err := restarted.seed(time.Now().UTC(), snapshot, trig.emitter.SignerKeyHex()); err != nil {
+	if err := restarted.seed(time.Now().UTC(), snapshot, trig.emitter); err != nil {
 		t.Fatalf("seed with torn-pointer fallback: %v", err)
 	}
 }
@@ -1633,7 +1652,9 @@ func TestAutoAnchorAttemptFailurePaths(t *testing.T) {
 		want    string
 	}{
 		{name: "extract", prepare: func(_ *testing.T, trig *autoAnchorTestRig) {
-			trig.monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return nil, errors.New("torn tail") }
+			trig.monitor.walkFn = func(string, string, recorder.SessionHistoryPrefix, func(receipt.Receipt) error) error {
+				return errors.New("torn tail")
+			}
 		}, want: "extract live receipt chain"},
 		{name: "backend_config", prepare: func(_ *testing.T, trig *autoAnchorTestRig) {
 			trig.monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) {
@@ -1658,7 +1679,7 @@ func TestAutoAnchorAttemptFailurePaths(t *testing.T) {
 			trig.monitor.seeded = true
 			trig.monitor.backendFn = func(config.FlightRecorderAnchor) (anchorpkg.Backend, error) { return &countingAnchorBackend{}, nil }
 		}, want: "write live anchor state"},
-		{name: "checkpoint_not_advanced", prepare: func(t *testing.T, trig *autoAnchorTestRig) {
+		{name: "checkpoint_head_mismatch", prepare: func(t *testing.T, trig *autoAnchorTestRig) {
 			receipts, err := receipt.ExtractReceiptsFromSessionDir(trig.recorder.Dir(), transcriptRootSessionID)
 			if err != nil {
 				t.Fatalf("ExtractReceiptsFromSessionDir: %v", err)
@@ -1667,8 +1688,8 @@ func TestAutoAnchorAttemptFailurePaths(t *testing.T) {
 			trig.monitor.hasLastAnchor = true
 			trig.monitor.lastFinalSeq = 0
 			trig.monitor.lastReceiptCount = 1
-			trig.monitor.extractFn = func(string, string) ([]receipt.Receipt, error) { return receipts[:1], nil }
-		}, want: "did not advance"},
+			trig.monitor.walkFn = walkAutoAnchorTestReceipts(receipts[:1])
+		}, want: "writer-observed head"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1678,6 +1699,22 @@ func TestAutoAnchorAttemptFailurePaths(t *testing.T) {
 			trig.monitor.runPass()
 			assertAutoAnchorStats(t, trig.metrics, 1, 0, 1, tt.want)
 		})
+	}
+}
+
+func TestAutoAnchorRejectsUnadvancedCheckpoint(t *testing.T) {
+	trig := newAutoAnchorTestRig(t)
+	emitAutoAnchorReceipt(t, trig.emitter, "https://api.vendor.example/unadvanced")
+	receipts, err := receipt.ExtractReceiptsFromSessionDir(trig.recorder.Dir(), transcriptRootSessionID)
+	if err != nil {
+		t.Fatalf("ExtractReceiptsFromSessionDir: %v", err)
+	}
+	trig.monitor.seeded = true
+	trig.monitor.hasLastAnchor = true
+	trig.monitor.lastReceiptCount = uint64(len(receipts))
+	err = trig.monitor.anchor(trig.cfg.FlightRecorder.Anchor, trig.emitter)
+	if err == nil || !strings.Contains(err.Error(), "did not advance beyond") {
+		t.Fatalf("anchor error = %v, want unadvanced-checkpoint refusal", err)
 	}
 }
 
@@ -1743,7 +1780,7 @@ func newRotatedAutoAnchorChain(t *testing.T) (*recorder.Recorder, *receipt.Emitt
 	}
 	t.Cleanup(func() { _ = recB.Close() })
 	m := metrics.New()
-	emitterB := receipt.NewEmitter(receipt.EmitterConfig{Recorder: recB, PrivKey: privB, ConfigHash: "rotation-b", Principal: "tester", Actor: "runtime-test", Metrics: m})
+	emitterB := receipt.NewEmitter(receipt.EmitterConfig{Recorder: recB, PrivKey: privB, ConfigHash: "rotation-b", Principal: "tester", Actor: "runtime-test", Metrics: m, PriorSignerKeys: []string{fmt.Sprintf("%x", privA.Public().(ed25519.PublicKey))}})
 	if emitterB == nil || emitterB.InitError() != nil {
 		t.Fatalf("rotated NewEmitter = %v, init err = %v", emitterB, emitterB.InitError())
 	}
@@ -1818,3 +1855,58 @@ func assertAutoAnchorStats(t *testing.T, m *metrics.Metrics, attempts, successes
 }
 
 func uint64Pointer(value uint64) *uint64 { return &value }
+
+// The materialized backward trust walk is retained only as an independent
+// compatibility oracle for the streaming runtime path.
+func autoAnchorTrustedKeys(receipts []receipt.Receipt, currentSignerKey string) ([]string, error) {
+	if len(receipts) == 0 {
+		return nil, errors.New("refuse auto-anchor: live receipt chain is empty")
+	}
+	if currentSignerKey == "" {
+		return nil, errors.New("refuse auto-anchor: live receipt emitter signer key is unavailable")
+	}
+	finalSignerKey := receipts[len(receipts)-1].SignerKey
+	if finalSignerKey != currentSignerKey {
+		return nil, fmt.Errorf("refuse auto-anchor: receipt chain head signer %q does not match live emitter signer", finalSignerKey)
+	}
+	// The live emitter key is the only out-of-band trust anchor available to
+	// the runtime. Walk the chain backward and admit a predecessor only when a
+	// receipt signed by the already-trusted successor carries the transition.
+	// Promoting every key merely present in the file would let a forged or
+	// grafted segment enter the trusted set before structural verification.
+	seen := map[string]struct{}{currentSignerKey: {}}
+	trustedKeys := make([]string, 0, 1)
+	trustedKeys = append(trustedKeys, currentSignerKey)
+	expectedKey := currentSignerKey
+	for i := len(receipts) - 1; i >= 0; i-- {
+		rcpt := receipts[i]
+		if rcpt.SignerKey != expectedKey {
+			return nil, fmt.Errorf("refuse auto-anchor: receipt signer %q is not authorized by the live head", rcpt.SignerKey)
+		}
+		if err := receipt.VerifyWithKey(rcpt, expectedKey); err != nil {
+			return nil, fmt.Errorf("refuse auto-anchor: verify receipt under backward trust: %w", err)
+		}
+		transition := rcpt.ActionRecord.KeyTransition
+		if transition == nil {
+			continue
+		}
+		expectedKey = transition.PriorSignerKey
+		if _, ok := seen[expectedKey]; ok {
+			continue
+		}
+		seen[expectedKey] = struct{}{}
+		trustedKeys = append(trustedKeys, expectedKey)
+	}
+	return trustedKeys, nil
+}
+
+func walkAutoAnchorTestReceipts(receipts []receipt.Receipt) func(string, string, recorder.SessionHistoryPrefix, func(receipt.Receipt) error) error {
+	return func(_, _ string, _ recorder.SessionHistoryPrefix, consume func(receipt.Receipt) error) error {
+		for _, r := range receipts {
+			if err := consume(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}

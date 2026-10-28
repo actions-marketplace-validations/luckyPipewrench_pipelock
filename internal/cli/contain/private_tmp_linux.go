@@ -16,9 +16,9 @@ import (
 	"syscall"
 
 	"golang.org/x/sys/unix"
-)
 
-const systemdRunPath = "/usr/bin/systemd-run"
+	"github.com/luckyPipewrench/pipelock/internal/config"
+)
 
 var privateTmpUnitSequence atomic.Uint64
 
@@ -36,15 +36,26 @@ var (
 // required because PrivateTmp creates the service's private mount namespace.
 // plk-launch remains the final process so the existing allow-list and
 // env-clearing contract still apply inside that namespace.
-func privateTmpSystemdRunArgs(uid, gid uint32, groups []uint32, homeDir string, launchEnv, command []string, interactive, collect bool, unit string) []string {
+// display is the resolved DISPLAY value for this launch (operator-supplied or
+// the managed Xvfb fallback), never the raw config. A headed browser reaches
+// its X server through a Unix socket under /tmp/.X11-unix, which PrivateTmp
+// above hides along with the rest of the host /tmp; when display names a
+// local socket, that one socket is bound back in read-only so PrivateTmp
+// never ships without the one path a contained browser actually needs.
+func privateTmpSystemdRunArgs(uid, gid uint32, groups []uint32, homeDir, display string, launchEnv, command []string, interactive, collect bool, unit string) []string {
 	args := []string{
 		"--wait",
 		"--service-type=oneshot",
 		"--expand-environment=no",
 		"--property=PrivateTmp=true",
+		"--property=PrivateNetwork=true",
+		"--property=JoinsNamespaceOf=" + containedNetworkNamespaceUnit,
 		"--uid=" + strconv.FormatUint(uint64(uid), 10),
 		"--gid=" + strconv.FormatUint(uint64(gid), 10),
 		"--working-directory=" + homeDir,
+	}
+	for _, property := range runtimeSocketProperties() {
+		args = append(args, "--property="+property)
 	}
 	if collect {
 		args = append(args, "--collect")
@@ -54,6 +65,9 @@ func privateTmpSystemdRunArgs(uid, gid uint32, groups []uint32, homeDir string, 
 	}
 	if supplementary := supplementaryGroupIDs(groups, gid); len(supplementary) > 0 {
 		args = append(args, "--property=SupplementaryGroups="+strings.Join(supplementary, " "))
+	}
+	if socket, ok := localDisplaySocket(display); ok {
+		args = append(args, "--property=BindReadOnlyPaths="+socket)
 	}
 	for _, entry := range launchEnv {
 		args = append(args, "--setenv="+entry)
@@ -85,10 +99,29 @@ func supplementaryGroupIDs(groups []uint32, primary uint32) []string {
 
 func containedAgentPrivateTmpCommand(opts containedAgentCommandOptions) (*exec.Cmd, string) {
 	command := append([]string{defaultLaunchScript}, opts.args...)
-	launchEnv := containLaunchEnv(opts.agentUserName, opts.homeDir, opts.proxyPort, opts.postureProofPath)
+	launchEnv := containLaunchEnv(opts.agentUserName, opts.homeDir, opts.proxyPort, opts.postureProofPath, opts.display)
 	unit := fmt.Sprintf("pipelock-contain-%d-%d", os.Getpid(), privateTmpUnitSequence.Add(1))
+	if opts.lifecycleUnit != "" {
+		unit = opts.lifecycleUnit
+	}
 	cmd := exec.CommandContext(opts.ctx, systemdRunPath)
-	cmd.Args = append([]string{systemdRunPath}, privateTmpSystemdRunArgs(opts.uid, opts.gid, opts.groups, opts.homeDir, launchEnv, command, isTerminalReader(opts.stdin), false, unit)...)
+	display := opts.display
+	var filesystemProperties []string
+	if opts.filesystem.Mode == config.ContainmentFilesystemModeEnforce {
+		filesystemProperties = opts.filesystem.Properties
+		display = ""
+	}
+	args := privateTmpSystemdRunArgs(opts.uid, opts.gid, opts.groups, opts.homeDir, display, launchEnv, command, isTerminalReader(opts.stdin), false, unit)
+	args = insertSystemdProperties(args, filesystemProperties)
+	args = insertSystemdRuntimeSetting(args, filesystemProperties)
+	if opts.lifecycleRunID != "" {
+		args = append([]string{
+			"--system", "--no-ask-password",
+			"--description=" + lifecycleDescriptionPrefix + opts.lifecycleRunID,
+			"--property=KillMode=control-group", "--property=SendSIGKILL=yes", "--property=TimeoutStopSec=5s", "--property=Restart=no",
+		}, args...)
+	}
+	cmd.Args = append([]string{systemdRunPath}, args...)
 	cmd.Stdin = opts.stdin
 	cmd.Stdout = opts.stdout
 	cmd.Stderr = opts.stderr
@@ -192,7 +225,49 @@ func privateTmpSystemdRunArgsForAgent(env *probeEnv, command []string) ([]string
 	if err != nil {
 		return nil, fmt.Errorf("group ids for %s: %w", env.agentUserName, err)
 	}
-	return privateTmpSystemdRunArgs(uint32(uid), uint32(gid), groups, u.HomeDir, nil, command, false, true, ""), nil
+	return privateTmpSystemdRunArgs(uint32(uid), uint32(gid), groups, u.HomeDir, "", nil, command, false, true, ""), nil
+}
+
+func privateTmpSystemdRunArgsForAgentProperties(env *probeEnv, command, properties []string) ([]string, error) {
+	args, err := privateTmpSystemdRunArgsForAgent(env, command)
+	if err != nil {
+		return nil, err
+	}
+	return insertSystemdRuntimeSetting(insertSystemdProperties(args, properties), properties), nil
+}
+
+func insertSystemdRuntimeSetting(args, properties []string) []string {
+	for i, arg := range args {
+		if arg == "--" {
+			out := append([]string{}, args[:i]...)
+			out = append(out, "--setenv="+runtimeProtectHomeSetting(properties))
+			return append(out, args[i:]...)
+		}
+	}
+	return append(args, "--setenv="+runtimeProtectHomeSetting(properties))
+}
+
+func insertSystemdProperties(args, properties []string) []string {
+	if len(properties) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args)+len(properties))
+	inserted := false
+	for _, arg := range args {
+		if !inserted && arg == "--" {
+			for _, prop := range properties {
+				out = append(out, "--property="+prop)
+			}
+			inserted = true
+		}
+		out = append(out, arg)
+	}
+	if !inserted {
+		for _, prop := range properties {
+			out = append(out, "--property="+prop)
+		}
+	}
+	return out
 }
 
 func isTerminalReader(reader any) bool {

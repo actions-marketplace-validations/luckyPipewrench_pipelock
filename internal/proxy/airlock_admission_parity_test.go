@@ -4,6 +4,7 @@
 package proxy
 
 import (
+	"bytes"
 	"fmt"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
@@ -53,6 +55,29 @@ func airlockAdmissionConfig(t *testing.T, tier string) *config.Config {
 	return cfg
 }
 
+// airlockEvidenceLogger models independent enforced evidence arriving during a
+// warned scan. Warnings themselves must never create quarantine. This preserves
+// the admission/recorder interleaving exercised by the lifecycle tests.
+func airlockEvidenceLogger(t *testing.T, cfg *config.Config, p *Proxy, rec *SessionState, scope string, observe func([]byte)) *audit.Logger {
+	t.Helper()
+	var seeded atomic.Bool
+	var logger *audit.Logger
+	var err error
+	logger, err = audit.NewWithStream("json", "stdout", "", true, true, airlockLogCallback(func(record []byte) {
+		if observe != nil {
+			observe(record)
+		}
+		if (bytes.Contains(record, []byte(`"event":"header_dlp"`)) || bytes.Contains(record, []byte(`"event":"anomaly"`))) && seeded.CompareAndSwap(false, true) {
+			recordAdaptiveSignalForScope(rec, scope, session.SignalNearMiss, &cfg.AdaptiveEnforcement, &cfg.Airlock, decide.EscalationParams{Threshold: cfg.AdaptiveEnforcement.EscalationThreshold, Logger: logger, Metrics: p.metrics})
+		}
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
+	return logger
+}
+
 func TestAirlockAdmissionAfterHeaderFinding(t *testing.T) {
 	for _, tc := range []struct {
 		name, transport, method, trigger, initial string
@@ -71,10 +96,14 @@ func TestAirlockAdmissionAfterHeaderFinding(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
-			rp, p, upstream := newReverseParityHarness(t, airlockAdmissionConfig(t, tc.trigger), func(w http.ResponseWriter, _ *http.Request) {
+			cfg := airlockAdmissionConfig(t, tc.trigger)
+			rp, p, upstream := newReverseParityHarness(t, cfg, func(w http.ResponseWriter, _ *http.Request) {
 				calls.Add(1)
 				_, _ = fmt.Fprint(w, "upstream-control")
 			})
+			rec := p.sessionMgrPtr.Load().GetOrCreate(airlockAdmissionClient)
+			logger := airlockEvidenceLogger(t, cfg, p, rec, adaptiveScopeForHost(upstream.Hostname()), nil)
+			p.logger, rp.logger = logger, logger
 			if tc.initial != "" {
 				sess := p.sessionMgrPtr.Load().GetOrCreate(airlockAdmissionClient)
 				_, _, _ = sess.AirlockForScope(adaptiveScopeForHost(upstream.Hostname())).SetTier(tc.initial)
@@ -150,6 +179,15 @@ func TestAirlockResponseSignalUsesFinalOrigin(t *testing.T) {
 				p.handleFetch(w, req)
 			} else {
 				p.handleForwardHTTP(w, req)
+				if w.Code != http.StatusFound || calls.Load() != 0 || w.Header().Get("Location") != finalURL+"/result" {
+					t.Fatalf("forward redirect was not client-owned: status=%d calls=%d location=%q", w.Code, calls.Load(), w.Header().Get("Location"))
+				}
+				// The final response belongs to a new client request. Its
+				// taint signal must still attach only to that actual origin.
+				follow := httptest.NewRequestWithContext(t.Context(), http.MethodGet, w.Header().Get("Location"), nil)
+				follow.RemoteAddr = req.RemoteAddr
+				w = httptest.NewRecorder()
+				p.handleForwardHTTP(w, follow)
 			}
 			if w.Code != http.StatusOK || calls.Load() != 1 || strings.Contains(w.Body.String(), airlockResponseMarker) || !strings.Contains(w.Body.String(), "ordinary text") {
 				t.Fatalf("response control failed: status=%d calls=%d body=%s", w.Code, calls.Load(), w.Body.String())
@@ -218,6 +256,20 @@ func TestAirlockCleanRecoveryUsesFinalOrigin(t *testing.T) {
 					p.handleFetch(w, req)
 				} else {
 					p.handleForwardHTTP(w, req)
+					if redirected {
+						if w.Code != http.StatusFound || calls.Load() != 0 || w.Header().Get("Location") != final.URL+"/result" {
+							t.Fatalf("forward redirect was not client-owned: status=%d calls=%d location=%q", w.Code, calls.Load(), w.Header().Get("Location"))
+						}
+						// Delivering the clean 302 is an actual response from
+						// the original origin. Only it can recover at this point.
+						if sess.EffectiveEscalationLevel(originalScope) != 0 || sess.EffectiveEscalationLevel(finalScope) != 1 {
+							t.Fatalf("redirect response recovered the wrong scope: original=%d final=%d", sess.EffectiveEscalationLevel(originalScope), sess.EffectiveEscalationLevel(finalScope))
+						}
+						follow := httptest.NewRequestWithContext(t.Context(), http.MethodGet, w.Header().Get("Location"), nil)
+						follow.RemoteAddr = req.RemoteAddr
+						w = httptest.NewRecorder()
+						p.handleForwardHTTP(w, follow)
+					}
 				}
 				if w.Code != http.StatusOK || calls.Load() != 1 || !strings.Contains(w.Body.String(), "ordinary clean response") {
 					t.Fatalf("clean response control failed: status=%d calls=%d body=%s", w.Code, calls.Load(), w.Body.String())
@@ -225,8 +277,12 @@ func TestAirlockCleanRecoveryUsesFinalOrigin(t *testing.T) {
 				if got := sess.EffectiveEscalationLevel(finalScope); got != 0 {
 					t.Errorf("final response scope level=%d, want normal", got)
 				}
-				if got := sess.EffectiveEscalationLevel(originalScope); got != 1 {
-					t.Errorf("unrelated redirecting scope level=%d, want unchanged elevated", got)
+				wantOriginal := 1
+				if transport == TransportForward && redirected {
+					wantOriginal = 0 // Its own clean redirect was delivered separately.
+				}
+				if got := sess.EffectiveEscalationLevel(originalScope); got != wantOriginal {
+					t.Errorf("original scope level=%d, want %d after actual delivered responses", got, wantOriginal)
 				}
 			})
 		}

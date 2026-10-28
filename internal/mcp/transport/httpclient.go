@@ -6,6 +6,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/responseencoding"
 )
 
 // ErrStreamNotSupported indicates the upstream server returned HTTP 405 for
@@ -46,20 +50,7 @@ var ErrInvalidPipelockSessionToken = errors.New("invalid Pipelock session token"
 
 const pipelockSessionTokenHeader = "Pipelock-Session-Token"
 
-// hasNonIdentityEncoding mirrors internal/proxy/bodyscan.hasNonIdentityEncoding.
-// Duplicated here to avoid an import cycle (proxy depends on mcp/transport).
-func hasNonIdentityEncoding(ce string) bool {
-	if ce == "" {
-		return false
-	}
-	for _, enc := range strings.Split(ce, ",") {
-		enc = strings.TrimSpace(strings.ToLower(enc))
-		if enc != "" && enc != "identity" {
-			return true
-		}
-	}
-	return false
-}
+const mcpProtocolVersionHeader = "Mcp-Protocol-Version"
 
 func validPipelockSessionToken(token string) bool {
 	if len(token) != 43 {
@@ -91,12 +82,18 @@ func HasSingleSSEContentType(header http.Header) bool {
 // transport specification, handling both JSON and SSE response types,
 // session ID tracking, and 202 Accepted for notifications.
 type HTTPClient struct {
+	// ResponseKeyValidator is installed by the MCP pipeline before use. It
+	// gates transport state while leaving rejected bytes for pipeline diagnostics.
+	ResponseKeyValidator func([]byte) error
+
 	url                  string
 	headers              http.Header
 	client               *http.Client
 	sessionMu            sync.Mutex
 	sessionID            string
 	listenerSessionToken string
+	protocolVersion      string
+	initializeGeneration uint64
 }
 
 // NewHTTPClient creates an HTTPClient that POSTs JSON-RPC messages to url.
@@ -159,18 +156,45 @@ func (c *HTTPClient) SessionID() string {
 	return c.sessionID
 }
 
+// ProtocolVersion returns the version learned from the initialize response.
+func (c *HTTPClient) ProtocolVersion() string {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	return c.protocolVersion
+}
+
+// HTTPMessageOptions supplies per-message metadata and an optional shared raw
+// response budget. A non-nil Headers replaces static routing/parameter headers:
+// MCP 2026-07-28 Streamable HTTP "Client Behavior" requires body-derived values.
+// The budget counts decoded bytes before SSE framing, including comments.
+type HTTPMessageOptions struct {
+	Headers            http.Header
+	ResponseByteBudget *int
+	// PreserveSession keeps private requests from changing the caller's
+	// session ID or listener token. Existing state still accompanies the send.
+	PreserveSession bool
+}
+
 // SendMessage POSTs msg as a JSON-RPC 2.0 request and returns a MessageReader
 // for reading the response. The caller must drain the reader to release resources.
 //
 // Response handling:
-//   - 202 Accepted: returns an emptyReader (EOF immediately). Used for notifications.
+//   - 202 Accepted, 204 No Content, or another declared-empty 2xx: returns an
+//     emptyReader (EOF immediately). Used for notifications.
 //   - 200 OK: response body is scanned by the returned reader.
+//   - 4xx carrying the JSON-RPC error for this request: returned as the response
+//     so the caller scans and forwards the upstream's own answer.
 //   - Content-Type: text/event-stream: wraps body in SSEReader via closingSSEReader.
 //   - Other Content-Types (typically application/json): reads body as a single message.
 //   - Other status codes: returns an error (body is closed).
 //
 // The Mcp-Session-Id header is tracked from responses and sent on subsequent requests.
 func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader, error) {
+	return c.SendMessageWithOptions(ctx, msg, HTTPMessageOptions{})
+}
+
+// SendMessageWithOptions sends one message with body-derived request metadata.
+func (c *HTTPClient) SendMessageWithOptions(ctx context.Context, msg []byte, opts HTTPMessageOptions) (MessageReader, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(msg))
 	if err != nil {
 		return nil, fmt.Errorf("creating request: %w", err)
@@ -185,6 +209,7 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	responseencoding.RequestIdentity(req.Header)
 
 	// Always remove any caller-supplied Mcp-Session-Id BEFORE the conditional
 	// Set below: on the first request c.sessionID is empty and Set is skipped,
@@ -197,7 +222,16 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 	req.Header.Del(pipelockSessionTokenHeader)
 
 	// Include Pipelock-managed correlation state if established.
+	initializeID := httpInitializeRequestID(msg)
 	c.sessionMu.Lock()
+	if initializeID != nil {
+		c.initializeGeneration++
+		c.protocolVersion = ""
+	}
+	generation := c.initializeGeneration
+	if c.protocolVersion != "" {
+		req.Header.Set(mcpProtocolVersionHeader, c.protocolVersion)
+	}
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}
@@ -205,6 +239,18 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 		req.Header.Set(pipelockSessionTokenHeader, c.listenerSessionToken)
 	}
 	c.sessionMu.Unlock()
+
+	if opts.Headers != nil {
+		for name := range req.Header {
+			lower := strings.ToLower(name)
+			if lower == "mcp-method" || lower == "mcp-name" || strings.HasPrefix(lower, "mcp-param-") {
+				delete(req.Header, name)
+			}
+		}
+		for name, values := range opts.Headers {
+			req.Header[name] = append([]string(nil), values...)
+		}
+	}
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -220,6 +266,9 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 		if token != "" && !validPipelockSessionToken(token) {
 			return ErrInvalidPipelockSessionToken
 		}
+		if opts.PreserveSession {
+			return nil
+		}
 		c.sessionMu.Lock()
 		defer c.sessionMu.Unlock()
 		if sid != "" {
@@ -231,8 +280,10 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 		return nil
 	}
 
-	// 202 Accepted: notification acknowledged, no body to read.
-	if resp.StatusCode == http.StatusAccepted {
+	// An empty 2xx acknowledges a notification or client response; there is
+	// no message to read. A request is owed an answer, so only the legacy 202
+	// acknowledges one.
+	if AcceptedWithoutBody(resp) && (resp.StatusCode == http.StatusAccepted || !ExpectsReply(msg)) {
 		if err := trackSessionID(); err != nil {
 			_ = resp.Body.Close()
 			return nil, err
@@ -249,45 +300,345 @@ func (c *HTTPClient) SendMessage(ctx context.Context, msg []byte) (MessageReader
 	}
 
 	// Error status codes: do not echo attacker-controlled upstream body bytes
-	// into returned errors; callers commonly log these strings.
+	// into returned errors; callers commonly log these strings. A 4xx that
+	// carries the JSON-RPC error answering this request is the upstream's
+	// reply, not a transport failure, so it goes back to the caller as the
+	// response and through the same scanning as any other.
 	if resp.StatusCode >= 400 {
+		if IsClientError(resp.StatusCode) {
+			if requestID, ok := clientErrorCandidate(resp, msg); ok {
+				// The body is read on the first ReadMessage, not here, so the
+				// caller's per-response timeout bounds a refusal that sends
+				// headers and then stalls, exactly as it bounds a 200 body.
+				return &clientErrorReader{resp: resp, requestID: requestID}, nil
+			}
+		}
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Only 200 OK and 202 Accepted are valid successful POST responses for
-	// this transport. Treat other 2xx statuses (201/203/204/206/etc.) as
-	// unexpected upstream responses instead of normalizing them to success.
+	// Only 200 OK and the empty acknowledgements above are valid successful
+	// POST responses for this transport. Treat a 2xx that carries content on
+	// any other status (201/203/206/etc.) as an unexpected upstream response
+	// instead of normalizing it to success.
 	if resp.StatusCode != http.StatusOK {
 		_ = resp.Body.Close()
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	if err := trackSessionID(); err != nil {
+	// Header syntax is checked immediately, but response-derived session state
+	// is admitted only after the first message passes key validation.
+	if token := resp.Header.Get(pipelockSessionTokenHeader); token != "" && !validPipelockSessionToken(token) {
 		_ = resp.Body.Close()
-		return nil, err
+		return nil, ErrInvalidPipelockSessionToken
 	}
 
-	// Fail closed on compressed responses before wrapping the body in
-	// SingleMessageReader or SSEReader. Both readers see opaque bytes
-	// after this point; gzip/br/zstd would otherwise reach downstream
-	// scanners as binary garbage and never trigger the body-scan guards.
-	// DisableCompression on the transport guarantees the encoding header
-	// survives transparent decompression, so this check is authoritative.
-	if hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
-		_ = resp.Body.Close()
-		return nil, ErrCompressedResponse
+	if c.ResponseKeyValidator == nil {
+		if err := trackSessionID(); err != nil {
+			_ = resp.Body.Close()
+			return nil, err
+		}
+	}
+
+	// Decode supported buffered JSON responses before scanning. Compressed SSE,
+	// unsupported encodings, and malformed streams stay fail-closed.
+	if responseencoding.HasNonIdentityContentEncoding(resp.Header) {
+		if HasSingleSSEContentType(resp.Header) {
+			_ = resp.Body.Close()
+			return nil, ErrCompressedResponse
+		}
+		if err := responseencoding.DecodeResponse(resp); err != nil {
+			_ = resp.Body.Close()
+			return nil, ErrCompressedResponse
+		}
+	}
+
+	if opts.ResponseByteBudget != nil {
+		resp.Body = &budgetResponseBody{body: resp.Body, remaining: opts.ResponseByteBudget}
 	}
 
 	// Route based on Content-Type.
+	var reader interface {
+		MessageReader
+		io.Closer
+	}
 	if HasSingleSSEContentType(resp.Header) {
-		return &closingSSEReader{
+		reader = &closingSSEReader{
 			sse:  NewSSEReader(resp.Body),
 			body: resp.Body,
-		}, nil
+		}
+	} else {
+		reader = &SingleMessageReader{Body: resp.Body}
 	}
+	if c.ResponseKeyValidator != nil {
+		reader = &sessionResponseReader{reader: reader, validate: c.ResponseKeyValidator, commit: trackSessionID}
+	}
+	if initializeID != nil {
+		reader = &initializeResponseReader{reader: reader, client: c, id: initializeID, generation: generation}
+	}
+	return reader, nil
+}
 
-	// Default: treat as single JSON message.
-	return &SingleMessageReader{Body: resp.Body}, nil
+// sessionResponseReader defers header-state admission until a framed message
+// passes the caller's key guard. Invalid bytes still reach the response scanner.
+type sessionResponseReader struct {
+	reader interface {
+		MessageReader
+		io.Closer
+	}
+	validate func([]byte) error
+	commit   func() error
+	mu       sync.Mutex // guards admission against concurrent timeout cleanup
+	done     bool
+	closed   bool
+}
+
+func (r *sessionResponseReader) ReadMessage() ([]byte, error) {
+	msg, err := r.reader.ReadMessage()
+	if err != nil {
+		return msg, err
+	}
+	if r.validate != nil && r.validate(msg) != nil {
+		return msg, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.done || r.closed {
+		return msg, nil
+	}
+	if err := r.commit(); err != nil {
+		return nil, err
+	}
+	r.done = true
+	return msg, nil
+}
+
+func (r *sessionResponseReader) Close() error {
+	// A worker may already have the bytes when cleanup closes the body. Revoke
+	// admission before closing it, with the same lock held during commitment.
+	r.mu.Lock()
+	r.closed = true
+	r.mu.Unlock()
+	return r.reader.Close()
+}
+
+// Protocol negotiation observes framed responses without consuming or changing
+// the bytes that the MCP scanners receive. Only a matching initialize result can
+// change the transport header, including when SSE carries other messages first.
+type initializeResponseReader struct {
+	reader interface {
+		MessageReader
+		io.Closer
+	}
+	client     *HTTPClient
+	id         any
+	generation uint64
+	done       bool
+	closed     bool // guarded by client.sessionMu, alongside version commitment
+}
+
+func httpRPCID(raw json.RawMessage) any {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var id any
+	if decoder.Decode(&id) != nil {
+		return nil
+	}
+	switch id.(type) {
+	case string, json.Number:
+		return id
+	default:
+		return nil
+	}
+}
+
+// clientErrorCandidate reports whether a 4xx reply may carry the JSON-RPC
+// error answering the request in msg: the request has a method and an ID, and
+// the reply declares exactly one application/json type. It returns the
+// request's raw ID. The body is not read here.
+func clientErrorCandidate(resp *http.Response, msg []byte) (json.RawMessage, bool) {
+	var request map[string]json.RawMessage
+	if json.Unmarshal(msg, &request) != nil || request["method"] == nil || httpRPCID(request["id"]) == nil {
+		return nil, false
+	}
+	contentTypes := resp.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		return nil, false
+	}
+	if mediaType, _, err := mime.ParseMediaType(contentTypes[0]); err != nil || mediaType != "application/json" {
+		return nil, false
+	}
+	return request["id"], true
+}
+
+// UpstreamRequestFailedMessage is the error message a caller sees when an
+// upstream refusal cannot be relayed. It matches the message the MCP bridges
+// write for any other failed upstream request, so the two read the same.
+const UpstreamRequestFailedMessage = "pipelock: upstream error: upstream HTTP request failed"
+
+// clientErrorReader yields a 4xx reply as one message. A body that is the
+// JSON-RPC error for this request is returned as-is, for the caller to scan.
+// Anything else becomes a sanitized error carrying the request's ID, so the
+// caller is answered without any upstream bytes. A notification never gets
+// here: it has no ID to answer.
+type clientErrorReader struct {
+	resp      *http.Response
+	requestID json.RawMessage
+	done      bool
+}
+
+func (r *clientErrorReader) ReadMessage() ([]byte, error) {
+	if r.done {
+		return nil, io.EOF
+	}
+	r.done = true
+	body, err := ReadClientErrorBody(r.resp)
+	_ = r.resp.Body.Close()
+	if errors.Is(err, ErrIncompleteResponse) {
+		// Cancellation, a deadline or a dropped connection: report it the way
+		// SingleMessageReader reports a broken 200 body, not as an answer.
+		return nil, err
+	}
+	if err == nil && IsClientErrorReply(body, r.requestID) {
+		return body, nil
+	}
+	return sanitizedClientErrorReply(r.requestID), nil
+}
+
+// Close releases the body so a caller can abort a read that stalls.
+func (r *clientErrorReader) Close() error {
+	return r.resp.Body.Close()
+}
+
+// sanitizedClientErrorReply is composed directly rather than encoded: id is a
+// JSON string or number already accepted by httpRPCID, and the rest is
+// constant, so the bytes are exactly what an encoder would produce.
+func sanitizedClientErrorReply(id json.RawMessage) []byte {
+	return []byte(`{"jsonrpc":"2.0","id":` + string(id) + `,"error":{"code":-32003,"message":"` + UpstreamRequestFailedMessage + `"}}`)
+}
+
+// IsClientErrorReply reports whether body is a JSON-RPC error answering id.
+// Both HTTP transports use this guard before relaying a refusal as a message.
+func IsClientErrorReply(body []byte, id json.RawMessage) bool {
+	requestID := httpRPCID(id)
+	if requestID == nil {
+		return false
+	}
+	replyID, ok := jsonRPCErrorReplyID(body)
+	return ok && httpRPCID(replyID) == requestID
+}
+
+// IsUncorrelatedErrorReply reports whether body is a JSON-RPC error whose ID
+// is null. JSON-RPC 2.0 requires the id member in every response and sets it to
+// null when the request could not be identified: the MCP reference server sends
+// "Session not found" with a 404 and id null, and the specification tells a
+// client to start a new session on that 404. Such an error answers no
+// in-flight request, so a client cannot mistake it for another call's outcome.
+// An absent id is a malformed response, not an uncorrelated one.
+func IsUncorrelatedErrorReply(body []byte) bool {
+	replyID, ok := jsonRPCErrorReplyID(body)
+	return ok && string(replyID) == "null"
+}
+
+// jsonRPCErrorReplyID returns the raw ID of body when body is exactly a
+// JSON-RPC 2.0 error: no result, method or params, an error object with an
+// integer code and a string message, and no duplicate or case-folded envelope
+// keys a client might read instead.
+func jsonRPCErrorReplyID(body []byte) (json.RawMessage, bool) {
+	var reply map[string]json.RawMessage
+	if json.Unmarshal(body, &reply) != nil || jsonscan.RejectDuplicateKeys(body) != nil ||
+		jsonscan.RejectCaseFoldedAliases(body, "jsonrpc", "id", "method", "result", "error", "params") != nil {
+		return nil, false
+	}
+	var version string
+	if json.Unmarshal(reply["jsonrpc"], &version) != nil || version != "2.0" ||
+		reply["method"] != nil || reply["result"] != nil || reply["params"] != nil ||
+		!validJSONRPCErrorObject(reply["error"]) {
+		return nil, false
+	}
+	return reply["id"], true
+}
+
+// validJSONRPCErrorObject reports whether raw is an object whose code is an
+// integer and whose message is a string, the two members the JSON-RPC 2.0
+// specification requires of every error.
+func validJSONRPCErrorObject(raw json.RawMessage) bool {
+	// A map keeps member names exact: struct decoding would match "Code" and
+	// "Message" case-insensitively and accept an error a client reads as empty.
+	var errObj map[string]json.RawMessage
+	var message *string
+	if len(raw) == 0 || raw[0] != '{' || json.Unmarshal(raw, &errObj) != nil ||
+		json.Unmarshal(errObj["message"], &message) != nil || message == nil {
+		return false
+	}
+	code := errObj["code"]
+	// Read the raw token so a quoted code such as "-32001", which json.Number
+	// would accept, is refused.
+	if len(code) == 0 || (code[0] != '-' && (code[0] < '0' || code[0] > '9')) {
+		return false
+	}
+	_, err := json.Number(code).Int64()
+	return err == nil
+}
+
+func httpInitializeRequestID(msg []byte) any {
+	var request map[string]json.RawMessage
+	if json.Unmarshal(msg, &request) != nil {
+		return nil
+	}
+	var method, version string
+	if json.Unmarshal(request["method"], &method) != nil || method != "initialize" ||
+		json.Unmarshal(request["jsonrpc"], &version) != nil || version != "2.0" ||
+		jsonscan.RejectDuplicateKeys(msg) != nil {
+		return nil
+	}
+	return httpRPCID(request["id"])
+}
+
+func (r *initializeResponseReader) ReadMessage() ([]byte, error) {
+	msg, err := r.reader.ReadMessage()
+	if err != nil || r.done {
+		return msg, err
+	}
+	if r.client.ResponseKeyValidator != nil && r.client.ResponseKeyValidator(msg) != nil {
+		return msg, nil
+	}
+	var response map[string]json.RawMessage
+	if json.Unmarshal(msg, &response) != nil || jsonscan.RejectDuplicateKeys(msg) != nil ||
+		httpRPCID(response["id"]) != r.id {
+		return msg, nil
+	}
+	var rpcVersion string
+	if json.Unmarshal(response["jsonrpc"], &rpcVersion) != nil || rpcVersion != "2.0" || response["method"] != nil {
+		return msg, nil
+	}
+	r.done = true
+	if response["error"] != nil {
+		return msg, nil
+	}
+	var result map[string]json.RawMessage
+	var version string
+	if json.Unmarshal(response["result"], &result) != nil ||
+		json.Unmarshal(result["protocolVersion"], &version) != nil || len(version) != len(time.DateOnly) {
+		return msg, nil
+	}
+	if _, err := time.Parse(time.DateOnly, version); err != nil {
+		return msg, nil
+	}
+	r.client.sessionMu.Lock()
+	if !r.closed && r.client.initializeGeneration == r.generation {
+		r.client.protocolVersion = version
+	}
+	r.client.sessionMu.Unlock()
+	return msg, nil
+}
+
+func (r *initializeResponseReader) Close() error {
+	// Abort negotiation before closing the body: a concurrent read may already
+	// have obtained a response and otherwise commit it after this Close returns.
+	r.client.sessionMu.Lock()
+	r.closed = true
+	r.client.sessionMu.Unlock()
+	return r.reader.Close()
 }
 
 // emptyReader returns io.EOF on every ReadMessage call.
@@ -317,7 +668,7 @@ func (r *SingleMessageReader) ReadMessage() ([]byte, error) {
 	data, err := io.ReadAll(io.LimitReader(r.Body, int64(MaxLineSize)+1))
 	_ = r.Body.Close() // best-effort cleanup after read
 	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
+		return nil, fmt.Errorf("%w: reading response body: %w", ErrIncompleteResponse, err)
 	}
 	if len(data) > MaxLineSize {
 		return nil, fmt.Errorf("response body exceeds maximum size (%d bytes)", MaxLineSize)
@@ -380,10 +731,14 @@ func (c *HTTPClient) OpenGETStream(ctx context.Context) (MessageReader, error) {
 		}
 	}
 	req.Header.Set("Accept", "text/event-stream")
+	responseencoding.RequestIdentity(req.Header)
 
 	c.sessionMu.Lock()
 	req.Header.Del("Mcp-Session-Id")
 	req.Header.Del(pipelockSessionTokenHeader)
+	if c.protocolVersion != "" {
+		req.Header.Set(mcpProtocolVersionHeader, c.protocolVersion)
+	}
 	if c.sessionID != "" {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}
@@ -424,7 +779,7 @@ func (c *HTTPClient) OpenGETStream(ctx context.Context) (MessageReader, error) {
 	// SSEReader receives opaque bytes and would silently fail to parse a
 	// gzipped event stream, which is a bypass vector against the streaming
 	// scanners.
-	if hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+	if responseencoding.HasNonIdentityContentEncoding(resp.Header) {
 		_ = resp.Body.Close()
 		return nil, ErrCompressedResponse
 	}
@@ -447,6 +802,10 @@ func (c *HTTPClient) DeleteSession(logW io.Writer) {
 	c.sessionMu.Lock()
 	sid := c.sessionID
 	listenerToken := c.listenerSessionToken
+	version := c.protocolVersion
+	// Invalidate outstanding initialize readers even for stateless upstreams.
+	c.initializeGeneration++
+	c.protocolVersion = ""
 	c.sessionMu.Unlock()
 	if sid == "" && listenerToken == "" {
 		return
@@ -473,8 +832,12 @@ func (c *HTTPClient) DeleteSession(logW io.Writer) {
 			req.Header.Add(key, v)
 		}
 	}
+	responseencoding.RequestIdentity(req.Header)
 	req.Header.Del("Mcp-Session-Id")
 	req.Header.Del(pipelockSessionTokenHeader)
+	if version != "" {
+		req.Header.Set(mcpProtocolVersionHeader, version)
+	}
 	if sid != "" {
 		req.Header.Set("Mcp-Session-Id", sid)
 	}
@@ -504,3 +867,27 @@ func (c *HTTPClient) DeleteSession(logW io.Writer) {
 		_, _ = fmt.Fprintf(logW, "pipelock: session delete: server returned HTTP %d\n", resp.StatusCode)
 	}
 }
+
+// budgetResponseBody charges bytes even when SSE discards them as framing. Read
+// one byte beyond the budget to distinguish an exact-size body from overflow.
+type budgetResponseBody struct {
+	body      io.ReadCloser
+	remaining *int
+}
+
+func (r *budgetResponseBody) Read(p []byte) (int, error) {
+	if *r.remaining < 0 {
+		return 0, errors.New("discovery inventory exceeds response byte budget")
+	}
+	if len(p) > *r.remaining+1 {
+		p = p[:*r.remaining+1]
+	}
+	n, err := r.body.Read(p)
+	*r.remaining -= n
+	if *r.remaining < 0 {
+		return 0, errors.New("discovery inventory exceeds response byte budget")
+	}
+	return n, err
+}
+
+func (r *budgetResponseBody) Close() error { return r.body.Close() }

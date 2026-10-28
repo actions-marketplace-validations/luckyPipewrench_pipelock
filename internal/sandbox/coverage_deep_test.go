@@ -18,6 +18,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 // ---------------------------------------------------------------------------
@@ -124,10 +126,9 @@ func TestPrepareSandboxCmd_SetsIOStreams(t *testing.T) {
 	}
 }
 
-// NOTE: LaunchStandalone strict mode tests are not included because strict
-// mode blocks clone3 via seccomp, which prevents the Go runtime from
-// creating threads in the re-exec'd subprocess (cgo uses pthread_create).
 // Strict standalone mode is tested via the full binary integration tests.
+// Native pthread and Node compatibility with the strict seccomp filter is
+// covered separately by the linux/amd64 seccomp thread regressions.
 
 // ---------------------------------------------------------------------------
 // LaunchStandalone: proxy handler path with custom handler.
@@ -953,12 +954,12 @@ func TestLaunchStandalone_CustomPolicy(t *testing.T) {
 
 	policy := &Policy{
 		Workspace:     workspace,
-		AllowReadDirs: []string{"/usr/", "/lib/", "/lib64/", "/bin/", "/sbin/", "/etc/ssl/", "/etc/pki/", "/proc/self/"},
-		AllowReadFiles: []string{
+		AllowReadDirs: existingPaths([]string{"/usr/", "/lib/", "/lib64/", "/bin/", "/sbin/", "/etc/ssl/", "/etc/pki/", "/proc/self/"}),
+		AllowReadFiles: existingPaths([]string{
 			"/etc/resolv.conf", "/etc/hosts", "/etc/nsswitch.conf",
 			"/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/passwd", "/etc/group",
-		},
-		AllowRWDirs:  []string{workspace, "/dev/shm/"},
+		}),
+		AllowRWDirs:  existingPaths([]string{workspace, "/dev/shm/"}),
 		AllowRWFiles: []string{"/dev/null", "/dev/zero", "/dev/urandom"},
 	}
 	err := LaunchStandalone(StandaloneLaunchConfig{
@@ -1085,7 +1086,7 @@ func TestSetChildSubreaper_Deep(t *testing.T) {
 	if runtime.GOOS != osLinux {
 		t.Skip("linux only")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(5*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^$")
 	cmd.Env = append(os.Environ(), deepSubreapTestEnv+"=set-subreaper")
@@ -1099,7 +1100,7 @@ func TestReapOrphans_Deep(t *testing.T) {
 	if runtime.GOOS != osLinux {
 		t.Skip("linux only")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(5*time.Second))
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", "-test.run=^$")
 	cmd.Env = append(os.Environ(), deepSubreapTestEnv+"=reap-orphans")
@@ -1126,7 +1127,7 @@ func TestWaitForUserNamespaceProbeChildTimeout(t *testing.T) {
 		t.Skip("linux only")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(time.Second))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "sleep", "5")
@@ -1143,14 +1144,14 @@ func TestWaitForUserNamespaceProbeChildSuccess(t *testing.T) {
 		t.Skip("linux only")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(time.Second))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "true")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start true child: %v", err)
 	}
-	if !waitForUserNamespaceProbeChild(cmd.Process.Pid, time.Second) {
+	if !waitForUserNamespaceProbeChild(cmd.Process.Pid, testwait.Deadline(time.Second)) {
 		t.Fatal("expected fast-exiting probe child to be reaped successfully")
 	}
 }
@@ -1160,14 +1161,14 @@ func TestWaitForUserNamespaceProbeChildAlreadyReaped(t *testing.T) {
 		t.Skip("linux only")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testwait.Deadline(time.Second))
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "true")
 	if err := cmd.Run(); err != nil {
 		t.Fatalf("run true child: %v", err)
 	}
-	if waitForUserNamespaceProbeChild(cmd.Process.Pid, time.Second) {
+	if waitForUserNamespaceProbeChild(cmd.Process.Pid, testwait.Deadline(time.Second)) {
 		t.Fatal("expected already-reaped probe child to report false")
 	}
 }
@@ -1441,7 +1442,7 @@ func TestDetect_SELinuxField(t *testing.T) {
 
 func TestBuildRules_EmptyPolicy(t *testing.T) {
 	policy := Policy{}
-	rules := buildRules(policy)
+	rules := buildRules(policy, 1)
 	if len(rules) != 0 {
 		t.Errorf("expected 0 rules for empty policy, got %d", len(rules))
 	}
@@ -1454,7 +1455,7 @@ func TestBuildRules_AllSlicesFilled(t *testing.T) {
 		AllowRWDirs:    []string{"/tmp/work"},
 		AllowRWFiles:   []string{"/dev/null"},
 	}
-	rules := buildRules(policy)
+	rules := buildRules(policy, 1)
 	if len(rules) != 4 {
 		t.Errorf("expected 4 rules, got %d", len(rules))
 	}
@@ -1470,7 +1471,7 @@ func TestRlimitConstants(t *testing.T) {
 		got  uint64
 		want uint64
 	}{
-		{name: "nproc", got: rlimitNProc, want: 4096},
+		{name: "nproc", got: rlimitNProc, want: 8192},
 		{name: "nproc headroom", got: rlimitNProcHeadroom, want: 1024},
 		{name: "nofile", got: rlimitNoFile, want: 4096},
 		{name: "fsize", got: rlimitFSize, want: 1 << 30},

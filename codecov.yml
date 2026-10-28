@@ -1,9 +1,13 @@
 codecov:
   require_ci_to_pass: true
   notify:
-    # CI uploads seven coverage reports on a successful run: the six Go 1.25
-    # enterprise shards (proxy, scanner, mcp, rest-0, rest-1, rest-2) plus the
-    # merged sandbox subprocess profile. Codecov posts its verdict once this
+    # CI uploads 23 coverage reports on a successful run: every no-race
+    # Go 1.26 shard (scripts/ci_test_packages.py --list-unit-shards) under
+    # both build variants, plus the merged sandbox subprocess profile.
+    # Both build variants are needed because enterprise profiles exclude
+    # Apache-only stubs. The race lane runs on main only and uploads nothing,
+    # so pull requests and main expect the same count.
+    # Codecov posts its verdict once this
     # many uploads arrive and does not wait for the rest, so this must equal
     # the real upload count.
     #
@@ -13,7 +17,7 @@ codecov:
     # the check failed before flipping to pass minutes later. That is
     # indistinguishable from a real regression while you are looking at it.
     # scripts/check-codecov-upload-count.sh now fails if the two disagree.
-    after_n_builds: 7
+    after_n_builds: 23
     wait_for_ci: true
 
 parsers:
@@ -66,6 +70,10 @@ ignore:
   # those code paths from the in-tree test process; integration testing
   # happens via `make bench-egress` instead.
   - "bench/egress/**"
+  # Signed-receipt load harness: starts a real pipelock process per mode,
+  # drives it over loopback, and verifies the recorder chain with the CLI.
+  # Exercised by running scripts/receipt-load/run.sh, not by unit tests.
+  - "scripts/receipt-load/**"
   # Playground/demo harnesses exercise full subprocess, VM, LLM, browser, and
   # live-proxy flows. They are validated through integration/demo tests and
   # published audit-packet verification rather than treated as core library

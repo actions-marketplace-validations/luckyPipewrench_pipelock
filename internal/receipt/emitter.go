@@ -13,8 +13,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -23,11 +25,14 @@ import (
 
 	aelpkg "github.com/luckyPipewrench/pipelock/internal/ael"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/digestorigin"
 	"github.com/luckyPipewrench/pipelock/internal/evidencename"
 	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
+	"github.com/luckyPipewrench/pipelock/internal/receiptcontent"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/session"
+	"github.com/luckyPipewrench/pipelock/internal/verification"
 )
 
 // recorderEntryType is the recorder entry type for action receipts.
@@ -38,7 +43,7 @@ const (
 
 // recorderSessionID is the session ID used for all recorder entries from the emitter.
 // The recorder pins to the first session ID it sees, so all entries must use the same value.
-const recorderSessionID = "proxy"
+const recorderSessionID = recorder.DefaultSessionBase
 
 // MetricsSink receives receipt-emission observability signals. The proxy's
 // metrics package implements it; tests can supply a stub. A nil sink is a
@@ -81,11 +86,18 @@ const (
 	FailReasonSync = "sync"
 	// FailReasonSealed is an emit attempt after the transcript root was emitted.
 	FailReasonSealed = "sealed"
+	// FailReasonContent: receipt content was refused by the content boundary
+	// (a detector hit in an identity or joint view, or an exceeded bound).
+	// The chain did not advance and the emitter stays healthy.
+	FailReasonContent = "content"
 	// FailReasonUnavailable is a required-receipt emission attempt when no
 	// receipt emitter is configured. Best-effort receipt paths intentionally
 	// remain silent when receipts are disabled; this reason is for fail-closed
 	// require_receipts decisions only.
 	FailReasonUnavailable = "unavailable"
+	// FailReasonDurabilityInherited is a durable receipt refused or left
+	// unconfirmed because an earlier sync on the same evidence stream failed.
+	FailReasonDurabilityInherited = "durability_inherited"
 )
 
 // ErrExtensionMerge identifies a malformed or conflicting advisory extension.
@@ -94,9 +106,15 @@ const (
 // receipt altogether.
 var ErrExtensionMerge = errors.New("receipt extension merge failed")
 
+// ErrReceiptPostAdvance means the v1 chain position was consumed before its
+// recorder write finished. A required group must stop admissions because the
+// missing position cannot be safely retried on another shard.
+var ErrReceiptPostAdvance = errors.New("receipt chain advanced before persistence failed")
+
 // Emitter produces signed action receipts and writes them to the flight recorder.
 // It is safe for concurrent use - the underlying recorder handles its own locking.
 type Emitter struct {
+	receiptProducer        *receiptcontent.Producer
 	recorder               *recorder.Recorder
 	privKey                ed25519.PrivateKey
 	configHash             atomic.Value // stores string; updated on hot reload
@@ -111,20 +129,62 @@ type Emitter struct {
 	beforeChainLockForTest func()
 	runNonce               string
 	nativeAEL              *aelpkg.Emitter
+	groupBinding           *ReceiptGroupBinding
+
+	// session is the recorder session ID this emitter records under. It
+	// defaults to recorderSessionID for callers that do not set
+	// EmitterConfig.Session (every production caller now sets it to a
+	// process-unique run session minted by recorder.AcquireRunSession; tests
+	// that construct an Emitter directly keep the historical literal
+	// default). Every Record call in this file must use this field, never
+	// the bare recorderSessionID constant, so a caller-supplied run session
+	// is actually honored end to end.
+	session string
+	// priorSignerKeys is EmitterConfig.PriorSignerKeys: the different keys a
+	// resumed tail may be signed by.
+	priorSignerKeys []string
+	// chainLink is the signed continuity link published at the first
+	// receipt, or nil. Written once under chainMu.
+	chainLink    *ChainLink
+	recoverySeal *RecoverySeal
+	// linked guards the one-time link attempt; see linkPredecessor.
+	linked bool
+	// notices receives operator-facing lines about cross-run linking.
+	notices io.Writer
+
+	// emissionGate lets ordinary durable receipts confirm outside chainMu
+	// (read side, held until confirmed) while lifecycle records, transcript
+	// roots, chain links and native AEL transitions (write side) wait until
+	// every outstanding confirmation has finished. Always taken before chainMu.
+	emissionGate   sync.RWMutex
+	completionTail *emitCompletion
+	inflightOnce   sync.Once
+	inflight       chan struct{}
 
 	// Chain state - mutex-protected, updated on each Emit.
 	chainMu       sync.Mutex
 	chainSeq      uint64
 	chainPrevHash string
-	chainStart    time.Time // timestamp of first receipt
-	chainEnd      time.Time // timestamp of most recent receipt
-	rootEmitted   bool      // true after EmitTranscriptRoot; prevents duplicate roots
-	closeEmitted  bool      // true after session_close; prevents duplicate closes
-	closeErr      error     // sticky error for a written session_close whose durability confirmation failed
-	openErr       error     // sticky error for a written session_open whose durability confirmation failed
-	openNonce     string
-	heartbeatBeat uint64
-	lastHeartbeat time.Time
+	// persistedSeq and persistedHash name the newest receipt known to be
+	// written to the recorder: the resumed tail, then each receipt whose
+	// record call succeeded. They differ from the chain head only after a
+	// receipt's position was assigned and its write failed.
+	persistedSeq  uint64
+	persistedHash string
+	// unconfirmedSeq names the first receipt whose write reached the file
+	// but whose durable sync then failed. It is sticky like the stream
+	// failure behind it: the chain can no longer be shown intact.
+	unconfirmedSeq uint64
+	unconfirmed    bool
+	chainStart     time.Time // timestamp of first receipt
+	chainEnd       time.Time // timestamp of most recent receipt
+	rootEmitted    bool      // true after EmitTranscriptRoot; prevents duplicate roots
+	closeEmitted   bool      // true after session_close; prevents duplicate closes
+	closeErr       error     // sticky error for a written session_close whose durability confirmation failed
+	openErr        error     // sticky error for a written session_open whose durability confirmation failed
+	openNonce      string
+	heartbeatBeat  uint64
+	lastHeartbeat  time.Time
 
 	// heartbeatSeconds is the configured heartbeat cadence (seconds) recorded
 	// in the session_open record's Open.HeartbeatSeconds so a witness reading
@@ -158,11 +218,14 @@ type Emitter struct {
 
 // EmitterConfig holds the configuration for creating an Emitter.
 type EmitterConfig struct {
-	Recorder   *recorder.Recorder
-	PrivKey    ed25519.PrivateKey
-	ConfigHash string
-	Principal  string
-	Actor      string
+	// StartupVerification reports and cancels successor history verification.
+	// It is not retained by receipt emission or by a later startup.
+	StartupVerification verification.Options
+	Recorder            *recorder.Recorder
+	PrivKey             ed25519.PrivateKey
+	ConfigHash          string
+	Principal           string
+	Actor               string
 	// Metrics, when non-nil, receives emit-failure observability signals.
 	Metrics MetricsSink
 	// OnReceipt, when non-nil, is invoked with a copy of each signed receipt
@@ -187,6 +250,31 @@ type EmitterConfig struct {
 	// expected liveness interval off the run anchor. 0 (the default) means the
 	// cadence is unset / heartbeats disabled.
 	HeartbeatSeconds int
+	// Session is the recorder session ID this emitter records under. Every
+	// production caller sets this to the SAME run session ID that
+	// recorder.AcquireRunSession returned for cfg.Recorder, so every writer
+	// sharing that recorder agrees on one session and the recorder's
+	// one-session-per-recorder enforcement never sees a mismatch between
+	// siblings. Empty defaults to the historical literal "proxy" so existing
+	// direct-construction tests are unaffected.
+	Session string
+	// Notices receives operator-facing startup lines about cross-run chain
+	// linking (for example a corrupt predecessor tail that was skipped).
+	// Nil writes to os.Stderr.
+	Notices io.Writer
+	// PriorSignerKeys are the hex public keys this process has signed the
+	// session's receipts with before this emitter, set by a reload that
+	// rotates the signing key. More than one is possible: a reload whose
+	// session_open was written but not confirmed leaves the new key on the
+	// tail while the old emitter stays published. These are the only keys a
+	// resumed tail may carry when it differs from PrivKey's: a tail signed by
+	// any other key, even validly under its own embedded key, is refused.
+	// Empty (every fresh start, where the session was just minted) accepts no
+	// rotation.
+	PriorSignerKeys []string
+	// GroupBinding identifies this emitter's already published opening
+	// manifest. It is nil for the legacy single-chain path.
+	GroupBinding *ReceiptGroupBinding
 }
 
 // PostureBinding carries the signed posture-capsule fields that session_open
@@ -208,6 +296,10 @@ func NewEmitter(cfg EmitterConfig) *Emitter {
 		return nil
 	}
 	runNonce, nonceErr := newRunNonce()
+	session := cfg.Session
+	if session == "" {
+		session = recorderSessionID
+	}
 	e := &Emitter{
 		recorder:            cfg.Recorder,
 		privKey:             cfg.PrivKey,
@@ -221,18 +313,146 @@ func NewEmitter(cfg EmitterConfig) *Emitter {
 		postureBinding:      cfg.PostureBinding,
 		postureAvailability: cfg.PostureAvailability,
 		heartbeatSeconds:    cfg.HeartbeatSeconds,
+		session:             session,
+		priorSignerKeys:     slices.Clone(cfg.PriorSignerKeys),
 	}
-	e.configHash.Store(cfg.ConfigHash)
+	e.configHash.Store(holdConfigHash(cfg.ConfigHash))
 	if nonceErr != nil {
 		e.initErr = fmt.Errorf("generate run nonce: %w", nonceErr)
 		return e
+	}
+	// Retained content is refused here, at activation, rather than
+	// discovered as a refusal of every later receipt.
+	if err := validateRetainedContent(cfg.Recorder, cfg.Principal, cfg.Actor, cfg.ConfigHash, session); err != nil {
+		e.initErr = err
+		return e
+	}
+	base := session
+	if b, ok := receiptcontent.SplitProvenRunSession(session); ok {
+		base = b
+	}
+	e.receiptProducer = actionReceiptProducer.WithFixedValues(map[string][]string{
+		"action_record.principal":                             {cfg.Principal},
+		"action_record.actor":                                 {cfg.Actor},
+		"action_record.session_control.open.recorder_session": {base},
+	})
+	if cfg.GroupBinding != nil {
+		binding := *cfg.GroupBinding
+		if err := validateEmitterGroupBinding(binding, session, cfg.PrivKey); err != nil {
+			e.initErr = err
+			return e
+		}
+		e.groupBinding = &binding
 	}
 	e.initErr = e.resumeChain()
 	if e.initErr != nil {
 		return e
 	}
+	e.notices = cfg.Notices
+	if e.notices == nil {
+		e.notices = os.Stderr
+	}
+	// Retry a pending seal for an opening already persisted by recovery.
+	// Missing cross-run attestation must not block durable successor evidence.
+	if e.hasPriorTail && cfg.Recorder.RecoveryPredecessor() != "" {
+		e.chainMu.Lock()
+		e.linkPredecessor()
+		e.chainMu.Unlock()
+	}
 	e.nativeAEL = aelpkg.NewEmitter(cfg.Recorder, cfg.PrivKey, runNonce, cfg.HeartbeatSeconds)
 	return e
+}
+
+func validateEmitterGroupBinding(binding ReceiptGroupBinding, session string, key ed25519.PrivateKey) error {
+	base, ok := RunSessionBase(session)
+	if !ok || !groupRunSession(base, binding.SessionID) || binding.SessionID != session ||
+		!groupHex(binding.GroupID, 32) || binding.ShardIndex < 0 || binding.ShardIndex >= 32 ||
+		!groupHex(binding.OpenManifestSHA256, 64) ||
+		binding.SignerKey != hex.EncodeToString(key.Public().(ed25519.PublicKey)) ||
+		(binding.PreviousGroupID == "") != (binding.PreviousOpenManifestSHA256 == "") {
+		return errors.New("invalid receipt group binding for emitter session")
+	}
+	if binding.PreviousGroupID != "" &&
+		(!groupHex(binding.PreviousGroupID, 32) || !groupHex(binding.PreviousOpenManifestSHA256, 64) || binding.PreviousGroupID == binding.GroupID) {
+		return errors.New("invalid receipt group predecessor binding")
+	}
+	return nil
+}
+
+// linkPredecessor runs once, after this emitter's first receipt was recorded.
+// When the emitter owns a brand-new run session, it
+// publishes a signed link file continuing the most recent finished chain of
+// the same base. The chain file itself never carries the link.
+//
+// It runs at the first receipt rather than at construction because the
+// successor's evidence file only exists once something is written: a process
+// that built its emitter and then failed to start would otherwise leave a
+// link naming a successor that never existed, which verification reports as
+// a dangling link.
+//
+// Link and recovery-seal failures leave the run unlinked without disabling
+// emission. Pending recovery claims remain available for a later retry.
+// The caller holds chainMu, including during construction; callbacks update
+// chainLink and recoverySeal under that same lock.
+func (e *Emitter) linkPredecessor() {
+	if e.groupBinding != nil {
+		return
+	}
+	predecessor := e.recorder.RecoveryPredecessor()
+	if (predecessor == "" && (e.hasPriorTail || e.chainSeq != 1)) || e.recorder.Dir() == "" {
+		return
+	}
+	base, ok := RunSessionBase(e.session)
+	if !ok {
+		return
+	}
+	req := linkRequest{
+		dir:        filepath.Clean(e.recorder.Dir()),
+		base:       base,
+		self:       e.session,
+		privKey:    e.privKey,
+		now:        e.now(),
+		notice:     e.notices,
+		signerKeys: append(slices.Clone(e.priorSignerKeys), hex.EncodeToString(e.privKey.Public().(ed25519.PublicKey))),
+		onRecovery: func(s *RecoverySeal) { e.recoverySeal = s },
+	}
+	if predecessor != "" {
+		seal, err := publishRecoverySeal(req, predecessor)
+		if err != nil {
+			_, _ = fmt.Fprintf(e.notices, "pipelock: receipt chain %s starts unlinked: recovery seal unavailable for %s: %v\n", e.session, predecessor, err)
+			return
+		}
+		e.recoverySeal = seal
+		e.recorder.AcknowledgeRecovery(predecessor, e.session)
+		return
+	}
+	// Fresh starts can observe a predecessor signed by another operator key;
+	// its self-consistency is checked here, and offline readers decide trust.
+	req.signerKeys = nil
+	link, err := publishPredecessorLink(req, e.observeTornTail)
+	if err != nil {
+		_, _ = fmt.Fprintf(e.notices, "pipelock: receipt chain %s starts unlinked: %v\n", e.session, err)
+		return
+	}
+	e.chainLink = link
+}
+
+// ChainLink returns the continuity link this emitter published at its first
+// receipt, or nil when the run is unlinked or has not emitted yet. Safe on a
+// nil emitter.
+func (e *Emitter) ChainLink() *ChainLink {
+	if e == nil {
+		return nil
+	}
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
+	e.chainMu.Lock()
+	defer e.chainMu.Unlock()
+	if e.chainLink == nil {
+		return nil
+	}
+	l := *e.chainLink
+	return &l
 }
 
 // InitError returns the error (if any) that occurred while resuming the chain
@@ -289,6 +509,77 @@ func (e *Emitter) HealthSnapshot() (HealthSnapshot, bool) {
 	}, true
 }
 
+// TailObservation is one consistent view of a chain's head and its evidence
+// file, taken under the chain lock. Receipts are written only while that lock
+// is held, so the newest receipt in the first WriteEnd bytes of WriteFile (or
+// in the session's earlier files) is exactly the persisted receipt.
+type TailObservation struct {
+	HealthSnapshot
+	Session       string
+	PersistedSeq  uint64
+	PersistedHash string
+	// Unconfirmed reports a receipt that was written but whose durable sync
+	// failed; UnconfirmedSeq is its position.
+	Unconfirmed    bool
+	UnconfirmedSeq uint64
+	WriteFile      string
+	WriteEnd       int64
+	WriteKnown     bool
+}
+
+// TailObservation returns the chain head and the recorder's write position
+// for this emitter's session at the same instant. Nil-safe.
+func (e *Emitter) TailObservation() (TailObservation, error) {
+	if e == nil {
+		return TailObservation{}, errors.New("receipt emitter unavailable")
+	}
+	e.chainMu.Lock()
+	defer e.chainMu.Unlock()
+	obs := TailObservation{
+		HealthSnapshot: HealthSnapshot{
+			InitErr:           e.initErr != nil,
+			ChainSeq:          e.chainSeq,
+			PrevHash:          e.chainPrevHash,
+			LastEmit:          e.chainEnd,
+			LastHeartbeat:     e.lastHeartbeat,
+			HeartbeatObserved: !e.lastHeartbeat.IsZero(),
+			RootEmitted:       e.rootEmitted,
+			RunNonce:          e.runNonce,
+		},
+		Session:        e.session,
+		PersistedSeq:   e.persistedSeq,
+		PersistedHash:  e.persistedHash,
+		Unconfirmed:    e.unconfirmed,
+		UnconfirmedSeq: e.unconfirmedSeq,
+	}
+	name, end, ok, err := e.recorder.SessionWriteEnd(e.session)
+	if err != nil {
+		return TailObservation{}, fmt.Errorf("observe recorder write position: %w", err)
+	}
+	obs.WriteFile, obs.WriteEnd, obs.WriteKnown = name, end, ok
+	return obs, nil
+}
+
+// ConfirmedTailObservation waits for outstanding emission confirmations before
+// observing the tail. It releases the emission gate before returning; callers
+// must not hold up writers while reading or publishing the observed prefix.
+func (e *Emitter) ConfirmedTailObservation() (TailObservation, error) {
+	if e == nil {
+		return TailObservation{}, errors.New("receipt emitter unavailable")
+	}
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
+	return e.TailObservation()
+}
+
+// Session returns the recorder session this emitter records under. Nil-safe.
+func (e *Emitter) Session() string {
+	if e == nil {
+		return ""
+	}
+	return e.session
+}
+
 // SignerKeyHex returns the Ed25519 public key hex for receipts this emitter
 // signs. It is used by reload code to distinguish a policy-only reload from a
 // signer rotation without replacing a live emitter unnecessarily.
@@ -301,6 +592,12 @@ func (e *Emitter) SignerKeyHex() string {
 
 // EmitOpts holds the per-decision context for emitting a receipt.
 type EmitOpts struct {
+	promptInjectionModeSet bool
+	promptInjectionMode    string
+	// ShardIndex is selected once at admission and copied into later outcome,
+	// failure-marker, and v2 emissions. It is runtime-only, never signed JSON.
+	ShardIndex            int
+	ShardSelected         bool
 	ActionID              string
 	ParentActionID        string
 	Verdict               string
@@ -401,7 +698,7 @@ func (e *Emitter) EmitSessionOpen() error {
 			Open: &SessionOpen{
 				RunNonce:             e.runNonce,
 				OpenNonce:            openNonce,
-				RecorderSession:      recorderSessionID,
+				RecorderSession:      e.session,
 				HeartbeatSeconds:     e.heartbeatSeconds,
 				PolicyHash:           configHashString(e.configHash.Load()),
 				SignerKeyEpoch:       fmt.Sprintf("%x", e.privKey.Public().(ed25519.PublicKey)),
@@ -409,6 +706,7 @@ func (e *Emitter) EmitSessionOpen() error {
 				PostureSignerKeyID:   e.postureBinding.SignerKeyID,
 				ContainmentNonce:     e.postureBinding.ContainmentNonce,
 				ContainedUID:         e.postureBinding.ContainedUID,
+				GroupBinding:         e.groupBinding,
 			},
 		},
 	})
@@ -529,17 +827,81 @@ func (e *Emitter) emitWithControl(opts EmitOpts, durable bool, buildControl lock
 		sideEffect = sideEffectFromMCPAction(actionType)
 		reversibility = ReversibilityUnknown
 	}
+	// PolicyHash precedence: a non-empty per-emission opts.PolicyHash is the
+	// canonical policy hash of the config snapshot that actually decided this
+	// request, so it wins over the emitter's mutable configHash atomic. The
+	// atomic is updated on hot reload and can advance to the NEW policy while an
+	// in-flight request decided under the OLD policy is still being receipted;
+	// preferring the per-emission hash binds the receipt to the policy that made
+	// the decision. Callers with no request snapshot (session_open, non-proxy
+	// emitters) leave opts.PolicyHash empty and fall back to the atomic.
+	policyHash := configHashString(e.configHash.Load())
+	if opts.PolicyHash != "" {
+		normalizedPolicyHash, normalizeErr := normalizeCanonicalPolicyHash(opts.PolicyHash)
+		if normalizeErr != nil {
+			e.recordFailure(FailReasonHash)
+			return fmt.Errorf("policy hash override: %w", normalizeErr)
+		}
+		policyHash = normalizedPolicyHash
+	}
+
+	// Content is frozen and scanned BEFORE the chain lock: it does not depend
+	// on chain state, so a slow or rejected scan never holds chainMu and a
+	// content rejection never advances or poisons the chain. Lifecycle control
+	// records are built under the lock and are validated there instead.
+	tmpl := Receipt{Version: ReceiptVersion, ActionRecord: e.contentRecord(opts, actionType, sideEffect, reversibility, policyHash)}
+	if len(bytes.TrimSpace(opts.Extension)) != 0 {
+		var mergeErr error
+		tmpl.Ext, mergeErr = mergeReceiptExtensions(nil, opts.Extension)
+		if mergeErr != nil {
+			e.recordFailure(FailReasonMarshal)
+			return fmt.Errorf("%w: %w", ErrExtensionMerge, mergeErr)
+		}
+	}
+	lifecycle := opts.SessionControl != nil || buildControl != nil
+	var content *recorder.ContentScan
+	if !lifecycle {
+		var scanErr error
+		tmpl, content, scanErr = e.scanActionContent(tmpl)
+		if scanErr != nil {
+			e.recordFailure(FailReasonContent)
+			return fmt.Errorf("validating receipt content: %w", scanErr)
+		}
+	}
 	if e.beforeChainLockForTest != nil {
 		e.beforeChainLockForTest()
 	}
 
-	// Chain integrity: lock covers stamp → sign → hash → persist → advance.
-	// The mutex must span from timestamp through persist so concurrent Emit
+	// Lifecycle records see a chain with no unconfirmed receipts: they take
+	// the gate exclusively, which waits for every ordinary emission still
+	// confirming. Ordinary emissions share it until they are confirmed.
+	if lifecycle {
+		e.emissionGate.Lock()
+		defer e.emissionGate.Unlock()
+	} else {
+		e.emissionGate.RLock()
+		defer e.emissionGate.RUnlock()
+	}
+	deferred := durable && !lifecycle
+	if deferred {
+		release := e.acquireInflight()
+		defer release()
+	}
+
+	// Chain integrity: lock covers stamp → sign → hash → append → advance.
+	// The mutex must span from timestamp through append so concurrent Emit
 	// calls produce monotonic timestamps in chain order. State advances before
 	// recorder persistence so a failed Record leaves a detectable gap instead
-	// of reusing the same prev_hash/seq and forking the chain.
+	// of reusing the same prev_hash/seq and forking the chain. An ordinary
+	// durable receipt confirms its durability after the lock is released; only
+	// the append, never the confirmation wait, happens under it.
 	e.chainMu.Lock()
-	defer e.chainMu.Unlock()
+	chainLocked := true
+	defer func() {
+		if chainLocked {
+			e.chainMu.Unlock()
+		}
+	}()
 	// Retirement can happen after the optimistic check above while this emit
 	// waits for chainMu. Re-check under the chain lock so a call admitted before
 	// signer rotation cannot append after the old native AEL run is closed.
@@ -567,110 +929,28 @@ func (e *Emitter) emitWithControl(opts EmitOpts, durable bool, buildControl lock
 		return err
 	}
 
-	// PolicyHash precedence: a non-empty per-emission opts.PolicyHash is the
-	// canonical policy hash of the config snapshot that actually decided this
-	// request, so it wins over the emitter's mutable configHash atomic. The
-	// atomic is updated on hot reload and can advance to the NEW policy while an
-	// in-flight request decided under the OLD policy is still being receipted;
-	// preferring the per-emission hash binds the receipt to the policy that made
-	// the decision. Callers with no request snapshot (session_open, non-proxy
-	// emitters) leave opts.PolicyHash empty and fall back to the atomic exactly
-	// as before.
-	policyHash := configHashString(e.configHash.Load())
-	if opts.PolicyHash != "" {
-		normalizedPolicyHash, normalizeErr := normalizeCanonicalPolicyHash(opts.PolicyHash)
-		if normalizeErr != nil {
-			e.recordFailure(FailReasonHash)
-			return fmt.Errorf("policy hash override: %w", normalizeErr)
-		}
-		policyHash = normalizedPolicyHash
-	}
-
-	// Sanitize secret-bearing fields BEFORE signing. When redaction is enabled
-	// the recorder would otherwise redact target/pattern AFTER signing,
-	// desyncing the on-disk canonical bytes from both the signature and the
-	// recorded receipt-hash binding. Sanitizing pre-sign with the same
-	// DLP function makes the recorder's redaction a no-op, so the receipt
-	// verifies from the evidence file alone. The redactor is read from the
-	// recorder at emit time (not cached at construction) so it is always the
-	// exact function the recorder will apply, with no drift surface; it is nil
-	// when flight-recorder redaction is off, leaving targets unchanged.
-	target := opts.Target
-	pattern := opts.Pattern
-	if rf := e.recorder.ReceiptRedactor(); rf != nil {
-		clean := func(text string) bool { return rf(context.Background(), text).Clean }
-		target = sanitizeTarget(target, clean)
-		pattern = cleanOrRedacted(pattern, clean)
-	}
-
-	ar := ActionRecord{
-		Version:               ActionRecordVersion,
-		ActionID:              opts.ActionID,
-		ParentActionID:        opts.ParentActionID,
-		ActionType:            actionType,
-		Timestamp:             e.now().UTC(),
-		Principal:             e.principal,
-		Actor:                 e.actorLabel(opts),
-		DelegationChain:       nil, // Populated when delegation tracking ships
-		Target:                target,
-		SideEffectClass:       sideEffect,
-		Reversibility:         reversibility,
-		PolicyHash:            policyHash,
-		Verdict:               NormalizeVerdict(opts.Verdict),
-		DecisionPhase:         opts.DecisionPhase,
-		DeferID:               opts.DeferID,
-		ResolutionPolicy:      opts.ResolutionPolicy,
-		ResolutionSource:      opts.ResolutionSource,
-		SessionID:             opts.SessionID,
-		SessionIDOriginal:     opts.SessionIDOriginal,
-		SessionTaintLevel:     opts.SessionTaintLevel,
-		SessionContaminated:   opts.SessionContaminated,
-		RecentTaintSources:    append([]session.TaintSourceRef(nil), opts.RecentTaintSources...),
-		SessionTaskID:         opts.SessionTaskID,
-		SessionTaskLabel:      opts.SessionTaskLabel,
-		AuthorityKind:         opts.AuthorityKind,
-		TaintDecision:         opts.TaintDecision,
-		TaintDecisionReason:   opts.TaintDecisionReason,
-		TaskOverrideApplied:   opts.TaskOverrideApplied,
-		ContractWinningSource: opts.ContractWinningSource,
-		ContractLiveVerdict:   opts.ContractLiveVerdict,
-		ContractPolicySources: append([]string(nil), opts.ContractPolicySources...),
-		ContractRuleID:        opts.ContractRuleID,
-		ActiveManifestHash:    opts.ActiveManifestHash,
-		ContractHash:          opts.ContractHash,
-		ContractSelectorID:    opts.ContractSelectorID,
-		ContractGeneration:    opts.ContractGeneration,
-		Transport:             opts.Transport,
-		Method:                opts.Method,
-		Layer:                 opts.Layer,
-		Pattern:               pattern,
-		Severity:              opts.Severity,
-		Redaction:             redactionSummaryFromReport(opts.RedactionProfile, opts.RedactionReport),
-		Shield:                cloneShieldSummary(opts.Shield),
-		RequestID:             opts.RequestID,
-		ChainPrevHash:         chainPrevHash,
-		ChainSeq:              e.chainSeq,
-		RunNonce:              e.runNonce,
-		// pendingTransition is non-nil only on the first receipt of a new
-		// segment opened by resumeChain after a legitimate key rotation. It
-		// is bound into the signed record so the segment boundary is provable
-		// from this receipt alone, then cleared after a successful write.
-		KeyTransition:  e.pendingTransition,
-		SessionControl: sessionControl,
-	}
+	// Only generated fields are added under the lock: the timestamp, the
+	// chain position, the run nonce, a pending key transition and any
+	// lifecycle control. The content projection of the final receipt must
+	// equal the one scanned above, which BindReceiptContent re-derives.
+	ar := tmpl.ActionRecord
+	ar.Timestamp = e.now().UTC()
+	ar.ChainPrevHash = chainPrevHash
+	ar.ChainSeq = e.chainSeq
+	ar.RunNonce = e.runNonce
+	// pendingTransition is non-nil only on the first receipt of a new
+	// segment opened by resumeChain after a legitimate key rotation. It is
+	// bound into the signed record so the segment boundary is provable from
+	// this receipt alone, then cleared after a successful write.
+	ar.KeyTransition = e.pendingTransition
+	ar.SessionControl = sessionControl
 
 	rcpt, err := Sign(ar, e.privKey)
 	if err != nil {
 		e.recordFailure(FailReasonSign)
 		return fmt.Errorf("signing receipt: %w", err)
 	}
-	if len(bytes.TrimSpace(opts.Extension)) != 0 {
-		rcpt.Ext, err = mergeReceiptExtensions(rcpt.Ext, opts.Extension)
-		if err != nil {
-			e.recordFailure(FailReasonMarshal)
-			return fmt.Errorf("%w: %w", ErrExtensionMerge, err)
-		}
-	}
+	rcpt.Ext = tmpl.Ext
 	if isSessionOpenControl(sessionControl) && e.postureAvailability != "" {
 		rcpt.Ext, err = mergePostureAvailabilityExtension(rcpt.Ext, e.postureAvailability)
 		if err != nil {
@@ -690,46 +970,104 @@ func (e *Emitter) emitWithControl(opts EmitOpts, durable bool, buildControl lock
 		e.recordFailure(FailReasonMarshal)
 		return fmt.Errorf("marshaling receipt: %w", err)
 	}
-	if err := e.recorder.ValidateSignedReceiptDetail(json.RawMessage(receiptJSON)); err != nil {
+	if lifecycle {
+		// Lifecycle controls are validate-or-fail: never redacted, and a
+		// refusal reports no success.
+		rep, cs, scanErr := e.recorder.ScanReceiptContent(context.Background(), e.contentProducer(), receiptJSON)
+		if scanErr == nil && cs == nil {
+			scanErr = rep.Err()
+		}
+		if scanErr != nil {
+			e.recordFailure(FailReasonContent)
+			return fmt.Errorf("validating receipt content: %w", scanErr)
+		}
+		content = cs
+	}
+	scan, err := e.recorder.BindReceiptContent(content, e.contentProducer(), receiptJSON)
+	if err != nil {
 		e.recordFailure(FailReasonRecord)
 		return fmt.Errorf("validating signed receipt for recording: %w", err)
 	}
 
-	// Advance chain state BEFORE persist. Record may write the entry
-	// and then fail on checkpoint/rotation. If we left chain state
-	// unchanged, the next Emit would reuse the same prev_hash/seq,
-	// forking the chain. Advancing first means a failed Record
-	// leaves a gap (missing entry) rather than a fork (duplicate link),
-	// which is fail-closed: verify-chain detects gaps but not forks.
-	e.chainPrevHash = receiptHash
-	if e.chainSeq == 0 {
-		e.chainStart = ar.Timestamp
-	}
-	e.chainEnd = ar.Timestamp
-	e.chainSeq++
-	// The transition marker was bound into the receipt just signed; clear it
-	// so it is never re-stamped onto a later receipt (which would falsely
-	// claim a second segment boundary). Cleared with the rest of the
-	// advance-before-persist state for the same fork-avoidance reason.
-	e.pendingTransition = nil
 	openControl := isSessionOpenControl(sessionControl)
 	closeControl := isSessionCloseControl(sessionControl)
 
 	entry := recorder.Entry{
-		SessionID: recorderSessionID,
+		SessionID: e.session,
 		Type:      recorderEntryType,
 		EventKind: string(ar.ActionType),
-		Transport: opts.Transport,
+		// Mirror fields come from the signed record, never from opts: the
+		// recorder refuses an entry whose mirror differs from the producer's
+		// derivation of the exact detail.
+		Transport: ar.Transport,
 		Summary:   fmt.Sprintf("receipt: %s %s %s", ar.Verdict, ar.ActionType, ar.Transport),
 		Detail:    json.RawMessage(receiptJSON),
 	}
+	advanced := false
+	advance := func() {
+		// The recorder calls this after the exact line passes its size
+		// check, immediately before writing. Any later failure leaves a
+		// detectable gap rather than reusing this receipt chain position.
+		advanced = true
+		e.chainPrevHash = receiptHash
+		if e.chainSeq == 0 {
+			e.chainStart = ar.Timestamp
+		}
+		e.chainEnd = ar.Timestamp
+		e.chainSeq++
+		e.pendingTransition = nil
+	}
 	var recordErr error
-	if durable {
-		recordErr = e.recorder.RecordDurable(entry)
-	} else {
-		recordErr = e.recorder.Record(entry)
+	var ticket *recorder.DurableTicket
+	switch {
+	case deferred:
+		ticket, recordErr = e.recorder.AppendDurableWithReceiptScanPreAdvance(entry, &scan, advance)
+	case durable:
+		recordErr = e.recorder.RecordDurableWithReceiptScanPreAdvance(entry, &scan, advance)
+	default:
+		recordErr = e.recorder.RecordWithReceiptScanPreAdvance(entry, &scan, advance)
+	}
+	if ticket != nil {
+		// The append succeeded, so the receipt is in the file; its sync is
+		// confirmed after the lock is released.
+		e.persistedSeq, e.persistedHash = ar.ChainSeq, receiptHash
+		if !e.linked {
+			e.linked = true
+			e.linkPredecessor()
+		}
+		pending := deferredDurableEmission{rcpt: rcpt, ticket: ticket}
+		// The AEL record is appended in the same order as its receipt; its
+		// sync is reserved here and confirmed with the receipt's.
+		if aelErr := e.emitNativeAEL(ar, nil, false); aelErr != nil {
+			pending.aelErr = fmt.Errorf("emitting native AEL record: %w", aelErr)
+		} else if e.nativeAEL != nil && e.sessionOpenEmitted {
+			pending.waitAEL, aelErr = e.nativeAEL.ReserveDurability()
+			if aelErr != nil {
+				pending.aelErr = fmt.Errorf("emitting native AEL record: %w", aelErr)
+			}
+		}
+		if pending.aelErr != nil {
+			e.recordFailure(FailReasonAEL)
+			e.MarkUnhealthy(pending.aelErr)
+		}
+		pending.completion = e.nextCompletionLocked()
+		chainLocked = false
+		e.chainMu.Unlock()
+		return e.confirmDeferred(pending)
 	}
 	if recordErr != nil {
+		if !advanced {
+			if errors.Is(recordErr, recorder.ErrDurabilityInherited) {
+				e.recordFailure(FailReasonDurabilityInherited)
+			} else {
+				e.recordFailure(FailReasonRecord)
+			}
+			return fmt.Errorf("recording receipt before chain advance: %w", recordErr)
+		}
+		// A failed first write may leave no successor chain at all. Never
+		// claim its predecessor; later attempts have advanced chain state
+		// and cannot make this failed first position valid.
+		e.linked = true
 		emitErr := fmt.Errorf("recording receipt: %w", recordErr)
 		// Persist failed AFTER the chain state advanced (advance-before-persist,
 		// above). For the single-shot control receipts (open/close) mark the guard
@@ -760,7 +1098,12 @@ func (e *Emitter) emitWithControl(opts EmitOpts, durable bool, buildControl lock
 		} else {
 			e.recordFailure(FailReasonRecord)
 		}
-		return emitErr
+		return fmt.Errorf("%w: %w", ErrReceiptPostAdvance, emitErr)
+	}
+	e.persistedSeq, e.persistedHash = ar.ChainSeq, receiptHash
+	if !e.linked {
+		e.linked = true
+		e.linkPredecessor()
 	}
 	if err := e.emitNativeAEL(ar, sessionControl, durable); err != nil {
 		e.recordFailure(FailReasonAEL)
@@ -782,11 +1125,19 @@ func (e *Emitter) emitWithControl(opts EmitOpts, durable bool, buildControl lock
 		e.lastHeartbeat = ar.Timestamp
 	}
 
-	// Notify the observer (if any) AFTER the receipt is durably recorded, so a
-	// streamed decision can never appear before it exists on disk. The call is
-	// under the chain mutex, preserving chain order for observers. A copy is
+	// Notify the observer (if any) AFTER the receipt is recorded, so a
+	// streamed decision can never appear before it exists on disk, and in
+	// chain order. An ordinary receipt may follow durable receipts still
+	// confirming, so it takes a completion slot behind them; a lifecycle
+	// record holds the gate exclusively and has none ahead of it. A copy is
 	// passed so the observer cannot mutate emitter state, and the observer is
 	// contractually non-blocking (see EmitterConfig.OnReceipt).
+	if !lifecycle {
+		completion := e.nextCompletionLocked()
+		chainLocked = false
+		e.chainMu.Unlock()
+		return e.finishCompletion(completion, rcpt, nil, false)
+	}
 	if e.onReceipt != nil {
 		rc := rcpt
 		e.onReceipt(&rc)
@@ -926,6 +1277,8 @@ func (e *Emitter) CloseNativeAEL() error {
 	if e == nil {
 		return nil
 	}
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
 	e.chainMu.Lock()
 	defer e.chainMu.Unlock()
 	if e.nativeAEL == nil || !e.nativeAEL.Opened() {
@@ -954,6 +1307,8 @@ func (e *Emitter) RetireNativeAEL() error {
 	if e == nil {
 		return nil
 	}
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
 	e.chainMu.Lock()
 	defer e.chainMu.Unlock()
 	if e.nativeAEL != nil && e.nativeAEL.Opened() {
@@ -1022,7 +1377,7 @@ func (e *Emitter) prepareSessionControlLocked(in *SessionControl) (*SessionContr
 	out := cloneSessionControl(in)
 	open := out.Open
 	open.RunNonce = e.runNonce
-	open.RecorderSession = recorderSessionID
+	open.RecorderSession = e.session
 	open.PolicyHash = configHashString(e.configHash.Load())
 	open.SignerKeyEpoch = fmt.Sprintf("%x", e.privKey.Public().(ed25519.PublicKey))
 	open.ChainOpenSeq = e.chainSeq
@@ -1075,12 +1430,12 @@ func (e *Emitter) receiptHashRecorded(wantHash string) bool {
 	if e == nil || e.recorder == nil || wantHash == "" {
 		return false
 	}
-	files, err := recorderFiles(e.recorder.Dir())
+	files, err := recorderFiles(e.recorder.Dir(), e.session)
 	if err != nil {
 		return false
 	}
 	for _, file := range files {
-		entries, readErr := recorder.ReadEntries(file)
+		entries, readErr := recorder.ReadHistoryEntries(file)
 		if readErr != nil {
 			continue
 		}
@@ -1116,7 +1471,21 @@ func (e *Emitter) UpdateConfigHash(hash string) {
 	if e == nil {
 		return
 	}
-	e.configHash.Store(hash)
+	e.configHash.Store(holdConfigHash(hash))
+}
+
+// heldConfigHash is the emitter's config hash. When the hash is one this
+// process computed, the emitter holds its origin for as long as it stamps
+// the hash, so the hash stays excluded from receipt content however long
+// the emitter outlives the Config that computed it.
+type heldConfigHash struct {
+	hash   string
+	origin digestorigin.Digest
+}
+
+func holdConfigHash(hash string) heldConfigHash {
+	origin, _ := digestorigin.Retain(strings.TrimPrefix(hash, canonicalPolicyHashLabel))
+	return heldConfigHash{hash: hash, origin: origin}
 }
 
 func (e *Emitter) classifyAction(opts EmitOpts) ActionType {
@@ -1178,6 +1547,8 @@ func (e *Emitter) EmitTranscriptRoot(sessionID string) error {
 		return fmt.Errorf("resume receipt chain: %w", e.initErr)
 	}
 
+	e.emissionGate.Lock()
+	defer e.emissionGate.Unlock()
 	e.chainMu.Lock()
 	defer e.chainMu.Unlock()
 
@@ -1198,13 +1569,25 @@ func (e *Emitter) EmitTranscriptRoot(sessionID string) error {
 		EndTime:      e.chainEnd,
 	}
 
-	if err := e.recorder.Record(recorder.Entry{
-		SessionID: recorderSessionID,
-		Type:      transcriptRootEntryType,
-		EventKind: transcriptRootEntryType,
-		Summary:   fmt.Sprintf("transcript_root: %d receipts, root=%s", root.ReceiptCount, root.RootHash[:16]),
-		Detail:    root,
-	}); err != nil {
+	// The root is validate-or-fail: a refusal leaves rootEmitted unset and
+	// reports no seal. Generic redaction never replaces a root's detail.
+	rootJSON, err := json.Marshal(root)
+	if err != nil {
+		return fmt.Errorf("marshal transcript root: %w", err)
+	}
+	scan, err := e.recorder.BindLifecycleContent(transcriptRootProducer, rootJSON)
+	if err != nil {
+		e.recordFailure(FailReasonContent)
+		return fmt.Errorf("validating transcript root: %w", err)
+	}
+	outer, _ := transcriptRootOuter(rootJSON)
+	if err := e.recorder.RecordWithReceiptScan(recorder.Entry{
+		SessionID: e.session,
+		Type:      outer.Type,
+		EventKind: outer.EventKind,
+		Summary:   outer.Summary,
+		Detail:    json.RawMessage(rootJSON),
+	}, scan); err != nil {
 		return fmt.Errorf("recording transcript root: %w", err)
 	}
 
@@ -1212,11 +1595,14 @@ func (e *Emitter) EmitTranscriptRoot(sessionID string) error {
 	return nil
 }
 
-// configHashString safely extracts a string from an atomic.Value.
-// Returns empty string if the value is nil or not a string.
+// configHashString safely extracts the hash from an atomic.Value.
+// Returns empty string if the value is nil or holds no hash.
 func configHashString(v any) string {
-	if s, ok := v.(string); ok {
-		return s
+	switch h := v.(type) {
+	case heldConfigHash:
+		return h.hash
+	case string:
+		return h
 	}
 	return ""
 }
@@ -1292,7 +1678,7 @@ func (e *Emitter) resumeChain() error {
 		return nil
 	}
 
-	files, err := recorderFiles(e.recorder.Dir())
+	files, err := recorderFiles(e.recorder.Dir(), e.session)
 	if err != nil {
 		return err
 	}
@@ -1303,6 +1689,10 @@ func (e *Emitter) resumeChain() error {
 			return entry.Type == recorderEntryType
 		})
 		if readErr != nil {
+			if errors.Is(readErr, recorder.ErrTornTail) {
+				keys := append(slices.Clone(e.priorSignerKeys), fmt.Sprintf("%x", e.privKey.Public().(ed25519.PublicKey)))
+				readErr = CheckSessionTail(e.recorder, e.session, keys)
+			}
 			return fmt.Errorf("reading existing evidence file %s: %w", filepath.Base(files[i]), readErr)
 		}
 		if found {
@@ -1349,20 +1739,19 @@ func (e *Emitter) resumeChain() error {
 	//
 	//  1. Tail signed by the CURRENT key, signature valid  -> resume the
 	//     same chain segment (the common case).
-	//  2. Tail signed by a DIFFERENT key, but self-valid under its OWN
-	//     embedded signer_key -> a legitimate signing-key rotation. The
-	//     operator regenerated the key (e.g. `contain install`); the prior
-	//     chain is intact, it is simply sealed under the old key. Open a NEW
-	//     segment anchored to the prior tail's hash and stamp a transition
-	//     marker on the next receipt, instead of bricking emission forever.
+	//  2. Tail signed by a DIFFERENT key, self-valid under its OWN embedded
+	//     signer_key, AND that key is the one this process signed with
+	//     before a signer-rotating reload (EmitterConfig.PriorSignerKeys) ->
+	//     a legitimate rotation. Open a NEW segment anchored to the prior
+	//     tail's hash and stamp a transition marker on the next receipt.
+	//     Any other different-key tail is refused.
 	//  3. Tail's OWN signature is INVALID (corrupt / tampered, regardless of
 	//     key) -> FAIL CLOSED. This is the tamper case and must never be
 	//     weakened into a silent reset.
 	//
-	// Why case 2 is safe: we require the tail to be self-consistently signed
-	// by the key embedded in it (VerifyInternalConsistencyOnly). An attacker who can only write a
-	// forged tail with a bad signature lands in case 3 and is rejected, so a
-	// forged tail cannot force a silent segment reset that hides history. A
+	// Why case 2 is safe: the prior key must be one this process held, so a
+	// tail self-signed with a key an attacker chose is refused rather than
+	// vouched for, and a tail with a bad signature lands in case 3. A
 	// rotation reset preserves continuity two ways: the new segment's first
 	// receipt carries the prior tail's hash as its ChainPrevHash plus an
 	// explicit KeyTransition marker (prior signer key + prior seq + prior
@@ -1379,13 +1768,26 @@ func (e *Emitter) resumeChain() error {
 
 		currentKeyHex := fmt.Sprintf("%x", e.privKey.Public().(ed25519.PublicKey))
 		if lastReceipt.SignerKey != currentKeyHex {
-			// Case 2: legitimate rotation. Open a new segment.
+			// Case 2: a rotation is legitimate only when this process itself
+			// signed the tail with the key it is rotating away from. A tail
+			// that is merely self-consistent proves nothing about who wrote
+			// it: anyone can sign a receipt with a key of their own, and
+			// accepting it would have the live key vouch for that key in the
+			// KeyTransition, which auto-anchor then trusts. Every run mints a
+			// fresh session, so outside a signer-rotating reload an existing
+			// tail under a different key has no legitimate source.
+			if !slices.Contains(e.priorSignerKeys, lastReceipt.SignerKey) {
+				return fmt.Errorf("refusing to resume session %q: its last receipt (seq %d) is signed by key %s, which this process did not sign with; the evidence directory may have been altered, so inspect it and restart to begin a new session",
+					e.session, lastReceipt.ActionRecord.ChainSeq, lastReceipt.SignerKey)
+			}
+			// Open a new segment.
 			hash, err := ReceiptHash(*lastReceipt)
 			if err != nil {
 				return fmt.Errorf("hashing prior segment tail: %w", err)
 			}
 			e.chainSeq = 0
 			e.chainPrevHash = hash
+			e.persistedSeq, e.persistedHash = lastReceipt.ActionRecord.ChainSeq, hash
 			e.hasPriorTail = true
 			e.priorTailSeq = lastReceipt.ActionRecord.ChainSeq
 			e.priorTailHash = hash
@@ -1409,6 +1811,7 @@ func (e *Emitter) resumeChain() error {
 	e.chainPrevHash = hash
 	e.chainSeq = lastReceipt.ActionRecord.ChainSeq + 1
 	e.chainEnd = lastReceipt.ActionRecord.Timestamp
+	e.persistedSeq, e.persistedHash = lastReceipt.ActionRecord.ChainSeq, hash
 	e.hasPriorTail = true
 	e.priorTailSeq = lastReceipt.ActionRecord.ChainSeq
 	e.priorTailHash = hash
@@ -1441,11 +1844,65 @@ func receiptBytesFromEntry(entry recorder.Entry) ([]byte, error) {
 	return detailJSON, nil
 }
 
-func recorderFiles(dir string) ([]string, error) {
+func recorderFiles(dir, session string) ([]string, error) {
 	if dir == "" {
 		return nil, nil
 	}
+	ix, err := indexRecorderFiles(dir)
+	if err != nil {
+		return nil, err
+	}
+	return ix.files(session)
+}
 
+// evidenceIndex maps each session to its evidence shard paths, in chain order.
+type evidenceIndex map[string][]string
+
+type indexedRecorderShard struct {
+	path     string
+	base     string
+	seqStart uint64
+}
+
+// sessions returns every session in the index, sorted.
+func (ix evidenceIndex) sessions() []string {
+	out := make([]string, 0, len(ix))
+	for s := range ix {
+		out = append(out, s)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// files returns session's shards, refusing duplicate shard starts.
+func (ix evidenceIndex) files(session string) ([]string, error) {
+	files := ix[session]
+	// Same refusal the recorder applies to its resume candidates. This list
+	// feeds resumeChain, which sets live chain sequence and prev-hash state, so
+	// silently tie-breaking here while the recorder refuses would let the two
+	// derive different chain heads from identical bytes.
+	if err := evidencename.CheckNoDuplicateSeqStart(files); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+// indexRecorderFiles reads dir once and groups every evidence shard by
+// session. It is uncapped, like the recorder's own resume scan: the capped
+// read ceiling guards query paths that would otherwise present a partial view
+// as complete, while this index must see every shard to be correct at all.
+func indexRecorderFiles(dir string) (evidenceIndex, error) {
+	return indexRecorderFilesWithGroupFilter(dir, false)
+}
+
+// indexRecorderFilesExcludingReceiptGroups filters each session before adding
+// it to the legacy index. A disk-backed name spool keeps historical group
+// filenames out of Go heap while retaining complete directory coverage.
+func indexRecorderFilesExcludingReceiptGroups(dir string) (evidenceIndex, error) {
+	return indexRecorderFilesExcludingGroupsSpill(dir)
+}
+
+func indexRecorderFilesWithGroupFilter(dir string, excludeGroups bool) (evidenceIndex, error) {
 	dirEntries, err := os.ReadDir(filepath.Clean(dir))
 	if err != nil {
 		return nil, fmt.Errorf("reading evidence directory: %w", err)
@@ -1457,12 +1914,20 @@ func recorderFiles(dir string) ([]string, error) {
 	// session's shard to this one: for session "s", "evidence-s-evil-999.jsonl"
 	// satisfies the prefix but belongs to session "s-evil". Both now go through
 	// recorder.ParseEvidenceFilename so there is one definition of membership.
-	type shard struct {
-		path     string
-		base     string
-		seqStart uint64
+	bySession := make(map[string][]indexedRecorderShard)
+	currentSession := ""
+	var currentShards []indexedRecorderShard
+	flush := func() {
+		if currentSession == "" || len(currentShards) == 0 {
+			return
+		}
+		if excludeGroups && isGroupSessionShards(currentShards) {
+			currentSession, currentShards = "", nil
+			return
+		}
+		bySession[currentSession] = append(bySession[currentSession], currentShards...)
+		currentSession, currentShards = "", nil
 	}
-	shards := make([]shard, 0)
 	for _, de := range dirEntries {
 		if de.IsDir() {
 			continue
@@ -1472,33 +1937,46 @@ func recorderFiles(dir string) ([]string, error) {
 			continue
 		}
 		parsedSession, seqStart, ok := recorder.ParseEvidenceFilename(name)
-		if !ok || parsedSession != recorderSessionID {
+		if !ok {
 			continue
 		}
-		shards = append(shards, shard{
+		if currentSession != "" && currentSession != parsedSession {
+			flush()
+		}
+		currentSession = parsedSession
+		currentShards = append(currentShards, indexedRecorderShard{
 			path:     filepath.Join(filepath.Clean(dir), name),
 			base:     name,
 			seqStart: seqStart,
 		})
 	}
-	// Total order: sort.Slice is not stable, so break seqStart ties on basename
-	// rather than leaving the result dependent on directory order.
-	sort.Slice(shards, func(i, j int) bool {
-		if shards[i].seqStart != shards[j].seqStart {
-			return shards[i].seqStart < shards[j].seqStart
+	flush()
+	ix := make(evidenceIndex, len(bySession))
+	for session, shards := range bySession {
+		// Total order: sort.Slice is not stable, so break seqStart ties on
+		// basename rather than leaving the result dependent on directory order.
+		sort.Slice(shards, func(i, j int) bool {
+			if shards[i].seqStart != shards[j].seqStart {
+				return shards[i].seqStart < shards[j].seqStart
+			}
+			return shards[i].base < shards[j].base
+		})
+		files := make([]string, 0, len(shards))
+		for _, s := range shards {
+			files = append(files, s.path)
 		}
-		return shards[i].base < shards[j].base
-	})
-	files := make([]string, 0, len(shards))
-	for _, s := range shards {
-		files = append(files, s.path)
+		ix[session] = files
 	}
-	// Same refusal the recorder applies to its resume candidates. This list
-	// feeds resumeChain, which sets live chain sequence and prev-hash state, so
-	// silently tie-breaking here while the recorder refuses would let the two
-	// derive different chain heads from identical bytes.
-	if err := evidencename.CheckNoDuplicateSeqStart(files); err != nil {
-		return nil, err
+	return ix, nil
+}
+
+func isGroupSessionShards(shards []indexedRecorderShard) bool {
+	for _, shard := range shards {
+		if shard.seqStart != 0 {
+			continue
+		}
+		first, seen, err := firstGroupEvidenceEntry(shard.path)
+		return err != nil || seen && first.Type == recorder.GroupGateEntryType
 	}
-	return files, nil
+	return false
 }

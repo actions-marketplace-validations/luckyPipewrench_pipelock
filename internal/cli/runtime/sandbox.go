@@ -21,6 +21,7 @@ import (
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
+	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/proxy"
 	"github.com/luckyPipewrench/pipelock/internal/sandbox"
@@ -71,6 +72,9 @@ Examples:
 			// Load config for scanner.
 			cfg, err := cliutil.LoadConfigOrDefault(configFile)
 			if err != nil {
+				return err
+			}
+			if err := cfg.ResolveRuntimeCredentials(); err != nil {
 				return err
 			}
 
@@ -144,6 +148,8 @@ Examples:
 				BestEffortReason: useBestEffortReason,
 				BestEffortExpiry: useBestEffortExpiry,
 				ExtraEnv:         extraEnv,
+
+				BridgeIdleTimeout: sandboxBridgeIdleTimeout(cfg),
 			}
 
 			// Merge custom filesystem policy from config into defaults.
@@ -185,6 +191,10 @@ Examples:
 
 			m := metrics.New()
 			logger := audit.NewNop() // standalone sandbox uses stderr, not structured audit
+			// No structured audit sink here: disclose the policy and report
+			// warn-only wording observations on stderr instead.
+			announcePromptInjectionPolicy(cfg, nil, cmd.ErrOrStderr())
+			wirePromptInjectionStderr(sc, cmd.ErrOrStderr())
 
 			// Build the proxy once, share across connections.
 			p, pErr := proxy.New(cfg, logger, sc, m)
@@ -303,4 +313,23 @@ func printJSON(w io.Writer, v interface{}) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(v)
+}
+
+// sandboxBridgeIdleTimeout is the idle bound for the sandbox-side bridge
+// relay. The bridge carries CONNECT tunnels, WebSocket traffic, and plain
+// HTTP requests whose response the parent may wait fetch_proxy.timeout_seconds
+// for, so it takes the largest of those parent timers: the parent proxy
+// remains the policy authority, and the bridge only reaps relays the parent
+// has already let go.
+func sandboxBridgeIdleTimeout(cfg *config.Config) time.Duration {
+	secs := max(cfg.ForwardProxy.IdleTimeoutSeconds, cfg.WebSocketProxy.IdleTimeoutSeconds, cfg.FetchProxy.TimeoutSeconds)
+	if secs <= 0 {
+		return 0
+	}
+	// Saturate rather than let the multiplication wrap to a negative or short
+	// duration. Validation already bounds these fields far below this.
+	if int64(secs) > int64(sandbox.MaxBridgeIdleTimeout/time.Second) {
+		return sandbox.MaxBridgeIdleTimeout
+	}
+	return time.Duration(secs) * time.Second
 }

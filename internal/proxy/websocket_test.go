@@ -32,6 +32,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/capture"
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
@@ -144,7 +145,7 @@ func TestWebSocketClientMessageBody_ContentEntropy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := testScannerConfig()
 			cfg.WebSocketProxy.Enabled = true
-			cfg.WebSocketProxy.ContentEntropyExclusions = tt.wsExclusion
+			cfg.WebSocketProxy.ContentEntropyExclusions = config.EntropyHostExclusions(tt.wsExclusion...)
 			cfg.TrustedDomains = tt.trusted
 			cfg.RequestBodyScanning.ContentEntropyEnabled = true
 			cfg.RequestBodyScanning.ContentEntropyAction = tt.action
@@ -360,6 +361,38 @@ func setupWSProxyWithLogger(t *testing.T, logger *audit.Logger, cfgMod func(*con
 // dialWSConn connects to the proxy /ws endpoint and returns the raw connection.
 // Compression is disabled to avoid "compressed frames not supported" errors
 // when the proxy relays frames without per-message deflate negotiation.
+// wsTestDial dials a WebSocket and keeps any frame bytes that arrived in the
+// same read as the handshake response. gobwas returns those bytes in a pooled
+// reader; discarding it loses a frame the proxy forwarded right after the
+// upgrade, which surfaced as an intermittent idle-timeout close.
+func wsTestDial(ctx context.Context, dialer ws.Dialer, target string) (net.Conn, error) {
+	conn, reader, _, err := dialer.Dial(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	if reader == nil {
+		return conn, nil
+	}
+	defer ws.PutReader(reader)
+	if n := reader.Buffered(); n > 0 {
+		prefix, peekErr := reader.Peek(n)
+		if peekErr != nil {
+			_ = conn.Close()
+			return nil, peekErr
+		}
+		return &wsTestPrefixedConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(bytes.Clone(prefix)), conn)}, nil
+	}
+	return conn, nil
+}
+
+// wsTestPrefixedConn reads the preserved handshake-adjacent bytes before the socket.
+type wsTestPrefixedConn struct {
+	net.Conn
+	reader io.Reader
+}
+
+func (c *wsTestPrefixedConn) Read(p []byte) (int, error) { return c.reader.Read(p) }
+
 func dialWSConn(proxyAddr, backendAddr string) (net.Conn, error) {
 	return dialWSConnWithHeader(proxyAddr, backendAddr, nil)
 }
@@ -370,7 +403,7 @@ func dialWSConnToTarget(proxyAddr, targetURL string) (net.Conn, error) {
 
 	wsURL := fmt.Sprintf("ws://%s/ws?url=%s", proxyAddr, url.QueryEscape(targetURL))
 	dialer := ws.Dialer{Extensions: nil}
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +421,7 @@ func dialWSConnWithHeader(proxyAddr, backendAddr string, header http.Header) (ne
 	if len(header) > 0 {
 		dialer.Header = ws.HandshakeHeaderHTTP(header)
 	}
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		return nil, err
 	}
@@ -536,6 +569,133 @@ func waitForWarnContext(t *testing.T, hookCh <-chan scanner.DLPWarnContext, scop
 	case <-time.After(testWarnHookTimeout):
 		t.Fatalf("timed out waiting for DLP warn hook to capture %s context", scope)
 		return scanner.DLPWarnContext{}
+	}
+}
+
+func TestWSProxyIssuerHistoryUncertainty(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
+	proxyAddr, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.TLSInterception.Enabled = true
+		cfg.DefaultAgentIdentity = "sender"
+		cfg.BindDefaultAgentIdentity = true
+	})
+	defer cleanup()
+	store := p.issuerStoreForUnmediatedSend()
+	if store == nil {
+		t.Fatal("issuer history store unavailable")
+	}
+	origin, err := url.Parse("https://" + backendAddr + "/filters")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := sessionKeyFor(p.cfgPtr.Load(), edition.ConfigDefaultName("sender"), "127.0.0.1", envelope.ActorAuthConfigDefault)
+	peer := sessionKeyFor(p.cfgPtr.Load(), "peer", "127.0.0.1", envelope.ActorAuthBound)
+	for _, key := range []string{sender, peer} {
+		store.recordSent(key, origin, nil, nil, true, time.Now())
+		store.mintServerID(key, origin, serverIDListed, time.Now())
+		if !store.serverIDIssued(key, origin, serverIDListed) {
+			t.Fatal("positive control: caller did not learn the ID")
+		}
+	}
+	conn, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/"+agentBlob)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	var statusErr ws.StatusError
+	if !errors.As(err, &statusErr) || int(statusErr) != http.StatusForbidden {
+		t.Fatalf("unissued high-entropy WebSocket target error = %v, want HTTP 403", err)
+	}
+	if !store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("a blocked WebSocket request tainted its caller")
+	}
+	conn = dialWS(t, proxyAddr, backendAddr)
+	defer func() { _ = conn.Close() }()
+	if err := wsutil.WriteClientMessage(conn, ws.OpText, []byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := wsutil.ReadServerData(conn); err != nil {
+		t.Fatal(err)
+	}
+	if store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("sender kept an ID after its WebSocket traffic reached the host")
+	}
+	if !store.serverIDIssued(peer, origin, serverIDListed) {
+		t.Fatal("sender's WebSocket tainted another trusted caller")
+	}
+}
+
+func TestWSProxyIssuerHistoryTaintedBeforeHandshake(t *testing.T) {
+	proxyAddr, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
+		cfg.TLSInterception.Enabled = true
+		cfg.DefaultAgentIdentity = "sender"
+		cfg.BindDefaultAgentIdentity = true
+	})
+	defer cleanup()
+	store := p.issuerStoreForUnmediatedSend()
+	if store == nil {
+		t.Fatal("issuer history store unavailable")
+	}
+	sender := sessionKeyFor(p.cfgPtr.Load(), edition.ConfigDefaultName("sender"), "127.0.0.1", envelope.ActorAuthConfigDefault)
+	peer := sessionKeyFor(p.cfgPtr.Load(), "peer", "127.0.0.1", envelope.ActorAuthBound)
+	type evidence struct{ retained, minted, peerRetained bool }
+	observed := make(chan evidence, 1)
+	var origin *url.URL
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// This runs concurrently with the proxy at the first upstream HTTP
+		// request, before any upgrade response or WebSocket frame exists.
+		retained := store.serverIDIssued(sender, origin, serverIDListed)
+		store.mintServerID(sender, origin, serverIDOther, time.Now())
+		observed <- evidence{retained, store.serverIDIssued(sender, origin, serverIDOther), store.serverIDIssued(peer, origin, serverIDListed)}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+	var err error
+	origin, err = url.Parse(strings.Replace(upstream.URL, "http://", "https://", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{sender, peer} {
+		store.recordSent(key, origin, nil, nil, true, time.Now())
+		store.mintServerID(key, origin, serverIDListed, time.Now())
+		if !store.serverIDIssued(key, origin, serverIDListed) {
+			t.Fatal("positive control: caller did not learn the ID")
+		}
+	}
+	conn, err := dialWSConnToTarget(proxyAddr, strings.Replace(upstream.URL, "http://", "ws://", 1))
+	if err != nil {
+		t.Fatalf("client upgrade before upstream dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	handshakeTimeout := time.NewTimer(5 * time.Second)
+	defer handshakeTimeout.Stop()
+	select {
+	case got := <-observed:
+		if got.retained || got.minted || !got.peerRetained {
+			t.Fatalf("upstream handshake saw usable issuer evidence: %+v", got)
+		}
+	case <-handshakeTimeout.C:
+		t.Fatal("upstream handshake was not observed")
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = wsutil.ReadServerData(conn)
+	var closed wsutil.ClosedError
+	// The upstream's 503 makes the dial fail after the handshake was sent.
+	// A close frame or EOF proves the client cannot keep using the stream.
+	if !errors.Is(err, io.EOF) && (!errors.As(err, &closed) || closed.Code != ws.StatusInternalServerError) {
+		t.Fatalf("failed upstream handshake = %v, want closed stream", err)
+	}
+	if store.serverIDIssued(sender, origin, serverIDListed) {
+		t.Fatal("failed upstream dial restored previously learned evidence")
+	}
+	store.mintServerID(sender, origin, serverIDOther, time.Now())
+	if store.serverIDIssued(sender, origin, serverIDOther) {
+		t.Fatal("failed upstream dial allowed new issuer evidence")
+	}
+	if !store.serverIDIssued(peer, origin, serverIDListed) {
+		t.Fatal("failed upstream dial tainted another trusted caller")
 	}
 }
 
@@ -751,14 +911,14 @@ func TestWSProxyRedaction_RewritesJSONMessage(t *testing.T) {
 
 	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
 		cfg.Enforce = ptrBool(false)
-		applyRedactionTestProfile(cfg)
+		applyWSRedactionTestProfile(cfg)
 	})
 	defer proxyCleanup()
 
 	conn := dialWS(t, proxyAddr, backendAddr)
 	defer conn.Close() //nolint:errcheck // test
 
-	secret := redactionE2ESecret()
+	secret := wsRedactionE2ESecret()
 	msg := []byte(`{"prompt":"use ` + secret + ` to deploy"}`)
 	if err := wsutil.WriteClientMessage(conn, ws.OpText, msg); err != nil {
 		t.Fatalf("write: %v", err)
@@ -775,7 +935,7 @@ func TestWSProxyRedaction_RewritesJSONMessage(t *testing.T) {
 	if strings.Contains(replyStr, secret) {
 		t.Fatalf("echoed reply leaked secret: %q", replyStr)
 	}
-	if !strings.Contains(replyStr, placeholderAWS) {
+	if !strings.Contains(replyStr, wsPlaceholderAnthropic) {
 		t.Fatalf("echoed reply missing placeholder: %q", replyStr)
 	}
 }
@@ -786,7 +946,7 @@ func TestWSProxyRedactionMetricUsesProfileLabel(t *testing.T) {
 
 	proxyAddr, p, proxyCleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
 		cfg.Enforce = ptrBool(false)
-		applyRedactionTestProfile(cfg)
+		applyWSRedactionTestProfile(cfg)
 	})
 	defer proxyCleanup()
 
@@ -797,7 +957,7 @@ func TestWSProxyRedactionMetricUsesProfileLabel(t *testing.T) {
 	}
 	defer func() { _ = conn.Close() }()
 
-	secret := redactionE2ESecret()
+	secret := wsRedactionE2ESecret()
 	msg := []byte(`{"prompt":"use ` + secret + ` to deploy"}`)
 	if err := wsutil.WriteClientMessage(conn, ws.OpText, msg); err != nil {
 		t.Fatalf("write: %v", err)
@@ -806,8 +966,8 @@ func TestWSProxyRedactionMetricUsesProfileLabel(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 
-	assertMetricsContain(t, p.metrics, `pipelock_body_redactions_total{agent="_default",class="aws-access-key",parser="json",provider="generic-json",transport="websocket"} 1`)
-	assertMetricsNotContain(t, p.metrics, `pipelock_body_redactions_total{agent="arbitrary-attacker-chosen-name",class="aws-access-key",parser="json",provider="generic-json",transport="websocket"} 1`)
+	assertMetricsContain(t, p.metrics, `pipelock_body_redactions_total{agent="_default",class="anthropic-api-key",parser="json",provider="generic-json",transport="websocket"} 1`)
+	assertMetricsNotContain(t, p.metrics, `pipelock_body_redactions_total{agent="arbitrary-attacker-chosen-name",class="anthropic-api-key",parser="json",provider="generic-json",transport="websocket"} 1`)
 }
 
 func TestWSProxyRequireReceipts_RedactedSuccessEmitsCloseSummary(t *testing.T) {
@@ -818,13 +978,13 @@ func TestWSProxyRequireReceipts_RedactedSuccessEmitsCloseSummary(t *testing.T) {
 	proxyAddr, p, proxyCleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
 		cfg.Enforce = ptrBool(false)
 		cfg.FlightRecorder.RequireReceipts = true
-		applyRedactionTestProfile(cfg)
+		applyWSRedactionTestProfile(cfg)
 	})
 	defer proxyCleanup()
 	p.receiptEmitterPtr.Store(rph.emitter)
 
 	conn := dialWS(t, proxyAddr, backendAddr)
-	secret := redactionE2ESecret()
+	secret := wsRedactionE2ESecret()
 	msg := []byte(`{"prompt":"use ` + secret + ` to deploy"}`)
 	if err := wsutil.WriteClientMessage(conn, ws.OpText, msg); err != nil {
 		t.Fatalf("write: %v", err)
@@ -1289,11 +1449,11 @@ func TestWSFilterUniqueDLPMatches_SkipsExcludedAndDuplicates(t *testing.T) {
 	if len(filtered) != 2 {
 		t.Fatalf("filtered matches = %d, want 2", len(filtered))
 	}
-	if wsDLPMatchKey(filtered[0]) != "dup\x00hex" {
-		t.Fatalf("first filtered key = %q, want dup\\x00hex", wsDLPMatchKey(filtered[0]))
+	if wsDLPMatchKey(filtered[0]) != "dup\x00hex\x00false" {
+		t.Fatalf("first filtered key = %q, want dup\\x00hex\\x00false", wsDLPMatchKey(filtered[0]))
 	}
-	if wsDLPMatchKey(filtered[1]) != "other\x00" {
-		t.Fatalf("second filtered key = %q, want other\\x00", wsDLPMatchKey(filtered[1]))
+	if wsDLPMatchKey(filtered[1]) != "other\x00\x00false" {
+		t.Fatalf("second filtered key = %q, want other\\x00\\x00false", wsDLPMatchKey(filtered[1]))
 	}
 }
 
@@ -1459,6 +1619,22 @@ func TestWSRelay_HandleClientMessageBodyResult_ContentEntropyWarnAudits(t *testi
 	logText := string(logBytes)
 	if !strings.Contains(logText, `"event":"ws_scan"`) || !strings.Contains(logText, `"scanner":"body_entropy"`) || !strings.Contains(logText, `"action":"warn"`) {
 		t.Fatalf("expected ws_scan body_entropy warn audit event, got:\n%s", logText)
+	}
+}
+
+func TestWSRelay_EntropyWarnAtElevatedLevel(t *testing.T) {
+	cfg := adaptiveConfig()
+	cfg.RequestBodyScanning.ContentEntropyAction = config.ActionWarn
+	m := metrics.New()
+	sm := NewSessionManager(&cfg.SessionProfiling, nil, m)
+	defer sm.Close()
+	rec := sm.GetOrCreate(adaptiveSessionKeyLoopback)
+	escalateRec(rec, 1)
+	before := rec.ThreatScore()
+	relay := &wsRelay{proxy: &Proxy{metrics: m}, cfg: cfg, rec: rec, hostname: "socket.vendor.example", agent: agentAnonymous, clientIP: adaptiveSessionKeyLoopback, targetURL: "wss://socket.vendor.example/socket"}
+	blocked := relay.handleClientMessageBodyResult(audit.NewNop(), []byte("opaque"), BodyScanResult{Action: config.ActionWarn, EntropyFinding: &ContentEntropyFinding{Entropy: 4.8, Threshold: 4.5, Length: 64}})
+	if blocked || rec.ThreatScore() != before {
+		t.Fatalf("elevated entropy warning blocked=%v score=%.1f, want forward and score %.1f", blocked, rec.ThreatScore(), before)
 	}
 }
 
@@ -1725,7 +1901,7 @@ func TestWSProxyInjectionWarn_ContaminatesSessionBeforeSensitiveAction(t *testin
 	if sm == nil {
 		t.Fatal("session manager not initialized")
 	}
-	sess := sm.GetOrCreate(ceeSessionKey(agent, "127.0.0.1", envelope.ActorAuthSelfDeclared))
+	sess := sm.GetOrCreate(ceeSessionKey(nil, agent, "127.0.0.1", envelope.ActorAuthSelfDeclared))
 	if risk := sess.RiskSnapshot(); !risk.Contaminated {
 		t.Fatal("WebSocket injection finding left the session falsely clean")
 	}
@@ -1787,7 +1963,7 @@ func TestWSProxyResponseTaintControls(t *testing.T) {
 				t.Fatalf("read response: %v", err)
 			}
 
-			sess := p.sessionMgrPtr.Load().GetOrCreate(sessionKeyFor(agentAnonymous, "127.0.0.1", envelope.ActorAuthUnknown))
+			sess := p.sessionMgrPtr.Load().GetOrCreate(sessionKeyFor(nil, agentAnonymous, "127.0.0.1", envelope.ActorAuthUnknown))
 			risk := sess.RiskSnapshot()
 			if risk.Contaminated != tt.wantTainted {
 				t.Fatalf("contaminated = %v, want %v", risk.Contaminated, tt.wantTainted)
@@ -1799,14 +1975,14 @@ func TestWSProxyResponseTaintControls(t *testing.T) {
 	}
 }
 
-func TestWSRelayResponseTaint_ReResolvesEvictedSession(t *testing.T) {
+func TestWSRelayResponseTaint_ReResolvesDeletedSession(t *testing.T) {
 	_, p, cleanup := setupWSProxyDefaultWithProxy(t, func(cfg *config.Config) {
 		cfg.SessionProfiling.Enabled = true
 		cfg.SessionProfiling.MaxSessions = 1
 	})
 	defer cleanup()
 
-	key := ceeSessionKey("named-agent", "127.0.0.1", envelope.ActorAuthSelfDeclared)
+	key := ceeSessionKey(nil, "named-agent", "127.0.0.1", envelope.ActorAuthSelfDeclared)
 	relay := &wsRelay{
 		proxy:           p,
 		cfg:             p.CurrentConfig(),
@@ -1819,12 +1995,12 @@ func TestWSRelayResponseTaint_ReResolvesEvictedSession(t *testing.T) {
 	if !original.RiskSnapshot().Contaminated {
 		t.Fatal("first external WebSocket response did not contaminate session")
 	}
-	sm.GetOrCreate("evict-response-taint-session")
+	sm.Delete(key)
 
 	relay.observeUpstreamResponseTaint(true)
 	current := sm.GetOrCreate(key)
 	if current == original {
-		t.Fatal("test did not evict the original session")
+		t.Fatal("test did not delete the original session")
 	}
 	if risk := current.RiskSnapshot(); !risk.PromptHit || risk.Level != session.TaintExternalHostile {
 		t.Fatalf("recreated session risk = %+v, want hostile prompt hit", risk)
@@ -2399,7 +2575,7 @@ func TestWSProxyHeaderDLPDisablePatternAllowsNonCore(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("disabled non-core header DLP should allow websocket dial: %v", err)
 	}
@@ -2469,7 +2645,7 @@ func TestWSProxyHeaderDLPSessionAnomalyBlocksHandshake(t *testing.T) {
 		t.Fatalf("pre-lock status = %d, want %d", first.StatusCode, http.StatusSwitchingProtocols)
 	}
 	_ = first.Body.Close()
-	lockHTTPBaseline(t, sm, sessionKeyFor("agent-a", "127.0.0.1", envelope.ActorAuthSelfDeclared))
+	lockHTTPBaseline(t, sm, sessionKeyFor(nil, "agent-a", "127.0.0.1", envelope.ActorAuthSelfDeclared))
 
 	resp := requestWSHandshake(t, proxyAddr, backendAddr, http.Header{
 		AgentHeader: []string{"agent-a"},
@@ -2512,7 +2688,7 @@ func TestWSProxyHeaderDLPPatternWarnOverrideAllowsNonCore(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("warn-only non-core header DLP should allow websocket dial: %v", err)
 	}
@@ -2578,7 +2754,7 @@ func TestWSProxyHeaderDLPBlocksAllowlistedHost(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("expected dial to fail: header DLP must block secrets regardless of allowlist")
@@ -2612,7 +2788,7 @@ func TestWSProxyHeaderDLPSuppressedCriticalAllowed(t *testing.T) {
 		Timeout: 5 * time.Second,
 	}
 
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("expected suppressed header DLP to allow websocket dial: %v", err)
 	}
@@ -3468,7 +3644,7 @@ func TestWSProxy_CrossMessageDLP_FragmentThenSplit(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	wsURL := fmt.Sprintf("ws://%s/ws?url=ws://%s", proxyAddr, backendAddr)
-	conn, _, _, err := ws.Dialer{Extensions: nil}.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, ws.Dialer{Extensions: nil}, wsURL)
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)
 	}
@@ -3566,7 +3742,7 @@ func TestWSProxyWSSScheme(t *testing.T) {
 	// (maps scheme for scanning). The upstream dial may fail since the echo
 	// server isn't TLS, but this exercises the wss branch code path.
 	wsURL := fmt.Sprintf("ws://%s/ws?url=wss://%s/v1", proxyAddr, backendAddr)
-	conn, _, _, err := ws.Dialer{Extensions: nil}.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, ws.Dialer{Extensions: nil}, wsURL)
 	if err != nil {
 		// Expected: upstream dial fails because echo server isn't TLS.
 		// This is fine - the wss branch was exercised before the dial.
@@ -3658,7 +3834,7 @@ func TestWSProxyCookieForwarding(t *testing.T) {
 		}),
 		Timeout: 5 * time.Second,
 	}
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -3695,7 +3871,7 @@ func TestWSProxySessionBlocked(t *testing.T) {
 	for _, d := range domains {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		wsURL := fmt.Sprintf("ws://%s/ws?url=ws://%s:9999", proxyAddr, d)
-		conn, _, _, err := ws.Dialer{Extensions: nil}.Dial(ctx, wsURL)
+		conn, err := wsTestDial(ctx, ws.Dialer{Extensions: nil}, wsURL)
 		cancel()
 		if err == nil {
 			_ = conn.Close()
@@ -3757,7 +3933,7 @@ func TestWSProxySubprotocol(t *testing.T) {
 		}),
 		Timeout: 5 * time.Second,
 	}
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -4177,7 +4353,7 @@ func TestWSProxyAPIKeyHeader(t *testing.T) {
 		}),
 		Timeout: 5 * time.Second,
 	}
-	conn, _, _, err := dialer.Dial(ctx, wsURL)
+	conn, err := wsTestDial(ctx, dialer, wsURL)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -4363,6 +4539,7 @@ func TestWebSocketHandshake_CEEPathFragmentsBlockSecondUpgrade(t *testing.T) {
 		t.Fatalf("first incomplete handshake failed: %v", err)
 	}
 	defer func() { _ = first.Close() }()
+	waitForUpstreamHandshakes(t, handshakes, 1)
 
 	if _, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half2); err == nil {
 		t.Fatal("second path fragment completed a WebSocket upgrade")
@@ -4372,8 +4549,9 @@ func TestWebSocketHandshake_CEEPathFragmentsBlockSecondUpgrade(t *testing.T) {
 	}
 }
 
-func TestWebSocketHandshake_CEEPathWarnEscalatesBlockAll(t *testing.T) {
-	backendAddr, handshakes, _, _ := websocketBoundaryBackend(t)
+func TestWebSocketHandshake_CEEPathWarnCannotEscalateBlockAll(t *testing.T) {
+	backendAddr, backendCleanup := wsEchoServer(t)
+	defer backendCleanup()
 	proxyAddr, proxyCleanup := setupWSProxy(t, func(cfg *config.Config) {
 		cfg.CrossRequestDetection.Enabled = true
 		cfg.CrossRequestDetection.Action = config.ActionWarn
@@ -4396,12 +4574,11 @@ func TestWebSocketHandshake_CEEPathWarnEscalatesBlockAll(t *testing.T) {
 	}
 	defer func() { _ = first.Close() }()
 
-	if _, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half2); err == nil {
-		t.Fatal("warn-mode CEE match did not escalate the completing handshake to block_all")
+	second, err := dialWSConnToTarget(proxyAddr, "ws://"+backendAddr+"/upload/"+half2)
+	if err != nil {
+		t.Fatalf("warn-mode CEE match blocked the completing handshake: %v", err)
 	}
-	if got := handshakes.Load(); got != 1 {
-		t.Fatalf("upstream handshakes = %d, want only the first incomplete handshake", got)
-	}
+	defer func() { _ = second.Close() }()
 }
 
 // TestWSProxyInjectionStrip verifies that the response scanning strip action

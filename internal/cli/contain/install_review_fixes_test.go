@@ -70,6 +70,7 @@ func TestRenderLaunchWrapper_EmbedsAllowListLookup(t *testing.T) {
 		"not in pipelock contain allow-list",
 		"refusing non-absolute target",
 		`[[ ! "$TOOL" =~ ` + containToolNameRegex, // shared regex check
+		"contain assert-agent-netns --agent-user 'pipelock-agent' --proxy-port 8888",
 		"set -euo pipefail",
 	}
 	for _, r := range requirements {
@@ -286,6 +287,11 @@ func TestStepWriteToolsList_PreservesCustomEntries(t *testing.T) {
 	if err := os.WriteFile(env.toolsListPath, []byte(custom), 0o600); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
+	// Seed at the managed mode: a root-only list is rewritten (see
+	// TestStepWriteToolsListRepairsModeWhenContentUnchanged).
+	if err := os.Chmod(env.toolsListPath, modeAllowListReadable); err != nil {
+		t.Fatalf("chmod seed: %v", err)
+	}
 
 	s := stepWriteToolsList()
 	applied, err := s.apply(context.Background(), env)
@@ -341,18 +347,18 @@ func TestStepWriteToolsList_AddsMissingDefaultWithoutDroppingCustom(t *testing.T
 
 func plantResolvableDefaultTools(t *testing.T, env *installEnv, names ...string) {
 	t.Helper()
-	targets := make(map[string]string, len(names))
+	targets := make(map[string]bool, len(names))
 	for _, name := range names {
-		target, err := os.Executable()
-		if err != nil {
-			t.Fatalf("locate test executable: %v", err)
-		}
-		targets["/usr/local/bin/"+name] = target
+		targets["/usr/local/bin/"+name] = true
+	}
+	env.toolCanExecute = func(path string) bool {
+		_, ok := targets[path]
+		return ok
 	}
 	origStat := env.stat
 	env.stat = func(path string) (os.FileInfo, error) {
-		if target, ok := targets[path]; ok {
-			return origStat(target)
+		if _, ok := targets[path]; ok {
+			return fakeFileInfo{mode: 0o755}, nil
 		}
 		if strings.HasPrefix(path, "/home/"+env.agentUserName+"/.local/bin/") ||
 			strings.HasPrefix(path, "/usr/local/bin/") ||
@@ -487,6 +493,13 @@ func TestRenderedCCLaunch_ExecutesUnderBash(t *testing.T) {
 		},
 		{name: "not-in-list-exits-5", argv: []string{probe11Sentinel}, wantExit: 5},
 		{name: "happy-path-exits-0", argv: []string{"claude"}, wantExit: 0},
+		{
+			name: "namespace-assertion-failure-is-preserved", argv: []string{"claude"},
+			mutate: func() {
+				writeScriptFixture(t, env.pipelockTarget, "#!/bin/sh\nexit 10\n")
+			},
+			wantExit: 10,
+		},
 	}
 
 	for _, tc := range cases {
@@ -495,8 +508,15 @@ func TestRenderedCCLaunch_ExecutesUnderBash(t *testing.T) {
 			if err := os.WriteFile(toolsListPath, []byte(allowList), 0o600); err != nil {
 				t.Fatalf("reseed: %v", err)
 			}
+			writeScriptFixture(t, env.pipelockTarget, "#!/bin/sh\nexit 0\n")
+			if err := os.Chmod(env.pipelockTarget, 0o700); err != nil {
+				t.Fatalf("chmod namespace assertion fixture: %v", err)
+			}
 			if tc.mutate != nil {
 				tc.mutate()
+				if err := os.Chmod(env.pipelockTarget, 0o700); err != nil {
+					t.Fatalf("chmod mutated namespace assertion fixture: %v", err)
+				}
 			}
 			args := append([]string{scriptPath}, tc.argv...)
 			out := execRealCommand(t, "/bin/bash", args...)

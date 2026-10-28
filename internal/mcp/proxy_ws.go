@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/httpstream"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
@@ -53,9 +54,13 @@ func RunWSProxy(
 		opts.A2ACardURL = upstreamURL
 	}
 	opts.A2ACardURL = a2aCardURLForWSUpstream(opts.A2ACardURL)
+	startupAuditOpts := opts
+	startupAuditOpts.Transport = "mcp_ws"
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
+		dropMCPDenial(startupAuditOpts, mcpStartupDenialAudit(mcpListenerContractEvalDenialAudit()), "startup")
 		return fmt.Errorf("contract upstream evaluation: %w", gateErr)
 	} else if gate.Verdict == config.ActionBlock {
+		dropMCPDenial(startupAuditOpts, mcpStartupDenialAudit(mcpUpstreamGateDenialAudit(gate)), "startup")
 		return fmt.Errorf("contract upstream denied: %s", mcpContractBlockReason(gate))
 	}
 
@@ -64,14 +69,23 @@ func RunWSProxy(
 	// when either direction finishes (stdin EOF or upstream close).
 	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopInputClose := context.AfterFunc(innerCtx, func() {
+		if closer, ok := clientIn.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	})
+	defer stopInputClose()
 
 	// Per-invocation adaptive enforcement recorder.
 	var rec session.Recorder
 	if opts.Store != nil {
-		rec = opts.Store.GetOrCreate(session.NextInvocationKey("mcp-ws"))
+		invocationKey := session.NextInvocationKey("mcp-ws")
+		rec = opts.Store.GetOrCreate(invocationKey)
 		if rec == nil {
+			dropMCPDenial(startupAuditOpts, mcpStartupDenialAudit(mcpListenerCapacityDenialAudit()), "startup")
 			return session.ErrCapacity
 		}
+		defer opts.Store.Delete(invocationKey)
 	}
 	defer recordMCPBaselineSample(opts, rec)
 
@@ -102,6 +116,8 @@ func RunWSProxy(
 			BindingUnknownAction:    toolCfg.BindingUnknownAction,
 			BindingNoBaselineAction: toolCfg.BindingNoBaselineAction,
 			ExtraPoison:             toolCfg.ExtraPoison,
+			CredentialAcks:          toolCfg.CredentialAcks,
+			Now:                     toolCfg.Now,
 		}
 	}
 
@@ -124,6 +140,29 @@ func RunWSProxy(
 
 	var wg sync.WaitGroup
 	var lastScanErr error
+	var upstreamEnded bool // read only after the response goroutine is joined
+	var upstreamBlocked bool
+	defer func() {
+		cancel()
+		if wsClient != nil {
+			_ = wsClient.Close()
+		}
+		wg.Wait()
+		pendingOutcomes := tracker.DrainPendingOutcomes()
+		for _, pending := range pendingOutcomes {
+			reason, status := httpstream.Cancelled, "cancelled"
+			if upstreamEnded && ctx.Err() == nil {
+				reason, status = httpstream.Incomplete, "incomplete"
+				if upstreamBlocked && lastScanErr == nil {
+					reason, status = "policy_blocked", "blocked"
+				}
+			}
+			emitMCPOutcomeReceipt(wsOpts.receiptEmitter(), wsOpts.v2ReceiptEmitter(), wsOpts.ReceiptGroup, safeLogW, pending.Outcome.Receipt, status, -1, reason, wsOpts.requireReceipts())
+		}
+		if len(pendingOutcomes) == 0 && upstreamEnded && ctx.Err() == nil && errors.Is(lastScanErr, transport.ErrIncompleteResponse) {
+			emitMCPStandaloneStreamReceipt(wsOpts, safeLogW, mcpStreamReceipt(wsOpts, "WS"), "incomplete", httpstream.Incomplete)
+		}
+	}()
 
 	startUpstream := func() error {
 		if wsClient != nil {
@@ -148,9 +187,12 @@ func RunWSProxy(
 		go func(client *transport.WSClient) {
 			defer wg.Done()
 			defer cancel() // Signal main goroutine if upstream closes first.
-			_, scanErr := ForwardScanned(client, safeClientOut, safeLogW, tracker, wsOpts)
+			foundInjection, scanErr := ForwardScanned(client, safeClientOut, safeLogW, tracker, wsOpts)
+			upstreamEnded = innerCtx.Err() == nil
+			upstreamBlocked = foundInjection
 			if scanErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream scan error: %v\n", scanErr)
+				logMCPIncompleteResponse(safeLogW, wsOpts, "WS", scanErr)
 				lastScanErr = scanErr
 			}
 		}(wsClient)
@@ -168,9 +210,9 @@ func RunWSProxy(
 	// Stdin -> upstream loop (runs on main goroutine).
 	var stdinErr error
 	for {
-		msg, readErr := clientReader.ReadMessage()
+		msg, readErr := readMCPInputMessage(innerCtx, clientIn, clientReader)
 		if readErr != nil {
-			if !errors.Is(readErr, io.EOF) &&
+			if innerCtx.Err() == nil && !errors.Is(readErr, io.EOF) &&
 				(!sessionExit.inProgress() || !isSessionExitCloseErr(readErr)) {
 				stdinErr = fmt.Errorf("reading stdin: %w", readErr)
 			}
@@ -204,12 +246,21 @@ func RunWSProxy(
 		// Kill switch: deny all messages when active.
 		if opts.KillSwitch != nil {
 			if d := opts.KillSwitch.IsActiveMCP(msg); d.Active {
+				denialAudit := mcpKillMcpInputDenialAudit()
+				batchResp := refuseKillSwitchRequest(wsOpts, safeLogW, frame, d)
+				if batchResp != nil {
+					if wErr := writeMCPInputDenial(wsOpts, denialAudit, safeClientOut, batchResp); wErr != nil {
+						_, _ = fmt.Fprintf(safeLogW, "pipelock: stdout write error: %v\n", wErr)
+					}
+					continue
+				}
 				if d.IsNotification {
+					dropMCPDenial(wsOpts, denialAudit, "input")
 					_, _ = fmt.Fprintf(safeLogW, "pipelock: kill switch dropped notification (source=%s)\n", d.Source)
 					continue
 				}
 				resp := killswitch.ErrorResponse(frame.ID, d.Message)
-				if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
+				if wErr := writeMCPInputDenial(wsOpts, denialAudit, safeClientOut, resp); wErr != nil {
 					_, _ = fmt.Fprintf(safeLogW, "pipelock: stdout write error: %v\n", wErr)
 				}
 				continue
@@ -218,18 +269,16 @@ func RunWSProxy(
 
 		// Input scanning: DLP, injection, policy, chain detection.
 		decision := scanHTTPInputDecision(msg, safeLogW, sessionKey, sessionKey, wsOpts)
+		if decision.Synthetic != nil {
+			if err := deliverMCPSynthetic(decision.Synthetic, safeClientOut); err != nil {
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: synthetic response write error: %v\n", err)
+			}
+			continue
+		}
+
 		if decision.Blocked != nil {
-			if !decision.Blocked.IsNotification {
-				var resp []byte
-				if decision.Blocked.SyntheticResponse != nil {
-					// Redirect handler produced a synthetic response -- send it as-is.
-					resp = decision.Blocked.SyntheticResponse
-				} else {
-					resp = blockRequestResponse(*decision.Blocked)
-				}
-				if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
-					_, _ = fmt.Fprintf(safeLogW, "pipelock: stdout write error: %v\n", wErr)
-				}
+			if wErr := deliverMCPInputResult(wsOpts, *decision.Blocked, safeClientOut); wErr != nil {
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send input result: %v\n", wErr)
 			}
 			continue
 		}

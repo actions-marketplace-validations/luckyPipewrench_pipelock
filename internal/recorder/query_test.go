@@ -5,6 +5,7 @@ package recorder_test
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -69,6 +70,130 @@ func TestQuerySession_NoFilter(t *testing.T) {
 	if result.FilesRead != 1 {
 		t.Errorf("FilesRead = %d, want 1", result.FilesRead)
 	}
+}
+
+func TestWalkSessionHistoryMatchesQueryOrder(t *testing.T) {
+	dir := t.TempDir()
+	writeTestEntries(t, dir, "walk-session", 5)
+
+	queried, err := recorder.QuerySession(dir, "walk-session", nil)
+	if err != nil {
+		t.Fatalf("QuerySession: %v", err)
+	}
+	var walked []recorder.Entry
+	if err := recorder.WalkSessionHistory(dir, "walk-session", func(entry recorder.Entry) error {
+		walked = append(walked, entry)
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkSessionHistory: %v", err)
+	}
+	if !reflect.DeepEqual(walked, queried.Entries) {
+		t.Fatalf("walked %d entries differ from QuerySession's %d entries", len(walked), len(queried.Entries))
+	}
+
+	// Query ordering comes from each shard's starting sequence, not directory
+	// enumeration order or lexicographic numeric text order.
+	multiDir := t.TempDir()
+	for _, seq := range []uint64{10, 2} {
+		entry := recorder.Entry{
+			Version: recorder.EntryVersion, Sequence: seq, Timestamp: time.Now().UTC(),
+			SessionID: "multi-walk", Type: testType, Transport: testTransport,
+			Summary: fmt.Sprintf("entry %d", seq), PrevHash: recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		data, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := filepath.Join(multiDir, fmt.Sprintf("evidence-multi-walk-%d.jsonl", seq))
+		if err := writeFile(name, append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queried, err = recorder.QuerySession(multiDir, "multi-walk", nil)
+	if err != nil {
+		t.Fatalf("QuerySession(multi-shard): %v", err)
+	}
+	walked = nil
+	if err := recorder.WalkSessionHistory(multiDir, "multi-walk", func(entry recorder.Entry) error {
+		walked = append(walked, entry)
+		return nil
+	}); err != nil {
+		t.Fatalf("WalkSessionHistory(multi-shard): %v", err)
+	}
+	if !reflect.DeepEqual(walked, queried.Entries) {
+		t.Fatalf("multi-shard walk entries %#v differ from QuerySession entries %#v", walked, queried.Entries)
+	}
+}
+
+func TestWalkSessionHistoryFailsClosed(t *testing.T) {
+	t.Run("foreign session entry", func(t *testing.T) {
+		dir := t.TempDir()
+		entry := recorder.Entry{
+			Version: recorder.EntryVersion, Sequence: 0, Timestamp: time.Now().UTC(),
+			SessionID: "other", Type: testType, Transport: testTransport,
+			Summary: "foreign", PrevHash: recorder.GenesisHash,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		data, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := writeFile(filepath.Join(dir, "evidence-victim-0.jsonl"), append(data, '\n')); err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.WalkSessionHistory(dir, "victim", func(recorder.Entry) error { return nil }); !errors.Is(err, recorder.ErrEvidenceRefused) {
+			t.Fatalf("WalkSessionHistory error = %v, want ErrEvidenceRefused", err)
+		}
+	})
+
+	t.Run("torn tail", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestEntries(t, dir, "torn-session", 1)
+		files, err := filepath.Glob(filepath.Join(dir, "evidence-torn-session-*.jsonl"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("find evidence shard: files=%v err=%v", files, err)
+		}
+		f, err := os.OpenFile(files[0], os.O_APPEND|os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteString("{"); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := recorder.WalkSessionHistory(dir, "torn-session", func(recorder.Entry) error { return nil }); err == nil {
+			t.Fatal("WalkSessionHistory accepted torn tail")
+		}
+	})
+
+	t.Run("file change during callback", func(t *testing.T) {
+		dir := t.TempDir()
+		writeTestEntries(t, dir, "changed-session", 1)
+		files, err := filepath.Glob(filepath.Join(dir, "evidence-changed-session-*.jsonl"))
+		if err != nil || len(files) != 1 {
+			t.Fatalf("find evidence shard: files=%v err=%v", files, err)
+		}
+		changed := false
+		err = recorder.WalkSessionHistory(dir, "changed-session", func(recorder.Entry) error {
+			if changed {
+				return nil
+			}
+			changed = true
+			return os.WriteFile(files[0], []byte("changed\n"), 0o600)
+		})
+		if err == nil || !strings.Contains(err.Error(), "evidence file changed during read") {
+			t.Fatalf("WalkSessionHistory error = %v, want evidence file changed during read", err)
+		}
+		// Matching the text is not enough: callers retry or report "no
+		// verdict" only when the error carries the sentinel.
+		if !errors.Is(err, recorder.ErrEvidenceChanged) || !recorder.IsEvidenceUnavailable(err) {
+			t.Fatalf("WalkSessionHistory error = %v, want ErrEvidenceChanged classified as unavailable evidence", err)
+		}
+	})
 }
 
 // TestQuerySession_LegacyAndSingleLocationLayoutMatch is the migration safety
@@ -721,6 +846,29 @@ func TestQuerySession_FailsOnFilenameSessionMismatch(t *testing.T) {
 	if !strings.Contains(err.Error(), `session_id "other" does not match requested session "victim"`) {
 		t.Fatalf("error = %v", err)
 	}
+	// A verifier maps a refusal of evidence to a verification failure, so
+	// the error must be identifiable as one.
+	if !errors.Is(err, recorder.ErrEvidenceRefused) {
+		t.Fatalf("session mismatch is not ErrEvidenceRefused: %v", err)
+	}
+	if err := recorder.CheckEntrySessions([]recorder.Entry{e}, "other"); err != nil {
+		t.Fatalf("matching session refused: %v", err)
+	}
+}
+
+func TestResolveEvidenceLocation_SymlinkIsEvidenceRefused(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(t.TempDir(), "evidence-victim-0.jsonl")
+	if err := writeFile(target, []byte("{}\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "evidence-victim-0.jsonl")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	_, err := recorder.ResolveEvidenceLocation(dir, "")
+	if err == nil || !errors.Is(err, recorder.ErrEvidenceRefused) || !strings.Contains(err.Error(), "refuse symlink") {
+		t.Fatalf("symlinked evidence file: %v", err)
+	}
 }
 
 func TestQuerySession_NumericShardSort(t *testing.T) {
@@ -893,4 +1041,28 @@ func TestQuerySession_DirectoryEntries(t *testing.T) {
 
 func writeFile(path string, data []byte) error {
 	return os.WriteFile(path, data, 0o600)
+}
+
+func TestIsRecorderOwnedFile(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		owned bool
+	}{
+		{"evidence-proxy-0.jsonl", true},
+		{"evidence-proxy.run.00112233445566778899aabbccddeeff-3.jsonl", true},
+		{"evidence-proxy-0-raw-00112233445566778899aabbccddeeff.raw.enc", true},
+		{"chain-link-proxy.run.00112233445566778899aabbccddeeff.json", true},
+		{recorder.RunWriterLockPrefix + "proxy.run.00112233445566778899aabbccddeeff" + recorder.RunWriterLockSuffix, true},
+		{"anchor-state.json", true},
+		// Operator outputs that happen to sit beside evidence are not owned.
+		{"bundle.json", false},
+		{"report.md", false},
+		{"chain-link-notes.txt", false},
+		{"evidence-summary.md", false},
+	} {
+		if got := recorder.IsRecorderOwnedFile(tc.name); got != tc.owned {
+			t.Errorf("IsRecorderOwnedFile(%q) = %v, want %v", tc.name, got, tc.owned)
+		}
+	}
 }

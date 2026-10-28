@@ -368,6 +368,18 @@ flight_recorder:
   signing_key_path: /etc/pipelock/recorder.key
 ```
 
+On ordinary server shutdown, the follower closes its recorder and audit
+producer, then gives the pending batches up to five seconds for a final delivery
+attempt before it closes the durable audit queue. A batch the Conductor refuses
+moves to the queue's dead-letter directory and the drain continues with the next
+batch. A retryable failure stops the drain and leaves that batch pending. Either
+outcome logs `final conductor audit delivery incomplete`. Fleet entitlement revocation cancels
+delivery immediately. The drain does not make a batch admissible after an
+outage: the Conductor still refuses an audit envelope outside its 60-second
+freshness window, so a batch queued before a long outage can land in dead
+letters. Inspect the `pending/`, `inflight/`, and `dead/` directories under
+`durable_audit_queue_dir` before deleting any record.
+
 A follower **must produce signed evidence** to participate: config validation
 rejects `conductor.enabled: true` unless the flight recorder is enabled with
 signing checkpoints and a `signing_key_path`. The YAML above is a manual-mount
@@ -488,6 +500,13 @@ pipelock conductor publish \
 The command computes the canonical `policy_hash` / `payload_sha256`, stamps the
 validity window from `--validity`, and carries the operator-supplied monotonic
 `--version`.
+
+A follower that cannot prove its own released version (a dev or source build)
+always refuses a bundle carrying `--min-pipelock-version` and keeps its
+currently active policy. This refusal ignores `rules.allow_unversioned_bundle_load`,
+which governs only standalone rule-bundle loading (`pipelock rules install`)
+and defaults to warn-and-load there; Conductor's minimum-version check is
+stricter and has no equivalent setting.
 Add `--rule-bundle <path>` (repeatable) to ship signed rule bundles alongside the
 config, `--audience` to narrow the addressed followers, and
 `--previous-bundle-hash <hex>` to pin continuity against the prior bundle (the
@@ -589,12 +608,14 @@ the kill/resume state.
 ## 9. Roll back a bad bundle
 
 `pipelock conductor rollback` authorizes a signed revert to a prior bundle
-version:
+version for the policy stream selected by the current and target bundle pair.
+Other policy streams in the same organization and fleet remain unchanged.
+Per-instance and per-label rollback within that stream are not supported.
 
 ```bash
 pipelock conductor rollback \
   --conductor-url https://conductor.pipelock-control.svc.cluster.local:8895 \
-  --org org-acme --fleet prod --instance '*' \
+  --org org-acme --fleet prod \
   --current-bundle-id bundle-v2 --current-version 2 \
   --target-bundle-id bundle-v1 --target-version 1 \
   --signing-key /etc/pipelock/fleet-keys/rollback-approver-1.json \
@@ -642,6 +663,10 @@ Pass `--state-snapshot snapshot.json` to replay the publish preflight against a
 captured follower/runtime-status snapshot. The snapshot applies only to bundle
 replay preflight; the policy-bundle store chain is still evaluated against
 current Conductor state.
+
+## 9b. Follower startup and consistency
+
+On restart, a follower does not trust its cached last-known-good bundle blindly: it re-verifies the signature, audience, `not_before`, and local-version gates against that cached bundle before reloading it into the running proxy, the same checks a fresh apply runs. Admission is marked uncertain for the duration of that reload; if the reload fails, the follower denies admission and reports live policy as uncertain rather than serving traffic under an unconfirmed config. A failed activation during a normal (non-startup) apply reverts to the prior live policy when a restore path is available, rather than leaving the runtime and the durable "active" pointer disagreeing about which policy is live. See [§10](#10-recover-follower-bundle-state) if a follower gets stuck in this state and needs its local bundle cache reset.
 
 ## 10. Recover follower bundle state
 
@@ -921,7 +946,11 @@ pipelock verify-receipt --chain /var/lib/pipelock/recorder/evidence \
 
 Without `--key`, verification is **structural-only** and exits non-zero unless
 you pass `--allow-unpinned` — pin the trusted signer key to get a meaningful
-`CHAIN VALID`. See [receipt verification](receipt-verification.md).
+`CHAIN VALID`. A cleanly stopped single-chain run that recorded EvidenceReceipt
+v2 receipts reports `VALID PREFIX, END UNPROVEN` and exits 3 in this mode; add
+`--whole-recorder` to prove each run's end from its transcript root. A closed
+multi-chain receipt group is checked as a group and exits 0 with `GROUP_VALID`. See
+[receipt verification](receipt-verification.md).
 
 ## 17. Rotate certs and keys
 

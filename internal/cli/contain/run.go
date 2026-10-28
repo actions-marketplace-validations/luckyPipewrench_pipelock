@@ -14,6 +14,7 @@ import (
 	"io"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,7 @@ const (
 	defaultContainConfigPath = "/etc/pipelock/pipelock.yaml"
 	defaultContainPostureDir = "/var/lib/pipelock/contain/posture"
 	containRunPrivilegeProbe = "agent_privilege_escape_denied"
+	containRunToolProbe      = "requested_tool_registered"
 
 	// defaultWorkspaceDiffCapBytes is the per-file content-digest cap for the
 	// post-session workspace change statement. A regular file at or
@@ -42,22 +44,36 @@ const (
 )
 
 type containRunOptions struct {
-	configFile            string
-	port                  int
-	postureOutput         string
-	dryRun                bool
+	configFile      string
+	port            int
+	postureOutput   string
+	dryRun          bool
+	servicePrestart bool
+	// hostNamespace marks the re-executed host-side half of service-posture.
+	// The parent already attested the managed namespace; this half must itself
+	// run in the initial network namespace, where the managed nftables state
+	// and every host-loopback probe are meaningful.
+	hostNamespace         bool
 	workspaceDiffCapBytes int64
+	lifecycleOutput       string
 }
 
 type containRunEnv struct {
-	probe       *probeEnv
-	launch      func(context.Context, *probeEnv, []string, io.Reader, io.Writer, io.Writer) error
-	emitPosture func(cfg *config.Config, privKey ed25519.PrivateKey, outputDir string, env *probeEnv, args []string) (postureEmission, error)
+	probe                  *probeEnv
+	launch                 func(context.Context, *probeEnv, []string, io.Reader, io.Writer, io.Writer) error
+	emitPosture            func(cfg *config.Config, privKey ed25519.PrivateKey, outputDir string, env *probeEnv, args []string) (postureEmission, error)
+	assertServiceNamespace func(context.Context, netnsAssertEnv) error
+	// runInHostNamespace re-executes service-posture in the initial network
+	// namespace. Nil means the platform cannot, and service-posture refuses.
+	runInHostNamespace func(ctx context.Context, stdout, stderr io.Writer, args []string) error
 	// loadConfig loads the ONE config snapshot reused for both posture
 	// capsule emission and workspace-statement signing key resolution (H2).
 	// Defaults to config.Load; overridable in tests that stub emitPosture
 	// and never intend to touch a real config file on disk.
 	loadConfig func(configFile string) (*config.Config, error)
+	// newLifecycle is an internal test seam, never populated from config or
+	// command arguments. A nil value retains the root-checked implementation.
+	newLifecycle func(string) (*containRunLifecycle, error)
 }
 
 type postureEmission struct {
@@ -67,10 +83,13 @@ type postureEmission struct {
 
 func defaultContainRunEnv() containRunEnv {
 	return containRunEnv{
-		probe:       defaultProbeEnv(),
-		launch:      launchContainedAgent,
-		emitPosture: emitContainRunPosture,
-		loadConfig:  func(configFile string) (*config.Config, error) { return config.Load(filepath.Clean(configFile)) },
+		probe:                  defaultProbeEnv(),
+		launch:                 launchContainedAgent,
+		emitPosture:            emitContainRunPosture,
+		assertServiceNamespace: assertManagedNetworkNamespace,
+		runInHostNamespace:     runInHostNetworkNamespace,
+		loadConfig:             func(configFile string) (*config.Config, error) { return config.Load(filepath.Clean(configFile)) },
+		newLifecycle:           newContainRunLifecycle,
 	}
 }
 
@@ -122,6 +141,7 @@ Pipelock does not read or store agent secrets.`,
 	cmd.Flags().StringVar(&opts.postureOutput, "posture-output", opts.postureOutput, "directory for the signed contain-run posture capsule")
 	cmd.Flags().BoolVar(&opts.dryRun, "dry-run", false, "run preflight and print the session contract, then exit without emitting a posture capsule or launching")
 	cmd.Flags().Int64Var(&opts.workspaceDiffCapBytes, "workspace-diff-cap-bytes", opts.workspaceDiffCapBytes, "per-file content-digest cap for the post-session workspace change statement; larger files are recorded oversize with no digest")
+	cmd.Flags().StringVar(&opts.lifecycleOutput, "lifecycle-output", "", "new root-private directory for invocation-bound transient-service lifecycle evidence (Linux only)")
 
 	return cmd
 }
@@ -134,7 +154,7 @@ func runContainRun(
 	env containRunEnv,
 	opts containRunOptions,
 	args []string,
-) error {
+) (resultErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -154,6 +174,46 @@ func runContainRun(
 	if !addToolNamePattern.MatchString(tool) {
 		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("invalid tool name %q (must match %s)", tool, containToolNameRegex))
 	}
+	if opts.lifecycleOutput != "" {
+		if opts.dryRun || opts.servicePrestart {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, errors.New("--lifecycle-output requires an actual contain run launch"))
+		}
+		prepare := env.newLifecycle
+		if prepare == nil {
+			prepare = newContainRunLifecycle
+		}
+		lifecycle, err := prepare(opts.lifecycleOutput)
+		if err != nil {
+			return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("prepare lifecycle output: %w", err))
+		}
+		env.probe.lifecycle = lifecycle
+		var stop context.CancelFunc
+		ctx, stop = containRunLifecycleContext(ctx)
+		defer stop()
+		defer func() {
+			if !lifecycle.record.Final {
+				lifecycle.record.Phase = "incomplete"
+				lifecycle.record.Final = true
+				lifecycle.record.Failure = boundedLifecycleError(resultErr)
+				resultErr = errors.Join(resultErr, lifecycle.write())
+			}
+			resultErr = errors.Join(resultErr, lifecycle.close())
+		}()
+	}
+	if opts.servicePrestart {
+		if opts.hostNamespace {
+			// Host-side half: the parent attested the managed namespace. This
+			// half signs and must observe the initial namespace, or the nft
+			// and loopback probes would read the agent namespace instead.
+			if err := requireHostNetworkNamespace(env.probe.readLink); err != nil {
+				return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("service posture host-side preflight: %w", err))
+			}
+			env.probe.postureLauncher = servicePostureLauncher
+		} else {
+			return runServicePostureFromAgentNamespace(ctx, stdout, stderr, env, opts, args)
+		}
+	}
+	env.probe.prelaunch = true
 
 	// Read the workspace inventory ONCE, before preflight, so the workspace probe
 	// checks readability and expiry of every recorded grant in the same pass, and
@@ -170,24 +230,28 @@ func runContainRun(
 	grants := grantsForAgent(inv.Workspaces, env.probe.agentUserName)
 	env.probe.workspaceGrants = grants
 
-	_, _ = fmt.Fprintln(stdout, "pipelock contain run: verifying containment preflight")
-	entries, err := containRunPreflight(ctx, stdout, env.probe, tool)
-	if err != nil {
-		return err
+	commandLabel := "pipelock contain run"
+	if opts.servicePrestart {
+		commandLabel = "pipelock contain service-posture"
 	}
-
-	// Resolve the posture proof path this run writes, and thread it into the
-	// contained launch env so an in-child emitter binds the exact capsule rather
-	// than fall back to the default path and grade containment UNKNOWN. The child
-	// starts with its cwd set to the agent home, so relative --posture-output
-	// values must become absolute before they are hashed into launch evidence.
 	proofPath, err := containRunPostureProofPath(opts.postureOutput)
 	if err != nil {
 		return cliutil.ExitCodeError(cliutil.ExitConfig, err)
 	}
 	env.probe.postureProofPath = proofPath
 
+	_, _ = fmt.Fprintf(stdout, "%s: verifying containment preflight\n", commandLabel)
+	entries, err := containRunPreflight(ctx, stdout, env.probe, tool)
+	if err != nil {
+		return err
+	}
+
 	contract := buildSessionContract(env.probe, tool, entries, grants, proofPath)
+	contract.Command = commandLabel
+	if !opts.servicePrestart {
+		contract.FilesystemMode = env.probe.filesystem.Mode
+		contract.FilesystemBinds = filesystemContractBinds(env.probe.filesystem)
+	}
 	// The contract is the operator's review surface. If it cannot be written
 	// (closed pipe, failed writer) nobody saw the boundary, so refuse to go on
 	// rather than emit a capsule and launch unreviewed (fail closed).
@@ -221,11 +285,15 @@ func runContainRun(
 	// this warns and proceeds with the statement unavailable for this
 	// session rather than refusing containment the operator otherwise
 	// qualifies for.
-	beforeSnapshots, snapErr := snapshotWorkspaces(grants, opts.workspaceDiffCapBytes)
-	if snapErr != nil {
-		beforeSnapshots = nil
-		_, _ = fmt.Fprintf(stdout, "  [WARN] workspace change statement will be unavailable: %v\n", snapErr)
-		_, _ = fmt.Fprintf(stdout, "%s reason=%q\n", workspaceStatementUnavailableLine, snapErr.Error())
+	var beforeSnapshots map[string]workspacediff.Manifest
+	if !opts.servicePrestart {
+		var snapErr error
+		beforeSnapshots, snapErr = snapshotWorkspaces(grants, opts.workspaceDiffCapBytes)
+		if snapErr != nil {
+			beforeSnapshots = nil
+			_, _ = fmt.Fprintf(stdout, "  [WARN] workspace change statement will be unavailable: %v\n", snapErr)
+			_, _ = fmt.Fprintf(stdout, "%s reason=%q\n", workspaceStatementUnavailableLine, snapErr.Error())
+		}
 	}
 
 	// Resolve the workspace-statement signing key BEFORE launch, from the
@@ -247,7 +315,11 @@ func runContainRun(
 	if runCfgErr != nil {
 		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("loading config: %w", runCfgErr))
 	}
-
+	if env.probe.lifecycle != nil {
+		env.probe.lifecycle.record.ConfigSHA256 = runCfg.Hash()
+		env.probe.lifecycle.record.PolicySHA256 = runCfg.CanonicalPolicyHash()
+	}
+	env.probe.display = resolveLaunchDisplay(runCfg, env.probe.display, probeXvfbPresent(env.probe))
 	workspaceSigningKey, workspaceSigningKeyErr := resolveWorkspaceStatementSigningKey(runCfg)
 	if len(grants) > 0 && workspaceSigningKeyErr != nil {
 		_, _ = fmt.Fprintf(stdout, "  [WARN] workspace change statement will be unavailable: %v\n", workspaceSigningKeyErr)
@@ -269,10 +341,17 @@ func runContainRun(
 	}
 	posture, err := env.emitPosture(runCfg, capsuleSigningKey, opts.postureOutput, env.probe, args)
 	if err != nil {
-		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("emit contain-run posture capsule: %w", err))
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("%s posture capsule: %w", commandLabel, err))
+	}
+	if env.probe.lifecycle != nil {
+		env.probe.lifecycle.record.PostureCapsuleSHA256 = posture.capsuleSHA256
 	}
 	_, _ = fmt.Fprintf(stdout, "  [PASS] signed posture capsule: %s\n", posture.path)
 	warnCustomPostureOutput(stderr, opts.postureOutput, proofPath)
+	if opts.servicePrestart {
+		_, _ = fmt.Fprintln(stdout, "pipelock contain service-posture: signed evidence for the pending unprivileged service launch")
+		return nil
+	}
 	_, _ = fmt.Fprintf(stdout, "pipelock contain run: launching %s as %s\n", tool, env.probe.agentUserName)
 
 	launchErr := env.launch(ctx, env.probe, args, stdin, stdout, stderr)
@@ -430,6 +509,7 @@ func containRunNow(env *probeEnv) time.Time {
 // read), so the printed contract can never describe a boundary different from
 // the one that is enforced.
 type sessionContract struct {
+	Command         string
 	Tool            string
 	AgentUser       string
 	ProxyURL        string
@@ -441,6 +521,10 @@ type sessionContract struct {
 	// contain run preflight proves the transient-service canary before this
 	// contract is rendered, so this field is never true without that evidence.
 	PrivateTmp bool
+	// FilesystemMode is off, enforce, or empty when this launch did not resolve
+	// a profile. Empty stays out of the rendered contract.
+	FilesystemMode  string
+	FilesystemBinds []string
 }
 
 type contractWorkspace struct {
@@ -508,7 +592,11 @@ func (f *firstErrWriter) Write(p []byte) (int, error) {
 // so a caller can refuse to launch a boundary the operator never saw.
 func renderSessionContract(w io.Writer, c sessionContract) error {
 	out := &firstErrWriter{w: w}
-	_, _ = fmt.Fprintf(out, "pipelock contain run: session contract for %s\n", c.Tool)
+	commandLabel := c.Command
+	if commandLabel == "" {
+		commandLabel = "pipelock contain run"
+	}
+	_, _ = fmt.Fprintf(out, "%s: session contract for %s\n", commandLabel, c.Tool)
 	_, _ = fmt.Fprintf(out, "  agent user:       %s\n", c.AgentUser)
 	_, _ = fmt.Fprintf(out, "  proxy egress:     %s (loopback proxy only; direct egress denied by nftables)\n", c.ProxyURL)
 	_, _ = fmt.Fprintf(out, "  posture capsule:  %s\n", c.PostureCapsule)
@@ -516,6 +604,19 @@ func renderSessionContract(w io.Writer, c sessionContract) error {
 		_, _ = fmt.Fprintln(out, "  agent temp dirs:  /tmp and /var/tmp private (isolated from the operator)")
 	} else {
 		_, _ = fmt.Fprintln(out, "  agent temp dirs:  /tmp and /var/tmp shared with the operator (not private)")
+	}
+	if c.FilesystemMode != "" {
+		_, _ = fmt.Fprintf(out, "  filesystem profile: %s\n", c.FilesystemMode)
+		if c.FilesystemMode == config.ContainmentFilesystemModeEnforce {
+			if len(c.FilesystemBinds) == 0 {
+				_, _ = fmt.Fprintln(out, "  filesystem binds: (none)")
+			} else {
+				_, _ = fmt.Fprintln(out, "  filesystem binds:")
+				for _, bind := range c.FilesystemBinds {
+					_, _ = fmt.Fprintf(out, "    %s\n", bind)
+				}
+			}
+		}
 	}
 	if len(c.RegisteredTools) == 0 {
 		_, _ = fmt.Fprintln(out, "  registered tools: (none)")
@@ -569,34 +670,60 @@ func warnCustomPostureOutput(stderr io.Writer, postureOutput, posturePath string
 // tools.list entries it read for the registration check so the caller renders
 // the session contract from the SAME read the launch path relies on, never a
 // second, possibly-divergent read.
+
+// containRunOnlyProbes is the single declaration of the probe numbers that
+// `contain run` publishes and `contain verify` does not. Both the preflight
+// below and the collision test read it, so adding or renumbering a run-only
+// probe here is automatically covered instead of needing a second list kept in
+// step by hand. Published numbers are an operator- and dashboard-facing
+// identity: two different checks sharing one number cannot be told apart.
+var containRunOnlyProbes = map[int]probe{
+	17: {n: 17, name: containRunPrivilegeProbe, desc: "pipelock-agent cannot sudo back out"},
+	18: {n: 18, name: containRunToolProbe, desc: "requested tool is registered in tools.list"},
+}
+
 func containRunPreflight(ctx context.Context, out io.Writer, env *probeEnv, tool string) ([]toolsListEntry, error) {
 	for _, p := range probesForEnv(env) {
 		status, detail := p.fn(ctx, env)
 		writeTextLine(out, p, status, detail)
-		if status != statusPass {
+		if !containRunPreflightAllows(env, status) {
 			return nil, cliutil.ExitCodeError(cliutil.ExitGeneral,
 				fmt.Errorf("containment preflight failed at probe %d (%s): %s: %s", p.n, p.name, status, detail))
 		}
 	}
 
-	// Numbered above the verify probe range (allProbes tops out at 15 after the
-	// private-temp canary; the conditional workspace_access probe is 16) so
-	// these run-only checks never collide with a verify probe
-	// number operators may key off.
+	// Published numbers are a contract operators and dashboards key off, so a
+	// run-only check must never reuse a verify probe number. This comment used
+	// to be the only thing holding that invariant and it did not hold it: a
+	// verify probe was added at 18 while this file had already published 18.
+	// TestContainRunProbeNumbersDoNotCollideWithVerify now fails when the two
+	// sets overlap, so a new probe on either side cannot silently take a number
+	// the other already publishes.
 	status, detail := probeAgentPrivilegeEscapeDenied(ctx, env)
-	writeTextLine(out, probe{n: 17, name: containRunPrivilegeProbe, desc: "pipelock-agent cannot sudo back out"}, status, detail)
+	writeTextLine(out, containRunOnlyProbes[17], status, detail)
 	if status != statusPass {
 		return nil, cliutil.ExitCodeError(cliutil.ExitGeneral,
 			fmt.Errorf("containment preflight failed at %s: %s: %s", containRunPrivilegeProbe, status, detail))
 	}
 
 	entries, status, detail := probeRequestedToolRegistered(env, tool)
-	writeTextLine(out, probe{n: 18, name: "requested_tool_registered", desc: "requested tool is registered in tools.list"}, status, detail)
+	writeTextLine(out, containRunOnlyProbes[18], status, detail)
 	if status != statusPass {
 		return nil, cliutil.ExitCodeError(cliutil.ExitGeneral,
 			fmt.Errorf("containment preflight failed at requested_tool_registered: %s: %s", status, detail))
 	}
 	return entries, nil
+}
+
+// containRunPreflightAllows is the launch gate. Pass and an explicit off
+// profile may continue. The service-posture filesystem result may continue
+// because that command does not claim filesystem confinement; every other
+// non-pass still refuses the launch.
+func containRunPreflightAllows(env *probeEnv, status string) bool {
+	if status == statusPass || status == statusFilesystemOff {
+		return true
+	}
+	return env != nil && env.postureLauncher == servicePostureLauncher && status == statusFilesystemNotApplicable
 }
 
 func probeAgentPrivilegeEscapeDenied(ctx context.Context, env *probeEnv) (string, string) {
@@ -665,6 +792,9 @@ func parseAgentGIDs(ids []string, primary uint32) ([]uint32, error) {
 }
 
 func emitContainRunPosture(cfg *config.Config, privKey ed25519.PrivateKey, outputDir string, env *probeEnv, args []string) (postureEmission, error) {
+	if err := verifyAgentCannotReadSigningKey(context.Background(), env, cfg); err != nil {
+		return postureEmission{}, err
+	}
 	launchEvidence, err := containRunLaunchEvidence(env, args)
 	if err != nil {
 		return postureEmission{}, fmt.Errorf("build launch evidence: %w", err)
@@ -724,7 +854,7 @@ func containRunLaunchEvidence(env *probeEnv, args []string) (posturepkg.ContainL
 		return posturepkg.ContainLaunchEvidence{}, err
 	}
 
-	launchEnv := containLaunchEnv(env.agentUserName, homeDir, env.port, env.postureProofPath)
+	launchEnv := containLaunchEnv(env.agentUserName, homeDir, env.port, env.postureProofPath, env.display)
 	envVars := make([]string, 0, len(launchEnv))
 	for _, entry := range launchEnv {
 		name, _, ok := strings.Cut(entry, "=")
@@ -742,19 +872,26 @@ func containRunLaunchEvidence(env *probeEnv, args []string) (posturepkg.ContainL
 		return posturepkg.ContainLaunchEvidence{}, fmt.Errorf("hash env: %w", err)
 	}
 
+	launcher := env.postureLauncher
+	if launcher == "" {
+		launcher = defaultLaunchScript
+	}
+	mode, digest := filesystemEvidenceForLaunch(env)
 	return posturepkg.ContainLaunchEvidence{
-		Launcher:     defaultLaunchScript,
-		AgentUser:    env.agentUserName,
-		TargetUID:    strconv.FormatUint(uid, 10),
-		TargetGID:    strconv.FormatUint(gid, 10),
-		TargetGroups: groupIDStrings(groups),
-		Tool:         args[0],
-		Argc:         len(args),
-		ArgvSHA256:   argvHash,
-		CWD:          homeDir,
-		ProxyPort:    env.port,
-		EnvVars:      envVars,
-		EnvSHA256:    envHash,
+		Launcher:              launcher,
+		AgentUser:             env.agentUserName,
+		TargetUID:             strconv.FormatUint(uid, 10),
+		TargetGID:             strconv.FormatUint(gid, 10),
+		TargetGroups:          groupIDStrings(groups),
+		Tool:                  args[0],
+		Argc:                  len(args),
+		ArgvSHA256:            argvHash,
+		CWD:                   homeDir,
+		ProxyPort:             env.port,
+		EnvVars:               envVars,
+		EnvSHA256:             envHash,
+		FilesystemMode:        mode,
+		FilesystemBindsSHA256: digest,
 	}, nil
 }
 
@@ -769,12 +906,15 @@ func containRunContainmentEvidence(env *probeEnv, targetUID string) (posturepkg.
 		if err != nil {
 			return posturepkg.ContainmentEvidence{}, err
 		}
+		mode, digest := filesystemEvidenceForLaunch(env)
 		return posturepkg.ContainmentEvidence{
 			Mode:                     posturepkg.ContainmentModeKernelNFTOwnerMatch,
 			BoundaryVerified:         true,
 			ProbeRefusedDirectEgress: true,
 			KernelRuleHash:           ruleHash,
 			TargetUID:                targetUID,
+			FilesystemMode:           mode,
+			FilesystemBindsSHA256:    digest,
 		}, nil
 	}
 	if nftStatus != statusPass {
@@ -802,6 +942,38 @@ func groupIDsForEnv(env *probeEnv, u *user.User) ([]string, error) {
 	return realGroupIDs(u)
 }
 
+func filesystemContractBinds(profile filesystemProfile) []string {
+	if profile.Mode != config.ContainmentFilesystemModeEnforce {
+		return nil
+	}
+	out := make([]string, 0, len(profile.BindPaths)+len(profile.BindReadOnlyPaths))
+	for _, bind := range profile.BindPaths {
+		out = append(out, "BindPaths="+bind)
+	}
+	for _, bind := range profile.BindReadOnlyPaths {
+		out = append(out, "BindReadOnlyPaths="+bind)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func filesystemEvidenceFields(profile filesystemProfile) (string, string) {
+	if profile.Mode != config.ContainmentFilesystemModeEnforce {
+		return "", ""
+	}
+	return profile.Mode, filesystemBindsDigest(profile)
+}
+
+// filesystemEvidenceForLaunch omits the filesystem claim when the signed
+// capsule is for an operator-managed unit. A profile loaded or injected on
+// that path is not evidence of the unit systemd is about to start.
+func filesystemEvidenceForLaunch(env *probeEnv) (string, string) {
+	if env == nil || env.postureLauncher == servicePostureLauncher {
+		return "", ""
+	}
+	return filesystemEvidenceFields(env.filesystem)
+}
+
 func groupIDStrings(groups []uint32) []string {
 	out := make([]string, 0, len(groups))
 	for _, g := range groups {
@@ -825,4 +997,40 @@ func stringSliceSHA256(values []string) (string, error) {
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// runServicePostureFromAgentNamespace is the half of service-posture that runs
+// inside the unit's namespace. systemd runs ExecStartPre in the agent network
+// namespace (JoinsNamespaceOf=), which is the only place the signer can observe
+// that namespace and its proxy doorway. The containment preflight, though, is
+// written against the host: it reads the managed nftables table, plants a
+// host-loopback canary, and checks host-visible sockets. Run inside the agent
+// namespace those probes see an empty ruleset and the wrong loopback, so the
+// preflight is re-executed in the initial namespace once the attestation here
+// has passed. Any failure on either side refuses the launch.
+func runServicePostureFromAgentNamespace(ctx context.Context, stdout, stderr io.Writer, env containRunEnv, opts containRunOptions, args []string) error {
+	if env.assertServiceNamespace == nil {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("service posture namespace assertion is unavailable"))
+	}
+	assertEnv := defaultNetnsAssertEnv()
+	assertEnv.agentUser = env.probe.agentUserName
+	assertEnv.proxyPort = env.probe.port
+	if err := env.assertServiceNamespace(ctx, assertEnv); err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitConfig, fmt.Errorf("service posture signer is outside the managed agent namespace: %w", err))
+	}
+	if env.runInHostNamespace == nil {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, errors.New("service posture host-namespace preflight is unavailable"))
+	}
+	childArgs := []string{
+		"contain", "service-posture", "--host-namespace",
+		"--config", opts.configFile,
+		"--port", strconv.Itoa(opts.port),
+		"--posture-output", opts.postureOutput,
+		"--",
+	}
+	childArgs = append(childArgs, args...)
+	if err := env.runInHostNamespace(ctx, stdout, stderr, childArgs); err != nil {
+		return cliutil.ExitCodeError(cliutil.ExitGeneral, fmt.Errorf("service posture host-side preflight: %w", err))
+	}
+	return nil
 }

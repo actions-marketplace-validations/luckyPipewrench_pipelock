@@ -6,6 +6,7 @@ package scanner
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,7 +16,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -298,6 +301,9 @@ func TestScan_BlocksHighEntropySegments(t *testing.T) {
 	}
 	if result.Scanner != ScannerEntropy {
 		t.Errorf("expected scanner=entropy, got %s", result.Scanner)
+	}
+	if !result.IsEntropyOnly() {
+		t.Fatal("path entropy must carry the heuristic classification")
 	}
 }
 
@@ -1721,6 +1727,9 @@ func TestScan_HighEntropyQueryKey(t *testing.T) {
 	if result.Scanner != ScannerEntropy {
 		t.Errorf("expected scanner=entropy, got %s", result.Scanner)
 	}
+	if !result.IsEntropyOnly() {
+		t.Fatal("query-key entropy must carry the heuristic classification")
+	}
 }
 
 // --- Additional Scanner Edge Cases ---
@@ -2171,6 +2180,9 @@ func TestScan_EntropyInQueryParam(t *testing.T) {
 	}
 	if result.Scanner != ScannerEntropy {
 		t.Errorf("expected scanner=entropy, got %s", result.Scanner)
+	}
+	if !result.IsEntropyOnly() {
+		t.Fatal("query-value entropy must carry the heuristic classification")
 	}
 }
 
@@ -3950,6 +3962,9 @@ func TestCheckSubdomainEntropy_BlocksHighEntropyLabels(t *testing.T) {
 			if result.Scanner != ScannerSubdomainEntropy {
 				t.Errorf("expected scanner=subdomain_entropy, got %s (reason: %s)", result.Scanner, result.Reason)
 			}
+			if !result.IsEntropyOnly() {
+				t.Fatal("subdomain entropy must carry the heuristic classification")
+			}
 		})
 	}
 }
@@ -4040,6 +4055,9 @@ func TestCheckSubdomainEntropy_BlocksEncodedExfilLabels(t *testing.T) {
 			}
 			if result.Scanner != ScannerSubdomainEntropy {
 				t.Errorf("expected scanner=subdomain_entropy, got %s (reason: %s)", result.Scanner, result.Reason)
+			}
+			if !IsHostnameExfilResult(result) || result.IsEntropyOnly() {
+				t.Fatalf("structural hostname exfiltration must remain concrete evidence: %+v", result)
 			}
 		})
 	}
@@ -4966,20 +4984,64 @@ func TestKnownValueWindowBudget_URLShapesFitDerivedCeiling(t *testing.T) {
 	}
 }
 
-func TestKnownValueWindowBudget_RejectsOversizedValueBeforeCollection(t *testing.T) {
-	value := strings.Repeat("Q7vP2mK9xR4nT8wB", maxKnownValuePartialInputBytes/minKnownSecretSubstringLen+1)
-	if len(value) <= maxKnownValuePartialInputBytes {
-		t.Fatalf("fixture length = %d, want greater than %d", len(value), maxKnownValuePartialInputBytes)
+// highEntropyKnownValue returns a non-repeating base64 value of about n bytes.
+// A periodic fixture is low-information and gets no windows at any size, which
+// would make the anchor assertions below vacuous.
+func highEntropyKnownValue(n int) string {
+	raw := make([]byte, n*3/4)
+	for i := 0; i < len(raw); i += sha256.Size {
+		sum := sha256.Sum256([]byte(strconv.Itoa(i)))
+		copy(raw[i:], sum[:])
 	}
-	set, err := buildKnownValueWindows(newKnownValueWindowBudget(maxKnownValueWindowEntries), []string{value})
-	if !errors.Is(err, errKnownValueWindowBudget) {
-		t.Fatalf("oversized known value error = %v, want window budget error", err)
+	return base64.StdEncoding.EncodeToString(raw)
+}
+
+func TestKnownValueWindowBudget_OversizedValueIsSampledAcrossItsLength(t *testing.T) {
+	// 131,000 bytes is just under the Linux limit for one exec'd string.
+	for _, size := range []int{maxKnownValuePartialInputBytes + 1200, 131000} {
+		value := highEntropyKnownValue(size)
+		if len(value) <= maxKnownValuePartialInputBytes {
+			t.Fatalf("fixture length = %d, want greater than %d", len(value), maxKnownValuePartialInputBytes)
+		}
+		windows, err := collectValueWindowsBounded(value, maxKnownValueWindowEntries)
+		if err != nil {
+			t.Fatalf("len %d: oversized known value refused: %v", len(value), err)
+		}
+		if len(windows) > maxKnownValuePartialAnchors || len(windows) < maxKnownValuePartialAnchors/2 {
+			t.Fatalf("len %d: %d anchors, want between %d and %d", len(value), len(windows), maxKnownValuePartialAnchors/2, maxKnownValuePartialAnchors)
+		}
+		span := len(value) - minKnownSecretSubstringLen + 1
+		stride := (span + maxKnownValuePartialAnchors - 1) / maxKnownValuePartialAnchors
+		lowest, highest := len(value), -1
+		for window, offsets := range windows {
+			for _, off := range offsets {
+				if off%stride != 0 || value[off:off+minKnownSecretSubstringLen] != window {
+					t.Fatalf("len %d: anchor %q at offset %d is not a stride-%d window of the value", len(value), window, off, stride)
+				}
+				lowest, highest = min(lowest, off), max(highest, off)
+			}
+		}
+		// Anchors cover the whole value, not just its start, so a fragment
+		// copied from the middle or the end is still findable.
+		if lowest > stride || highest < len(value)-minKnownSecretSubstringLen-stride {
+			t.Fatalf("len %d: anchors span offsets %d..%d, want the whole value (stride %d)", len(value), lowest, highest, stride)
+		}
+		set, err := buildKnownValueWindows(newKnownValueWindowBudget(maxKnownValueWindowEntries), []string{value})
+		if err != nil {
+			t.Fatalf("len %d: index build refused: %v", len(value), err)
+		}
+		if set[value].len() == 0 {
+			t.Fatalf("len %d: oversized value retained no partial windows", len(value))
+		}
 	}
-	if set != nil {
-		t.Fatalf("oversized known value returned partial index: %+v", set)
+	// Positive control: a value at the ceiling keeps every window (stride 1).
+	atCap := highEntropyKnownValue(maxKnownValuePartialInputBytes + 1200)[:maxKnownValuePartialInputBytes]
+	capWindows, err := collectValueWindowsBounded(atCap, maxKnownValueWindowEntries)
+	if err != nil {
+		t.Fatalf("value at the ceiling: %v", err)
 	}
-	if !strings.Contains(err.Error(), "partial matching accepts at most") {
-		t.Fatalf("oversized known value error = %v, want per-value remedy", err)
+	if len(capWindows) < maxKnownValuePartialAnchors-64 {
+		t.Fatalf("value at the ceiling kept %d windows, want nearly all %d", len(capWindows), maxKnownValuePartialAnchors)
 	}
 }
 
@@ -4997,7 +5059,7 @@ func TestKnownValueWindowBudget_FailsBeforePartialIndex(t *testing.T) {
 
 func TestCollectValueWindowsBounded_DeduplicatesBeforeBudgetDecision(t *testing.T) {
 	value := strings.Repeat("A1b2C3d4E5f6G7h8", 3)
-	windows, err := collectValueWindowsBounded(value, 0, 0)
+	windows, err := collectValueWindowsBounded(value, 0)
 	if err != nil {
 		t.Fatalf("fully repeated windows consumed budget: %v", err)
 	}
@@ -6233,8 +6295,8 @@ func TestScan_QueryEntropyParamExclusion_MismatchesBlock(t *testing.T) {
 			url:  "https://api.vendor.example/v1/search/recent?query=" + highEntropy + "&query=small",
 		},
 		{
-			name: "percent-encoded key spelling",
-			url:  "https://api.vendor.example/v1/search/recent?qu%65ry=" + highEntropy,
+			name: "two percent-encoded spellings of the key",
+			url:  "https://api.vendor.example/v1/search/recent?qu%65ry=" + highEntropy + "&%71uery=small",
 		},
 		{
 			name: "percent-encoded duplicate key spelling",
@@ -6295,6 +6357,10 @@ func TestScan_QueryEntropyParamExclusion_DoesNotSkipDLP(t *testing.T) {
 		{
 			name: "secret in adjacent param",
 			url:  "https://api.vendor.example/v1/search/recent?query=normal&token=" + secret,
+		},
+		{
+			name: "secret in exempted param with percent-encoded key",
+			url:  "https://api.vendor.example/v1/search/recent?qu%65ry=" + secret,
 		},
 	}
 	for _, tt := range tests {
@@ -7226,4 +7292,261 @@ func TestScan_RequestPolicyPathExemption(t *testing.T) {
 			t.Error("policy-off scanner should not exempt")
 		}
 	})
+}
+
+// OData-style continuation links percent-encode the '$' in "$skiptoken". The
+// exclusion names the decoded key, so the encoded spelling must match it,
+// while a second key decoding to the same name still refuses the exclusion.
+func TestScan_QueryEntropyParamExclusion_PercentEncodedKey(t *testing.T) {
+	highEntropy := "Zx9KqWvB3nMpLrT7yFhJ2dGsQ8aEcVbN4uXoIzPwRmKtYgD5fHl"
+	cfg := testConfig()
+	cfg.DLP.Patterns = nil
+	cfg.FetchProxy.Monitoring.Blocklist = nil
+	cfg.FetchProxy.Monitoring.EntropyThreshold = 4.5
+	cfg.FetchProxy.Monitoring.QueryEntropyParamExclusions = []config.QueryEntropyParamExclusion{{
+		Scheme: "https",
+		Host:   "api.vendor.example",
+		Path:   "/v1.0/me/messages",
+		Param:  "$skiptoken",
+	}}
+	s := MustNew(cfg)
+	defer s.Close()
+
+	base := "https://api.vendor.example/v1.0/me/messages?%24search=%22report%22&%24top=100&"
+	tests := []struct {
+		name  string
+		query string
+		allow bool
+	}{
+		{name: "literal key", query: "$skiptoken=" + highEntropy, allow: true},
+		{name: "percent-encoded key", query: "%24skiptoken=" + highEntropy, allow: true},
+		{name: "partly percent-encoded key", query: "%24%73kiptoken=" + highEntropy, allow: true},
+		{name: "literal and encoded duplicate", query: "$skiptoken=" + highEntropy + "&%24skiptoken=small", allow: false},
+		{name: "two encoded duplicates", query: "%24skiptoken=small&%24skiptoken=" + highEntropy, allow: false},
+		{name: "encoded key of a different name", query: "%24skip=" + highEntropy, allow: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := s.Scan(context.Background(), base+tt.query)
+			if result.Allowed != tt.allow {
+				t.Fatalf("Scan() allowed = %v, want %v; scanner=%s reason=%s", result.Allowed, tt.allow, result.Scanner, result.Reason)
+			}
+			if !tt.allow && result.Scanner != ScannerEntropy {
+				t.Fatalf("scanner = %s, want %s; reason=%s", result.Scanner, ScannerEntropy, result.Reason)
+			}
+		})
+	}
+}
+
+func TestQueryValueEntropyASCIISplitting(t *testing.T) {
+	s := MustNew(testConfig())
+	defer s.Close()
+	token := syntheticEntropyToken()
+	short := token[:17]
+	other := token[17:35]
+	for _, tc := range []struct {
+		name, value string
+		blocked     bool
+	}{
+		{"short chunks", short + " " + other, true},
+		{"compact token", token, true},
+		{"Unicode space", short + "\u2003" + other, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, blocked := s.queryValueEntropy(tc.value, 0)
+			if blocked != tc.blocked {
+				t.Fatalf("blocked=%v, want %v", blocked, tc.blocked)
+			}
+		})
+	}
+}
+
+// A URL-shaped value is windowed per credential-bearing part, but the anchor
+// bound applies to the whole value: many long high-entropy path segments must
+// not add up to more anchors than one long value of the same length gets.
+func TestKnownValueWindowBudget_LongURLSharesOneAnchorBound(t *testing.T) {
+	const segments = 200
+	var b strings.Builder
+	b.WriteString("https://api.vendor.example")
+	for i := range segments {
+		sum := sha256.Sum256([]byte(strconv.Itoa(i)))
+		b.WriteString("/")
+		b.WriteString(hex.EncodeToString(sum[:]))
+	}
+	value := b.String()
+	windows, err := knownValueWindowsBounded(value, maxKnownValueWindowEntries)
+	if err != nil {
+		t.Fatalf("long URL value refused: %v", err)
+	}
+	anchors := 0
+	highest := -1
+	for _, offsets := range windows {
+		anchors += len(offsets)
+		for _, off := range offsets {
+			highest = max(highest, off)
+		}
+	}
+	if anchors > maxKnownValuePartialAnchors {
+		t.Fatalf("long URL produced %d anchors, want at most %d", anchors, maxKnownValuePartialAnchors)
+	}
+	// Positive control: sampling still reaches the last segment.
+	if highest < len(value)-2*64 {
+		t.Fatalf("anchors end at offset %d of %d, want coverage through the last segment", highest, len(value))
+	}
+}
+
+// Sampling carries across URL parts, so thousands of minimum-length segments
+// share the value-wide anchor bound instead of each restarting at offset zero
+// and taking one anchor apiece.
+func TestKnownValueWindowBudget_ManyShortURLSegmentsShareTheBound(t *testing.T) {
+	const segments = 5000
+	var b strings.Builder
+	b.WriteString("https://api.vendor.example")
+	for i := range segments {
+		sum := sha256.Sum256([]byte(strconv.Itoa(i)))
+		b.WriteString("/")
+		b.WriteString(hex.EncodeToString(sum[:])[:minKnownSecretSubstringLen])
+	}
+	value := b.String()
+	windows, err := knownValueWindowsBounded(value, maxKnownValuePartialAnchors)
+	if err != nil {
+		t.Fatalf("URL with %d short segments refused under a %d-entry budget: %v", segments, maxKnownValuePartialAnchors, err)
+	}
+	anchors := 0
+	highest := -1
+	for _, offsets := range windows {
+		anchors += len(offsets)
+		for _, off := range offsets {
+			highest = max(highest, off)
+		}
+	}
+	if anchors > maxKnownValuePartialAnchors {
+		t.Fatalf("URL with %d short segments produced %d anchors, want at most %d", segments, anchors, maxKnownValuePartialAnchors)
+	}
+	// Positive controls: the sample is value-wide, not only the first parts,
+	// and it is not empty.
+	if anchors < maxKnownValuePartialAnchors/2 {
+		t.Fatalf("URL with %d short segments kept %d anchors, want a value-wide sample", segments, anchors)
+	}
+	if highest < len(value)-4*(minKnownSecretSubstringLen+1) {
+		t.Fatalf("anchors end at offset %d of %d, want coverage through the last segments", highest, len(value))
+	}
+}
+
+// Query values come from a map, so the sample must follow their order in the
+// value: otherwise which values keep anchors changes from one scanner build to
+// the next.
+func TestKnownValueWindowBudget_LongURLSampleIsDeterministic(t *testing.T) {
+	const params = 300
+	var b strings.Builder
+	b.WriteString("https://api.vendor.example/v1?")
+	for i := range params {
+		sum := sha256.Sum256([]byte("q" + strconv.Itoa(i)))
+		if i > 0 {
+			b.WriteString("&")
+		}
+		b.WriteString("k" + strconv.Itoa(i) + "=")
+		b.WriteString(hex.EncodeToString(sum[:])[:40])
+	}
+	value := b.String()
+	first, err := knownValueWindowsBounded(value, maxKnownValueWindowEntries)
+	if err != nil {
+		t.Fatalf("long query URL refused: %v", err)
+	}
+	// Positive control: the value is long enough to be sampled, not indexed whole.
+	anchors := 0
+	for _, offsets := range first {
+		anchors += len(offsets)
+	}
+	if anchors == 0 {
+		t.Fatal("long query URL retained no anchors")
+	}
+	if full := params * (40 - minKnownSecretSubstringLen + 1); anchors >= full {
+		t.Fatalf("got %d anchors of %d windows, want a sampled value", anchors, full)
+	}
+	for run := range 30 {
+		again, againErr := knownValueWindowsBounded(value, maxKnownValueWindowEntries)
+		if againErr != nil {
+			t.Fatal(againErr)
+		}
+		if !reflect.DeepEqual(first, again) {
+			t.Fatalf("build %d retained different anchors from the first build", run+2)
+		}
+	}
+}
+
+// A sampled URL keeps every credential part's first window, so a whole short
+// part copied on its own is found even when one long part forces a stride
+// wider than the short part.
+func TestKnownValueWindowBudget_SampledURLKeepsEveryPartsFirstWindow(t *testing.T) {
+	const shortParts = 50
+	var b strings.Builder
+	b.WriteString("https://api.vendor.example/")
+	b.WriteString(highEntropyKnownValue(60 * 1024))
+	b.WriteString("?")
+	var shorts []string
+	for i := range shortParts {
+		sum := sha256.Sum256([]byte("short" + strconv.Itoa(i)))
+		v := base64.RawURLEncoding.EncodeToString(sum[:])[:20]
+		if ShannonEntropy(v[:minKnownSecretSubstringLen]) <= envLeakMinEntropy {
+			t.Fatalf("fixture part %q has a first window below the entropy floor", v)
+		}
+		shorts = append(shorts, v)
+		if i > 0 {
+			b.WriteString("&")
+		}
+		b.WriteString("k" + strconv.Itoa(i) + "=" + v)
+	}
+	value := b.String()
+	windows, err := knownValueWindowsBounded(value, maxKnownValueWindowEntries)
+	if err != nil {
+		t.Fatalf("long URL refused: %v", err)
+	}
+	anchors := 0
+	for _, offsets := range windows {
+		anchors += len(offsets)
+	}
+	if anchors == 0 || anchors > maxKnownValuePartialAnchors {
+		t.Fatalf("long URL kept %d anchors, want 1..%d", anchors, maxKnownValuePartialAnchors)
+	}
+	// Positive control: the long segment really forces a stride wider than a
+	// short part's five window starts, so without the reserved first window
+	// some short parts would get none.
+	if stride := knownValueStride(60*1024 - minKnownSecretSubstringLen + 1); stride <= 20-minKnownSecretSubstringLen+1 {
+		t.Fatalf("stride %d does not exceed a short part's window starts", stride)
+	}
+	for _, v := range shorts {
+		first := v[:minKnownSecretSubstringLen]
+		want := strings.Index(value, v)
+		found := false
+		for _, off := range windows[first] {
+			found = found || off == want
+		}
+		if !found {
+			t.Fatalf("short part %q at offset %d has no indexed first window", v, want)
+		}
+	}
+}
+
+// Encoded forms of a known value are never shorter than the value, so a value
+// longer than every scanned text is not re-encoded on each scan.
+func TestMatchSecretEncodingSpan_SkipsEncodingsLongerThanText(t *testing.T) {
+	secret := highEntropyKnownValue(64 * 1024)
+	short := []spanTextView{{text: "payload=nothing to see here", viewLabel: "raw"}}
+	allocs := testing.AllocsPerRun(20, func() {
+		if _, _, _, _, ok := matchSecretEncodingSpan(secret, knownValueWindowIndex{}, nil, short, short); ok {
+			t.Fatal("short unrelated text matched a long secret")
+		}
+	})
+	if allocs > 2 {
+		t.Fatalf("matching a 64 KiB secret against short text allocated %.0f times per scan, want encodings skipped", allocs)
+	}
+	// Positive control: the same secret base64-encoded inside a long enough
+	// text is still found, so the guard only skips impossible encodings.
+	encoded := base64.StdEncoding.EncodeToString([]byte(secret))
+	long := []spanTextView{{text: "payload=" + encoded, viewLabel: "raw"}}
+	match, _, _, _, ok := matchSecretEncodingSpan(secret, knownValueWindowIndex{}, nil, long, long)
+	if !ok || match.encoding != encodingBase64 {
+		t.Fatalf("base64 of a long secret in a long text: ok=%v encoding=%q, want base64 match", ok, match.encoding)
+	}
 }

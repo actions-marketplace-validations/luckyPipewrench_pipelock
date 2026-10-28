@@ -45,6 +45,12 @@ func PreserveConductorBundleLocalRuntimeState(newCfg, oldCfg *Config, bundleYAML
 	newCfg.WebSocketProxy = oldCfg.WebSocketProxy
 	newCfg.TLSInterception = oldCfg.TLSInterception
 	newCfg.KillSwitch = oldCfg.KillSwitch
+	// The admin token is resolved into private state at load time (from
+	// api_token_file or the env override). A bundle config is loaded without
+	// runtime file access, so the preserved section must carry the follower's
+	// accepted snapshot or ResolveRuntime would drop a file-only token.
+	newCfg.resolvedKillSwitchAPIToken = oldCfg.resolvedKillSwitchAPIToken
+	newCfg.killSwitchAPITokenWasResolved = oldCfg.killSwitchAPITokenWasResolved
 	newCfg.ExplainBlocks = oldCfg.ExplainBlocks
 	newCfg.Logging = oldCfg.Logging
 	newCfg.Emit = oldCfg.Emit
@@ -58,6 +64,9 @@ func PreserveConductorBundleLocalRuntimeState(newCfg, oldCfg *Config, bundleYAML
 	}
 	if oldCfg.Containment.LoopbackServices != nil {
 		newCfg.Containment.LoopbackServices = append([]ContainmentLoopbackService(nil), oldCfg.Containment.LoopbackServices...)
+	}
+	if oldCfg.Containment.PublishedServices != nil {
+		newCfg.Containment.PublishedServices = append([]ContainmentPublishedService(nil), oldCfg.Containment.PublishedServices...)
 	}
 	newCfg.MCPWSListener = oldCfg.MCPWSListener
 	newCfg.ReverseProxy = oldCfg.ReverseProxy
@@ -73,11 +82,16 @@ func PreserveConductorBundleLocalRuntimeState(newCfg, oldCfg *Config, bundleYAML
 	} else {
 		newCfg.Agents = nil
 	}
+	// The license-gate record describes the preserved agents map, so it
+	// follows that map rather than the bundle.
+	newCfg.LicenseDisabledAgents = oldCfg.LicenseDisabledAgents
+	newCfg.LicenseDisabledReason = oldCfg.LicenseDisabledReason
 	newCfg.LicenseKey = oldCfg.LicenseKey
 	newCfg.LicenseFile = oldCfg.LicenseFile
 
 	newCfg.Internal = append([]string(nil), oldCfg.Internal...)
 	newCfg.TrustedDomains = append([]string(nil), oldCfg.TrustedDomains...)
+	newCfg.DestinationGrants = append([]DestinationGrant(nil), oldCfg.DestinationGrants...)
 	newCfg.SSRF = oldCfg.SSRF
 	newCfg.DNS = oldCfg.DNS
 	newCfg.Suppress = append([]SuppressEntry(nil), oldCfg.Suppress...)

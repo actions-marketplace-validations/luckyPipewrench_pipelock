@@ -12,6 +12,12 @@ import (
 	"path/filepath"
 )
 
+// ErrEvidenceFileChanged reports that an evidence file grew, shrank or was
+// replaced while it was being read. A live recorder appending to the file is
+// the ordinary cause; readers decide whether to retry or treat it as
+// inconclusive, never as corruption.
+var ErrEvidenceFileChanged = fmt.Errorf("%w: evidence file changed during read", ErrEvidenceChanged)
+
 func validateEvidenceLocation(location EvidenceLocation) error {
 	root := filepath.Clean(location.Root)
 	if location.Root == "" || root == "." {
@@ -35,6 +41,20 @@ func validateEvidenceLocation(location EvidenceLocation) error {
 		return errors.New("evidence location directory does not match its root and ID")
 	}
 	return nil
+}
+
+// OpenEvidenceDirectory opens an evidence directory through the platform's
+// secure traversal, including its unsupported-platform access check.
+func OpenEvidenceDirectory(dir string) (*os.File, error) {
+	return openEvidenceLocationDirectory(EvidenceLocation{Root: dir, Dir: dir})
+}
+
+// OpenEvidenceFile opens an evidence artifact through the same directory
+// traversal and regular-file checks as the session evidence reader.
+func OpenEvidenceFile(path string) (*os.File, os.FileInfo, error) {
+	clean := filepath.Clean(path)
+	dir := filepath.Dir(clean)
+	return openEvidenceLocationFile(EvidenceLocation{Root: dir, Dir: dir}, filepath.Base(clean))
 }
 
 func readEvidenceLocationDirectoryEntries(location EvidenceLocation, maxEntries int) ([]os.DirEntry, bool, error) {
@@ -74,23 +94,43 @@ func ReadEvidenceLocationEntriesBounded(location EvidenceLocation, maxEntries in
 }
 
 func readEntriesAtEvidenceLocation(location EvidenceLocation, name string, limits entryReadLimits) ([]Entry, bool, int64, error) {
+	var entries []Entry
+	_, truncated, bytesRead, err := walkBoundedEntriesAtEvidenceLocation(location, name, limits, func(e Entry) error {
+		entries = append(entries, e)
+		return nil
+	})
+	if err != nil {
+		return nil, false, bytesRead, err
+	}
+	return entries, truncated, bytesRead, nil
+}
+
+// walkBoundedEntriesAtEvidenceLocation reads one shard through its resolved
+// location under limits, delivering each entry to consume. It returns the
+// number of entries delivered. A shard that changed while it was read is an
+// error even though its entries were already delivered.
+func walkBoundedEntriesAtEvidenceLocation(location EvidenceLocation, name string, limits entryReadLimits, consume func(Entry) error) (int, bool, int64, error) {
 	file, before, err := openEvidenceLocationFile(location, name)
 	if err != nil {
-		return nil, false, 0, fmt.Errorf("opening evidence file: %w", err)
+		return 0, false, 0, fmt.Errorf("opening evidence file: %w", err)
 	}
 	defer func() { _ = file.Close() }()
-	entries, truncated, bytesRead, err := readEntriesFromReader(file, limits)
+	count := 0
+	truncated, bytesRead, err := walkEntriesFromReader(file, limits, func(e Entry) error {
+		count++
+		return consume(e)
+	})
 	if err != nil {
-		return nil, false, bytesRead, fmt.Errorf("reading evidence file: %w", err)
+		return 0, false, bytesRead, fmt.Errorf("reading evidence file: %w", err)
 	}
 	after, err := file.Stat()
 	if err != nil {
-		return nil, false, bytesRead, fmt.Errorf("restat evidence file: %w", err)
+		return 0, false, bytesRead, fmt.Errorf("restat evidence file: %w", err)
 	}
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
-		return nil, false, bytesRead, errors.New("evidence file changed during read")
+		return 0, false, bytesRead, ErrEvidenceFileChanged
 	}
-	return entries, truncated, bytesRead, nil
+	return count, truncated, bytesRead, nil
 }
 
 // ReadEvidenceLocationFileBounded reads one regular evidence file through its
@@ -119,7 +159,7 @@ func ReadEvidenceLocationFileBounded(location EvidenceLocation, name string, max
 		return nil, err
 	}
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
-		return nil, errors.New("evidence file changed during read")
+		return nil, ErrEvidenceFileChanged
 	}
 	return raw, nil
 }
@@ -161,9 +201,47 @@ func StreamEvidenceLocationFileForOfflineCompaction(location EvidenceLocation, n
 		return err
 	}
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() || before.Mode() != after.Mode() {
-		return errors.New("evidence file changed during offline compaction read")
+		return fmt.Errorf("%w: evidence file changed during offline compaction read", ErrEvidenceChanged)
 	}
 	return nil
+}
+
+// afterAppendTailRead is a test seam between the read and the restat in
+// ReadEvidenceLocationAppendTail. Production leaves it a no-op.
+var afterAppendTailRead = func(string) {}
+
+// ReadEvidenceLocationAppendTail reads up to maxBytes ending at the file's
+// size when it was opened. It tolerates appends made during the read: the
+// bytes it returns lie in a prefix that an append does not change. A file
+// that shrank during the read returns ErrEvidenceFileChanged. The read stays
+// on the file that was opened: a rename over its path during the read is seen
+// by the next read, not this one.
+// Use it for a live recorder's own files; use ReadEvidenceLocationFileTail
+// where the whole file must be stable.
+func ReadEvidenceLocationAppendTail(location EvidenceLocation, name string, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes <= 0 {
+		return nil, false, errors.New("evidence tail limit must be positive")
+	}
+	file, before, err := openEvidenceLocationFile(location, name)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = file.Close() }()
+	readLen := min(before.Size(), maxBytes)
+	start := before.Size() - readLen
+	raw := make([]byte, readLen)
+	if _, err := io.ReadFull(io.NewSectionReader(file, start, readLen), raw); err != nil {
+		return nil, false, err
+	}
+	afterAppendTailRead(name)
+	after, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !os.SameFile(before, after) || after.Size() < before.Size() {
+		return nil, false, ErrEvidenceFileChanged
+	}
+	return raw, start > 0, nil
 }
 
 // ReadEvidenceLocationFileTail reads at most maxBytes from the end of one
@@ -188,7 +266,74 @@ func ReadEvidenceLocationFileTail(location EvidenceLocation, name string, maxByt
 		return nil, false, err
 	}
 	if !os.SameFile(before, after) || before.Size() != after.Size() || before.ModTime() != after.ModTime() {
-		return nil, false, errors.New("evidence file changed during read")
+		return nil, false, ErrEvidenceFileChanged
+	}
+	return raw, start > 0, nil
+}
+
+// SessionWriteEnd reports the session's current evidence file and the byte
+// offset just past its last written entry. Every entry is flushed while the
+// recorder mutex is held, so the size observed here is exactly what has been
+// written. A caller that also holds the lock serializing the session's own
+// writers gets a position that no later write of theirs can precede. An
+// empty session means the recorder's bound session.
+func (r *Recorder) SessionWriteEnd(session string) (name string, end int64, ok bool, err error) {
+	if r == nil || r.nop {
+		return "", 0, false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	file, lastName, lastSize := r.file, r.lastFileName, r.lastFileSize
+	if session != "" && session != r.sessionID {
+		state := r.groupSessions[session]
+		if state == nil {
+			return "", 0, false, nil
+		}
+		file, lastName, lastSize = state.file, state.lastFileName, state.lastFileSize
+	}
+	if file == nil {
+		// No file is open: the next write opens a new one, which sorts
+		// after this one and so lies outside the reported bound.
+		if lastName == "" {
+			return "", 0, false, nil
+		}
+		return lastName, lastSize, true, nil
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return "", 0, false, err
+	}
+	return filepath.Base(file.Name()), info.Size(), true, nil
+}
+
+// ReadEvidenceLocationFilePrefixTail reads up to maxBytes ending at offset end
+// of the named file. Bytes before end were written before end was observed,
+// so appends during the read cannot change them; a file that is shorter than
+// end, or shrinks during the read, returns ErrEvidenceFileChanged.
+func ReadEvidenceLocationFilePrefixTail(location EvidenceLocation, name string, end, maxBytes int64) ([]byte, bool, error) {
+	if maxBytes <= 0 || end < 0 {
+		return nil, false, errors.New("evidence prefix tail bounds are invalid")
+	}
+	file, before, err := openEvidenceLocationFile(location, name)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = file.Close() }()
+	if before.Size() < end {
+		return nil, false, ErrEvidenceFileChanged
+	}
+	readLen := min(end, maxBytes)
+	start := end - readLen
+	raw := make([]byte, readLen)
+	if _, err := io.ReadFull(io.NewSectionReader(file, start, readLen), raw); err != nil {
+		return nil, false, err
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+	if !os.SameFile(before, after) || after.Size() < end {
+		return nil, false, ErrEvidenceFileChanged
 	}
 	return raw, start > 0, nil
 }

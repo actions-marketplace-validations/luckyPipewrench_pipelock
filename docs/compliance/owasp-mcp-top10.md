@@ -43,7 +43,7 @@ trigger fields.
 - **Environment leak detection:** `dlp.scan_env` reads the local environment and flags any outbound request containing env var values above a minimum length threshold.
 - **MCP input scanning:** scans tool call arguments (client-to-server) for secrets before they reach the MCP server. Catches agents forwarding credentials to untrusted tools.
 - **Encoding resistance:** 6-pass normalization decodes base64, hex, and URL encoding before pattern matching. Secrets encoded to evade detection are decoded and caught.
-- **Critical body-DLP hard-blocking in enforce mode (v2.5):** request bodies containing critical-severity findings (e.g., AWS keys, Anthropic tokens, GitHub tokens) return 403 with `BR=dlp_match` before reaching the upstream, even when `request_body_scanning.action` is otherwise configured to warn. Operators who used request-body warn mode as log-only must explicitly mark a pattern warn-only or rely on provider-exempt redaction to retain prior behaviour.
+- **Critical body-DLP hard-blocking in enforce mode (v2.5):** request bodies containing critical-severity findings (e.g., AWS keys, Anthropic tokens, GitHub tokens) return 403 with `BR=dlp_match` before reaching the upstream, even when `request_body_scanning.action` is otherwise configured to warn (except a provider credential presented to its compiled issuing audience on a permitted carrier, which is allowed instead of blocked). Operators who used request-body warn mode as log-only must explicitly mark a pattern warn-only or rely on provider-exempt redaction to retain prior behaviour.
 - **Provider-aware redaction (v2.5):** Anthropic, OpenAI, and Gemini request parsers walk the body schema and emit irreversible typed placeholders for matched secrets so a sanitized request can still be forwarded to provider-exempt hosts. v2.5 hardens placeholder semantics across JSON / form / split-field shapes and tightens the Databricks-token pattern to remove a class-of-byte-coincidence false positive on opaque image data URLs.
 
 **Configuration:** `dlp`, `mcp_input_scanning`, `request_body_scanning`, `redaction`
@@ -60,7 +60,7 @@ trigger fields.
 
 - **Session binding:** `mcp_session_binding` pins the tool inventory (names + schemas) at session start. If tools are added mid-session (scope expansion), the change is detected and flagged.
 - **Tool policy rules:** `mcp_tool_policy` enforces pre-execution allow/deny rules on tool calls. Rules constrain which tools an agent can invoke and with what arguments, regardless of what the MCP server offers.
-- **Adaptive enforcement:** automatic escalation from warn to block based on session risk patterns. An agent that triggers multiple warnings gets progressively restricted.
+- **Adaptive enforcement:** enforced findings raise a per-session risk score, and an escalated session can upgrade later warnings to blocks. Warnings on their own don't escalate a session.
 - **Per-agent budgets:** rate limiting and data budgets constrain how much each agent identity can do per time window.
 
 **Configuration:** `mcp_session_binding`, `mcp_tool_policy`, `adaptive_enforcement`
@@ -130,7 +130,7 @@ trigger fields.
 - **MCP response scanning:** tool results are scanned through the same pipeline before reaching the agent.
 - **State/control poisoning patterns:** detect credential solicitation ("provide your API key"), memory persistence ("save this for future sessions"), preference poisoning ("from now on, always use this tool"), and silent credential handling.
 - **Pre-filter optimization:** keyword-based gating skips expensive regex on clean content. Scan latency for clean responses stays in the low-microsecond range on typical hardware.
-- **Request-body prompt-injection blocking (v2.5):** outbound request bodies are scanned across JSON, form-urlencoded, multipart, raw text, split-field, and key-as-payload shapes. Detected payloads return 403 with `BR=prompt_injection` before the request reaches the upstream LLM provider. Closes the loop where a tainted tool result re-enters the agent's next outbound prompt — a primary failure mode for indirect prompt injection on long-running agents.
+- **Request-body prompt-injection blocking (v2.5):** outbound request bodies are scanned across JSON, form-urlencoded, multipart, raw text, split-field, and key-as-payload shapes. In enforce mode, detected payloads return 403 with `BR=prompt_injection` before the request reaches the upstream, except on destinations an operator lists in `request_body_scanning.trusted_hosts`. Closes the loop where a tainted tool result re-enters the agent's next outbound prompt — a primary failure mode for indirect prompt injection on long-running agents.
 
 **Configuration:** `response_scanning`, `request_body_scanning`
 
@@ -179,7 +179,7 @@ trigger fields.
 
 **Pipelock coverage:**
 
-- **Discovery:** `pipelock discover` reports MCP server configurations for its supported local clients, including Claude Code, Claude Desktop, Cursor, VS Code, Cline, Continue, Junie, and Zed.
+- **Discovery:** `pipelock discover` reports MCP server configurations for its supported local clients, including Claude Code, Claude Desktop, Codex, Grok, Cursor, VS Code, Cline, Continue, Junie, and Zed. Claude Code configs under `CLAUDE_CONFIG_DIR` are included when that variable is set, or when named with `--claude-config-dir`. A command matching the running Pipelock executable invoked as `mcp proxy` is reported as **unconfirmed**, because a checked configuration file cannot establish what the client launches. Codex trusted-project and requested Grok project overrides are applied to separate project views; other launch sources remain unchecked. Unconfirmed entries do not count as protected. For other wrappers, the evidence says whether the executable path is missing, relative, a different file, or could not be checked. See [discovery coverage](../cli/discover.md).
 - **Preflight checks:** `pipelock preflight` validates deployment readiness (network isolation, config completeness, proxy routing).
 - **Diagnostics:** `pipelock diagnose` reports environment state, connectivity, and configuration issues.
 

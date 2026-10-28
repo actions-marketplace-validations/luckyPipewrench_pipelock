@@ -29,6 +29,37 @@ func TestRunRollback_DryRunDoesNotShellOut(t *testing.T) {
 	}
 }
 
+func TestRollbackViewerUserRequiresCreationRecord(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	env.displayUnitPath = filepath.Join(t.TempDir(), "display.service")
+	env.lookupUser = func(name string) (*user.User, error) {
+		if name == viewerUserName {
+			return &user.User{Uid: "900", Gid: "900"}, nil
+		}
+		return &user.User{Uid: "1000", Gid: "1000"}, nil
+	}
+	remove := actionMaybeDeleteViewerUser(rollbackOpts{})
+	if err := remove.undo(context.Background(), env); err != nil || runnerSaw(runner, "userdel -r "+viewerUserName) {
+		t.Fatalf("pre-existing viewer deleted: %v", err)
+	}
+	marker := viewerCreationMarkerPath(env)
+	if err := os.MkdirAll(filepath.Dir(marker), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("901\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := remove.undo(context.Background(), env); err == nil || !strings.Contains(err.Error(), "UID differs") || runnerSaw(runner, "userdel -r "+viewerUserName) {
+		t.Fatalf("replacement viewer deleted: %v", err)
+	}
+	if err := os.WriteFile(marker, []byte("900\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := remove.undo(context.Background(), env); err != nil || !runnerSaw(runner, "userdel -r "+viewerUserName) {
+		t.Fatalf("created viewer retained: %v", err)
+	}
+}
+
 func TestRunRollback_ExecutesActionsInReverse(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	// Plant some artifacts so several actions have something to remove.
@@ -79,6 +110,183 @@ func TestActionRemoveAgentToolConfigs_RestoresPreExistingBackups(t *testing.T) {
 	}
 }
 
+func TestActionRemoveNetworkNamespaceRestoresOperatorState(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	record := loopbackForwarderRecord{
+		Unit:      loopbackForwarderUnitBase("127.0.0.1", 9200),
+		Host:      "127.0.0.1",
+		Port:      9200,
+		Owner:     "search-team",
+		Reason:    "local retrieval",
+		ExpiresAt: futureExpiryForTest,
+	}
+	data, err := json.MarshalIndent(loopbackForwarderInventory{Services: []loopbackForwarderRecord{record}}, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(env.loopbackForwarderInvPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.loopbackForwarderInvPath, append(data, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Dir(env.proxyForwarderSocketPath)
+	dynamicSocket := filepath.Join(unitDir, record.Unit+".socket")
+	dynamicService := filepath.Join(unitDir, record.Unit+".service")
+	for _, path := range []string{dynamicSocket, dynamicService, env.proxyForwarderSocketPath, env.proxyForwarderServicePath, env.networkNamespaceUnitPath} {
+		if err := os.WriteFile(path, []byte("managed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	operatorBody := "[Service]\nExecStart=/usr/local/bin/operator-owned-listener\n"
+	for _, path := range []string{dynamicService, env.proxyForwarderServicePath} {
+		if err := os.WriteFile(path+".bak", []byte(operatorBody), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(env.ownedLoopbackAnchorUnitPath, []byte("managed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.ownedLoopbackAnchorUnitPath+".bak", []byte(operatorBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := actionRemoveNetworkNamespace().undo(context.Background(), env); err != nil {
+		t.Fatalf("remove network namespace: %v", err)
+	}
+	for _, path := range []string{dynamicService, env.proxyForwarderServicePath, env.ownedLoopbackAnchorUnitPath} {
+		body, err := os.ReadFile(filepath.Clean(path))
+		if err != nil || string(body) != operatorBody {
+			t.Fatalf("operator unit %s = %q, %v", path, body, err)
+		}
+	}
+	for _, path := range []string{dynamicSocket, env.proxyForwarderSocketPath, env.networkNamespaceUnitPath, env.ownedLoopbackAnchorUnitPath + ".bak", env.loopbackForwarderInvPath} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("managed path %s survived rollback: %v", path, err)
+		}
+	}
+	for _, call := range []string{
+		"systemctl disable --now " + record.Unit + ".socket",
+		"systemctl disable --now " + filepath.Base(env.proxyForwarderSocketPath),
+		"systemctl daemon-reload",
+	} {
+		if !fakeRunnerCalled(runner, call) {
+			t.Fatalf("missing cleanup call %q: %v", call, runner.calls)
+		}
+	}
+}
+
+func TestActionRemoveNetworkNamespaceAggregatesCleanupFailures(t *testing.T) {
+	env, runner, _ := newFakeEnv(t)
+	record := loopbackForwarderRecord{Unit: loopbackForwarderUnitBase("127.0.0.1", 9200), Host: "127.0.0.1", Port: 9200}
+	data, err := json.Marshal(loopbackForwarderInventory{Services: []loopbackForwarderRecord{record}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(env.loopbackForwarderInvPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(env.loopbackForwarderInvPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unitDir := filepath.Dir(env.proxyForwarderSocketPath)
+	dynamicService := filepath.Join(unitDir, record.Unit+".service")
+	for _, path := range []string{filepath.Join(unitDir, record.Unit+".socket"), dynamicService, env.proxyForwarderSocketPath, env.proxyForwarderServicePath, env.ownedLoopbackAnchorUnitPath} {
+		if err := os.WriteFile(path, []byte("managed\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.networkNamespaceUnitPath = ""
+	runner.on(argvFor("systemctl", "disable", "--now", record.Unit+".socket"), "", 1, errors.New("dynamic disable failed"))
+	runner.on(argvFor("systemctl", "disable", "--now", filepath.Base(env.proxyForwarderSocketPath)), "", 1, errors.New("proxy disable failed"))
+	runner.on(argvFor("systemctl", "disable", "--now", filepath.Base(env.ownedLoopbackAnchorUnitPath)), "", 1, errors.New("legacy disable failed"))
+	runner.on(argvFor("systemctl", "daemon-reload"), "", 1, errors.New("reload failed"))
+	originalRemove := env.removeFile
+	env.removeFile = func(path string) error {
+		if path == dynamicService || path == env.proxyForwarderSocketPath || path == env.ownedLoopbackAnchorUnitPath || path == env.loopbackForwarderInvPath {
+			return errors.New("remove failed")
+		}
+		return originalRemove(path)
+	}
+
+	err = actionRemoveNetworkNamespace().undo(context.Background(), env)
+	if err == nil {
+		t.Fatal("expected aggregated cleanup failure")
+	}
+	for _, want := range []string{"dynamic disable failed", "proxy disable failed", "legacy disable failed", "remove failed", "reload failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("cleanup error %q does not contain %q", err, want)
+		}
+	}
+}
+
+func assertRestorePathPositiveControl(t *testing.T) {
+	t.Helper()
+	env, _, _ := newFakeEnv(t)
+	if err := os.MkdirAll(filepath.Dir(env.caExportPath), 0o750); err != nil {
+		t.Fatalf("mkdir CA export directory: %v", err)
+	}
+	if err := os.WriteFile(env.caExportPath, []byte("managed"), 0o600); err != nil {
+		t.Fatalf("write managed CA export: %v", err)
+	}
+	if err := os.WriteFile(env.caExportPath+".bak", []byte("previous"), 0o600); err != nil {
+		t.Fatalf("write prior CA export: %v", err)
+	}
+	if err := actionRestorePath("CA export", func(e *installEnv) string { return e.caExportPath }).undo(context.Background(), env); err != nil {
+		t.Fatalf("restore positive control: %v", err)
+	}
+	got, err := os.ReadFile(env.caExportPath)
+	if err != nil || string(got) != "previous" {
+		t.Fatalf("restored CA export = %q, %v; want prior export", got, err)
+	}
+}
+
+func TestActionRestorePathRestoresOrRemovesCAExports(t *testing.T) {
+	t.Run("positive control restores a previous export", func(t *testing.T) {
+		assertRestorePathPositiveControl(t)
+	})
+
+	t.Run("without a backup removes only the managed export", func(t *testing.T) {
+		assertRestorePathPositiveControl(t)
+		env, _, _ := newFakeEnv(t)
+		if err := os.MkdirAll(filepath.Dir(env.caExportPath), 0o750); err != nil {
+			t.Fatalf("mkdir CA export directory: %v", err)
+		}
+		if err := os.WriteFile(env.caExportPath, []byte("managed"), 0o600); err != nil {
+			t.Fatalf("write managed CA export: %v", err)
+		}
+		if err := actionRestorePath("CA export", func(e *installEnv) string { return e.caExportPath }).undo(context.Background(), env); err != nil {
+			t.Fatalf("remove newly-created CA export: %v", err)
+		}
+		if _, err := os.Stat(env.caExportPath); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("newly-created CA export remains after rollback: %v", err)
+		}
+	})
+
+	t.Run("rename failure is returned with the artifact label", func(t *testing.T) {
+		assertRestorePathPositiveControl(t)
+		env, _, _ := newFakeEnv(t)
+		if err := os.MkdirAll(filepath.Dir(env.caExportPath), 0o750); err != nil {
+			t.Fatalf("mkdir CA export directory: %v", err)
+		}
+		if err := os.WriteFile(env.caExportPath, []byte("managed"), 0o600); err != nil {
+			t.Fatalf("write managed CA export: %v", err)
+		}
+		if err := os.WriteFile(env.caExportPath+".bak", []byte("previous"), 0o600); err != nil {
+			t.Fatalf("write prior CA export: %v", err)
+		}
+		env.rename = func(string, string) error { return errors.New("rename denied") }
+
+		err := actionRestorePath("CA export", func(e *installEnv) string { return e.caExportPath }).undo(context.Background(), env)
+		if err == nil || !strings.Contains(err.Error(), "restore CA export") || !strings.Contains(err.Error(), "rename denied") {
+			t.Fatalf("rename failure = %v", err)
+		}
+		if _, backupErr := os.Stat(env.caExportPath + ".bak"); backupErr != nil {
+			t.Fatalf("rollback error discarded the recoverable backup: %v", backupErr)
+		}
+	})
+}
+
 func TestReadWrapperInventory_FallsBackToToolsList(t *testing.T) {
 	env, _, _ := newFakeEnv(t)
 	writeTestToolsList(t, env, []toolsListEntry{
@@ -119,8 +327,15 @@ func TestRollbackActions_KeepUsersSuppressesUserDel(t *testing.T) {
 
 func TestRollbackActions_PurgeUsersOverridesKeepUsers(t *testing.T) {
 	env, runner, _ := newFakeEnv(t)
+	env.displayUnitPath = filepath.Join(t.TempDir(), "display.service")
 	env.lookupUser = func(name string) (*user.User, error) {
 		return &user.User{Uid: "988", Gid: "988", Username: name}, nil
+	}
+	if err := os.MkdirAll(filepath.Dir(viewerCreationMarkerPath(env)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(viewerCreationMarkerPath(env), []byte("988\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	actions := rollbackActions(rollbackOpts{keepUsers: true, purgeUsers: true, keepData: true})
 	for i := len(actions) - 1; i >= 0; i-- {
@@ -130,15 +345,15 @@ func TestRollbackActions_PurgeUsersOverridesKeepUsers(t *testing.T) {
 		}
 		_ = a.undo(context.Background(), env)
 	}
-	// userdel must run for BOTH users.
+	// userdel must run for all three managed users.
 	count := 0
 	for _, c := range runner.calls {
 		if c.name == testUserDel {
 			count++
 		}
 	}
-	if count != 2 {
-		t.Errorf("expected 2 userdel calls (proxy + agent), got %d in %v", count, runner.calls)
+	if count != 3 {
+		t.Errorf("expected 3 userdel calls (proxy + agent + viewer), got %d in %v", count, runner.calls)
 	}
 }
 

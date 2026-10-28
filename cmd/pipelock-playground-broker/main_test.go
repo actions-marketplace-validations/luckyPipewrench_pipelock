@@ -26,12 +26,32 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
+	"github.com/luckyPipewrench/pipelock/internal/playground"
 	"github.com/luckyPipewrench/pipelock/internal/playground/broker"
 	"github.com/luckyPipewrench/pipelock/internal/playground/livechat"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
 type fakeProvider struct{}
+
+func TestBuildBrokerVerifyKitUsesShippedBinaryPaths(t *testing.T) {
+	binaries := brokerVerifyKitBinaries()
+	for osName, want := range map[playground.VerifyKitOS]string{
+		playground.VerifyKitOSLinux:   "/usr/local/bin/pipelock-verifier-linux",
+		playground.VerifyKitOSMacOS:   "/usr/local/bin/pipelock-verifier-macos",
+		playground.VerifyKitOSWindows: "/usr/local/bin/pipelock-verifier-windows.exe",
+	} {
+		t.Run(string(osName), func(t *testing.T) {
+			if got := binaries.Path(osName); got != want {
+				t.Fatalf("verifier path = %q, want %q", got, want)
+			}
+			_, _, err := buildBrokerVerifyKit(t.Context(), osName, []byte("invalid bundle"))
+			if err == nil {
+				t.Fatal("expected invalid bundle or missing verifier to fail")
+			}
+		})
+	}
+}
 
 func (fakeProvider) CreateMachine(_ context.Context, _ broker.MachineSpec) (*broker.Machine, error) {
 	return nil, errors.New("not used")
@@ -214,9 +234,8 @@ func TestMergeSessionAndBaseEnvLayersSessionOverBase(t *testing.T) {
 		"PLAYGROUND_DAILY_TURN_BUDGET": "20",
 	}
 	sessionEnv := map[string]string{
-		"PLAYGROUND_MODEL":            "session-model",
-		"PLAYGROUND_MODEL_KEY":        "session-key",
-		"PLAYGROUND_ORCHESTRATOR_KEY": "orchestrator-key",
+		"PLAYGROUND_MODEL":     "session-model",
+		"PLAYGROUND_MODEL_KEY": "session-key",
 	}
 
 	got := mergeSessionAndBaseEnv(sessionEnv, baseEnv, "visitor-code")
@@ -335,6 +354,7 @@ func TestBuildServerStaticDir(t *testing.T) {
 		t.Fatalf("mkdir ui: %v", err)
 	}
 	writeTestFile(t, uiDir, "index.html", "<html><body>live demo ui</body></html>")
+	writeTestFile(t, uiDir, "build-info.json", `{"schema_version":1}`)
 	flyTokenFile := writeTestFile(t, dir, "fly.token", "fly-file-token\n")
 	gateSecret := base64.StdEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	gateSecretFile := writeTestFile(t, dir, "gate.b64", gateSecret+"\n")
@@ -371,6 +391,9 @@ func TestBuildServerStaticDir(t *testing.T) {
 	t.Cleanup(ts.Close)
 	if body, status := httpGetStatus(t, ts.URL+"/"); status != http.StatusOK || !strings.Contains(body, "live demo ui") {
 		t.Fatalf("GET / = %d %q, want 200 serving the UI", status, body)
+	}
+	if body, status := httpGetStatus(t, ts.URL+"/build-info.json"); status != http.StatusOK || body != `{"schema_version":1}` {
+		t.Fatalf("GET /build-info.json = %d %q, want served build info", status, body)
 	}
 	if _, status := httpGetStatus(t, ts.URL+livechat.RouteHealth); status != http.StatusOK {
 		t.Fatalf("GET %s = %d, want 200 (API served alongside static)", livechat.RouteHealth, status)
@@ -2114,6 +2137,22 @@ func TestCFAccessJWKS_NegativeCache(t *testing.T) {
 	if fetchCount != fetchesBefore {
 		t.Fatalf("fetch during negative-cache window: got %d additional fetches", fetchCount-fetchesBefore)
 	}
+
+	// Repeated outages must not extend trust beyond the original key lifetime.
+	now = now.Add(cfAccessNegativeCacheTTL)
+	jwt = signedCFAccessTestJWT(t, priv, kid, verifier.issuer, verifier.audience, now)
+	if err := verifier.verify(context.Background(), jwt); err == nil {
+		t.Fatal("accepted stale Access key after original cache lifetime")
+	}
+	failedFetches := fetchCount
+	for range 3 {
+		if err := verifier.verify(context.Background(), jwt); err == nil {
+			t.Fatal("accepted expired Access key during outage")
+		}
+	}
+	if fetchCount != failedFetches {
+		t.Fatalf("expired-key outage made %d extra JWKS fetches, want 0", fetchCount-failedFetches)
+	}
 }
 
 func TestCFAccessJWKS_NoCacheFailsClosed(t *testing.T) {
@@ -2474,12 +2513,15 @@ func TestValidateAdminListenScope(t *testing.T) {
 	}{
 		{name: "loopback_ok", listen: "127.0.0.1:9090", wantErr: false},
 		{name: "loopback_v6_ok", listen: "[::1]:9090", wantErr: false},
-		{name: "private_rfc1918_ok", listen: "10.0.0.5:9090", wantErr: false},
-		{name: "private_172_ok", listen: "172.16.0.1:9090", wantErr: false},
-		{name: "private_192_ok", listen: "192.168.1.1:9090", wantErr: false},
-		{name: "link_local_ok", listen: "169.254.1.1:9090", wantErr: false},
-		{name: "ula_ok", listen: "[fd00::1]:9090", wantErr: false},
+		{name: "private_rfc1918_rejected", listen: "10.0.0.5:9090", wantErr: true},
+		{name: "private_172_rejected", listen: "172.16.0.1:9090", wantErr: true},
+		{name: "private_192_rejected", listen: "192.168.1.1:9090", wantErr: true},
+		{name: "link_local_rejected", listen: "169.254.1.1:9090", wantErr: true},
+		{name: "ula_rejected", listen: "[fd00::1]:9090", wantErr: true},
+		{name: "private_with_unsafe_ok", listen: "10.0.0.5:9090", unsafePublic: true},
 		{name: "localhost_ok", listen: "localhost:9090", wantErr: false},
+		{name: "hostname_with_unsafe_ok", listen: "admin.example:9090", unsafePublic: true, wantErr: false},
+		{name: "hostname_rejected", listen: "admin.example:9090", wantErr: true},
 		{name: "unspecified_rejected", listen: "0.0.0.0:9090", wantErr: true},
 		{name: "unspecified_v6_rejected", listen: "[::]:9090", wantErr: true},
 		{name: "empty_host_rejected", listen: ":9090", wantErr: true},

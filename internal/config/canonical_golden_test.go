@@ -419,7 +419,43 @@ const (
 	// Re-bumped for transition-prefixed response directives.
 	// Re-bumped for polite and recipient-first directive coverage.
 	// Re-bumped for explicitly marked directive transitions.
-	goldenHashDefaults = "cbca1d1e7e5730870bdc311be3e0fca59b4e68b87d7907cbe37cb925c8a69ca9"
+	// Re-bumped for response_scanning.core_observe_exceptions: a declared
+	// per-host observe entry withholds a block on the immutable response
+	// floor, so two deployments differing only in their exceptions have
+	// genuinely different enforcement and their receipts must say so.
+	// Re-bumped when the Slack bot/user and app-level tokens gained the compiled
+	// audience slack.com and the immutable core floor learned to honor a compiled
+	// audience at a credential's own issuing authority. Slack Token is a core
+	// pattern, so this narrows where that credential is enforced (allowed at its
+	// exact encrypted Slack authorities, blocked everywhere else); the identity
+	// moves with the binary's built-in set, not with operator YAML.
+	// Re-bumped when Slack's hosted MCP authority was added to the Slack Token
+	// audience. The extra exact host changes where that built-in credential is
+	// enforced, so the binary's reported policy identity must move with it.
+	// Re-bumped when the built-in Google OAuth Token pattern gained the compiled
+	// audience *.googleapis.com, restricted to Bearer Authorization headers.
+	// Other carriers still block, and the binary policy identity moves.
+	// Re-bumped when GitHub and GitLab token classes gained compiled audiences
+	// (GitHub Token, Fine-Grained PAT, GitLab PAT, CI job token) and the DLP
+	// section gained the declared enterprise host lists.
+	// Re-bumped when shipped path-entropy routes began merging beside operator
+	// entries instead of being replaced by them.
+	// Re-bumped when the built-in DAN jailbreak token began requiring word
+	// context, which changes a shipped response pattern.
+	// Re-bumped when issuer-bound session cookies became a request-body
+	// scanning default.
+	// Re-bumped when GitLab's native Private-Token and Job-Token headers joined
+	// the default sensitive headers.
+	// Re-bumped when the built-in JWT Token pattern gained a compiled URL-query
+	// audience for GitHub's release download storage host.
+	// Re-bumped when the built-in Azure SAS Token pattern gained a compiled
+	// ReleaseGrantSAS audience for the same release-asset host, so the shipped
+	// GitHub release redirect's Azure SAS can be admitted alongside its JWT
+	// grant instead of blocking on its own.
+	// Re-bumped when GitHub package registries gained a compiled Basic
+	// audience, RubyGems gained Bearer, and the container-registry JWT
+	// gained a bearer audience for ghcr.io.
+	goldenHashDefaults = "57cf6ccb637f0070db5dd5f05ac563991a8758217d1107071b57ec0820dff92d"
 
 	// goldenHashRichConfig pins the hash for goldenRichYAML loaded via
 	// config.Load, post-ApplyDefaults + Validate. Covers a broad,
@@ -644,7 +680,22 @@ const (
 	// Re-bumped alongside goldenHashDefaults for transition-prefixed directives.
 	// Re-bumped alongside goldenHashDefaults for polite and recipient-first directives.
 	// Re-bumped alongside goldenHashDefaults for explicitly marked transitions.
-	goldenHashRichConfig = "3174d057644fff75966a53bf7e8b237174f2618d8fb0157dd07c1d67d8d3b467"
+	// Re-bumped for response_scanning.core_observe_exceptions: a declared
+	// per-host observe entry withholds a block on the immutable response
+	// floor, so two deployments differing only in their exceptions have
+	// genuinely different enforcement and their receipts must say so.
+	// Re-bumped alongside goldenHashDefaults for the Slack compiled audience and
+	// the core-floor audience change; the rich fixture carries the built-in DLP
+	// patterns, so its policy identity moves the same way.
+	// Re-bumped for Slack's hosted MCP authority; see goldenHashDefaults above.
+	// Re-bumped for the Google OAuth Token compiled audience; see goldenHashDefaults above.
+	// Re-bumped for the GitLab native token headers in the default sensitive
+	// headers; see goldenHashDefaults above.
+	// Re-bumped for the JWT Token URL-query audience; see goldenHashDefaults above.
+	// Re-bumped for the Azure SAS Token ReleaseGrantSAS audience; see
+	// goldenHashDefaults above. The rich fixture inherits the default DLP
+	// pattern set, so the hash shifts in lockstep.
+	goldenHashRichConfig = "3dfb5e4b36f15a3e20559aa5650e5a6f1695dfbf98af6935a2730d99c43483a4"
 )
 
 // goldenRichYAML is the canonical fixture for goldenHashRichConfig. It
@@ -1213,8 +1264,13 @@ func TestCanonicalPolicyHash_NewToolAdmissionVocabularyGolden(t *testing.T) {
 		admission string
 		wantHash  string
 	}{
-		{name: "admit remains warn", admission: NewToolAdmit, wantHash: "d3fcfd6ac95cbf206039874dfc4e25e938e8894671dc2f8f7bc341c50f86f424"},
-		{name: "withhold remains block", admission: NewToolWithhold, wantHash: "7049ba45c892dafeb65e0d88b351911edeecc1c75d27e1a8fe279223ece759a6"},
+		// These YAML fixtures reflect both the inherited shipped blocklist and
+		// the compiled Authorization-only Google credential audience policy, and
+		// the GitLab native token headers in the default sensitive headers.
+		// the compiled Authorization-only Google credential audience policy and the
+		// JWT Token URL-query audience.
+		{name: "admit remains warn", admission: NewToolAdmit, wantHash: "e9b56ac324d2bfb7bfe7e7d642c206e2ee08e6a88646e09b57ef155960e9e4b3"},
+		{name: "withhold remains block", admission: NewToolWithhold, wantHash: "568505b4feef4d0ab453316c46f31cf4848629dd536b9786d90ea8886e6d96f0"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

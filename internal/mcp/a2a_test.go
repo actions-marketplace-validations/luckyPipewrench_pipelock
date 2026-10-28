@@ -19,7 +19,7 @@ type walkedLeaf struct {
 
 func collectWalk(data string) []walkedLeaf {
 	var got []walkedLeaf
-	WalkA2AJSON(json.RawMessage(data), func(path, value string, class FieldClass) {
+	mustWalkA2AJSON(json.RawMessage(data), func(path, value string, class FieldClass) {
 		got = append(got, walkedLeaf{path, value, class})
 	})
 	return got
@@ -143,7 +143,7 @@ func TestWalkA2AJSON_NodeBudgetExceeded(t *testing.T) {
 	}
 	data, _ := json.Marshal(arr)
 	budgetExceeded := false
-	WalkA2AJSON(json.RawMessage(data), func(_ string, _ string, class FieldClass) {
+	mustWalkA2AJSON(json.RawMessage(data), func(_ string, _ string, class FieldClass) {
 		if class == FieldBudgetExceeded {
 			budgetExceeded = true
 		}
@@ -154,39 +154,43 @@ func TestWalkA2AJSON_NodeBudgetExceeded(t *testing.T) {
 }
 
 func TestWalkA2AJSON_DepthLimit(t *testing.T) {
-	// 25 levels deep (exceeds maxWalkDepth=20).
+	// The walker stops beyond the shared inspection bound.
 	nested := `"leaf"`
-	for range 25 {
+	for range maxWalkDepth + 1 {
 		nested = `{"a":` + nested + `}`
 	}
 	var count int
-	WalkA2AJSON(json.RawMessage(nested), func(_, _ string, class FieldClass) {
+	mustWalkA2AJSON(json.RawMessage(nested), func(_, _ string, class FieldClass) {
 		if class != FieldKeyEntropy {
 			count++
 		}
 	})
-	// The leaf string sits at depth 25 which exceeds maxWalkDepth=20, so the
-	// emit callback should never fire (keys named "a" are not classified).
+	// Structural keys are excluded from the classified leaf count.
 	if count != 0 {
-		t.Errorf("walker emitted %d nodes, want 0 (leaf should be unreachable at depth 25)", count)
+		t.Errorf("walker emitted %d nodes, want 0 past the inspection bound", count)
 	}
 }
 
 func TestWalkA2AJSON_EmptyAndInvalid(t *testing.T) {
 	tests := []struct {
-		name string
-		data string
+		name    string
+		data    string
+		wantErr bool
 	}{
-		{"empty", ""},
-		{"null", "null"},
-		{"invalid", "{bad json}"},
+		{"empty", "", true},
+		{"null", "null", false},
+		{"invalid", "{bad json}", true},
+		{"trailing data", `{"a":1} {}`, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var count int
-			WalkA2AJSON(json.RawMessage(tt.data), func(_, _ string, _ FieldClass) {
+			err := WalkA2AJSON(json.RawMessage(tt.data), func(_, _ string, _ FieldClass) {
 				count++
 			})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, want error %v", err, tt.wantErr)
+			}
 			if count != 0 {
 				t.Errorf("expected 0 emissions, got %d", count)
 			}
@@ -216,7 +220,7 @@ func TestWalkA2AJSON_SortedKeyOrder(t *testing.T) {
 	// Keys should be visited in sorted order for determinism.
 	data := `{"z":"last","a":"first","m":"middle"}`
 	var order []string
-	WalkA2AJSON(json.RawMessage(data), func(path, value string, class FieldClass) {
+	mustWalkA2AJSON(json.RawMessage(data), func(path, value string, class FieldClass) {
 		if value != "" && class != FieldKeyEntropy {
 			order = append(order, value)
 		}
@@ -531,7 +535,7 @@ func TestWalkA2AJSON_NumberAndBoolLeaves(t *testing.T) {
 	// Numbers and bools are visited (nodeCount) but not emitted as scannable strings.
 	data := `{"count":42,"active":true,"items":null}`
 	var count int
-	WalkA2AJSON(json.RawMessage(data), func(_, _ string, _ FieldClass) {
+	mustWalkA2AJSON(json.RawMessage(data), func(_, _ string, _ FieldClass) {
 		count++
 	})
 	// Keys "count", "active", "items" may emit as keys if URI-like (they're not),
@@ -664,3 +668,10 @@ func TestCanonicalizeJSON_Empty(t *testing.T) {
 }
 
 // camelToSnake was removed - snake_case field names now use dedicated lookup tables.
+
+// mustWalkA2AJSON walks test input that must be valid JSON.
+func mustWalkA2AJSON(data json.RawMessage, emit func(path string, value string, class FieldClass)) {
+	if err := WalkA2AJSON(data, emit); err != nil {
+		panic(err)
+	}
+}

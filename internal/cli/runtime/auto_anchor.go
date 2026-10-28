@@ -39,7 +39,7 @@ type autoAnchorMonitor struct {
 	logW      io.Writer
 	nowFn     func() time.Time
 	backendFn func(config.FlightRecorderAnchor) (anchorpkg.Backend, error)
-	extractFn func(string, string) ([]receipt.Receipt, error)
+	walkFn    func(string, string, recorder.SessionHistoryPrefix, func(receipt.Receipt) error) error
 	sessionID string
 
 	mu                   sync.Mutex
@@ -84,8 +84,8 @@ func newAutoAnchorMonitor(
 		logW:      logW,
 		nowFn:     func() time.Time { return time.Now().UTC() },
 		backendFn: autoAnchorBackend,
-		extractFn: receipt.ExtractReceiptsFromSessionDir,
-		sessionID: transcriptRootSessionID,
+		walkFn:    receipt.WalkReceiptsFromSessionDirPrefix,
+		sessionID: recorderSessionOf(rec),
 	}
 }
 
@@ -145,7 +145,7 @@ func (m *autoAnchorMonitor) runPass() {
 		return
 	}
 	now := m.now()
-	if err := m.seed(now, snapshot, emitter.SignerKeyHex()); err != nil {
+	if err := m.seed(now, snapshot, emitter); err != nil {
 		m.fail(err)
 		return
 	}
@@ -170,7 +170,8 @@ func (m *autoAnchorMonitor) runPass() {
 	}
 }
 
-func (m *autoAnchorMonitor) seed(now time.Time, snapshot receipt.HealthSnapshot, currentSignerKey string) error {
+func (m *autoAnchorMonitor) seed(now time.Time, snapshot receipt.HealthSnapshot, emitter *receipt.Emitter) error {
+	currentSignerKey := emitter.SignerKeyHex()
 	m.mu.Lock()
 	if m.seeded {
 		m.mu.Unlock()
@@ -201,11 +202,11 @@ func (m *autoAnchorMonitor) seed(now time.Time, snapshot receipt.HealthSnapshot,
 		}
 		state.ReceiptCount = checkpoint.ReceiptCount
 		state.SignerKey = checkpoint.SignerKeys[len(checkpoint.SignerKeys)-1]
-		receipts, extractErr := m.extractFn(m.recorder.Dir(), m.sessionID)
+		_, prefix, extractErr := m.buildCheckpoint(emitter, state.ReceiptCount)
 		if extractErr != nil {
 			return fmt.Errorf("seed auto-anchor state: extract receipt chain: %w", extractErr)
 		}
-		if err := validateAutoAnchorSeedState(state, receipts, currentSignerKey); err != nil {
+		if err := validateAutoAnchorSeedState(state, prefix); err != nil {
 			return fmt.Errorf("seed auto-anchor state: %w", err)
 		}
 		if state.SignerKey == "" || state.SignerKey == currentSignerKey {
@@ -306,15 +307,7 @@ func (m *autoAnchorMonitor) triggered(fr config.FlightRecorder, receiptCount uin
 }
 
 func (m *autoAnchorMonitor) anchor(anchorCfg config.FlightRecorderAnchor, emitter *receipt.Emitter) error {
-	receipts, err := m.extractFn(m.recorder.Dir(), m.sessionID)
-	if err != nil {
-		return fmt.Errorf("extract live receipt chain: %w", err)
-	}
-	trustedKeys, err := autoAnchorTrustedKeys(receipts, emitter.SignerKeyHex())
-	if err != nil {
-		return err
-	}
-	checkpoint, err := anchorpkg.BuildCheckpoint(m.sessionID, receipts, trustedKeys)
+	checkpoint, _, err := m.buildCheckpoint(emitter, 0)
 	if err != nil {
 		return fmt.Errorf("build live receipt checkpoint: %w", err)
 	}
@@ -476,25 +469,64 @@ func loadAutoAnchorCheckpoint(dir string, state anchorState) (anchorpkg.Checkpoi
 	})
 }
 
-func validateAutoAnchorSeedState(state anchorState, receipts []receipt.Receipt, currentSignerKey string) error {
+func validateAutoAnchorSeedState(state anchorState, checkpoint anchorpkg.Checkpoint) error {
 	if state.ReceiptCount == 0 {
 		return errors.New("auto-anchor checkpoint receipt_count is zero")
-	}
-	if state.ReceiptCount > uint64(len(receipts)) {
-		return fmt.Errorf("auto-anchor checkpoint receipt_count %d is ahead of live chain count %d", state.ReceiptCount, len(receipts))
-	}
-	trustedKeys, err := autoAnchorTrustedKeys(receipts, currentSignerKey)
-	if err != nil {
-		return err
-	}
-	checkpoint, err := anchorpkg.BuildCheckpoint(state.SessionID, receipts[:state.ReceiptCount], trustedKeys)
-	if err != nil {
-		return fmt.Errorf("rebuild auto-anchor checkpoint: %w", err)
 	}
 	if checkpoint.FinalSeq != state.FinalSeq || checkpoint.RootHash != state.RootHash || checkpoint.ReceiptCount != state.ReceiptCount {
 		return errors.New("auto-anchor checkpoint does not match the live receipt chain")
 	}
 	return nil
+}
+
+// buildCheckpoint verifies the complete confirmed prefix, even when rebuilding
+// a persisted marker. A saved marker never skips verification of disk bytes.
+func (m *autoAnchorMonitor) buildCheckpoint(emitter *receipt.Emitter, prefixCount uint64) (checkpoint, prefix anchorpkg.Checkpoint, err error) {
+	observation, err := emitter.ConfirmedTailObservation()
+	if err != nil {
+		return checkpoint, prefix, err
+	}
+	if observation.InitErr || observation.Session != m.sessionID || observation.Unconfirmed {
+		return checkpoint, prefix, errors.New("refuse auto-anchor: emitter head is unconfirmed, gapped or belongs to another session")
+	}
+	if !observation.WriteKnown {
+		return checkpoint, prefix, errAutoAnchorWritePending
+	}
+	if observation.PersistedHash != observation.PrevHash {
+		return checkpoint, prefix, errors.New("refuse auto-anchor: emitter head is unconfirmed, gapped or belongs to another session")
+	}
+	verifier, err := receipt.NewHeadTrustedVerifier(emitter.SignerKeyHex(), prefixCount)
+	if err != nil {
+		return checkpoint, prefix, err
+	}
+	defer func() {
+		if closeErr := verifier.Close(); closeErr != nil {
+			if err == nil {
+				err = fmt.Errorf("clean up receipt verification state: %w", closeErr)
+			} else {
+				// Keep the walk failure as the cause, but never hide a spill
+				// directory left on disk.
+				err = errors.Join(err, fmt.Errorf("clean up receipt verification state: %w", closeErr))
+			}
+		}
+	}()
+	bound := recorder.SessionHistoryPrefix{File: observation.WriteFile, End: observation.WriteEnd}
+	if err := m.walkFn(m.recorder.Dir(), m.sessionID, bound, verifier.Add); err != nil {
+		return checkpoint, prefix, fmt.Errorf("extract live receipt chain: %w", err)
+	}
+	fullResult, prefixResult, err := verifier.FinishAtHead(observation.PersistedSeq, observation.PersistedHash)
+	if err != nil {
+		return checkpoint, prefix, err
+	}
+	return checkpointFromSummary(m.sessionID, fullResult), checkpointFromSummary(m.sessionID, prefixResult), nil
+}
+
+func checkpointFromSummary(sessionID string, result receipt.ChainResult) anchorpkg.Checkpoint {
+	return anchorpkg.Checkpoint{
+		SessionID: sessionID, FinalSeq: result.FinalSeq,
+		RootHash: result.RootHash, ReceiptCount: result.ReceiptCount,
+		StartTime: result.StartTime, EndTime: result.EndTime, SignerKeys: result.SignerKeys,
+	}
 }
 
 func (m *autoAnchorMonitor) emitter() *receipt.Emitter {
@@ -512,7 +544,7 @@ func (m *autoAnchorMonitor) now() time.Time {
 }
 
 func (m *autoAnchorMonitor) fail(err error) {
-	if err == nil {
+	if err == nil || errors.Is(err, errAutoAnchorWritePending) {
 		return
 	}
 	if m != nil && m.metrics != nil {
@@ -523,47 +555,7 @@ func (m *autoAnchorMonitor) fail(err error) {
 	}
 }
 
-func autoAnchorTrustedKeys(receipts []receipt.Receipt, currentSignerKey string) ([]string, error) {
-	if len(receipts) == 0 {
-		return nil, errors.New("refuse auto-anchor: live receipt chain is empty")
-	}
-	if currentSignerKey == "" {
-		return nil, errors.New("refuse auto-anchor: live receipt emitter signer key is unavailable")
-	}
-	finalSignerKey := receipts[len(receipts)-1].SignerKey
-	if finalSignerKey != currentSignerKey {
-		return nil, fmt.Errorf("refuse auto-anchor: receipt chain head signer %q does not match live emitter signer", finalSignerKey)
-	}
-	// The live emitter key is the only out-of-band trust anchor available to
-	// the runtime. Walk the chain backward and admit a predecessor only when a
-	// receipt signed by the already-trusted successor carries the transition.
-	// Promoting every key merely present in the file would let a forged or
-	// grafted segment enter the trusted set before structural verification.
-	seen := map[string]struct{}{currentSignerKey: {}}
-	trustedKeys := make([]string, 0, 1)
-	trustedKeys = append(trustedKeys, currentSignerKey)
-	expectedKey := currentSignerKey
-	for i := len(receipts) - 1; i >= 0; i-- {
-		rcpt := receipts[i]
-		if rcpt.SignerKey != expectedKey {
-			return nil, fmt.Errorf("refuse auto-anchor: receipt signer %q is not authorized by the live head", rcpt.SignerKey)
-		}
-		if err := receipt.VerifyWithKey(rcpt, expectedKey); err != nil {
-			return nil, fmt.Errorf("refuse auto-anchor: verify receipt under backward trust: %w", err)
-		}
-		transition := rcpt.ActionRecord.KeyTransition
-		if transition == nil {
-			continue
-		}
-		expectedKey = transition.PriorSignerKey
-		if _, ok := seen[expectedKey]; ok {
-			continue
-		}
-		seen[expectedKey] = struct{}{}
-		trustedKeys = append(trustedKeys, expectedKey)
-	}
-	return trustedKeys, nil
-}
+var errAutoAnchorWritePending = errors.New("auto-anchor is waiting for an observed write position")
 
 func autoAnchorBackend(anchorCfg config.FlightRecorderAnchor) (anchorpkg.Backend, error) {
 	rekorURL := strings.TrimSpace(anchorCfg.RekorURL)

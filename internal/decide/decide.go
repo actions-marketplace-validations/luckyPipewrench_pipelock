@@ -6,10 +6,12 @@ package decide
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -102,6 +104,11 @@ type Evidence struct {
 	Severity string `json:"severity,omitempty"` // critical, high, medium, low
 	Detail   string `json:"detail,omitempty"`   // human-readable detail
 	Action   string `json:"action"`             // block, warn (determines outcome)
+	// core marks a finding from the built-in core credential floor, which
+	// blocks even when enforce is off.
+	core bool
+	// inspectionIncomplete marks a scan refusal rather than a completed finding.
+	inspectionIncomplete bool
 }
 
 // Decision is the result of evaluating an Action.
@@ -145,14 +152,18 @@ func decideShell(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Conf
 
 	var evidence []Evidence
 
-	// DLP: scan the command for secrets. DLP findings are always block-level.
+	// DLP: scan the command; informational card evidence remains a warning.
 	dlpResult := sc.ScanTextForDLP(context.Background(), p.Command)
 	evidence = append(evidence, evidenceFromDLP(dlpResult)...)
 
 	// Injection: scan command for prompt injection relay.
-	if cfg.ResponseScanning.Enabled {
+	// sc.ResponseScanningEnabled()/ResponseAction(), not the raw config: the core
+	// response patterns are the immutable floor and keep running when the
+	// operator turns the optional layer off, and the action resolves to block
+	// when only the floor is live.
+	if sc.ResponseScanningEnabled() {
 		injResult := sc.ScanResponse(context.Background(), p.Command)
-		evidence = append(evidence, evidenceFromInjection(injResult, cfg.ResponseScanning.Action)...)
+		evidence = append(evidence, evidenceFromInjection(injResult, sc.ResponseAction())...)
 	}
 
 	// Policy: map shell execution to tool name "bash" to reuse existing rules.
@@ -172,8 +183,10 @@ func decideMCP(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Config
 
 	var evidence []Evidence
 
-	// Extract all strings from tool_input for scanning.
-	var argStrings []string
+	// Extract all strings from tool_input for scanning. Keys and values feed
+	// DLP and injection scanning; policy also matches the values on their
+	// own, as the MCP proxy does (see policy.CheckToolCallJSON).
+	var argStrings, policyArgs []string
 	var scanText string
 	if p.ToolInput != "" {
 		if !json.Valid([]byte(p.ToolInput)) {
@@ -189,7 +202,9 @@ func decideMCP(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Config
 			scanText = p.ToolInput
 		} else {
 			extracted := ExtractAllStringsFromJSONResult(json.RawMessage(p.ToolInput))
-			if extracted.Truncated {
+			var valuesTruncated bool
+			policyArgs, valuesTruncated = policy.ArgValues(json.RawMessage(p.ToolInput))
+			if extracted.Truncated || valuesTruncated {
 				evidence = append(evidence, uninspectableJSONEvidence())
 			}
 			argStrings = extracted.Strings
@@ -198,9 +213,8 @@ func decideMCP(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Config
 	}
 
 	// DLP + injection: respect MCP input scanning toggle and action.
-	if scanText != "" && cfg.MCPInputScanning.Enabled {
-		dlpResult := sc.ScanTextForDLP(context.Background(), scanText)
-		evidence = append(evidence, evidenceFromDLP(dlpResult)...)
+	if p.ToolInput != "" && cfg.MCPInputScanning.Enabled {
+		evidence = append(evidence, evidenceFromJSONDLP(sc, scanText, p.ToolInput, argStrings)...)
 
 		injResult := sc.ScanResponse(context.Background(), scanText)
 		evidence = append(evidence, evidenceFromInjection(injResult, cfg.MCPInputScanning.Action)...)
@@ -213,7 +227,7 @@ func decideMCP(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Config
 		if p.ToolInput != "" && json.Valid([]byte(p.ToolInput)) {
 			rawArgs = json.RawMessage(p.ToolInput)
 		}
-		policyVerdict := policyCfg.CheckToolCallWithArgs(p.ToolName, argStrings, rawArgs)
+		policyVerdict := policyCfg.CheckToolCallJSON(p.ToolName, policyArgs, argStrings, rawArgs)
 		evidence = append(evidence, evidenceFromPolicy(policyVerdict)...)
 	}
 
@@ -243,12 +257,29 @@ func decideWebFetch(ctx context.Context, cfg *config.Config, sc *scanner.Scanner
 		return Decision{Outcome: Allow}
 	}
 
+	core := scanner.IsCoreCriticalResult(result)
 	evidence := []Evidence{{
 		Scanner:  result.Scanner,
 		Pattern:  result.Reason,
 		Severity: config.SeverityHigh,
 		Action:   config.ActionBlock,
+		core:     core,
 	}}
+	// The URL scan stops at its first failing stage, so check the core floor
+	// directly when an earlier stage refused the URL. Its own evidence entry
+	// names the credential, which is why the request stays denied in audit
+	// mode even though the earlier stage alone would only warn.
+	if !core {
+		if floor := sc.ScanURLCoreFloor(p.URL); !floor.Allowed {
+			evidence = append(evidence, Evidence{
+				Scanner:  floor.Scanner,
+				Pattern:  floor.Reason,
+				Severity: config.SeverityCritical,
+				Action:   config.ActionBlock,
+				core:     true,
+			})
+		}
+	}
 
 	return buildDecision(cfg, evidence)
 }
@@ -271,7 +302,7 @@ func decideToolUse(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Co
 	}
 
 	var evidence []Evidence
-	var argStrings []string
+	var argStrings, policyArgs []string
 	var rawArgs json.RawMessage
 	var scanText string
 
@@ -288,7 +319,9 @@ func decideToolUse(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Co
 		} else {
 			rawArgs = json.RawMessage(p.ToolInput)
 			extracted := ExtractAllStringsFromJSONResult(rawArgs)
-			if extracted.Truncated {
+			var valuesTruncated bool
+			policyArgs, valuesTruncated = policy.ArgValues(rawArgs)
+			if extracted.Truncated || valuesTruncated {
 				evidence = append(evidence, uninspectableJSONEvidence())
 			}
 			argStrings = extracted.Strings
@@ -296,18 +329,17 @@ func decideToolUse(cfg *config.Config, sc *scanner.Scanner, policyCfg *policy.Co
 		}
 	}
 
-	if scanText != "" {
-		dlpResult := sc.ScanTextForDLP(context.Background(), scanText)
-		evidence = append(evidence, evidenceFromDLP(dlpResult)...)
+	if p.ToolInput != "" {
+		evidence = append(evidence, evidenceFromJSONDLP(sc, scanText, p.ToolInput, argStrings)...)
 
-		if cfg.ResponseScanning.Enabled {
+		if sc.ResponseScanningEnabled() {
 			injResult := sc.ScanResponse(context.Background(), scanText)
-			evidence = append(evidence, evidenceFromInjection(injResult, cfg.ResponseScanning.Action)...)
+			evidence = append(evidence, evidenceFromInjection(injResult, sc.ResponseAction())...)
 		}
 	}
 
 	if policyCfg != nil {
-		policyVerdict := policyCfg.CheckToolCallWithArgs(p.ToolName, argStrings, rawArgs)
+		policyVerdict := policyCfg.CheckToolCallJSON(p.ToolName, policyArgs, argStrings, rawArgs)
 		evidence = append(evidence, evidenceFromPolicy(policyVerdict)...)
 	}
 
@@ -331,9 +363,9 @@ func decideFileContent(cfg *config.Config, sc *scanner.Scanner, policyCfg *polic
 		dlpResult := sc.ScanTextForDLP(context.Background(), content)
 		evidence = append(evidence, evidenceFromDLP(dlpResult)...)
 
-		if cfg.ResponseScanning.Enabled {
+		if sc.ResponseScanningEnabled() {
 			injResult := sc.ScanResponse(context.Background(), content)
-			evidence = append(evidence, evidenceFromInjection(injResult, cfg.ResponseScanning.Action)...)
+			evidence = append(evidence, evidenceFromInjection(injResult, sc.ResponseAction())...)
 		}
 	}
 
@@ -367,8 +399,11 @@ func buildDecision(cfg *config.Config, evidence []Evidence) Decision {
 	}
 	summary := strings.Join(parts, ", ")
 
-	// Warn-only findings or enforce=false: allow with advisory message.
-	if strictest == config.ActionWarn || !cfg.EnforceEnabled() {
+	// Warn-only findings or enforce=false: allow with advisory message. Audit
+	// mode never releases incomplete typed inspection or the core credential
+	// floor, matching the proxy transports.
+	mustBlock := slices.ContainsFunc(evidence, func(e Evidence) bool { return e.core || e.inspectionIncomplete })
+	if !mustBlock && (strictest == config.ActionWarn || !cfg.EnforceEnabled()) {
 		verb := "warning"
 		if !cfg.EnforceEnabled() {
 			verb = "detected (enforce off)"
@@ -389,17 +424,37 @@ func buildDecision(cfg *config.Config, evidence []Evidence) Decision {
 	}
 }
 
-func evidenceFromDLP(result scanner.TextDLPResult) []Evidence {
-	if result.Clean {
-		return nil
+// evidenceFromJSONDLP preserves scalar boundaries in synthetic argument joins.
+// The existing extractor keeps its limits and string-only injection/policy view.
+func evidenceFromJSONDLP(sc *scanner.Scanner, text, raw string, values []string) []Evidence {
+	if !json.Valid([]byte(raw)) {
+		return evidenceFromDLP(sc.ScanTextForDLP(context.Background(), text))
 	}
+	atoms := extract.AllStringsFromJSONResult(json.RawMessage(raw)).Atoms
+	cardView := extract.JoinCardAtoms(atoms, " ")
+	result := sc.ScanTextForDLPWithTypedCardView(context.Background(), text, cardView)
+	evidence := evidenceFromDLP(result)
+	for _, value := range values {
+		evidence = append(evidence, evidenceFromDLP(sc.ScanTextForDLP(context.Background(), value))...)
+	}
+	evidence = append(evidence, evidenceFromDLP(scanner.TextDLPResult{Matches: sc.ScanJSONCardRuns(context.Background(), raw)})...)
+	return evidence
+}
+
+func evidenceFromDLP(result scanner.TextDLPResult) []Evidence {
 	var ev []Evidence
 	for _, m := range result.Matches {
+		action := config.ActionBlock
+		if m.IsInformational() {
+			action = config.ActionWarn
+		}
 		ev = append(ev, Evidence{
-			Scanner:  scanner.ScannerDLP,
-			Pattern:  m.PatternName,
-			Severity: m.Severity,
-			Action:   config.ActionBlock, // DLP findings are always block-level
+			Scanner:              scanner.ScannerDLP,
+			Pattern:              m.PatternName,
+			Severity:             m.Severity,
+			Action:               action,
+			core:                 scanner.IsCoreCriticalMatch(m),
+			inspectionIncomplete: m.IsInspectionLimit(),
 		})
 	}
 	return ev
@@ -409,14 +464,24 @@ func evidenceFromInjection(result scanner.ResponseScanResult, cfgAction string) 
 	if result.Failed() {
 		return []Evidence{{Scanner: scanner.DecideStructuralLabel, Detail: "response scan failed: " + result.ScanError, Action: config.ActionBlock}}
 	}
+	// Global warn-only wording findings are advisory evidence: they surface to
+	// the user without enforcing, and never carry the matched text.
+	var ev []Evidence
+	for _, m := range result.WarnedMatches {
+		ev = append(ev, Evidence{
+			Scanner: scanner.DecideInjectionLabel,
+			Pattern: m.PatternName,
+			Detail:  "prompt_injection_detection: warn-only",
+			Action:  config.ActionWarn,
+		})
+	}
 	if result.Clean {
-		return nil
+		return ev
 	}
 	action := cfgAction
 	if action == "" {
 		action = config.ActionBlock // fail-closed default
 	}
-	var ev []Evidence
 	for _, m := range result.Matches {
 		ev = append(ev, Evidence{
 			Scanner: scanner.DecideInjectionLabel,
@@ -452,13 +517,29 @@ func evidenceFromPolicy(verdict policy.Verdict) []Evidence {
 		if action == config.ActionWarn {
 			sev = "medium"
 		}
+		detail := "action=" + action
+		if rule == policy.IncompletePairCheckRule && len(verdict.IncompleteRules) > 0 {
+			detail += "; rules=" + strings.Join(verdict.IncompleteRules, ", ")
+		}
 		ev = append(ev, Evidence{
 			Scanner:  scanner.DecidePolicyLabel,
 			Pattern:  rule,
 			Severity: sev,
-			Detail:   "action=" + action,
+			Detail:   detail,
 			Action:   action,
 		})
 	}
 	return ev
+}
+
+// IncompleteCheckLine returns a log line naming the tool policy rules whose
+// check could not rule out a match, or "" when there are none. Hooks write
+// it to stderr so a warn verdict still leaves a record.
+func IncompleteCheckLine(d Decision) string {
+	for _, e := range d.Evidence {
+		if e.Scanner == scanner.DecidePolicyLabel && e.Pattern == policy.IncompletePairCheckRule {
+			return "pipelock: " + policy.IncompletePairCheckRule + " (" + e.Detail + ")"
+		}
+	}
+	return ""
 }

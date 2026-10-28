@@ -60,8 +60,9 @@ networks:
 
 services:
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock@sha256:73e5d240f2ae02392c7de9c8858e9dee164396382c13e0ea95b4a497b2567965
+    image: ghcr.io/luckypipewrench/pipelock@sha256:3936eaa3a400e61584d67212d25aa9000c60b0e32850d72b1e459e3559aa159a
     command: run --config /config/pipelock.yaml --listen 0.0.0.0:8888
+    stop_grace_period: 10m   # Receipt-group close at shutdown; Compose default is 10 s
     volumes:
       - ./pipelock.yaml:/config/pipelock.yaml:ro
     networks:
@@ -101,6 +102,7 @@ services:
       --mcp-listen 0.0.0.0:8889
       --mcp-upstream http://mcp-server:3000/mcp
       --mcp-auth-token-file /run/pipelock/mcp-listener.token
+    stop_grace_period: 10m
     volumes:
       - ./pipelock.yaml:/config/pipelock.yaml:ro
       - ./mcp-listener.token:/run/pipelock/mcp-listener.token:ro
@@ -194,10 +196,12 @@ spec:
       labels:
         app: my-agent
     spec:
+      # Room for the receipt-group close at shutdown; Kubernetes defaults to 30 s
+      terminationGracePeriodSeconds: 600
       # Init container: copy pipelock binary for MCP stdio wrapping
       initContainers:
         - name: pipelock-init
-          image: ghcr.io/luckypipewrench/pipelock-init@sha256:0d54825d0ddf820edd9627cc08253ed838aebd43f7a62938505f6eae7955d714
+          image: ghcr.io/luckypipewrench/pipelock-init@sha256:64b5e62dd93585ff4a11eae2ef3ba9360375833601d48c27d7b013dae2aa7202
           command: ["cp", "/pipelock", "/shared-bin/pipelock"]
           volumeMounts:
             - name: shared-bin
@@ -206,7 +210,7 @@ spec:
       containers:
         # Pipelock sidecar
         - name: pipelock
-          image: ghcr.io/luckypipewrench/pipelock@sha256:73e5d240f2ae02392c7de9c8858e9dee164396382c13e0ea95b4a497b2567965
+          image: ghcr.io/luckypipewrench/pipelock@sha256:3936eaa3a400e61584d67212d25aa9000c60b0e32850d72b1e459e3559aa159a
           args:
             - run
             - --config
@@ -474,8 +478,9 @@ Topology assumption: service-routed Docker Compose, same as the earlier Compose 
 ```yaml
 services:
   pipelock:
-    image: ghcr.io/luckypipewrench/pipelock@sha256:73e5d240f2ae02392c7de9c8858e9dee164396382c13e0ea95b4a497b2567965
+    image: ghcr.io/luckypipewrench/pipelock@sha256:3936eaa3a400e61584d67212d25aa9000c60b0e32850d72b1e459e3559aa159a
     command: run --config /config/pipelock.yaml --listen 0.0.0.0:8888
+    stop_grace_period: 10m   # Receipt-group close at shutdown; Compose default is 10 s
     volumes:
       - ./pipelock.yaml:/config/pipelock.yaml:ro
       - ./ca.pem:/etc/pipelock/ca.pem:ro
@@ -523,7 +528,7 @@ Mount both into the pipelock sidecar, and the CA (not the key) into the agent co
 ```yaml
 containers:
   - name: pipelock
-    image: ghcr.io/luckypipewrench/pipelock@sha256:73e5d240f2ae02392c7de9c8858e9dee164396382c13e0ea95b4a497b2567965
+    image: ghcr.io/luckypipewrench/pipelock@sha256:3936eaa3a400e61584d67212d25aa9000c60b0e32850d72b1e459e3559aa159a
     args: ["run", "--config", "/etc/pipelock/pipelock.yaml"]
     volumeMounts:
       - name: pipelock-config

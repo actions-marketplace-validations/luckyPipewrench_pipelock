@@ -14,6 +14,7 @@ enum NestedKind {
     KeyTransition,
     SessionControl,
     SessionOpen,
+    GroupBinding,
     SessionHeartbeat,
     SessionClose,
 }
@@ -167,6 +168,17 @@ const SESSION_OPEN_FIELDS: &[FieldSpec] = &[
     field("posture_signer_key_id", true),
     field("containment_nonce", true),
     field("contained_uid", true),
+    nested_field("group_binding", true, NestedKind::GroupBinding),
+];
+
+const GROUP_BINDING_FIELDS: &[FieldSpec] = &[
+    field("group_id", false),
+    field("shard_index", false),
+    field("session_id", false),
+    field("open_manifest_sha256", false),
+    field("signer_key", false),
+    field("previous_group_id", false),
+    field("previous_open_manifest_sha256", false),
 ];
 
 const SESSION_HEARTBEAT_FIELDS: &[FieldSpec] = &[
@@ -211,14 +223,42 @@ pub fn canonicalize_action_record(action_record: &Value) -> Vec<u8> {
     canonical_json_bytes(&order_struct(action_record, ACTION_RECORD_FIELDS))
 }
 
+/// Reproduces Go's `json.Marshal(Receipt)`, the chain link preimage. Go
+/// appends the unsigned top-level `ext` bag (a `json.RawMessage`) after
+/// `signer_key` whenever it is present, including an explicit `null`, so ext
+/// bytes take part in the link hash even though they never take part in the
+/// signature. Those bytes come from the ext value's source text when the
+/// receipt was read from a recorder line; re-serializing the parsed value is a
+/// fallback for receipts built in memory and matches Go only for ext values
+/// whose Go encoding survives a parse and re-serialize.
 pub fn canonicalize_receipt(receipt: &Value) -> Vec<u8> {
-    canonical_json_bytes(&order_struct(receipt, RECEIPT_FIELDS))
+    let mut out = canonical_json_bytes(&order_struct(receipt, RECEIPT_FIELDS));
+    let Some(ext) = receipt.get("ext") else {
+        return out;
+    };
+    let ext_bytes = match crate::rawjson::ext_source_bytes(receipt) {
+        Some(bytes) => bytes.as_bytes().to_vec(),
+        None => canonical_json_string(ext).into_bytes(),
+    };
+    out.pop();
+    if out.len() > 1 {
+        out.push(b',');
+    }
+    out.extend_from_slice(b"\"ext\":");
+    out.extend_from_slice(&ext_bytes);
+    out.push(b'}');
+    out
 }
 
 pub fn canonical_json_string(value: &Value) -> String {
     go_html_escape(&serde_json::to_string(value).expect("serialize JSON value"))
 }
 
+/// Reproduces Go's `encoding/json.Marshal` output for the values the verifier
+/// re-signs. `serde_json` already writes the short escapes (`\b \f \n \r
+/// \t`) and lowercase `\u00XX` for other controls exactly as Go 1.22+ does;
+/// `go_html_escape` adds the HTML and line-separator escapes Go also applies.
+/// `sdk/conformance/testdata/go-json-escapes` holds Go's own output to check it.
 pub(crate) fn go_json_bytes<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_string(value).map(|encoded| go_html_escape(&encoded).into_bytes())
 }
@@ -277,6 +317,9 @@ fn order_struct(value: &Value, fields: &[FieldSpec]) -> Value {
             }
             Some(NestedKind::SessionOpen) if field_value.is_object() => {
                 order_struct(&field_value, SESSION_OPEN_FIELDS)
+            }
+            Some(NestedKind::GroupBinding) if field_value.is_object() => {
+                order_struct(&field_value, GROUP_BINDING_FIELDS)
             }
             Some(NestedKind::SessionHeartbeat) if field_value.is_object() => {
                 order_struct(&field_value, SESSION_HEARTBEAT_FIELDS)
@@ -423,4 +466,44 @@ fn go_html_escape(serialized: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod go_json_escape_tests {
+    use super::{canonical_json_string, encode_jcs_string, go_json_bytes};
+    use std::path::PathBuf;
+
+    // Written by the Go conformance test from encoding/json itself, so this
+    // holds the Rust encoder to Go's bytes rather than to a recollection.
+    #[test]
+    fn go_json_bytes_writes_every_ascii_character_and_line_separators_as_go_does() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../conformance/testdata/go-json-escapes/table.json");
+        let table: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).expect("read table"))
+                .expect("parse table");
+        let entries = table["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 130);
+        for entry in entries {
+            let cp = entry["codepoint"].as_str().expect("codepoint");
+            let ch = char::from_u32(u32::from_str_radix(cp, 16).expect("hex")).expect("char");
+            let want = entry["go_json_hex"].as_str().expect("hex");
+            let got = hex::encode(go_json_bytes(&ch.to_string()).expect("encode"));
+            assert_eq!(got, want, "go_json_bytes U+{cp}");
+            // The v1 receipt canonicalizer and the v2 receipt JCS encoder also
+            // rebuild strings Go wrote with encoding/json; NFC leaves every
+            // code point here unchanged.
+            let value = serde_json::Value::String(ch.to_string());
+            assert_eq!(
+                hex::encode(canonical_json_string(&value)),
+                want,
+                "canonical_json_string U+{cp}"
+            );
+            assert_eq!(
+                hex::encode(encode_jcs_string(&ch.to_string())),
+                want,
+                "encode_jcs_string U+{cp}"
+            );
+        }
+    }
 }

@@ -16,16 +16,17 @@ import (
 
 const (
 	// MaxEvidenceReadFileBytes matches the bounded dashboard evidence
-	// verification ceiling: one evidence source may contribute at most 8 MiB
-	// to in-memory verifier and online UI reads. Recorder resume uses a
+	// display ceiling: one evidence source may contribute at most 8 MiB
+	// to bounded query and online UI reads. Authoritative history readers do
+	// not apply this ceiling. Recorder resume uses a
 	// separately bounded single-entry tail read so legacy shards larger than
 	// this whole-file ceiling remain upgradeable.
 	MaxEvidenceReadFileBytes int64 = 8 << 20
 
 	// MaxEvidenceReadDirectoryEntries matches the bounded dashboard evidence
-	// directory ceiling. It applies to READ paths (query, verification, the
-	// dashboard), where a truncated read would present partial evidence as
-	// complete.
+	// directory ceiling. It applies to bounded query and dashboard reads,
+	// which report truncation or refusal instead of presenting partial evidence
+	// as complete. Authoritative history readers do not apply this ceiling.
 	//
 	// It deliberately does NOT apply to recorder resume. Resume enumerates the
 	// session's shards uncapped and reads them newest first until one yields a
@@ -46,14 +47,20 @@ const (
 	// symptom worth surfacing, because retention cannot prune chain shards.
 	EvidenceFileWarningThreshold = 200
 
-	// MaxEvidenceReadEntries matches the recorder's default shard size. A
-	// healthy default shard can be resumed, while appended over-cap records fail
-	// closed instead of being silently ignored.
+	// MaxEvidenceReadEntries matches the recorder's default shard size and
+	// bounds display reads. Authoritative history streams every complete entry.
 	MaxEvidenceReadEntries = defaultMaxEntriesPerFile
 )
 
 // ErrEvidenceReadLimitExceeded marks a fail-closed evidence read cap hit.
 var ErrEvidenceReadLimitExceeded = errors.New("evidence read limit exceeded")
+
+// ErrEvidenceRefused marks evidence a reader refused to read as the chain it
+// was asked for: a symlink inside an evidence root, or an entry whose
+// session_id is not the session its file name claims. A verifier reports it
+// as a verification failure, not as a configuration error, because the
+// evidence itself is what is wrong.
+var ErrEvidenceRefused = errors.New("evidence refused")
 
 // openRegularEvidenceFile opens an unchanged regular evidence file after the
 // platform access policy has accepted the operation.
@@ -67,7 +74,7 @@ func openRegularEvidenceFile(path string, accessErr error) (*os.File, os.FileInf
 		return nil, nil, err
 	}
 	if before.Mode()&os.ModeSymlink != 0 || !before.Mode().IsRegular() {
-		return nil, nil, errors.New("evidence file is symlinked or non-regular")
+		return nil, nil, fmt.Errorf("%w: evidence file is symlinked or non-regular", ErrEvidenceRefused)
 	}
 	file, err := os.OpenFile(cleanPath, os.O_RDONLY|evidenceReadNoFollowFlag|evidenceReadNonblockFlag, 0)
 	if err != nil {
@@ -78,11 +85,26 @@ func openRegularEvidenceFile(path string, accessErr error) (*os.File, os.FileInf
 		_ = file.Close()
 		return nil, nil, err
 	}
-	if !info.Mode().IsRegular() || !os.SameFile(before, info) {
+	if err := checkOpenedEvidenceFile(before, info); err != nil {
 		_ = file.Close()
-		return nil, nil, errors.New("evidence file changed or is non-regular")
+		return nil, nil, err
 	}
 	return file, info, nil
+}
+
+// checkOpenedEvidenceFile compares the file a reader opened with the entry it
+// examined before opening. A non-regular file is refused evidence, as it is
+// before the open. A different regular file means the shard was replaced
+// between the two, a race with the writer that callers retry or report as no
+// verdict rather than as a finding.
+func checkOpenedEvidenceFile(before, opened os.FileInfo) error {
+	if !opened.Mode().IsRegular() {
+		return fmt.Errorf("%w: opened evidence file is non-regular", ErrEvidenceRefused)
+	}
+	if !os.SameFile(before, opened) {
+		return fmt.Errorf("%w: evidence file replaced before it was opened", ErrEvidenceChanged)
+	}
+	return nil
 }
 
 // readBoundedEvidence opens path as a regular no-follow file and copies at
@@ -115,7 +137,7 @@ func readBoundedEvidence(path string, maxBytes int64, sink io.Writer) error {
 		return err
 	}
 	if after.Size() != info.Size() || after.ModTime() != info.ModTime() {
-		return errors.New("evidence file changed during read")
+		return ErrEvidenceFileChanged
 	}
 	return nil
 }

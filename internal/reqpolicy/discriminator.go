@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
+	"github.com/luckyPipewrench/pipelock/internal/jsonscan"
 )
 
 // discOutcome is the result of evaluating a discriminator predicate against a
@@ -29,6 +30,43 @@ const (
 type discPredicate struct {
 	field    string
 	valueRes []*regexp.Regexp
+}
+
+type exactException struct {
+	field  string
+	values map[string]struct{}
+}
+
+func compileExactException(e *config.RequestPolicyException) *exactException {
+	if e == nil {
+		return nil
+	}
+	x := &exactException{field: strings.TrimSpace(e.Field), values: make(map[string]struct{}, len(e.Values))}
+	for _, value := range e.Values {
+		x.values[value] = struct{}{}
+	}
+	return x
+}
+
+// matches returns true only when the inspected body proves an exact exception.
+// A missing, duplicate, non-string, or unparsed field leaves the block active.
+func (e *exactException) matches(meta RequestMeta) bool {
+	if !meta.JSONBodyParsed {
+		return false
+	}
+	obj, ok := meta.JSONBody.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, duplicated := meta.JSONDupKeys[e.field]; duplicated || jsonscan.HasKeyAlias(obj, e.field) {
+		return false
+	}
+	value, ok := obj[e.field].(string)
+	if !ok {
+		return false
+	}
+	_, ok = e.values[value]
+	return ok
 }
 
 // compileDiscriminatorPredicate compiles a rule's discriminator predicate,
@@ -64,7 +102,7 @@ func (d *discPredicate) eval(meta RequestMeta) discOutcome {
 		// so treat it as opaque rather than a benign no-match.
 		return discOpaque
 	}
-	if _, dup := meta.JSONDupKeys[d.field]; dup {
+	if _, dup := meta.JSONDupKeys[d.field]; dup || jsonscan.HasKeyAlias(obj, d.field) {
 		// The targeted field appears more than once at the top level. Go keeps
 		// the last value, but a first-wins upstream could dispatch on a
 		// different one, so we cannot trust the collapsed value: fail closed.

@@ -5,11 +5,11 @@
 // self-updater that fetches a release archive from GitHub, verifies it against
 // the published checksums and the native Ed25519 release manifest, optionally
 // verifies the legacy cosign keyless signature when cosign is available, then
-// atomically replaces the running binary.
+// replaces the running binary through the platform installation helper.
 //
-// Every failure in the verification chain aborts and leaves the installed
-// binary untouched. The temp download/extract happens in the SAME directory as
-// the target binary so the final os.Rename is atomic on one filesystem.
+// Every verification failure leaves the installed binary untouched. Staging is
+// on the target filesystem: Unix uses atomic rename; Windows renames the running
+// image aside, installs the candidate, and restores the original on failure.
 package selfupdate
 
 import (
@@ -61,6 +61,14 @@ const (
 	// releaseWorkflowIdentity is the exact GitHub Actions OIDC identity that
 	// signs release checksums for a tag.
 	releaseWorkflowIdentity = "https://github.com/luckyPipewrench/pipelock/.github/workflows/release.yaml@refs/tags/%s"
+
+	// orgReleaseWorkflowIdentity is the same release workflow after the
+	// repository moves to the pipelab-org organization. A certificate's
+	// identity names the repository that signed it and does not follow
+	// GitHub's redirects, so a binary that knew only the first identity would
+	// refuse every release signed after the move. Each is still an exact
+	// string bound to the requested tag; no pattern is accepted.
+	orgReleaseWorkflowIdentity = "https://github.com/pipelab-org/pipelock/.github/workflows/release.yaml@refs/tags/%s"
 
 	// httpTimeout bounds every network operation.
 	httpTimeout = 60 * time.Second

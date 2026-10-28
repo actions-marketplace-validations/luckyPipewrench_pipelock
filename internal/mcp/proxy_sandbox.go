@@ -95,10 +95,13 @@ func runProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, start func()
 	}
 	var rec session.Recorder
 	if opts.Store != nil {
-		rec = opts.Store.GetOrCreate(session.NextInvocationKey("mcp-stdio"))
+		invocationKey := session.NextInvocationKey("mcp-stdio")
+		rec = opts.Store.GetOrCreate(invocationKey)
 		if rec == nil {
+			dropMCPDenial(opts, mcpStartupDenialAudit(mcpListenerCapacityDenialAudit()), "startup")
 			return session.ErrCapacity
 		}
+		defer opts.Store.Delete(invocationKey)
 	}
 	defer recordMCPBaselineSample(opts, rec)
 
@@ -114,6 +117,11 @@ func runProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, start func()
 		return fmt.Errorf("creating stdout pipe: %w", err)
 	}
 	sandboxCmd.Stderr = safeLogW
+	// Bound Cmd.Wait's stderr copier even if an escaped writer survives cleanup.
+	// Preserve a caller's shorter bound and configure it before Start.
+	if sandboxCmd.WaitDelay <= 0 || sandboxCmd.WaitDelay > defaultParentExitGrace {
+		sandboxCmd.WaitDelay = defaultParentExitGrace
+	}
 	// The sandbox launch preserves other SysProcAttr settings, but it must run
 	// in its own process group before session teardown can safely signal its
 	// subprocess tree.
@@ -223,6 +231,8 @@ func runProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, start func()
 			BindingUnknownAction:    toolCfg.BindingUnknownAction,
 			BindingNoBaselineAction: toolCfg.BindingNoBaselineAction,
 			ExtraPoison:             toolCfg.ExtraPoison,
+			CredentialAcks:          toolCfg.CredentialAcks,
+			Now:                     toolCfg.Now,
 		}
 	}
 
@@ -270,16 +280,7 @@ func runProxyWithSandbox(ctx context.Context, sandboxCmd *exec.Cmd, start func()
 	go func() {
 		defer wgBlocked.Done()
 		for blocked := range blockedCh {
-			if blocked.IsNotification {
-				continue
-			}
-			var resp []byte
-			if blocked.SyntheticResponse != nil {
-				resp = blocked.SyntheticResponse
-			} else {
-				resp = blockRequestResponse(blocked)
-			}
-			if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
+			if wErr := deliverMCPInputResult(inputOpts, blocked, safeClientOut); wErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send block response: %v\n", wErr)
 			}
 		}

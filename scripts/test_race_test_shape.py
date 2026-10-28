@@ -10,16 +10,19 @@ import subprocess
 import unittest
 from pathlib import Path
 
+from scripts.ci_test_packages import TEST_SPLITS
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-race-test.sh"
 CI_RACE_PRODUCERS = (
-    "test-oss-go125",
     "test-oss-go126",
-    "test-enterprise-go125",
+    "test-oss-go127",
     "test-enterprise-go126",
+    "test-enterprise-go127",
 )
 LEGACY_CI_RACE_PRODUCERS = ("test-oss", "test-enterprise")
+ATTEMPT_MARGIN_SECONDS = 300
 SHELL_ASSIGNMENT = r"[A-Za-z_][A-Za-z0-9_]*=(?:[^\s\"']*|\"[^\"]*\"|'[^']*')"
 COMMAND_PREFIX = rf"(?:env\s+)?(?:{SHELL_ASSIGNMENT}\s+)*"
 RUNNER_COMMAND = re.compile(
@@ -107,6 +110,8 @@ def ci_race_shape_errors(ci: str) -> list[str]:
             direct_count
             and '-p="$package_parallelism" -parallel=2' in job
             and "-timeout=15m -count=1" in job
+            and 'ci_test_packages.py --shard "$TEST_SHARD" --selector' in job
+            and '${test_selector:+"$test_selector"}' in job
         ):
             inline.append(name)
         else:
@@ -122,23 +127,140 @@ def ci_race_shape_errors(ci: str) -> list[str]:
     return errors
 
 
-class TestRaceTestShape(unittest.TestCase):
-    def test_oss_proxy_shape_limits_package_fanout(self) -> None:
-        command = printed_command("--shard", "proxy")
+def ci_retry_budget_errors(ci: str) -> list[str]:
+    """Budget complete command attempts, independent of package execution waves."""
+    errors = []
+    for name in CI_RACE_PRODUCERS:
+        job = job_block(ci, name)
+        job_timeout = re.search(r"(?m)^    timeout-minutes: (\d+)\s*$", job)
+        test_timeout = re.search(r"-timeout=(\d+)m\b", job)
+        if job_timeout is None or test_timeout is None:
+            errors.append(f"{name}: missing explicit job or test deadline")
+            continue
+        retry_command = re.search(r"(?m)^\s*bash scripts/ci-test-with-retry\.sh\b[^\n]*$", job)
+        if retry_command is None:
+            errors.append(f"{name}: missing bounded retry runner")
+            continue
+        attempt_timeout = re.search(
+            r"--attempt-timeout-seconds ([1-9][0-9]*) --(?:\s*\\)?\s*$",
+            retry_command[0],
+        )
+        if attempt_timeout is None:
+            errors.append(f"{name}: missing whole-command attempt deadline")
+            continue
+        seconds = int(attempt_timeout[1])
+        # Only go test's own timeout panic names the test that hung. Compile
+        # time and package waves run before a test binary's timer starts, so a
+        # one-minute margin let the attempt deadline win and the shard died
+        # silently; five minutes keeps go test's panic first.
+        if seconds - int(test_timeout[1]) * 60 < ATTEMPT_MARGIN_SECONDS:
+            errors.append(
+                f"{name}: attempt deadline must exceed the package timeout by "
+                f"{ATTEMPT_MARGIN_SECONDS} seconds so go test names a hung test"
+            )
+        # Capture allows the command's ten-second KILL grace, plus ten seconds
+        # to stop a stuck reader. Both readers run concurrently. The existing
+        # buffer covers group cleanup, setup and upload; round up to minutes.
+        minimum = (2 * (seconds + 20) + 59) // 60 + 5
+        if int(job_timeout[1]) < minimum:
+            errors.append(f"{name}: job budget must be at least {minimum} minutes")
+    return errors
 
-        self.assertIn("go test -race -p=1 -parallel=2 -count=1 -timeout=15m", command)
-        self.assertIn("github.com/luckyPipewrench/pipelock/internal/proxy", command)
+
+class TestRaceTestShape(unittest.TestCase):
+    def test_ci_job_budget_covers_the_timeout_retry(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        self.assertEqual(ci_retry_budget_errors(ci), [])
+
+    def test_shortening_one_retry_budget_is_detected(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        name = "test-enterprise-go126"
+        original = job_block(ci, name)
+        shortened, count = re.subn(
+            r"(?m)^    timeout-minutes: \d+$",
+            "    timeout-minutes: 20",
+            original,
+        )
+        self.assertEqual(count, 1)
+        drifted = ci.replace(original, shortened, 1)
+        self.assertIn(
+            f"{name}: job budget must be at least 48 minutes",
+            ci_retry_budget_errors(drifted),
+        )
+
+    def test_package_timeout_cannot_substitute_for_an_attempt_deadline(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        name = "test-enterprise-go126"
+        original = job_block(ci, name)
+        unbounded, count = re.subn(r" --attempt-timeout-seconds [0-9]+", "", original)
+        self.assertEqual(count, 1)
+        drifted = ci.replace(original, unbounded, 1)
+        self.assertIn(
+            f"{name}: missing whole-command attempt deadline",
+            ci_retry_budget_errors(drifted),
+        )
+
+    def test_package_timeout_too_close_to_attempt_deadline_is_detected(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        name = "test-oss-go126"
+        original = job_block(ci, name)
+        # The pre-fix shape: a 20m package timeout inside a 1260s attempt.
+        crowded, count = re.subn(r"-timeout=15m\b", "-timeout=20m", original)
+        self.assertEqual(count, 1)
+        self.assertIn(
+            f"{name}: attempt deadline must exceed the package timeout by 300 seconds so go test names a hung test",
+            ci_retry_budget_errors(ci.replace(original, crowded, 1)),
+        )
+
+    def test_attempt_deadline_changes_recompute_the_job_budget(self) -> None:
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        name = "test-oss-go127"
+        original = job_block(ci, name)
+        longer, count = re.subn(r"--attempt-timeout-seconds [0-9]+", "--attempt-timeout-seconds 1800", original)
+        self.assertEqual(count, 1)
+        self.assertIn(
+            f"{name}: job budget must be at least 66 minutes",
+            ci_retry_budget_errors(ci.replace(original, longer, 1)),
+        )
+
+    def test_oss_proxy_shape_limits_package_fanout(self) -> None:
+        last = TEST_SPLITS["proxy"] - 1
+        cases = [(f"proxy-{index}", "-run=") for index in range(last)] + [(f"proxy-{last}", "-skip=")]
+        for shard, flag in cases:
+            with self.subTest(shard=shard):
+                command = printed_command("--shard", shard)
+
+                self.assertIn("go test -race -p=1 -parallel=2 -count=1 -timeout=20m", command)
+                self.assertIn("github.com/luckyPipewrench/pipelock/internal/proxy", command)
+                self.assertIn(flag, command)
+
+    def test_unsplit_shard_has_no_test_selector(self) -> None:
+        command = printed_command("--shard", "rest-0")
+
+        self.assertNotIn("-run", command)
+        self.assertNotIn("-skip", command)
+
+    def test_run_pattern_cannot_override_a_sub_shard_selector(self) -> None:
+        result = subprocess.run(
+            ["bash", str(RUNNER), "--shard", "scanner-1", "--run", "TestX", "--print-command"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("already selects its tests", result.stderr)
 
     def test_enterprise_rest_shape_uses_common_limits(self) -> None:
         command = printed_command("--shard", "rest-0", "--tags", "enterprise")
 
-        self.assertIn("go test -race -p=2 -parallel=2 -count=1 -timeout=15m", command)
+        self.assertIn("go test -race -p=2 -parallel=2 -count=1 -timeout=20m", command)
         self.assertIn("-tags enterprise", command)
 
     def test_named_package_selection_cannot_bypass_common_limits(self) -> None:
         command = printed_command("--packages", "./internal/config ./internal/mcp")
 
-        self.assertIn("go test -race -p=2 -parallel=2 -count=1 -timeout=15m", command)
+        self.assertIn("go test -race -p=2 -parallel=2 -count=1 -timeout=20m", command)
         self.assertIn("./internal/config ./internal/mcp", command)
 
     def test_local_and_release_targets_delegate_to_the_runner(self) -> None:
@@ -168,14 +290,34 @@ class TestRaceTestShape(unittest.TestCase):
         ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
         self.assertEqual(ci_race_shape_errors(ci), [])
 
+    def test_dropping_the_shard_selector_fails_the_contract(self) -> None:
+        # Sub-shard package lists are identical. Without the selector each
+        # sub-shard runs the whole tree, so the split silently doubles work
+        # and the release partition check still passes: it builds its own
+        # selectors and never reads this command line.
+        ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
+        first_producer = "test-oss-go126" if "  test-oss-go126:\n" in ci else "test-oss"
+        original_job = job_block(ci, first_producer)
+        dropped = original_job.replace('${test_selector:+"$test_selector"}', "")
+        self.assertNotEqual(dropped, original_job)
+        drifted = ci.replace(original_job, dropped, 1)
+        self.assertIn(
+            f"CI race jobs drifted from shared shape: ['{first_producer}']",
+            ci_race_shape_errors(drifted),
+        )
+
     def test_one_drifted_ci_race_job_fails_the_contract(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
-        first_producer = "test-oss-go125" if "  test-oss-go125:\n" in ci else "test-oss"
-        drifted = ci.replace(
-            'go test -race -p="$package_parallelism" -parallel=2 -timeout=15m -count=1 -json \\',
-            "go test -race -p=8 -parallel=8 -timeout=15m -count=1 -json \\",
+        first_producer = "test-oss-go126" if "  test-oss-go126:\n" in ci else "test-oss"
+        original_job = job_block(ci, first_producer)
+        original_shape = 'go test -race -p="$package_parallelism" -parallel=2'
+        self.assertEqual(original_job.count(original_shape), 1)
+        drifted_job = original_job.replace(
+            original_shape,
+            "go test -race -p=8 -parallel=8",
             1,
         )
+        drifted = ci.replace(original_job, drifted_job, 1)
         self.assertIn(
             f"CI race jobs drifted from shared shape: ['{first_producer}']",
             ci_race_shape_errors(drifted),
@@ -202,7 +344,7 @@ class TestRaceTestShape(unittest.TestCase):
 
     def test_partial_runner_delegation_fails_the_contract(self) -> None:
         ci = (ROOT / ".github/workflows/ci.yaml").read_text(encoding="utf-8")
-        first_producer = "test-oss-go125" if "  test-oss-go125:\n" in ci else "test-oss"
+        first_producer = "test-oss-go126" if "  test-oss-go126:\n" in ci else "test-oss"
         for prefix in ("", 'GOFLAGS="" ', "env GOFLAGS=-mod=readonly "):
             with self.subTest(prefix=prefix):
                 mixed = ci.replace(
@@ -223,7 +365,7 @@ env CGO_ENABLED=1 go test -race ./internal/proxy
 
     def test_invalid_selection_fails_before_running_go(self) -> None:
         result = subprocess.run(
-            ["bash", str(RUNNER), "--shard", "mcp", "--packages", "./internal/mcp"],
+            ["bash", str(RUNNER), "--shard", "mcp-0", "--packages", "./internal/mcp"],
             cwd=ROOT,
             text=True,
             capture_output=True,

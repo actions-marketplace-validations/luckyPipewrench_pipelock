@@ -16,11 +16,33 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .canonical import canonicalize
+from .input_file import iter_verifier_jsonl_lines, read_verifier_file
+from .key_fold import field_alias
+from .line_space import trim_go_space
 from .number import (
     StrictParseError,
     UnsafeNumberError,
     enforce_cross_language_number_range,
     parse_json_strict,
+)
+from .rawjson import (
+    SourcedReceipt,
+    ext_source_bytes,
+    object_member_span,
+    recorder_line_ext_bytes,
+)
+from .secret_egress import (
+    SECRET_EGRESS_PAYLOAD_KIND,
+    SecretEgressError,
+)
+from .secret_egress import (
+    validate_envelope as validate_secret_egress_envelope,
+)
+from .secret_egress import (
+    validate_payload as validate_secret_egress_payload,
+)
+from .secret_egress import (
+    validate_source as validate_secret_egress_source,
 )
 
 V2_RECORD_TYPE = "evidence_receipt_v2"
@@ -48,10 +70,12 @@ UNPINNED_RECEIPT_BANNER = (
 )
 
 _PAYLOAD_KINDS = {
+    SECRET_EGRESS_PAYLOAD_KIND,
     "proxy_decision",
     "proxy_decision_with_spans",
 }
 _POLICY_HASH_PAYLOAD_KINDS = {
+    SECRET_EGRESS_PAYLOAD_KIND,
     "proxy_decision",
     "proxy_decision_with_spans",
 }
@@ -277,6 +301,17 @@ _SESSION_OPEN_FIELDS: tuple[tuple[str, bool, str | None], ...] = (
     ("posture_signer_key_id", True, None),
     ("containment_nonce", True, None),
     ("contained_uid", True, None),
+    ("group_binding", True, "group_binding"),
+)
+
+_GROUP_BINDING_FIELDS: tuple[tuple[str, bool, str | None], ...] = (
+    ("group_id", False, None),
+    ("shard_index", False, None),
+    ("session_id", False, None),
+    ("open_manifest_sha256", False, None),
+    ("signer_key", False, None),
+    ("previous_group_id", False, None),
+    ("previous_open_manifest_sha256", False, None),
 )
 
 _SESSION_HEARTBEAT_FIELDS: tuple[tuple[str, bool, str | None], ...] = (
@@ -320,9 +355,12 @@ class ReceiptError(Exception):
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    seen: set[str] = set()
     for key, value in pairs:
-        if key in out:
+        folded = key
+        if folded in seen:
             raise ReceiptError(f"duplicate object key: {key}")
+        seen.add(folded)
         out[key] = value
     return out
 
@@ -338,7 +376,10 @@ _SKIPPABLE_ENTRY_TYPES = frozenset(
 
 
 def load_receipt(path: str | Path) -> dict[str, Any]:
-    data = Path(path).read_text(encoding="utf-8")
+    try:
+        data = read_verifier_file(path).decode("utf-8")
+    except OSError as exc:
+        raise ReceiptError(str(exc)) from exc
     # Python is arbitrary-precision, so it neither rounds nor overflows on a
     # number outside the I-JSON safe range: it silently ACCEPTS what the Go,
     # Rust, and TypeScript verifiers now reject, which is the same
@@ -361,6 +402,10 @@ def load_receipt(path: str | Path) -> dict[str, Any]:
         raise ReceiptError(f"malformed JSON: {exc}") from exc
     if not isinstance(value, dict):
         raise ReceiptError("receipt must be an object")
+    try:
+        validate_secret_egress_source(value, data)
+    except SecretEgressError as exc:
+        raise ReceiptError(str(exc)) from exc
     return value
 
 
@@ -393,7 +438,13 @@ def verify_receipt_file(
             payload = receipt.get("payload")
             if isinstance(payload, dict):
                 report["verdict"] = payload.get("verdict")
-                report["transport"] = payload.get("transport")
+                if receipt.get("payload_kind") == SECRET_EGRESS_PAYLOAD_KIND:
+                    decision = payload.get("decision")
+                    if isinstance(decision, dict):
+                        report["action_id"] = decision.get("action_id")
+                        report["transport"] = decision.get("transport")
+                else:
+                    report["transport"] = payload.get("transport")
             report["signer_key"] = key_hex
             report["policy_hash"] = receipt.get("policy_hash")
             report["chain_seq"] = receipt.get("chain_seq")
@@ -433,12 +484,52 @@ def verify_evidence_chain_file(
 
 
 def load_evidence_chain(path: str | Path) -> list[dict[str, Any]]:
-    receipts: list[dict[str, Any]] = []
-    chain_type: str | None = None
-    for index, line in enumerate(
-        Path(path).read_text(encoding="utf-8").splitlines(), start=1
-    ):
-        raw = line.strip()
+    """Load a chain and give file-change errors precedence over parse errors."""
+    return _load_chain_file(path, False)
+
+
+def load_receipt_chains(
+    path: str | Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Read both receipt chains from the same verified file snapshot."""
+    return _load_chain_file(path, True)
+
+
+def _load_chain_file(path: str | Path, both: bool) -> Any:
+    lines = iter_verifier_jsonl_lines(path)
+    try:
+        return _load_evidence_chain_lines(lines, both)
+    except Exception as original:
+        # A malformed row must not skip the final descriptor/path identity
+        # check. Drain the bounded stream; any read or snapshot failure wins.
+        try:
+            for _ in lines:
+                pass
+        except Exception as changed:
+            raise changed from original
+        raise
+
+
+def _load_evidence_chain_lines(lines: Any, both: bool = False) -> Any:
+    """Load the receipt chain carried in a flight-recorder JSONL file.
+
+    Mirrors the Go reference receipt-chain mode: the action_receipt
+    subsequence is the chain and evidence_receipt entries are skipped. A
+    default Pipelock run interleaves both types in one file, each on its own
+    chain. A file that carries only evidence_receipt entries is loaded as an
+    evidence_receipt_v2 chain.
+    """
+    action: list[dict[str, Any]] = []
+    evidence: list[dict[str, Any]] = []
+    # Split on LF only, like Go's line scanner. str.splitlines() also splits
+    # on U+0085, U+2028 and other separators that Go's encoder leaves raw
+    # inside JSON strings, which would cut a valid entry in half.
+    for index, line in enumerate(lines, start=1):
+        try:
+            decoded = line.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ReceiptError(f"line {index}: input is not UTF-8: {exc}") from exc
+        raw = trim_go_space(decoded)
         if raw == "":
             continue
         try:
@@ -463,15 +554,33 @@ def load_evidence_chain(path: str | Path) -> list[dict[str, Any]]:
             raise ReceiptError(
                 f"line {index}: unexpected recorder entry type {entry_type!r}"
             )
-        if chain_type is None:
-            chain_type = entry_type
-        elif entry_type != chain_type:
-            raise ReceiptError("mixed action/evidence receipt chains are not supported")
         detail = entry.get("detail")
         if not isinstance(detail, dict):
             raise ReceiptError(f"line {index}: evidence entry has empty detail")
-        receipts.append(detail)
-    return receipts
+        detail_span = object_member_span(raw, 0, "detail")
+        assert detail_span is not None  # Parsed detail is already an object.
+        try:
+            validate_secret_egress_source(detail, raw, detail_span[0])
+        except SecretEgressError as exc:
+            raise ReceiptError(f"line {index}: {exc}") from exc
+        # The recorder wrapper and signed receipt must select the same schema.
+        # Validate before splitting so inner dispatch cannot reinterpret a row.
+        if (entry_type == EVIDENCE_ENTRY_TYPE) != (
+            detail.get("record_type") == V2_RECORD_TYPE
+        ):
+            raise ReceiptError(f"line {index}: recorder and receipt kind disagree")
+        if entry_type == EVIDENCE_ENTRY_TYPE:
+            evidence.append(detail)
+            continue
+        if "ext" in detail:
+            try:
+                ext_bytes = recorder_line_ext_bytes(raw)
+            except ValueError as exc:
+                raise ReceiptError(f"line {index}: ext source: {exc}") from exc
+            if ext_bytes is not None:
+                detail = SourcedReceipt(detail, ext_bytes)
+        action.append(detail)
+    return (action, evidence) if both else action if action else evidence
 
 
 def verify_evidence_chain(
@@ -719,13 +828,17 @@ def _start_rotated_segment(
             f"seq {seq}: key_transition prior_signer_key does not match prior "
             "segment key",
         )
+    signer_key = _require_string(receipt.get("signer_key"), "signer_key").lower()
+    if signer_key == state["cur_key"]:
+        return _broken_chain(
+            seq, f"seq {seq}: key_transition does not change signer key"
+        )
     if marker.get("prior_chain_seq") != state["prior_segment_seq"]:
         return _broken_chain(
             seq,
             f"seq {seq}: key_transition prior_chain_seq does not match prior "
             "segment final seq",
         )
-    signer_key = _require_string(receipt.get("signer_key"), "signer_key").lower()
     if trusted_keys:
         if signer_key not in trusted_keys:
             return _broken_chain(
@@ -918,7 +1031,27 @@ def compute_session_open_genesis(open_record: dict[str, Any]) -> str:
 
 
 def _canonicalize_receipt(receipt: dict[str, Any]) -> bytes:
-    return _canonical_json(_order_struct(receipt, _RECEIPT_FIELDS))
+    """Reproduce Go's json.Marshal(Receipt), the chain link preimage.
+
+    Go appends the unsigned top-level ext bag (a json.RawMessage) after
+    signer_key whenever it is present, including an explicit null, so ext
+    bytes take part in the link hash even though they never take part in the
+    signature. Those bytes come from the ext value's source text when the
+    receipt was read from a recorder line; re-serializing the parsed value is
+    a fallback for receipts built in memory and matches Go only for ext values
+    whose Go encoding survives a parse and re-serialize.
+    """
+    base = _canonical_json(_order_struct(receipt, _RECEIPT_FIELDS))
+    if "ext" not in receipt:
+        return base
+    source = ext_source_bytes(receipt)
+    ext_bytes = (
+        source.encode("utf-8")
+        if source is not None
+        else _canonical_json(receipt["ext"])
+    )
+    head = b"{" if base == b"{}" else base[:-1] + b","
+    return head + b'"ext":' + ext_bytes + b"}"
 
 
 def _canonical_json(value: Any) -> bytes:
@@ -964,6 +1097,8 @@ def _order_struct(
             field_value = _order_struct(field_value, _SESSION_CONTROL_FIELDS)
         elif nested == "session_open" and isinstance(field_value, dict):
             field_value = _order_struct(field_value, _SESSION_OPEN_FIELDS)
+        elif nested == "group_binding" and isinstance(field_value, dict):
+            field_value = _order_struct(field_value, _GROUP_BINDING_FIELDS)
         elif nested == "session_heartbeat" and isinstance(field_value, dict):
             field_value = _order_struct(field_value, _SESSION_HEARTBEAT_FIELDS)
         elif nested == "session_close" and isinstance(field_value, dict):
@@ -1087,9 +1222,9 @@ def verify_action_receipt(receipt: dict[str, Any], expected_key_hex: str = "") -
 def normalize_action_receipt(receipt: dict[str, Any]) -> None:
     # EV2-FU-1: the single tolerated unknown top-level surface is the advisory
     # ext bag. It is unsigned (the signature covers only the canonical action
-    # record) and never consulted, so it is accepted here but deliberately kept
-    # out of _RECEIPT_FIELDS (the canonical/hash preimage) rather than added to
-    # it. Every other unrecognized field is rejected by _reject_unknown.
+    # record) and never consulted for a verdict. Its bytes still join the chain
+    # link hash, as in Go; _canonicalize_receipt appends them. Every other
+    # unrecognized field is rejected by _reject_unknown.
     _reject_unknown(receipt, _field_names(_RECEIPT_FIELDS) | {"ext"}, "receipt")
     if receipt.get("version") != 1:
         raise ReceiptError(
@@ -1204,7 +1339,10 @@ def _validate_session_open(value: Any) -> None:
     _require_string(
         open_record.get("recorder_session"), "session_control.open.recorder_session"
     )
-    _require_policy_hash(
+    # Go decodes session_control.open.policy_hash into a plain string field
+    # and applies no format rule; its emitter writes the bare hex config hash.
+    # Accept exactly what Go decodes: absent, null, or any string.
+    _require_optional_string(
         open_record.get("policy_hash"), "session_control.open.policy_hash"
     )
     _require_string(
@@ -1254,6 +1392,33 @@ def _validate_session_open(value: Any) -> None:
     _require_optional_string(
         open_record.get("contained_uid"), "session_control.open.contained_uid"
     )
+    # Go decodes a null group_binding into a nil pointer: an ungrouped session.
+    if open_record.get("group_binding") is not None:
+        binding = _require_object(
+            open_record["group_binding"], "session_control.open.group_binding"
+        )
+        _reject_unknown(
+            binding,
+            _field_names(_GROUP_BINDING_FIELDS),
+            "session_control.open.group_binding",
+        )
+        for name in (
+            "group_id",
+            "session_id",
+            "open_manifest_sha256",
+            "signer_key",
+        ):
+            _require_string(
+                binding.get(name), f"session_control.open.group_binding.{name}"
+            )
+        for name in ("previous_group_id", "previous_open_manifest_sha256"):
+            if name not in binding or not isinstance(binding[name], str):
+                raise ReceiptError(
+                    f"session_control.open.group_binding.{name} must be a string"
+                )
+        _require_uint64(
+            binding.get("shard_index"), "session_control.open.group_binding.shard_index"
+        )
 
 
 def _validate_session_heartbeat(value: Any) -> None:
@@ -1319,6 +1484,11 @@ def _session_close(value: Any) -> dict[str, Any] | None:
 
 
 def normalize_evidence_receipt(receipt: dict[str, Any]) -> None:
+    if receipt.get("payload_kind") == SECRET_EGRESS_PAYLOAD_KIND:
+        try:
+            validate_secret_egress_envelope(receipt)
+        except SecretEgressError as exc:
+            raise ReceiptError(str(exc)) from exc
     _reject_unknown(receipt, _ENVELOPE_FIELDS, "receipt")
     if _require_string(receipt.get("record_type"), "record_type") != V2_RECORD_TYPE:
         raise ReceiptError("unsupported record_type for v2 verifier")
@@ -1343,6 +1513,11 @@ def normalize_evidence_receipt(receipt: dict[str, Any]) -> None:
         _validate_proxy_decision_payload(payload)
     elif payload_kind == "proxy_decision_with_spans":
         _validate_proxy_decision_with_spans_payload(payload)
+    elif payload_kind == SECRET_EGRESS_PAYLOAD_KIND:
+        try:
+            validate_secret_egress_payload(payload, receipt["event_id"])
+        except SecretEgressError as exc:
+            raise ReceiptError(str(exc)) from exc
 
 
 def _validate_canonicalization(value: Any) -> None:
@@ -1403,6 +1578,7 @@ def _validate_crit(value: Any, payload_kind: str) -> None:
     seen: set[str] = set()
     has_canonicalization = False
     has_source_spans = False
+    has_secret_egress = False
     for name in crit:
         if name == "":
             raise ReceiptError("crit has an empty name")
@@ -1413,6 +1589,8 @@ def _validate_crit(value: Any, payload_kind: str) -> None:
             has_canonicalization = True
         elif name == CRIT_SOURCE_SPANS:
             has_source_spans = True
+        elif name == SECRET_EGRESS_PAYLOAD_KIND:
+            has_secret_egress = True
         else:
             raise ReceiptError(f"crit has unknown field {name}")
     if not has_canonicalization:
@@ -1421,6 +1599,12 @@ def _validate_crit(value: Any, payload_kind: str) -> None:
         raise ReceiptError("crit must include source_spans")
     if payload_kind != "proxy_decision_with_spans" and has_source_spans:
         raise ReceiptError(f"crit source_spans is invalid for {payload_kind}")
+    if payload_kind == SECRET_EGRESS_PAYLOAD_KIND and not has_secret_egress:
+        raise ReceiptError(f"crit must include {SECRET_EGRESS_PAYLOAD_KIND}")
+    if payload_kind != SECRET_EGRESS_PAYLOAD_KIND and has_secret_egress:
+        raise ReceiptError(
+            f"crit {SECRET_EGRESS_PAYLOAD_KIND} is invalid for {payload_kind}"
+        )
 
 
 def _validate_signature(receipt: dict[str, Any], payload_kind: str) -> None:
@@ -1552,6 +1736,8 @@ def _evidence_preimage(receipt: dict[str, Any]) -> bytes:
 
 def _reject_unknown(value: dict[str, Any], allowed: set[str], label: str) -> None:
     for key in value:
+        if alias := field_alias(key, allowed):
+            raise ReceiptError(f"{label}: {key!r} aliases {alias!r} (case-insensitive)")
         if key not in allowed:
             raise ReceiptError(f"{label}: unknown field {key}")
 

@@ -7,8 +7,10 @@ package llmagent
 
 import "os/exec"
 
-// boundToProcessGroup is a no-op on Windows: the playground agent's contained
-// run_command shell is a Linux-only deployment (nftables owner-match containment
-// requires a Linux kernel), so the process-group reaping there is the path that
-// matters. The default context cancellation still bounds the direct child here.
-func boundToProcessGroup(_ *exec.Cmd) {}
+const runCommandSupported = false
+
+// configureRunCommand refuses targets that cannot kill a shell's descendants
+// as one process group.
+func configureRunCommand(_ *exec.Cmd) error {
+	return errRunCommandUnsupported
+}

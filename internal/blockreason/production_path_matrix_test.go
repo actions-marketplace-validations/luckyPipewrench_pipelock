@@ -138,6 +138,8 @@ func constNameForReason(r blockreason.Reason) string {
 		return "SSRFDNSRebind"
 	case blockreason.PathEntropy:
 		return "PathEntropy"
+	case blockreason.QueryEntropy:
+		return "QueryEntropy"
 	case blockreason.BodyEntropy:
 		return "BodyEntropy"
 	case blockreason.SubdomainEntropy:
@@ -150,6 +152,8 @@ func constNameForReason(r blockreason.Reason) string {
 		return "DataBudget"
 	case blockreason.ResponseSize:
 		return "ResponseSize"
+	case blockreason.ResponseIncomplete:
+		return "ResponseIncomplete"
 	case blockreason.DLPMatch:
 		return "DLPMatch"
 	case blockreason.PromptInjection:
@@ -190,6 +194,8 @@ func constNameForReason(r blockreason.Reason) string {
 		return "CompressedResponse"
 	case blockreason.BrowserShieldOversize:
 		return "BrowserShieldOversize"
+	case blockreason.BrowserShieldUninspectable:
+		return "BrowserShieldUninspectable"
 	case blockreason.ParseError:
 		return "ParseError"
 	case blockreason.Timeout:

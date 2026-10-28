@@ -54,6 +54,12 @@ type Edition interface {
 	Close()
 }
 
+// LicenseRevocationReceiver is implemented by editions with paid profiles.
+// Updates must be safe alongside request-time profile resolution.
+type LicenseRevocationReceiver interface {
+	SetLicenseRevoked(bool)
+}
+
 // ResolvedAgent carries the resolved per-agent config, scanner, and
 // budget tracker for a single request. Budget must be NoopBudget (not nil)
 // when unlimited to avoid nil-interface panics.
@@ -62,6 +68,13 @@ type ResolvedAgent struct {
 	Config  *config.Config
 	Scanner *scanner.Scanner
 	Budget  BudgetChecker
+	// LicenseRevoked closes when this paid entitlement is revoked. Long-lived
+	// handlers must terminate when it closes. Nil means the free/default path.
+	// Recovery creates a new signal; a revoked snapshot never becomes valid again.
+	LicenseRevoked <-chan struct{}
+	// LicenseExpiresAt is the root entitlement's Unix deadline. Merged profile
+	// configs do not carry all runtime-derived license metadata.
+	LicenseExpiresAt int64
 }
 
 // BudgetChecker enforces per-agent request/byte budgets.
@@ -208,6 +221,14 @@ func boundDefaultIdentity(defaultIdentity string, bindDefaultIdentity bool) (str
 		return "", false
 	}
 	return sanitizeAgentName(defaultIdentity), true
+}
+
+// ConfigDefaultName returns the agent name default_agent_identity resolves to
+// after sanitization. State keying that must land a header-carrying request in
+// the configured default's bucket uses this so it names the same bucket
+// configDefaultIdentity does for a request without the header.
+func ConfigDefaultName(defaultIdentity string) string {
+	return sanitizeAgentName(defaultIdentity)
 }
 
 func configDefaultIdentity(knownProfiles map[string]bool, defaultIdentity string) AgentIdentity {

@@ -16,6 +16,7 @@ on:
       - 'go.sum'
       - 'internal/**'
       - 'scripts/e2e/**'
+      - 'scripts/ci_process_supervisor.py'
       - 'scripts/test_e2e_hermetic.py'
       - 'scripts/test_example_verification_workflow.py'
       - 'scripts/verify-examples.sh'
@@ -30,6 +31,7 @@ on:
       - 'go.sum'
       - 'internal/**'
       - 'scripts/e2e/**'
+      - 'scripts/ci_process_supervisor.py'
       - 'scripts/test_e2e_hermetic.py'
       - 'scripts/test_example_verification_workflow.py'
       - 'scripts/verify-examples.sh'
@@ -44,7 +46,7 @@ permissions:
 jobs:
   verify:
     name: Examples and installation E2E (advisory, not required)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 25
     steps:
       - name: Check out source
@@ -58,7 +60,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Set up Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
 
@@ -70,12 +72,44 @@ jobs:
           command -v npx
           command -v python3
 
+      # Shared runners exhaust Docker Hub's anonymous pull limit, which failed
+      # the compose examples with toomanyrequests before any verifier ran.
+      # Route Docker Hub pulls through Google's public pull-through cache; the
+      # daemon falls back to Docker Hub for anything the cache lacks, and the
+      # shipped example files are unchanged. Without a Docker daemon this step
+      # leaves pulls alone so the verifiers still report their own skips.
+      - name: Pull Docker Hub images through a public mirror
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! systemctl is-active --quiet docker; then
+            printf '::notice::No running Docker daemon; Docker Hub pulls are left unchanged.\n'
+            exit 0
+          fi
+          conf=/etc/docker/daemon.json
+          current='{}'
+          if sudo test -s "$conf"; then current="$(sudo cat "$conf")"; fi
+          jq '."registry-mirrors" = (((."registry-mirrors" // []) + ["https://mirror.gcr.io"]) | unique)' <<<"$current" \
+            | sudo tee "$conf" >/dev/null
+          sudo systemctl restart docker
+          timeout 60 bash -c 'until sudo docker info >/dev/null 2>&1; do sleep 1; done'
+          sudo docker info --format 'registry mirrors: {{json .RegistryConfig.Mirrors}}'
+
       - name: Run shipped verification scripts
         id: verification
         continue-on-error: true
         env:
           PIPELOCK_E2E_LIVE_UPSTREAM: '1'
         run: make verify-examples
+
+      - name: Browser reproduction regressions against the built candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          PIPELOCK_BROWSER_TEST_BIN="$PWD/pipelock" \
+            python3 -m unittest discover -s scripts/e2e/browser_repro -p 'test_*.py'
+          node --check scripts/e2e/browser_repro/driver.mjs
+          node --test scripts/e2e/browser_repro/test_contracts.mjs
 
       - name: Report verification result
         if: ${{ always() }}

@@ -17,6 +17,25 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
+func TestManagerResolutionPreservesAdmissionShard(t *testing.T) {
+	m := NewManager(Config{Enabled: true, Timeout: time.Second})
+	var resolved Resolution
+	if err := m.Hold(HeldAction{
+		DeferID: "held-shard", ActionID: "held-shard", Target: "tool", SizeBytes: 1,
+		ShardIndex: 1, ShardSelected: true,
+		Authority: AuthoritySnapshot{SessionID: "session"},
+		Resolve:   func(res Resolution) { resolved = res },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Resolve("held-shard", config.ActionBlock, SourceContext); err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ShardIndex != 1 || !resolved.ShardSelected {
+		t.Fatalf("resolution shard = %d selected=%t", resolved.ShardIndex, resolved.ShardSelected)
+	}
+}
+
 func TestManagerTimeoutResolvesBlockOnce(t *testing.T) {
 	ch := make(chan Resolution, 2)
 	m := NewManager(Config{
@@ -54,6 +73,42 @@ func TestManagerTimeoutResolvesBlockOnce(t *testing.T) {
 	case got := <-ch:
 		t.Fatalf("double resolution delivered: %+v", got)
 	default:
+	}
+}
+
+func TestManagerBeforeAllowClaimsOrBlocksBeforeResolution(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		claim        bool
+		wantDecision string
+		wantSource   string
+	}{
+		{"claim", true, config.ActionAllow, SourceContext},
+		{"activation", false, config.ActionBlock, SourceKillSwitch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(Config{Enabled: true, Timeout: time.Second})
+			released := false
+			var got Resolution
+			err := m.Hold(HeldAction{
+				DeferID: "held", ActionID: "held", Target: "tool", SizeBytes: 1,
+				Authority:   AuthoritySnapshot{SessionID: "session"},
+				BeforeAllow: func() (func(), bool) { return func() { released = true }, tc.claim },
+				Resolve:     func(res Resolution) { got = res },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := m.Resolve("held", config.ActionAllow, SourceContext); err != nil {
+				t.Fatal(err)
+			}
+			if got.FinalDecision != tc.wantDecision || got.ResolutionSource != tc.wantSource {
+				t.Fatalf("resolution = (%s, %s), want (%s, %s)", got.FinalDecision, got.ResolutionSource, tc.wantDecision, tc.wantSource)
+			}
+			if released != tc.claim {
+				t.Fatalf("release = %v, want %v", released, tc.claim)
+			}
+		})
 	}
 }
 
@@ -858,8 +913,10 @@ func TestManagerResolveJournalFailureFailsClosed(t *testing.T) {
 				}
 				return
 			}
-			if len(entries) != 2 || entries[1].State != StateResolvedAllow || entries[1].Source != SourceApproval {
-				t.Fatalf("journal after allow = %+v, want held then resolved_allow approval", entries)
+			if len(entries) != 3 ||
+				entries[1].State != StateHeld || !entries[1].ReleasePending || entries[1].Source != SourceApproval ||
+				entries[2].State != StateResolvedAllow || entries[2].Source != SourceApproval {
+				t.Fatalf("journal after allow = %+v, want held, release-pending held, then resolved_allow approval", entries)
 			}
 		})
 	}
@@ -1352,6 +1409,38 @@ func TestRecordRestartRecoveryClearsPendingJournal(t *testing.T) {
 }
 
 func TestPendingJournalRoundTripsCascadeFieldsAndPreUpgradeEntries(t *testing.T) {
+	t.Run("receipt shard survives held and release pending rows", func(t *testing.T) {
+		for _, index := range []int{0, 1} {
+			t.Run(fmt.Sprintf("shard %d", index), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "deferred-actions.jsonl")
+				m := NewManager(Config{Enabled: true, Timeout: time.Hour, MaxPending: 4, MaxPendingPerSession: 4, JournalPath: path})
+				held := HeldAction{
+					DeferID: "held", ActionID: "action", Surface: SurfaceMCPStdio, SizeBytes: 1,
+					ShardIndex: index, ShardSelected: true,
+					Authority: AuthoritySnapshot{SessionID: "session"}, Resolve: func(Resolution) {},
+				}
+				if err := m.Hold(held); err != nil {
+					t.Fatal(err)
+				}
+				check := func() {
+					t.Helper()
+					pending, err := PendingJournal(path)
+					if err != nil || len(pending) != 1 {
+						t.Fatalf("pending = %+v, err = %v", pending, err)
+					}
+					if pending[0].ShardIndex != index || !pending[0].ShardSelected {
+						t.Fatalf("recovered shard = %d selected=%t", pending[0].ShardIndex, pending[0].ShardSelected)
+					}
+				}
+				check()
+				if err := m.appendJournal(releasePendingEntry(held, SourceOperator)); err != nil {
+					t.Fatal(err)
+				}
+				check()
+			})
+		}
+	})
+
 	t.Run("roundtrip cascade fields", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "deferred-actions.jsonl")
 		m := NewManager(Config{Enabled: true, Timeout: time.Hour, MaxPending: 4, MaxPendingPerSession: 4, MaxCascadeDepth: 4, JournalPath: path})
@@ -1596,5 +1685,64 @@ func TestManagerDuplicateRejectionDoesNotDropLiveHoldOnReplay(t *testing.T) {
 				t.Fatalf("admission rejection retained caller-supplied lineage: %+v", entry)
 			}
 		}
+	}
+}
+
+// TestResolveApprovalResultReportsAppliedDecision pins that the operator-facing
+// result is the terminal decision that was applied, not the one that was asked
+// for. The operator API used to echo the approval's own allow while the kill
+// switch (or a release gate) had already closed the call, so the operator was
+// told a cancelled call had been allowed.
+func TestResolveApprovalResultReportsAppliedDecision(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		beforeAllow  func() (func(), bool)
+		prepare      func(Resolution) (Resolution, func())
+		wantDecision string
+		wantSource   string
+	}{
+		{"approve, nothing objects", config.ActionAllow, func() (func(), bool) { return func() {}, true }, nil, config.ActionAllow, SourceOperator},
+		{"approve, kill switch closed it", config.ActionAllow, func() (func(), bool) { return nil, false }, nil, config.ActionBlock, SourceKillSwitch},
+		{
+			"approve, release gate closed it", config.ActionAllow, func() (func(), bool) { return func() {}, true },
+			func(res Resolution) (Resolution, func()) {
+				res.FinalDecision = config.ActionBlock
+				res.ResolutionSource = SourceUpstreamContract
+				return res, nil
+			}, config.ActionBlock, SourceUpstreamContract,
+		},
+		{"deny", config.ActionBlock, nil, nil, config.ActionBlock, SourceOperator},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := NewManager(Config{Enabled: true, Timeout: time.Second})
+			var got Resolution
+			rp := config.DeferResolutionPolicy{}
+			rp.AllowOn.Approval = true
+			if err := m.Hold(HeldAction{
+				DeferID: "held", ActionID: "held", Target: "tool", SizeBytes: 1,
+				Authority:   AuthoritySnapshot{SessionID: "session"},
+				RulePolicy:  rp,
+				BeforeAllow: tt.beforeAllow,
+				Prepare:     tt.prepare,
+				Resolve:     func(res Resolution) { got = res },
+			}); err != nil {
+				t.Fatal(err)
+			}
+			decision, err := m.ResolveApprovalResult("held", tt.input, SourceOperator)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if decision != tt.wantDecision {
+				t.Fatalf("reported decision = %q, want %q", decision, tt.wantDecision)
+			}
+			if got.FinalDecision != decision {
+				t.Fatalf("reported %q but the call resolved %q", decision, got.FinalDecision)
+			}
+			if got.ResolutionSource != tt.wantSource {
+				t.Fatalf("resolution source = %q, want %q", got.ResolutionSource, tt.wantSource)
+			}
+		})
 	}
 }

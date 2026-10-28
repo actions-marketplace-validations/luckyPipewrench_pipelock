@@ -18,6 +18,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
+
 	"github.com/luckyPipewrench/pipelock/internal/config"
 )
 
@@ -68,7 +70,7 @@ func receiveNotify(t *testing.T, messages <-chan string) string {
 	select {
 	case message := <-messages:
 		return message
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Deadline(time.Second)):
 		t.Fatal("timed out waiting for systemd notification")
 		return ""
 	}
@@ -159,7 +161,7 @@ func TestSDNotify(t *testing.T) {
 			if err == nil {
 				t.Fatal("sdNotify unreachable socket = nil error")
 			}
-		case <-time.After(time.Second):
+		case <-time.After(testwait.Deadline(time.Second)):
 			t.Fatal("sdNotify exceeded its bounded deadline")
 		}
 	})
@@ -177,6 +179,9 @@ func TestServerSystemdNotifications(t *testing.T) {
 		if got := receiveNotify(t, messages); got != "READY=1" {
 			t.Fatalf("startup notification = %q, want READY=1", got)
 		}
+		if got := receiveNotify(t, messages); !strings.Contains(got, "STATUS=config accepted instance=") || !strings.Contains(got, "generation=1") {
+			t.Fatalf("startup status = %q", got)
+		}
 		waitForServerCancel(t, s)
 		if err := s.Shutdown(context.Background()); err != nil {
 			t.Fatalf("Shutdown: %v", err)
@@ -189,7 +194,7 @@ func TestServerSystemdNotifications(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Start returned %v", err)
 			}
-		case <-time.After(5 * time.Second):
+		case <-time.After(testwait.Deadline(5 * time.Second)):
 			t.Fatal("Start did not return after shutdown")
 		}
 	})
@@ -204,7 +209,7 @@ func TestServerSystemdNotifications(t *testing.T) {
 		if !strings.HasPrefix(first, "RELOADING=1\nMONOTONIC_USEC=") || !monotonicUsec(first) {
 			t.Fatalf("first reload notification = %q, want monotonic RELOADING", first)
 		}
-		if second != "READY=1\nSTATUS=config reload applied" {
+		if !strings.HasPrefix(second, "READY=1\nSTATUS=config accepted instance=") && !strings.HasPrefix(second, "READY=1\nSTATUS=config unchanged instance=") {
 			t.Fatalf("completion notification = %q", second)
 		}
 	})
@@ -221,7 +226,7 @@ func TestServerSystemdNotifications(t *testing.T) {
 		candidate.Mode = config.ModeBalanced
 		s.handleConfigReload(config.ReloadEvent{Config: candidate, Trigger: config.ReloadTriggerSignal})
 		_ = receiveNotify(t, messages)
-		if got := receiveNotify(t, messages); !strings.Contains(got, "READY=1\nSTATUS=config reload rejected:") {
+		if got := receiveNotify(t, messages); !strings.Contains(got, "READY=1\nSTATUS=config rejected instance=") {
 			t.Fatalf("rejected completion notification = %q", got)
 		}
 		if s.proxy.CurrentConfig() != old {
@@ -247,7 +252,7 @@ func TestSDNotifyReloadEventErrorBypassesReload(t *testing.T) {
 		t.Fatalf("first notification = %q, want the reloading envelope", got)
 	}
 	got := receiveNotify(t, messages)
-	if !strings.HasPrefix(got, "READY=1") || !strings.Contains(got, "STATUS=config reload rejected: invalid config reload: bad yaml") {
+	if !strings.HasPrefix(got, "READY=1") || !strings.Contains(got, "STATUS=config rejected instance=") || !strings.Contains(got, "configuration loading or validation failed") {
 		t.Fatalf("completion = %q, want a rejected verdict", got)
 	}
 	if s.proxy.CurrentConfig() != before {
@@ -326,7 +331,7 @@ func TestStartupReadinessGate(t *testing.T) {
 	}
 	select {
 	case <-s.startupNotified():
-	case <-time.After(time.Second):
+	case <-time.After(testwait.Deadline(time.Second)):
 		t.Fatal("readiness channel did not close")
 	}
 
@@ -408,7 +413,7 @@ func TestConsumeReloadsAbortsWhenStartupNeverSettles(t *testing.T) {
 			tc.abort(cancel, settled)
 			select {
 			case <-done:
-			case <-time.After(5 * time.Second):
+			case <-time.After(testwait.Deadline(5 * time.Second)):
 				t.Fatal("the reload consumer did not stop when startup never settled")
 			}
 			if s.proxy.CurrentConfig() != before {
@@ -457,7 +462,7 @@ func TestReloadWithoutSystemdIsUnchangedAndSilent(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() { errCh <- s.Start(context.Background()) }()
 
-	deadline := time.After(10 * time.Second)
+	deadline := time.After(testwait.Deadline(10 * time.Second))
 	for !s.startupNotifiedAlready() {
 		select {
 		case <-deadline:
@@ -487,7 +492,7 @@ func TestReloadWithoutSystemdIsUnchangedAndSilent(t *testing.T) {
 	}()
 	select {
 	case <-reloadDone:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Deadline(10 * time.Second)):
 		t.Fatal("a SIGHUP-triggered reload never completed on a host with no systemd")
 	}
 	if got := s.proxy.CurrentConfig().Mode; got != next.Mode {
@@ -503,7 +508,7 @@ func TestReloadWithoutSystemdIsUnchangedAndSilent(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Start returned %v", err)
 		}
-	case <-time.After(10 * time.Second):
+	case <-time.After(testwait.Deadline(10 * time.Second)):
 		t.Fatal("Start did not return after shutdown")
 	}
 

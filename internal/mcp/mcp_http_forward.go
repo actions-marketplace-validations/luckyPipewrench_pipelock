@@ -13,12 +13,16 @@ import (
 	"os"
 	"sync"
 
+	"github.com/luckyPipewrench/pipelock/internal/audit"
+	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
 	"github.com/luckyPipewrench/pipelock/internal/deferred"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
+	"github.com/luckyPipewrench/pipelock/internal/mcp/jsonrpc"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/tools"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/transport"
+	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	session "github.com/luckyPipewrench/pipelock/internal/session"
 )
 
@@ -41,7 +45,7 @@ func emitRequestScopedTimeout(
 			if wErr := writer.WriteMessage(resp); wErr != nil {
 				_, _ = fmt.Fprintf(logW, "pipelock: failed to send timeout response: %v\n", wErr)
 			}
-			emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), logW, outcome.Receipt, "error", int64(len(resp)), "response_timeout")
+			emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, outcome.Receipt, "error", int64(len(resp)), "response_timeout", opts.requireReceipts())
 		}
 	}
 	_, _ = fmt.Fprintln(logW, logMessage)
@@ -52,7 +56,26 @@ func emitTrackedTerminalOutcome(logW io.Writer, tracker *RequestTracker, id json
 	if !ok {
 		return
 	}
-	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), logW, outcome.Receipt, mcpResponseStatus(resp), int64(len(resp)), reason)
+	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, outcome.Receipt, mcpResponseStatus(resp), int64(len(resp)), reason, opts.requireReceipts())
+}
+
+// emitTrackedContractRefusedOutcome closes the tracked intent of a request the
+// live upstream contract refused after its intent receipt was written.
+func emitTrackedContractRefusedOutcome(logW io.Writer, tracker *RequestTracker, id json.RawMessage, gate mcpContractGateOutput, reason string, resp []byte, opts MCPProxyOpts) {
+	outcome, ok := consumeTrackedRequestOutcome(tracker, id)
+	if !ok {
+		return
+	}
+	emitContractRefusedOutcome(logW, outcome, gate, reason, int64(len(resp)), opts)
+}
+
+// emitContractRefusedOutcome writes the blocked outcome for a call the live
+// upstream contract refused. Notifications are never tracked, so their caller
+// passes the outcome from the input decision directly.
+func emitContractRefusedOutcome(logW io.Writer, outcome TrackedRequestOutcome, gate mcpContractGateOutput, reason string, bytesTransferred int64, opts MCPProxyOpts) {
+	receiptOpts := mcpWithContractReceipt(outcome.Receipt, gate)
+	receiptOpts.Layer = mcpContractReceiptLayer
+	emitMCPBlockedOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, receiptOpts, bytesTransferred, reason, opts.requireReceipts())
 }
 
 func emitTrackedIncompleteOutcome(logW io.Writer, tracker *RequestTracker, id json.RawMessage, reason string, opts MCPProxyOpts) {
@@ -60,7 +83,7 @@ func emitTrackedIncompleteOutcome(logW io.Writer, tracker *RequestTracker, id js
 	if !ok {
 		return
 	}
-	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), logW, outcome.Receipt, "incomplete", -1, reason)
+	emitMCPOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, outcome.Receipt, "incomplete", -1, reason, opts.requireReceipts())
 }
 
 func consumeTrackedRequestOutcome(tracker *RequestTracker, id json.RawMessage) (TrackedRequestOutcome, bool) {
@@ -143,8 +166,10 @@ func RunHTTPProxy(
 	opts.TaintExternalSource = true
 
 	if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
+		dropMCPDenial(opts, mcpStartupDenialAudit(mcpListenerContractEvalDenialAudit()), "startup")
 		return fmt.Errorf("contract upstream evaluation: %w", gateErr)
 	} else if gate.Verdict == config.ActionBlock {
+		dropMCPDenial(opts, mcpStartupDenialAudit(mcpUpstreamGateDenialAudit(gate)), "startup")
 		return fmt.Errorf("contract upstream denied: %s", mcpContractBlockReason(gate))
 	}
 
@@ -157,12 +182,15 @@ func RunHTTPProxy(
 	if opts.Store != nil {
 		rec = opts.Store.GetOrCreate(invocationKey)
 		if rec == nil {
+			dropMCPDenial(opts, mcpStartupDenialAudit(mcpListenerCapacityDenialAudit()), "startup")
 			return session.ErrCapacity
 		}
+		defer opts.Store.Delete(invocationKey)
 	}
 	defer recordMCPBaselineSample(opts, rec)
 
 	httpClient := transport.NewHTTPClientWithDialer(upstreamURL, extraHeaders, opts.DialContext)
+	httpClient.ResponseKeyValidator = jsonrpc.ValidateMessageKeys
 	var upstreamMu sync.Mutex
 
 	// Tool scanning baseline for this session. Clone the caller's ToolCfg
@@ -179,8 +207,20 @@ func RunHTTPProxy(
 			ExtraPoison:             toolCfg.ExtraPoison,
 			BindingUnknownAction:    toolCfg.BindingUnknownAction,
 			BindingNoBaselineAction: toolCfg.BindingNoBaselineAction,
+			CredentialAcks:          toolCfg.CredentialAcks,
+			Now:                     toolCfg.Now,
 		}
 	}
+
+	if fwdToolCfg == nil {
+		fwdToolCfg = &tools.ToolScanConfig{
+			Baseline:            tools.NewToolBaseline(),
+			Action:              config.ActionBlock,
+			HeaderContractsOnly: true,
+			CredentialAcks:      nil, // The caller supplied no tool-scanning configuration.
+		}
+	}
+	contractState := &mcpListenerClientState{baseline: fwdToolCfg.Baseline}
 
 	// Request tracker for confused deputy protection.
 	tracker := NewRequestTracker()
@@ -194,17 +234,26 @@ func RunHTTPProxy(
 	fwdOpts.Rec = rec
 	fwdOpts.ToolCfg = fwdToolCfg
 	fwdOpts.ToolCfgFn = nil
+	if toolCfg == nil {
+		fwdOpts.ToolCfg = nil
+	}
 	fwdOpts.WarnContext = ctx
 	fwdOpts.sessionExit = sessionExit
 	resolverRuntime := newDeferResolverRuntime(ctx)
 	fwdOpts.DeferResolverRuntime = resolverRuntime
+	killWatchCtx, stopKillWatch := context.WithCancel(ctx)
+	go watchDeferredKillSwitch(killWatchCtx, fwdOpts.KillSwitch, fwdOpts.deferManager())
 	defer func() {
+		stopKillWatch()
 		resolverRuntime.Cancel()
 		if manager := fwdOpts.deferManager(); manager != nil {
 			manager.ResolveAll(config.ActionBlock, deferred.SourceCancel)
 		}
 		resolverRuntime.Wait()
 	}()
+
+	bridgeHeaders := &mcpBridgeHeaders{client: httpClient, state: contractState, opts: fwdOpts, log: safeLogW}
+	bridgeHeaders.opts.ToolCfg = fwdToolCfg
 
 	clientReader := transport.NewStdioReader(clientIn)
 
@@ -220,11 +269,21 @@ func RunHTTPProxy(
 			}
 			return fmt.Errorf("reading stdin: %w", err)
 		}
+		var deferredGeneration uint64
+		if fwdOpts.KillSwitch != nil {
+			deferredGeneration = fwdOpts.KillSwitch.DeferredGeneration()
+		}
 
 		// Parse the inbound frame once per message. Kill switch, request
 		// tracking, and upstream-error responses all read frame.ID
 		// instead of re-parsing.
+		fwdOpts := fwdOpts // Each deferred closure retains this message's policy snapshot.
 		frame := ParseMCPFrame(msg)
+		fwdOpts.validateToolHeaders = bridgeHeaders.version(msg) >= currentMCPVersion
+		if fwdOpts.validateToolHeaders {
+			fwdOpts.ToolCfg = fwdToolCfg
+		}
+		var denialAudit mcpDenialAudit
 
 		select {
 		case <-ctx.Done():
@@ -235,16 +294,25 @@ func RunHTTPProxy(
 		// Kill switch: deny all messages when active.
 		if opts.KillSwitch != nil {
 			if d := opts.KillSwitch.IsActiveMCP(msg); d.Active {
+				denialAudit = mcpInputGateBlockAudit(scanner.AuditKillSwitch, mcpKillSwitchReason, audit.BlockClassProtective)
 				if manager := fwdOpts.deferManager(); manager != nil {
 					manager.ResolveAll(config.ActionBlock, deferred.SourceKillSwitch)
 				}
+				batchResp := refuseKillSwitchRequest(fwdOpts, safeLogW, frame, d)
+				if batchResp != nil {
+					if wErr := writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, batchResp); wErr != nil {
+						_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send kill switch response: %v\n", wErr)
+					}
+					continue
+				}
 				if d.IsNotification {
+					dropMCPDenial(fwdOpts, denialAudit, "input")
 					_, _ = fmt.Fprintf(safeLogW, "pipelock: kill switch dropped notification (source=%s)\n", d.Source)
 					continue
 				}
 				rpcID := frame.ID
 				resp := killswitch.ErrorResponse(rpcID, d.Message)
-				if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
+				if wErr := writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, resp); wErr != nil {
 					_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send kill switch response: %v\n", wErr)
 				}
 				continue
@@ -254,23 +322,27 @@ func RunHTTPProxy(
 		// Input scanning - call ScanRequest and CheckRequest directly.
 		// The sequential (non-concurrent) architecture means no channel needed.
 		decision := scanHTTPInputDecision(msg, safeLogW, invocationKey, invocationKey, fwdOpts)
-		if decision.Blocked != nil {
-			if !decision.Blocked.IsNotification {
-				var resp []byte
-				if decision.Blocked.SyntheticResponse != nil {
-					resp = decision.Blocked.SyntheticResponse
-				} else {
-					resp = blockRequestResponse(*decision.Blocked)
-				}
-				if wErr := safeClientOut.WriteMessage(resp); wErr != nil {
-					_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send block response: %v\n", wErr)
-				}
+		if decision.Synthetic != nil {
+			if err := deliverMCPSynthetic(decision.Synthetic, safeClientOut); err != nil {
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: synthetic response write error: %v\n", err)
 			}
 			continue
 		}
+
+		if decision.Blocked != nil {
+			if wErr := deliverMCPInputResult(fwdOpts, *decision.Blocked, safeClientOut); wErr != nil {
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send input result: %v\n", wErr)
+			}
+			continue
+		}
+
 		if decision.Deferred != nil {
 			manager := fwdOpts.deferManager()
 			if manager == nil || !manager.Enabled() {
+				denialAudit = mcpDeferDisabledDenialAudit()
+				if decision.Deferred.IsNotification {
+					dropMCPDenial(fwdOpts, denialAudit, "input")
+				}
 				resp := blockRequestResponse(BlockedRequest{
 					ID:             decision.Deferred.ID,
 					IsNotification: decision.Deferred.IsNotification,
@@ -278,39 +350,144 @@ func RunHTTPProxy(
 					ErrorMessage:   "pipelock: defer is disabled",
 				})
 				if !decision.Deferred.IsNotification {
-					_ = safeClientOut.WriteMessage(resp)
+					_ = writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, resp)
 				}
 				continue
 			}
 			deferredReq := decision.Deferred
+			// gateBlock carries a release-time upstream gate denial from
+			// Prepare to Resolve for this hold.
+			var gateBlock *BlockedRequest
+			var gateAudit mcpDenialAudit
+			var releaseHeaders http.Header
+			var headerContractErr error
+			receiptSettle := &deferredReceiptSettlement{}
+			var terminalSlot mcpDeferredTerminal
+			// A receipt or journal failure can downgrade a prepared allow to
+			// deny. Release its upstream write lock and send claim before the
+			// finalizer's synchronous audit sinks or downstream delivery can
+			// block unrelated upstream work. OnceFunc also makes the manager's
+			// deferred cleanup safe after this early denial cleanup.
+			var finishDeniedRelease func()
 			holdErr := manager.Hold(deferred.HeldAction{
-				DeferID:    deferredReq.DeferID,
-				ActionID:   deferredReq.DeferID,
-				Target:     deferredReq.ToolName,
-				Reason:     deferredReq.Reason,
-				Surface:    opts.Transport,
-				Method:     deferredReq.Method,
-				SizeBytes:  len(deferredReq.ForwardMessage),
-				RulePolicy: deferredReq.ResolutionPolicy,
-				Payload:    append([]byte(nil), deferredReq.ForwardMessage...),
-				ArgDigest:  deferredReq.ArgDigest,
+				DeferID:       deferredReq.DeferID,
+				ActionID:      deferredReq.DeferID,
+				ShardIndex:    deferredReq.ShardIndex,
+				ShardSelected: deferredReq.ShardSelected,
+				Target:        deferredReq.ToolName,
+				Reason:        deferredReq.Reason,
+				Surface:       opts.Transport,
+				Method:        deferredReq.Method,
+				SizeBytes:     len(deferredReq.ForwardMessage),
+				RulePolicy:    deferredReq.ResolutionPolicy,
+				Payload:       append([]byte(nil), deferredReq.ForwardMessage...),
+				ArgDigest:     deferredReq.ArgDigest,
 				Authority: deferred.AuthoritySnapshot{
 					SessionID:         deferredReq.SessionID,
 					SessionIDOriginal: deferredReq.SessionIDOriginal,
 				},
-				Resolve: func(res deferred.Resolution) {
-					authorityDenied := false
+				BeforeAllow: func() (func(), bool) {
+					return deferredReleasePrecheck(fwdOpts, deferredGeneration)
+				},
+				// Prepare settles the final decision before the manager
+				// journals it, so the journal and the receipt agree. On an
+				// allow it returns holding upstreamMu and the kill-switch
+				// claim; the manager releases both with defer after Resolve
+				// returns or panics. It runs on the resolving goroutine
+				// immediately before Resolve, which reads gateBlock.
+				Prepare: func(res deferred.Resolution) (deferred.Resolution, func()) {
 					if res.FinalDecision == config.ActionAllow {
 						if authErr := authorizeMCP(ctx, deferredReq.authorityRef, deferredReq.authorityCarrierErr, deferredReq.authorityFrame, fwdOpts); authErr != nil {
 							res.FinalDecision = config.ActionBlock
 							res.ResolutionSource = deferred.SourceAuthority
 							res.Reason = "authority verification failed"
-							authorityDenied = true
 						}
 					}
-					if emitErr := emitDeferredResolutionReceipt(fwdOpts, safeLogW, res); emitErr != nil {
+					if res.ResolutionSource == deferred.SourceKillSwitch {
+						markDeferredKillSwitch(&res)
+					}
+					// Rerun the live upstream gate the ordinary forward path
+					// applies before SendMessage; the upstream may have been
+					// locked while the call was held.
+					if res.FinalDecision == config.ActionAllow {
+						gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, fwdOpts)
+						switch {
+						case gateErr != nil:
+							gateAudit = mcpListenerContractEvalDenialAudit()
+							_, _ = fmt.Fprintf(safeLogW, "pipelock: contract upstream evaluation failed: %v\n", gateErr)
+							br := mcpContractBlockRequest(deferredReq.ID, mcpContractGateOutput{}, "pipelock: contract upstream evaluation failed")
+							gateBlock = &br
+						case gate.Verdict == config.ActionBlock && mcpContractBlockReason(gate) == blockreason.KillSwitchActive:
+							markDeferredKillSwitch(&res)
+						case gate.Verdict == config.ActionBlock:
+							_, _ = fmt.Fprintf(safeLogW, "pipelock: contract upstream denied: %s\n", gate.Reason)
+							gateAudit = mcpUpstreamGateDenialAudit(gate)
+							br := mcpContractBlockRequest(deferredReq.ID, gate, "pipelock: upstream URL blocked by live-lock contract")
+							gateBlock = &br
+						}
+						if gateBlock != nil {
+							res.FinalDecision = config.ActionBlock
+							res.ResolutionSource = deferred.SourceUpstreamContract
+							res.Reason = deferredUpstreamContractReason
+						}
+					}
+					if res.FinalDecision != config.ActionAllow {
+						return res, nil
+					}
+
+					releaseHeaders, headerContractErr = bridgeHeaders.prepare(ctx, deferredReq.ForwardMessage)
+					if headerContractErr != nil {
+						// The resolution receipt closes the held action, as for the
+						// live upstream gate above. The hold wrote a defer receipt,
+						// not an intent, so an outcome under its ID would read as
+						// "outcome without matching intent" to completeness checks.
+						_, _ = fmt.Fprintf(safeLogW, "pipelock: header contract refused deferred call %s: %q\n", deferredReq.DeferID, headerContractErr.Error())
+						res.FinalDecision = config.ActionBlock
+						res.ResolutionSource = deferred.SourceUpstreamContract
+						res.Reason = "tool_header_contract_unavailable"
+						br := BlockedRequest{ID: deferredReq.ID, ErrorCode: -32020, ErrorMessage: "pipelock: cannot establish tool header contract"}
+						gateBlock = &br
+						gateAudit = mcpListenerInspectionDenialAudit()
+						return res, nil
+					}
+					// Irreversible release boundary. Take the upstream lock
+					// first so no wait for another send sits between the
+					// kill-switch claim and SendMessage; see
+					// claimDeferredRelease for the ordering argument.
+					prepared, finish := lockAndClaimDeferredRelease(&upstreamMu, fwdOpts, deferredGeneration, res)
+					if finish != nil {
+						finish = sync.OnceFunc(finish)
+						finishDeniedRelease = finish
+					}
+					prepared = receiptSettle.probeAllow(fwdOpts, prepared)
+					return prepared, finish
+				},
+				// The release receipt is written while the journal shows the
+				// release as pending: the allow first, then a corrective block
+				// if the journal cannot record the allow as final.
+				AfterJournal: func(res deferred.Resolution) error {
+					return receiptSettle.commitAllow(fwdOpts, safeLogW, res)
+				},
+				Resolve: func(res deferred.Resolution) {
+					denialOpts := fwdOpts
+					denialOpts.denialTerminal = &terminalSlot
+					denialAudit := mcpDeferredDenialAudit(res)
+					if gateBlock != nil {
+						denialAudit = gateAudit
+					}
+					authorityDenied := res.ResolutionSource == deferred.SourceAuthority
+					if emitErr := receiptSettle.ensure(fwdOpts, safeLogW, res); emitErr != nil {
+						if finishDeniedRelease != nil {
+							finishDeniedRelease()
+						}
+						if res.FinalDecision == config.ActionAllow {
+							denialAudit = mcpReceiptMcpInputDenialAudit()
+						}
+						if deferredReq.IsNotification {
+							dropMCPDenial(denialOpts, denialAudit, "input")
+						}
 						if !deferredReq.IsNotification {
-							_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
+							_ = writeMCPInputDenial(denialOpts, denialAudit, safeClientOut, blockRequestResponse(BlockedRequest{
 								ID:           deferredReq.ID,
 								ErrorCode:    -32007,
 								ErrorMessage: "pipelock: receipt emission failed",
@@ -320,12 +497,11 @@ func RunHTTPProxy(
 					}
 					switch res.FinalDecision {
 					case config.ActionAllow:
-						upstreamMu.Lock()
-						defer upstreamMu.Unlock()
+						// upstreamMu is held by Prepare's release claim.
 						if isRequest(deferredReq.ForwardMessage) {
 							tracker.TrackRequest(deferredReq.ID, deferredReq.Method)
 						}
-						respReader, sendErr := httpClient.SendMessage(ctx, deferredReq.ForwardMessage)
+						respReader, sendErr := httpClient.SendMessageWithOptions(ctx, deferredReq.ForwardMessage, transport.HTTPMessageOptions{Headers: releaseHeaders})
 						if sendErr != nil {
 							if !deferredReq.IsNotification {
 								_ = safeClientOut.WriteMessage(upstreamErrorResponse(deferredReq.ID, fmt.Errorf("upstream HTTP request failed")))
@@ -354,12 +530,30 @@ func RunHTTPProxy(
 							commitMCPToolCall(baselineMetricsRecorder(fwdOpts, rec), baselineIdentity)
 						}
 					default:
+						if finishDeniedRelease != nil {
+							finishDeniedRelease()
+						}
+						if res.ResolutionSource == deferred.SourceKillSwitch {
+							denialAudit = mcpInputGateBlockAudit(scanner.AuditKillSwitch, mcpKillSwitchReason, audit.BlockClassProtective)
+							_, _ = fmt.Fprintf(safeLogW, "pipelock: deferred call %s cancelled by kill switch\n", res.DeferID)
+						}
+						if deferredReq.IsNotification {
+							dropMCPDenial(denialOpts, denialAudit, "input")
+						}
 						if !deferredReq.IsNotification {
 							if authorityDenied {
-								_ = safeClientOut.WriteMessage(blockRequestResponse(*authorityBlockedRequest(deferredReq.authorityFrame)))
+								_ = writeMCPInputDenial(denialOpts, denialAudit, safeClientOut, blockRequestResponse(*authorityBlockedRequest(deferredReq.authorityFrame)))
 								return
 							}
-							_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
+							if gateBlock != nil {
+								_ = writeMCPInputDenial(denialOpts, denialAudit, safeClientOut, blockRequestResponse(*gateBlock))
+								return
+							}
+							if res.ResolutionSource == deferred.SourceKillSwitch {
+								_ = writeMCPInputDenial(denialOpts, denialAudit, safeClientOut, killswitch.ErrorResponse(deferredReq.ID, deferredKillSwitchMessage(fwdOpts)))
+								return
+							}
+							_ = writeMCPInputDenial(denialOpts, denialAudit, safeClientOut, blockRequestResponse(BlockedRequest{
 								ID:           deferredReq.ID,
 								ErrorCode:    -32002,
 								ErrorMessage: "pipelock: deferred action denied",
@@ -370,7 +564,9 @@ func RunHTTPProxy(
 			})
 			if holdErr != nil {
 				errorMessage, emitErr := emitHoldFailureResolution(fwdOpts, safeLogW, holdErr, holdFailureResolution{
-					DeferID: deferredReq.DeferID,
+					DeferID:       deferredReq.DeferID,
+					ShardIndex:    deferredReq.ShardIndex,
+					ShardSelected: deferredReq.ShardSelected,
 					Authority: deferred.AuthoritySnapshot{
 						SessionID:         deferredReq.SessionID,
 						SessionIDOriginal: deferredReq.SessionIDOriginal,
@@ -381,8 +577,12 @@ func RunHTTPProxy(
 					Reason: deferredReq.Reason,
 				})
 				logHoldFailureReceiptGap(safeLogW, deferredReq.DeferID, emitErr)
+				denialAudit = mcpDeferHoldDenialAudit()
+				if deferredReq.IsNotification {
+					dropMCPDenial(fwdOpts, denialAudit, "input")
+				}
 				if !deferredReq.IsNotification {
-					_ = safeClientOut.WriteMessage(blockRequestResponse(BlockedRequest{
+					_ = writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, blockRequestResponse(BlockedRequest{
 						ID:           deferredReq.ID,
 						ErrorCode:    -32002,
 						ErrorMessage: errorMessage,
@@ -408,46 +608,104 @@ func RunHTTPProxy(
 		}
 
 		if gate, gateErr := evaluateMCPUpstreamGate(ctx, upstreamURL, opts); gateErr != nil {
+			denialAudit = mcpListenerContractEvalDenialAudit()
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: contract upstream evaluation failed: %v\n", gateErr)
 			// Notifications have no id; JSON-RPC forbids responses to
 			// them. Mirror the kill-switch and input-scan paths above.
 			if isRPCNotification(frame.ID) {
+				dropMCPDenial(fwdOpts, denialAudit, "input")
+				emitContractRefusedOutcome(safeLogW, decision.Outcome, mcpContractGateOutput{}, mcpContractEvaluationFailedReason, 0, fwdOpts)
 				continue
 			}
 			errResp := blockRequestResponse(mcpContractBlockRequest(frame.ID, mcpContractGateOutput{}, "pipelock: contract upstream evaluation failed"))
-			if wErr := safeClientOut.WriteMessage(errResp); wErr != nil {
+			if wErr := writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, errResp); wErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send contract response: %v\n", wErr)
 			}
-			emitTrackedTerminalOutcome(safeLogW, tracker, frame.ID, errResp, "upstream_contract", fwdOpts)
+			emitTrackedContractRefusedOutcome(safeLogW, tracker, frame.ID, mcpContractGateOutput{}, mcpContractEvaluationFailedReason, errResp, fwdOpts)
 			continue
 		} else if gate.Verdict == config.ActionBlock {
+			denialAudit = mcpUpstreamGateDenialAudit(gate)
 			if gate.WinningSource == contractruntime.WinningSourceScanner {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream scanner denied: %s\n", gate.Reason)
 			} else {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: contract upstream denied: %s\n", gate.Reason)
 			}
 			if isRPCNotification(frame.ID) {
+				dropMCPDenial(fwdOpts, denialAudit, "input")
+				emitContractRefusedOutcome(safeLogW, decision.Outcome, gate, mcpContractDeniedReason, 0, fwdOpts)
 				continue
 			}
 			errResp := blockRequestResponse(mcpContractBlockRequest(frame.ID, gate, "pipelock: upstream URL blocked by live-lock contract"))
-			if wErr := safeClientOut.WriteMessage(errResp); wErr != nil {
+			if wErr := writeMCPInputDenial(fwdOpts, denialAudit, safeClientOut, errResp); wErr != nil {
 				_, _ = fmt.Fprintf(safeLogW, "pipelock: failed to send contract response: %v\n", wErr)
 			}
-			emitTrackedTerminalOutcome(safeLogW, tracker, frame.ID, errResp, "upstream_contract", fwdOpts)
+			emitTrackedContractRefusedOutcome(safeLogW, tracker, frame.ID, gate, mcpContractDeniedReason, errResp, fwdOpts)
 			continue
 		}
 
+		requestHeaders, headerErr := bridgeHeaders.prepare(ctx, decision.ForwardMessage)
+		if headerErr != nil {
+			_, _ = fmt.Fprintf(safeLogW, "pipelock: header contract refused: %q\n", headerErr.Error())
+			// Notifications are never tracked: close their intent from the input
+			// decision, as the upstream gate above does.
+			if isRPCNotification(frame.ID) {
+				dropMCPDenial(fwdOpts, mcpListenerInspectionDenialAudit(), "input")
+				emitBridgeHeaderContractRefusal(safeLogW, decision.Outcome, fwdOpts)
+				continue
+			}
+			response := blockRequestResponse(BlockedRequest{ID: frame.ID, ErrorCode: -32020, ErrorMessage: "pipelock: cannot establish tool header contract"})
+			_ = writeMCPInputDenial(fwdOpts, mcpListenerInspectionDenialAudit(), safeClientOut, response)
+			outcome, ok := consumeTrackedRequestOutcome(tracker, frame.ID)
+			if ok {
+				emitBridgeHeaderContractRefusal(safeLogW, outcome, fwdOpts)
+			}
+			continue
+		}
+
+		unlockInventory := func() {}
+		if frame.Method == "tools/list" {
+			if lockErr := contractState.contractMu.Lock(ctx); lockErr != nil {
+				// Only cancellation fails this wait. Close the request's
+				// tracked outcome and leave through the shared shutdown path,
+				// which settles other pending outcomes and ends the session.
+				_, _ = fmt.Fprintf(safeLogW, "pipelock: inventory lock not acquired: %v\n", lockErr)
+				emitTrackedIncompleteOutcome(safeLogW, tracker, frame.ID, "upstream_closed", fwdOpts)
+				lastScanErr = lockErr
+				break
+			}
+			var inventoryResolutions []string
+			fwdOpts.toolInventoryResolution = func(decision string) { inventoryResolutions = append(inventoryResolutions, decision) }
+			unlockInventory = sync.OnceFunc(func() {
+				contractState.contractMu.Unlock()
+				if manager := fwdOpts.deferManager(); manager != nil {
+					for _, decision := range inventoryResolutions {
+						manager.ResolveToolInventory(invocationKey, decision)
+					}
+				}
+			})
+		}
 		// POST to upstream.
 		respReader, err := func() (transport.MessageReader, error) {
 			upstreamMu.Lock()
 			defer upstreamMu.Unlock()
-			return httpClient.SendMessage(ctx, decision.ForwardMessage)
+			return httpClient.SendMessageWithOptions(ctx, decision.ForwardMessage, transport.HTTPMessageOptions{Headers: requestHeaders})
 		}()
 		if err != nil {
+			unlockInventory()
 			// SendMessage returns context cancellation/deadline errors as-is
 			// and sanitizes upstream request failures/status errors so raw
 			// upstream bytes cannot cross this logging boundary.
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: upstream error: %v\n", err)
+			// A notification has no ID to answer, so a failure on one gets no
+			// client reply; an error response with a null ID is a reply the
+			// client never asked for. Notifications are never tracked, so an
+			// intent receipt is closed from the input decision directly.
+			if isRPCNotification(frame.ID) {
+				if decision.Outcome.Receipt.ActionID != "" {
+					emitMCPOutcomeReceipt(fwdOpts.receiptEmitter(), fwdOpts.v2ReceiptEmitter(), fwdOpts.ReceiptGroup, safeLogW, decision.Outcome.Receipt, "error", -1, "upstream_error", fwdOpts.requireReceipts())
+				}
+				continue
+			}
 			// Send sanitized error to client - don't include upstream body content
 			// which could contain prompt injection payloads.
 			rpcID := frame.ID
@@ -474,15 +732,23 @@ func RunHTTPProxy(
 				fwdOpts,
 			)
 			lastScanErr = scanErr
+			unlockInventory()
 			continue
 		}
 		if scanErr != nil {
 			_, _ = fmt.Fprintf(safeLogW, "pipelock: scan error: %v\n", scanErr)
-			emitTrackedIncompleteOutcome(safeLogW, tracker, frame.ID, "scan_error", fwdOpts)
+			logMCPIncompleteResponse(safeLogW, fwdOpts, frame.Method, scanErr)
+			if errors.Is(scanErr, transport.ErrIncompleteResponse) || ctx.Err() != nil {
+				emitTrackedStreamError(ctx, safeLogW, tracker, frame.ID, fwdOpts, scanErr)
+			} else {
+				emitTrackedIncompleteOutcome(safeLogW, tracker, frame.ID, "scan_error", fwdOpts)
+			}
 			lastScanErr = scanErr
 		} else if !foundInjection {
 			commitMCPToolCall(baselineMetricsRecorder(fwdOpts, rec), mcpFrameBaselineIdentity(frame))
 		}
+
+		unlockInventory()
 
 		// After first successful response with a session ID, start GET stream
 		// for server-initiated messages. Check session ID OUTSIDE the Once so
@@ -495,15 +761,22 @@ func RunHTTPProxy(
 		}
 	}
 
-	// Terminate session if established.
+	// Stop the GET stream and any held-call release before terminating the
+	// session. DeleteSession clears the negotiated version, so a release sent
+	// after it would leave without its modern request metadata; releases send
+	// on ctx, and DeleteSession uses its own context.
+	cancel()
 	if httpClient.SessionID() != "" {
 		httpClient.DeleteSession(safeLogW)
 	}
-
-	// Stop GET stream and wait for it to finish.
-	cancel()
 	wg.Wait()
 	emitPendingIncompleteOutcomes(safeLogW, tracker, fwdOpts, "upstream_closed")
 
 	return lastScanErr
+}
+
+func emitBridgeHeaderContractRefusal(logW io.Writer, outcome TrackedRequestOutcome, opts MCPProxyOpts) {
+	intent := outcome.Receipt
+	intent.Layer = mcpReceiptLayerHeaderContract
+	emitMCPBlockedOutcomeReceipt(opts.receiptEmitter(), opts.v2ReceiptEmitter(), opts.ReceiptGroup, logW, intent, -1, "tool_header_contract_unavailable", opts.requireReceipts())
 }

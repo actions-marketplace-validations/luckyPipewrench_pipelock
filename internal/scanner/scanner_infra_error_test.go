@@ -5,6 +5,7 @@ package scanner
 
 import (
 	"context"
+	"net"
 	"testing"
 
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -61,6 +62,29 @@ func TestIsAdaptiveNeutral(t *testing.T) {
 	}
 }
 
+func TestEntropyOnlyAdaptiveClassification(t *testing.T) {
+	cases := []struct {
+		name   string
+		result Result
+		want   bool
+	}{
+		{"path or query", Result{Scanner: ScannerEntropy, Class: ClassHeuristicEntropy, Allowed: false}, true},
+		{"subdomain", Result{Scanner: ScannerSubdomainEntropy, Class: ClassHeuristicEntropy, Allowed: false, Reason: "high entropy label"}, true},
+		{"structural hostname", Result{Scanner: ScannerSubdomainEntropy, Allowed: false, Reason: subdomainEncodedChunksReasonPrefix + " encoded labels"}, false},
+		{"dlp", Result{Scanner: ScannerDLP, Allowed: false}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.result.IsEntropyOnly(); got != tc.want {
+				t.Fatalf("IsEntropyOnly() = %v, want %v", got, tc.want)
+			}
+			if got := tc.result.IsAdaptiveNeutral(); got != tc.want {
+				t.Fatalf("IsAdaptiveNeutral() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestScanURL_DNSFailure_ClassifiedAsInfrastructureError verifies that an
 // SSRF check against a hostname the resolver cannot look up returns
 // Result{Allowed: false, Class: ClassInfrastructureError}.
@@ -80,7 +104,10 @@ func TestScanURL_DNSFailure_ClassifiedAsInfrastructureError(t *testing.T) {
 	// DNS path at all. nil would disable the SSRF check entirely.
 	cfg.Internal = []string{"127.0.0.0/8", "10.0.0.0/8"}
 
-	s := MustNew(cfg)
+	s, err := NewWithOptions(cfg, Options{UpstreamResolver: failingLookupResolver{}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer s.Close()
 
 	result := s.Scan(context.Background(), "https://nonexistent.invalid/")
@@ -188,4 +215,12 @@ func TestScanURL_RealSSRF_StillThreat(t *testing.T) {
 	if result.Class != ClassThreat {
 		t.Errorf("real SSRF must remain ClassThreat; got class=%d", result.Class)
 	}
+}
+
+// failingLookupResolver fails every lookup so the test does not depend on
+// how the host resolver treats reserved names.
+type failingLookupResolver struct{}
+
+func (failingLookupResolver) LookupHost(_ context.Context, host string) ([]string, error) {
+	return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
 }

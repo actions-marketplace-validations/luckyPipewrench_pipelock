@@ -57,6 +57,25 @@ const (
 	mcpPlaceholderAWS            = "<pl:aws-access-key:1>"
 )
 
+func TestInputVerdictEntropyOnlyClassification(t *testing.T) {
+	cases := []struct {
+		name    string
+		verdict InputVerdict
+		want    bool
+	}{
+		{"entropy URL", InputVerdict{URLFindings: []scanner.Result{{Scanner: scanner.ScannerEntropy, Class: scanner.ClassHeuristicEntropy}}}, true},
+		{"mixed DLP", InputVerdict{URLFindings: []scanner.Result{{Scanner: scanner.ScannerEntropy, Class: scanner.ClassHeuristicEntropy}}, Matches: []scanner.TextDLPMatch{{}}}, false},
+		{"structural hostname", InputVerdict{URLFindings: []scanner.Result{{Scanner: scanner.ScannerSubdomainEntropy, Reason: "subdomain payload chunked across 4 encoded labels"}}}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.verdict.IsEntropyOnly(); got != tc.want {
+				t.Fatalf("IsEntropyOnly() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func base64Encode(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 func hexEncode(s string) string    { return hex.EncodeToString([]byte(s)) }
 func intPtrInput(v int) *int       { return &v }
@@ -292,11 +311,12 @@ func TestScanRequest(t *testing.T) {
 			wantError:    true,
 		},
 		{
-			name:         "parse error with on_parse_error=forward",
+			name:         "invalid JSON blocks with on_parse_error=forward",
 			line:         "not json at all",
 			action:       config.ActionBlock,
 			onParseError: "forward",
-			wantClean:    true,
+			wantClean:    false,
+			wantError:    true,
 		},
 		{
 			name:         "invalid JSON-RPC version with block",
@@ -831,6 +851,7 @@ func TestForwardScannedInput_BlocksToolCallRedactionFailure(t *testing.T) {
 // tools/call block verdicts. Exercising the FrozenTool path here is
 // representative: all four use the same emitToolReceipt closure.
 func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
+	logger, events := newListenerEventLogger(t)
 	sc := testInputScanner(t)
 	msg := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"exec_command","arguments":{"cmd":"ls"}}}`
 
@@ -840,6 +861,7 @@ func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
 	blockedCh := make(chan BlockedRequest, 1)
 	opts := MCPProxyOpts{
 		Scanner:             sc,
+		AuditLogger:         logger,
 		Transport:           "mcp_stdio",
 		ReceiptEmitter:      emitter,
 		ToolFreezer:         &stubToolFreezer{frozen: true, allowed: map[string]bool{"read_file": true}},
@@ -858,6 +880,9 @@ func TestForwardScannedInput_FrozenToolBlockEmitsReceipt(t *testing.T) {
 		opts,
 	)
 
+	if !strings.Contains(events.String(), `"resource":"exec_command"`) {
+		t.Fatalf("released frozen-tool resource changed: %s", events.String())
+	}
 	blocked, ok := <-blockedCh
 	if !ok {
 		t.Fatal("expected blocked request on frozen-tool path")
@@ -1319,10 +1344,18 @@ func TestForwardScannedInput_ParseErrorBlocked(t *testing.T) {
 
 	var serverIn bytes.Buffer
 	var logW bytes.Buffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	blockedCh := make(chan BlockedRequest, 10)
 
 	clientIn := strings.NewReader("not json\n")
-	fwdScannedInput(clientIn, &serverIn, &logW, sc, "block", "block", blockedCh)
+	opts := testOpts(sc)
+	opts.AuditLogger = logger
+	ForwardScannedInput(transport.NewStdioReader(clientIn), transport.NewStdioWriter(&serverIn), &logW, "block", "block", blockedCh, nil, nil, opts)
 
 	// Should NOT be forwarded
 	if serverIn.Len() > 0 {
@@ -1343,6 +1376,11 @@ func TestForwardScannedInput_ParseErrorBlocked(t *testing.T) {
 	}
 	if !gotBlocked {
 		t.Error("expected blocked request for parse error")
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditMCPInputInspection+`"`) ||
+		!strings.Contains(got, `"block_class":"infrastructure_error"`) || strings.Contains(got, "not json") {
+		t.Fatalf("stdio parse denial audit event = %s", got)
 	}
 }
 
@@ -1390,8 +1428,8 @@ func TestForwardScannedInput_ParseErrorWithIDProducesErrorResponse(t *testing.T)
 func TestForwardScannedInput_ParseErrorForwardMode(t *testing.T) {
 	sc := testInputScanner(t)
 
-	// With on_parse_error=forward, parse errors should result in clean verdict
-	// which means the (invalid) line is forwarded to the server
+	// Key validation is a parser-integrity gate. Invalid JSON is blocked
+	// even when on_parse_error=forward permits other protocol parse failures.
 	var serverIn bytes.Buffer
 	var logW bytes.Buffer
 	blockedCh := make(chan BlockedRequest, 10)
@@ -1399,9 +1437,8 @@ func TestForwardScannedInput_ParseErrorForwardMode(t *testing.T) {
 	clientIn := strings.NewReader("not json\n")
 	fwdScannedInput(clientIn, &serverIn, &logW, sc, "block", "forward", blockedCh)
 
-	// With forward parse error, the line gets verdict.Clean=true so it's forwarded
-	if !strings.Contains(serverIn.String(), "not json") {
-		t.Error("expected forwarded parse error line in forward mode")
+	if serverIn.Len() != 0 {
+		t.Error("invalid JSON forwarded despite key-validation failure")
 	}
 }
 
@@ -1676,6 +1713,27 @@ func TestScanRequest_ParamsWithOnlyNumbers(t *testing.T) {
 	verdict := ScanRequest(context.Background(), []byte(line), sc, config.ActionBlock, config.ActionBlock)
 	if !verdict.Clean {
 		t.Errorf("expected clean for numeric-only params, got error=%q", verdict.Error)
+	}
+}
+
+func TestScanRequest_UnknownEnvelopeFieldDLP(t *testing.T) {
+	sc := testInputScanner(t)
+	secret := testSecretPrefix + strings.Repeat("a", 25)
+	line := `{"jsonrpc":"2.0","id":1,"method":"ping","params":{"ok":true},"extension":"` + secret + `"}`
+	verdict := ScanRequest(t.Context(), []byte(line), sc, config.ActionBlock, config.ActionBlock)
+	if verdict.Clean || verdict.Action != config.ActionBlock || len(verdict.Matches) == 0 {
+		t.Fatalf("unknown envelope credential passed input DLP: %+v", verdict)
+	}
+}
+
+func TestMCPListenerSessionHeaderDLP(t *testing.T) {
+	sc := testInputScanner(t)
+	headers := make(http.Header)
+	headers.Set("Mcp-Session-Id", testSecretPrefix+strings.Repeat("b", 25))
+	for _, cfg := range []*config.RequestBodyScanning{nil, {Enabled: true, ScanHeaders: false}, {Enabled: true, ScanHeaders: true, HeaderMode: config.HeaderModeAll, IgnoreHeaders: []string{"Mcp-Session-Id"}}} {
+		if got := scanMCPListenerHeadersForDLP(t.Context(), headers, sc, cfg); got == nil || got.header != "Mcp-Session-Id" || len(got.matches) == 0 {
+			t.Fatalf("session header escaped DLP with config %+v: %+v", cfg, got)
+		}
 	}
 }
 
@@ -3315,12 +3373,20 @@ func TestForwardScannedInput_SessionBinding_BlockUnknown(t *testing.T) {
 
 	var serverBuf bytes.Buffer
 	var logBuf bytes.Buffer
+	var events bytes.Buffer
+	logger, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(logger.Close)
 	blockedCh := make(chan BlockedRequest, 10)
+	opts := testOpts(sc)
+	opts.AuditLogger = logger
 
 	ForwardScannedInput(
 		transport.NewStdioReader(strings.NewReader(req)),
 		transport.NewStdioWriter(&serverBuf),
-		&logBuf, "warn", "block", blockedCh, bindingCfg, nil, testOpts(sc),
+		&logBuf, "warn", "block", blockedCh, bindingCfg, nil, opts,
 	)
 
 	blocked := make([]BlockedRequest, 0)
@@ -3336,6 +3402,11 @@ func TestForwardScannedInput_SessionBinding_BlockUnknown(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "not in session baseline") {
 		t.Errorf("expected 'not in session baseline' in log, got: %s", logBuf.String())
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditMCPSessionBinding+`"`) ||
+		!strings.Contains(got, "mcp_session_binding.unknown_tool_action") || strings.Contains(got, "exec_command") {
+		t.Fatalf("session binding audit event = %s", got)
 	}
 }
 
@@ -3695,7 +3766,12 @@ func TestForwardScannedInput_ChainDetectionBlock(t *testing.T) {
 
 func TestForwardScannedInput_ChainDetectionBlock_WithAuditLogger(t *testing.T) {
 	sc := testScanner(t)
-	al := audit.NewNop()
+	var events bytes.Buffer
+	al, err := audit.NewWithStream("json", "stdout", "", true, true, &events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(al.Close)
 
 	chainCfg := &config.ToolChainDetection{
 		Enabled:       true,
@@ -3731,6 +3807,11 @@ func TestForwardScannedInput_ChainDetectionBlock_WithAuditLogger(t *testing.T) {
 	}
 	if blocked[0].ErrorCode != -32004 {
 		t.Errorf("expected error code -32004, got %d", blocked[0].ErrorCode)
+	}
+	if got := events.String(); strings.Count(got, `"event":"blocked"`) != 1 ||
+		!strings.Contains(got, `"scanner":"`+scanner.AuditChainDetection+`"`) ||
+		!strings.Contains(got, "tool_chain_detection.pattern_overrides") {
+		t.Fatalf("chain denial audit event = %s", got)
 	}
 }
 
@@ -5568,5 +5649,22 @@ func TestScanRequest_EnvVarSecretShellExampleFP(t *testing.T) {
 	leakLine := makeRequest(2, "tools/call", map[string]string{"prompt": realLeak})
 	if v := ScanRequest(context.Background(), []byte(leakLine), sc, config.ActionBlock, config.ActionBlock); v.Clean {
 		t.Error("real leaked env-var secret in tool args must still block")
+	}
+}
+
+// The MCP raw-text view decodes an unpaired surrogate escape to U+FFFD, as it
+// did before it shared the provenance decoder. Leaving the escape literal
+// separated two words by six characters and hid an injection phrase that a
+// one-character gap still matches.
+func TestUnescapeJSONUnicodeUnpairedSurrogate(t *testing.T) {
+	for in, want := range map[string]string{
+		`ignore\uD800previous instructions`: "ignore�previous instructions",
+		`\uDC00x`:                           "�x",
+		`🚀`:                                 "\U0001F680",
+		`\u12`:                              `\u12`,
+	} {
+		if got := unescapeJSONUnicode(in); got != want {
+			t.Errorf("unescapeJSONUnicode(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

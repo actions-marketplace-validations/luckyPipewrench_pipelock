@@ -5,421 +5,19 @@
 package audit
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 
 	"github.com/luckyPipewrench/pipelock/internal/emit"
 	scannerpkg "github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/rs/zerolog"
-)
-
-type contentFieldMode int
-
-const (
-	contentFieldModeRedacted contentFieldMode = iota
-	contentFieldModeDestination
-	contentFieldModePathDiagnostic
-)
-
-// scannerContentFieldMode classifies URL/target/resource fields for audit
-// output. The default is redaction: future or misspelled scanner labels may be
-// content-bearing, so they must not silently echo paths, queries, or resources
-// into logs and external sinks.
-//
-// No mode emits a query string or fragment. Scanner order decides which
-// detector reports a request first, and a destination-class scanner routinely
-// fires ahead of DLP: the core SSRF floor runs several stages before the core
-// DLP floor, so a request to a metadata address carrying a credential in its
-// query is attributed to SSRF and never reaches the detector that would have
-// recognised the credential. Classifying by scanner identity therefore cannot
-// decide whether a URL is safe to log; only the URL component can. Query and
-// fragment are operand-carrying by construction and are always dropped.
-func scannerContentFieldMode(scanner string) contentFieldMode {
-	switch scanner {
-	case scannerpkg.ScannerPathTraversal,
-		scannerpkg.ScannerCRLF:
-		// The path is the finding itself; a block is not diagnosable without it.
-		return contentFieldModePathDiagnostic
-	case scannerpkg.ScannerSSRF,
-		scannerpkg.ScannerSSRFMetadata,
-		scannerpkg.ScannerCoreSSRF,
-		scannerpkg.ScannerAllowlist,
-		scannerpkg.ScannerBlocklist,
-		scannerpkg.ScannerRateLimit,
-		scannerpkg.ScannerDataBudget,
-		scannerpkg.ScannerContext,
-		scannerpkg.ScannerMCPToolScanning,
-		scannerpkg.AuditMCPSessionBinding,
-		scannerpkg.AuditFrozenTool:
-		// The destination, not the request line, is the diagnostic object.
-		return contentFieldModeDestination
-	default:
-		return contentFieldModeRedacted
-	}
-}
-
-// IsContentScanner reports whether blocks attributed to the given scanner
-// name imply the URL/target contains the secret-shaped bytes that fired
-// the match. Callers constructing client-facing block responses (fetch,
-// reverse proxy, forward proxy) should redact the URL/target before
-// echoing it back so the credential is not returned to the caller.
-func IsContentScanner(name string) bool {
-	return scannerContentFieldMode(name) == contentFieldModeRedacted
-}
-
-func redactedContentFields(ctx LogContext, scanner string) (loggedURL, loggedTarget, loggedResource string) {
-	loggedResource = ctx.resource
-	switch scannerContentFieldMode(scanner) {
-	case contentFieldModeDestination:
-		return dropURLContentSegments(ctx.url, false),
-			dropURLContentSegments(ctx.target, false),
-			loggedResource
-	case contentFieldModePathDiagnostic:
-		return dropURLContentSegments(ctx.url, true),
-			dropURLContentSegments(ctx.target, true),
-			loggedResource
-	default:
-		loggedURL = redactContentBearingURL(ctx.url)
-		loggedTarget = redactContentBearingURL(ctx.target)
-		if loggedResource != "" {
-			loggedResource = "[redacted]"
-		}
-		return loggedURL, loggedTarget, loggedResource
-	}
-}
-
-// dropURLContentSegments removes the query and fragment from raw, and removes
-// the path as well unless keepPath is set. A value that does not parse as an
-// absolute URL is truncated at the earliest delimiter rather than replaced
-// wholesale, so a forward-proxy CONNECT authority such as host:443 survives
-// intact while nothing after a delimiter rides through.
-//
-// The fallback covers more than CONNECT authorities. A schemeless value parses
-// with an empty Host and lands here with its path intact, so the fallback has to
-// apply the same component rules the parsed branch does; treating it as opaque
-// would let destination mode echo path content for exactly the inputs too
-// malformed to reason about.
-func dropURLContentSegments(raw string, keepPath bool) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		delims := "?#"
-		if !keepPath {
-			delims += "/"
-		}
-		if i := strings.IndexAny(raw, delims); i >= 0 {
-			return raw[:i]
-		}
-		return raw
-	}
-	out := u.Host
-	if u.Scheme != "" {
-		out = u.Scheme + "://" + u.Host
-	}
-	if keepPath {
-		out += u.EscapedPath()
-	}
-	return out
-}
-
-// RedactContentBearingURL returns a URL safe to echo when a
-// content-matching scanner fired. Keeps scheme + host; drops path,
-// query, and fragment. Falls back to a generic placeholder when parsing
-// fails rather than passing the raw string through. Exported for use
-// from the proxy package in client-facing block responses.
-func RedactContentBearingURL(raw string) string {
-	return redactContentBearingURL(raw)
-}
-
-// redactContentBearingURL is the internal implementation. Kept separate
-// from the exported wrapper so in-package callers (LogBlocked) and
-// out-of-package callers (proxy FetchResponse / reverse-proxy block
-// bodies) share a single source of truth.
-func redactContentBearingURL(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" {
-		return "[redacted-url]"
-	}
-	return u.Scheme + "://" + u.Host + "/[redacted]"
-}
-
-// sanitizeString strips control characters and ANSI escape sequences from a
-// string before logging. Prevents terminal escape injection via crafted URLs
-// (e.g., \x1b[2J to clear screen when tailing audit logs).
-func sanitizeString(s string) string {
-	// Fast path: most strings have no control characters.
-	clean := true
-	for _, r := range s {
-		if r != '\t' && r != '\n' && (unicode.IsControl(r) || r == '\x1b') {
-			clean = false
-			break
-		}
-	}
-	if clean {
-		return s
-	}
-
-	var b strings.Builder
-	b.Grow(len(s))
-	inEscape := false
-	for _, r := range s {
-		if inEscape {
-			// ANSI escape sequences end with a letter (A-Z, a-z).
-			if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
-				inEscape = false
-			}
-			continue
-		}
-		if r == '\x1b' {
-			inEscape = true
-			continue
-		}
-		// Allow tabs and newlines but strip other control chars.
-		if r != '\t' && r != '\n' && unicode.IsControl(r) {
-			continue
-		}
-		b.WriteRune(r)
-	}
-	return b.String()
-}
-
-// logEntry builds zerolog event and emit fields in parallel, eliminating
-// the double-build pattern across all Log* methods.
-type logEntry struct {
-	event  *zerolog.Event
-	fields map[string]any
-}
-
-func newLogEntry(event *zerolog.Event, eventType EventType) *logEntry {
-	return &logEntry{
-		event:  event.Str("event", string(eventType)),
-		fields: map[string]any{},
-	}
-}
-
-// newLogEntryRaw creates a logEntry with a raw event name string.
-func newLogEntryRaw(event *zerolog.Event, eventName string) *logEntry {
-	return &logEntry{
-		event:  event.Str("event", eventName),
-		fields: map[string]any{},
-	}
-}
-
-func (e *logEntry) str(key, value string) *logEntry {
-	sanitized := sanitizeString(value)
-	e.event = e.event.Str(key, sanitized)
-	e.fields[key] = sanitized
-	return e
-}
-
-// agentField emits the agent label together with its provenance grade. Use
-// this instead of optStr("agent", ...) everywhere: an agent name without its
-// grade is indistinguishable from a caller-controlled label once it reaches an
-// external consumer, so the two must never be emitted separately. An unknown
-// grade is written explicitly rather than omitted, so a consumer can tell
-// "not graded" apart from "field absent".
-func (e *logEntry) agentField(agent, auth string) *logEntry {
-	if agent == "" {
-		return e
-	}
-	if auth == "" {
-		auth = string(envelope.ActorAuthUnknown)
-	}
-	return e.str("agent", agent).str("agent_auth", auth)
-}
-
-func (e *logEntry) optStr(key, value string) *logEntry {
-	if value == "" {
-		return e
-	}
-	return e.str(key, value)
-}
-
-func (e *logEntry) intField(key string, value int) *logEntry {
-	e.event = e.event.Int(key, value)
-	e.fields[key] = value
-	return e
-}
-
-func (e *logEntry) int64Field(key string, value int64) *logEntry {
-	e.event = e.event.Int64(key, value)
-	e.fields[key] = value
-	return e
-}
-
-func (e *logEntry) scoreField(value float64) *logEntry {
-	const key = "score"
-	e.event = e.event.Float64(key, value)
-	e.fields[key] = value
-	return e
-}
-
-// durMS adds a "duration_ms" duration field to both zerolog and emit.
-// All duration fields in audit use the same key, so it is hardcoded to
-// satisfy the unparam linter.
-func (e *logEntry) durMS(value time.Duration) *logEntry {
-	e.event = e.event.Dur("duration_ms", value)
-	e.fields["duration_ms"] = value.Milliseconds()
-	return e
-}
-
-func (e *logEntry) strs(key string, values []string) *logEntry {
-	sanitized := make([]string, len(values))
-	for i, v := range values {
-		sanitized[i] = sanitizeString(v)
-	}
-	e.event = e.event.Strs(key, sanitized)
-	e.fields[key] = sanitized
-	return e
-}
-
-func (e *logEntry) errField(err error) *logEntry {
-	e.event = e.event.Err(err)
-	errStr := ""
-	if err != nil {
-		errStr = sanitizeString(err.Error())
-	}
-	e.fields["error"] = errStr
-	return e
-}
-
-// bundleRulesField adds "bundle_rules" to both zerolog and emit. All
-// Interface-typed audit fields use this key, so it is hardcoded to satisfy
-// the unparam linter. Called as a statement (never chained) because it is
-// always conditional on len(bundleRules) > 0.
-//
-// When the slice is the typed []BundleRuleHit form (the normal case), the
-// primary hit's RuleID and BundleVersion are also emitted as scalar fields
-// so emit-side consumers can read them without importing this package.
-// The primary hit is selected DETERMINISTICALLY by lexicographic sort on
-// RuleID, NOT by slice order, so the same detection produces the same
-// externally visible rule_id across runs even if scanner iteration order
-// changes upstream. Auditability depends on this property.
-// See internal/emit/otlp_agent_threat.go.
-func (e *logEntry) bundleRulesField(value any) {
-	e.event = e.event.Interface("bundle_rules", value)
-	e.fields["bundle_rules"] = value
-	if hits, ok := value.([]BundleRuleHit); ok && len(hits) > 0 {
-		primary := selectPrimaryBundleHit(hits)
-		if primary.RuleID != "" {
-			e.fields["primary_rule_id"] = primary.RuleID
-		}
-		if primary.BundleVersion != "" {
-			e.fields["bundle_version"] = primary.BundleVersion
-		}
-	}
-}
-
-// selectPrimaryBundleHit returns the canonical primary BundleRuleHit
-// for a multi-hit detection, using lexicographic sort on RuleID as the
-// stable tie-breaker. Hits with empty RuleID are deprioritised so a
-// well-formed hit wins over a malformed one. The input slice is not
-// mutated.
-//
-// Selection is intentionally NOT based on slice order. Pipelock's
-// scanner emits hits in pattern-iteration order, which is stable in
-// practice but not part of any documented contract. Pinning the
-// "primary" choice to a content-addressed criterion (RuleID) means
-// the externally visible agent.threat.detection.rule_id stays stable
-// regardless of upstream ordering changes.
-func selectPrimaryBundleHit(hits []BundleRuleHit) BundleRuleHit {
-	primary := hits[0]
-	for _, h := range hits[1:] {
-		// Empty-RuleID hits never win against a non-empty one.
-		if primary.RuleID == "" && h.RuleID != "" {
-			primary = h
-			continue
-		}
-		if h.RuleID == "" {
-			continue
-		}
-		if h.RuleID < primary.RuleID {
-			primary = h
-		}
-	}
-	return primary
-}
-
-// msg sends the zerolog message. Call this instead of e.event.Msg() to keep
-// the logEntry API consistent.
-func (e *logEntry) msg(text string) {
-	e.event.Msg(text)
-}
-
-// EventType describes the kind of audit event.
-type EventType string
-
-// Event type constants for structured audit log entries.
-const (
-	EventStartup                EventType = "startup"
-	EventShutdown               EventType = "shutdown"
-	EventAllowed                EventType = "allowed"
-	EventBlocked                EventType = "blocked"
-	EventError                  EventType = "error"
-	EventAnomaly                EventType = "anomaly"
-	EventResponseScan           EventType = "response_scan"
-	EventResponseScanSuppressed EventType = "response_scan_suppressed"
-	EventRedirect               EventType = "redirect"
-	EventTunnelOpen             EventType = "tunnel_open"
-	EventTunnelClose            EventType = "tunnel_close"
-	EventForwardHTTP            EventType = "forward_http"
-	EventConfigReload           EventType = "config_reload"
-	EventWSOpen                 EventType = "ws_open"
-	EventWSClose                EventType = "ws_close"
-	EventWSBlocked              EventType = "ws_blocked"
-	EventWSScan                 EventType = "ws_scan"
-	EventSessionAnomaly         EventType = "session_anomaly"
-	EventAdaptiveEscalation     EventType = "adaptive_escalation"
-	EventAdaptiveRecovery       EventType = "adaptive_recovery"
-	EventMCPUnknownTool         EventType = "mcp_unknown_tool"
-	EventKillSwitchDeny         EventType = "kill_switch_deny"
-	EventSNIMismatch            EventType = "sni_mismatch"
-	EventBodyDLP                EventType = "body_dlp"
-	EventBodyPromptInjection    EventType = "body_prompt_injection"
-	EventHeaderDLP              EventType = "header_dlp"
-	EventChainDetection         EventType = "chain_detection"
-	EventAddressProtection      EventType = "address_protection"
-	EventAgentListener          EventType = "agent_listener"
-	EventFileSentryDLP          EventType = "file_sentry_dlp"
-
-	EventCrossRequestEntropyExceeded EventType = "cross_request_entropy_exceeded"
-	EventCrossRequestDLPMatch        EventType = "cross_request_dlp_match"
-	EventCrossRequestEntropyAnomaly  EventType = "cross_request_entropy_anomaly"
-
-	EventAdaptiveUpgrade    EventType = "adaptive_upgrade"
-	EventToolRedirect       EventType = "tool_redirect"
-	EventSessionAdmin       EventType = "session_admin"
-	EventResponseScanExempt EventType = "response_scan_exempt"
-	EventTaintDecision      EventType = "taint_decision"
-
-	EventAirlockEnter           EventType = "airlock_enter"
-	EventAirlockDeny            EventType = "airlock_deny"
-	EventAirlockDeescalate      EventType = "airlock_deescalate"
-	EventShieldRewrite          EventType = "shield_rewrite"
-	EventMediaExposure          EventType = "media_exposure"
-	EventLicenseExpiry          EventType = "license_expiry"
-	EventRuleBundleDegraded     EventType = "rule_bundle_degraded"
-	EventCommitmentKeyLifecycle EventType = "commitment_key_lifecycle"
-	EventContainmentMetricsDeny EventType = "containment_metrics_access_denied"
-	EventAuthorityVerification  EventType = "authority_verification"
 )
 
 const responseScanExemptFullTrustEffect = "response_scanning.exempt_domains is a full-trust valve: injection scanning is disabled for ALL responses from this host, including oversized over-cap responses that stream unscanned"
@@ -451,179 +49,6 @@ type BundleRuleHit struct {
 	BundleVersion string `json:"bundle_version"`
 }
 
-// LogContext carries common fields shared across all audit log events.
-// Use the typed constructors (NewHTTPLogContext, NewMCPLogContext,
-// NewConnectLogContext) to enforce required fields per transport.
-//
-// URL, Target, and Resource are mutually exclusive identifiers:
-//   - URL: actual HTTP/HTTPS URLs (fetch, forward-proxy, response scan)
-//   - Target: CONNECT tunnel host:port destinations
-//   - Resource: MCP tool names, config file paths, listen addresses
-type LogContext struct {
-	method          string
-	url             string // actual HTTP URL
-	target          string // CONNECT host:port
-	resource        string // MCP tool, config path, listen address
-	clientIP        string
-	requestID       string
-	agent           string
-	agentAuth       string
-	dowSubjectKey   string
-	dowSubjectTrust string
-}
-
-func (c LogContext) Method() string    { return c.method }
-func (c LogContext) URL() string       { return c.url }
-func (c LogContext) Target() string    { return c.target }
-func (c LogContext) Resource() string  { return c.resource }
-func (c LogContext) ClientIP() string  { return c.clientIP }
-func (c LogContext) RequestID() string { return c.requestID }
-func (c LogContext) Agent() string     { return c.agent }
-
-// AgentAuth reports the provenance grade of the agent label, using the
-// envelope.ActorAuth vocabulary ("bound", "config-default", "matched",
-// "self-declared"). An empty value means the grade is unknown and MUST be
-// treated as untrusted by every consumer.
-func (c LogContext) AgentAuth() string { return c.agentAuth }
-
-// agentAuthOrUnknown returns the recorded grade, or the fail-closed unknown
-// grade when the context never carried one.
-func (c LogContext) agentAuthOrUnknown() string {
-	if c.agentAuth == "" {
-		return string(envelope.ActorAuthUnknown)
-	}
-	return c.agentAuth
-}
-
-// WithActorAuth records how the agent label was established. It mirrors
-// WithDoWAttribution: the grade travels with the context so downstream
-// emitters can tell an infrastructure-bound identity from a caller-supplied
-// one. A caller that omits it gets the fail-closed unknown treatment.
-func (c LogContext) WithActorAuth(auth string) LogContext {
-	c.agentAuth = auth
-	return c
-}
-
-// WithDoWAttribution adds denial-of-wallet subject metadata to a copy of the
-// context. The raw subject key stays process-local and is HMAC-redacted by the
-// logger before any local or external audit emission.
-func (c LogContext) WithDoWAttribution(subjectKey, subjectTrust string) LogContext {
-	c.dowSubjectKey = subjectKey
-	c.dowSubjectTrust = subjectTrust
-	return c
-}
-
-var (
-	errLogContextMissingClientIP  = errors.New("audit log context: client IP required")
-	errLogContextMissingRequestID = errors.New("audit log context: request ID required")
-	errLogContextMissingURL       = errors.New("audit log context: url required")
-	errLogContextMissingTarget    = errors.New("audit log context: target required")
-	errLogContextMissingResource  = errors.New("audit log context: resource required")
-	errLogContextIdentifierClash  = errors.New("audit log context: url, target, and resource are mutually exclusive")
-)
-
-// LogContextOpts bundles the parameters newLogContext consumes so the
-// internal constructor stays under the >6-params options-struct rule
-// (project CLAUDE.md). External callers should keep using the typed
-// NewHTTPLogContext / NewMCPLogContext / NewConnectLogContext / etc.
-// helpers; LogContextOpts is internal plumbing.
-type LogContextOpts struct {
-	Method    string
-	URL       string
-	Target    string
-	Resource  string
-	ClientIP  string
-	RequestID string
-	Agent     string
-}
-
-func newLogContext(o LogContextOpts) (LogContext, error) {
-	identifierCount := 0
-	if o.URL != "" {
-		identifierCount++
-	}
-	if o.Target != "" {
-		identifierCount++
-	}
-	if o.Resource != "" {
-		identifierCount++
-	}
-	if identifierCount > 1 {
-		return LogContext{}, errLogContextIdentifierClash
-	}
-	if o.Target != "" && o.Method != http.MethodConnect {
-		return LogContext{}, fmt.Errorf("audit log context: target contexts require %q method", http.MethodConnect)
-	}
-	return LogContext{
-		method:    o.Method,
-		url:       o.URL,
-		target:    o.Target,
-		resource:  o.Resource,
-		clientIP:  o.ClientIP,
-		requestID: o.RequestID,
-		agent:     o.Agent,
-	}, nil
-}
-
-// NewHTTPLogContext creates a LogContext for URL-based proxy requests
-// (fetch, forward-proxy, WebSocket, response scan). ClientIP and RequestID are
-// required to prevent accidental omission on URL-bearing transport paths.
-func NewHTTPLogContext(method, url, clientIP, requestID, agent string) (LogContext, error) {
-	if url == "" {
-		return LogContext{}, errLogContextMissingURL
-	}
-	if clientIP == "" {
-		return LogContext{}, errLogContextMissingClientIP
-	}
-	if requestID == "" {
-		return LogContext{}, errLogContextMissingRequestID
-	}
-	return newLogContext(LogContextOpts{Method: method, URL: url, ClientIP: clientIP, RequestID: requestID, Agent: agent})
-}
-
-// NewMCPLogContext creates a LogContext for MCP proxy requests. HTTP-specific
-// fields (ClientIP, RequestID) are omitted by design since MCP stdio has no
-// HTTP transport layer.
-func NewMCPLogContext(method, resource, agent string) (LogContext, error) {
-	if resource == "" {
-		return LogContext{}, errLogContextMissingResource
-	}
-	return newLogContext(LogContextOpts{Method: method, Resource: resource, Agent: agent})
-}
-
-// NewConnectLogContext creates a LogContext for CONNECT tunnel operations.
-func NewConnectLogContext(target, clientIP, requestID, agent string) (LogContext, error) {
-	if target == "" {
-		return LogContext{}, errLogContextMissingTarget
-	}
-	if clientIP == "" {
-		return LogContext{}, errLogContextMissingClientIP
-	}
-	if requestID == "" {
-		return LogContext{}, errLogContextMissingRequestID
-	}
-	return newLogContext(LogContextOpts{Method: http.MethodConnect, Target: target, ClientIP: clientIP, RequestID: requestID, Agent: agent})
-}
-
-// NewResourceLogContext creates a LogContext for operational events scoped to a
-// local resource such as a config path or listen address.
-func NewResourceLogContext(method, resource string) LogContext {
-	ctx, _ := newLogContext(LogContextOpts{Method: method, Resource: resource})
-	return ctx
-}
-
-// NewRequestLogContext creates a LogContext scoped only to a request ID.
-func NewRequestLogContext(requestID string) LogContext {
-	ctx, _ := newLogContext(LogContextOpts{RequestID: requestID})
-	return ctx
-}
-
-// NewMethodLogContext creates a LogContext scoped only to an operation name.
-func NewMethodLogContext(method string) LogContext {
-	ctx, _ := newLogContext(LogContextOpts{Method: method})
-	return ctx
-}
-
 // Logger handles structured audit logging using zerolog.
 type Logger struct {
 	zl                 zerolog.Logger
@@ -634,6 +59,7 @@ type Logger struct {
 	fileCreated        bool          // true when this logger created filePath
 	emitter            *emit.Emitter // optional external event emitter
 	identifierRedactor *lazyIdentifierRedactor
+	correlation        CorrelationID // per-request tag for emitted events; see WithCorrelation
 }
 
 // New creates a new audit logger. The caller should call Close when done.
@@ -844,185 +270,6 @@ func (l *Logger) SetEmitter(e *emit.Emitter) {
 	l.emitter = e
 }
 
-// CommitmentKeyLifecycleEvent records a commitment-key lifecycle operation.
-// It intentionally carries metadata only: callers must never place key
-// material or private evidence views in these fields.
-type CommitmentKeyLifecycleEvent struct {
-	Operation     string
-	Phase         string
-	Outcome       string
-	OperationID   string
-	KeyID         string
-	Epoch         uint64
-	Timestamp     string
-	Reason        string
-	Authorization string
-}
-
-// LogCommitmentKeyLifecycle records a commitment-key lifecycle operation.
-// Lifecycle records always bypass the allowed/blocked sampling controls: a
-// denied key operation is security evidence even when routine request logging
-// is reduced.
-func (l *Logger) LogCommitmentKeyLifecycle(ev CommitmentKeyLifecycleEvent) {
-	zlEvent := l.zl.Info()
-	if ev.Outcome == "denied" {
-		zlEvent = l.zl.Warn()
-	}
-	e := newLogEntry(zlEvent, EventCommitmentKeyLifecycle).
-		str("event_type", string(EventCommitmentKeyLifecycle)).
-		str("operation", ev.Operation).
-		str("outcome", ev.Outcome).
-		optStr("phase", ev.Phase).
-		optStr("operation_id", ev.OperationID).
-		optStr("key_id", ev.KeyID).
-		optStr("timestamp", ev.Timestamp).
-		optStr("reason", ev.Reason).
-		optStr("authorization", ev.Authorization)
-	if ev.Epoch != 0 {
-		e.event = e.event.Uint64("epoch", ev.Epoch)
-		e.fields["epoch"] = ev.Epoch
-	}
-	e.msg("commitment key lifecycle")
-}
-
-// WriteDurableCommitmentKeyLifecycle appends and syncs one lifecycle record.
-// It is deliberately separate from LogCommitmentKeyLifecycle: zerolog's
-// regular logging API reports write failures only through its global error
-// handler, while a lifecycle mutation must receive the write and fsync error
-// before it is allowed to proceed.
-func (l *Logger) WriteDurableCommitmentKeyLifecycle(ev CommitmentKeyLifecycleEvent) error {
-	if l.fileHandle == nil || l.filePath == "" {
-		return errors.New("durable audit log file is not open")
-	}
-	if err := l.verifyDurableFileBinding(); err != nil {
-		return err
-	}
-	now := sanitizeString(ev.Timestamp)
-	if now == "" {
-		now = time.Now().UTC().Format(time.RFC3339Nano)
-	}
-	record := durableCommitmentKeyLifecycleRecord{
-		Level:         "info",
-		Component:     "pipelock",
-		Event:         string(EventCommitmentKeyLifecycle),
-		EventType:     string(EventCommitmentKeyLifecycle),
-		Operation:     sanitizeString(ev.Operation),
-		Phase:         sanitizeString(ev.Phase),
-		Outcome:       sanitizeString(ev.Outcome),
-		OperationID:   sanitizeString(ev.OperationID),
-		KeyID:         sanitizeString(ev.KeyID),
-		Epoch:         ev.Epoch,
-		Reason:        sanitizeString(ev.Reason),
-		Authorization: sanitizeString(ev.Authorization),
-		Time:          now,
-		Timestamp:     now,
-		Message:       "commitment key lifecycle",
-	}
-	if ev.Outcome == "denied" {
-		record.Level = "warn"
-	}
-	if err := writeAndSyncLifecycleRecord(l.fileHandle, record); err != nil {
-		return err
-	}
-	if err := l.verifyDurableFileBinding(); err != nil {
-		return err
-	}
-	return nil
-}
-
-type durableCommitmentKeyLifecycleRecord struct {
-	Level         string `json:"level"`
-	Component     string `json:"component"`
-	Event         string `json:"event"`
-	EventType     string `json:"event_type"`
-	Operation     string `json:"operation"`
-	Phase         string `json:"phase,omitempty"`
-	Outcome       string `json:"outcome"`
-	OperationID   string `json:"operation_id,omitempty"`
-	KeyID         string `json:"key_id,omitempty"`
-	Epoch         uint64 `json:"epoch,omitempty"`
-	Reason        string `json:"reason,omitempty"`
-	Authorization string `json:"authorization,omitempty"`
-	Time          string `json:"time"`
-	Timestamp     string `json:"timestamp"`
-	Message       string `json:"message"`
-}
-
-type lifecycleRecordFile interface {
-	io.Writer
-	Sync() error
-}
-
-// writeAndSyncLifecycleRecord uses leading and trailing newlines as record
-// boundaries. The trailing newline makes each successful record independently
-// parseable by ordinary JSON Lines producers. The leading newline still
-// isolates the next lifecycle record after a partial append. Each lifecycle
-// record is one Write call, so O_APPEND preserves boundaries between concurrent
-// commands.
-func writeAndSyncLifecycleRecord(file lifecycleRecordFile, record durableCommitmentKeyLifecycleRecord) error {
-	data, err := json.Marshal(record)
-	if err != nil {
-		return fmt.Errorf("marshal lifecycle audit record: %w", err)
-	}
-	data = append(append([]byte{'\n'}, data...), '\n')
-	n, err := file.Write(data)
-	if err != nil {
-		return fmt.Errorf("write lifecycle audit record: %w", err)
-	}
-	if n != len(data) {
-		return fmt.Errorf("write lifecycle audit record: %w", io.ErrShortWrite)
-	}
-	if err := file.Sync(); err != nil {
-		return fmt.Errorf("sync lifecycle audit record: %w", err)
-	}
-	return nil
-}
-
-func (l *Logger) verifyDurableFileBinding() error {
-	pathInfo, err := os.Stat(l.filePath)
-	if err != nil {
-		return fmt.Errorf("stat configured audit log file: %w", err)
-	}
-	handleInfo, err := l.fileHandle.Stat()
-	if err != nil {
-		return fmt.Errorf("stat open audit log file: %w", err)
-	}
-	if !os.SameFile(pathInfo, handleInfo) {
-		return fmt.Errorf("configured audit log file was replaced or rotated: %s", l.filePath)
-	}
-	return nil
-}
-
-// RejectDurableFileAliases proves that the already-open durable file is not a
-// protected lifecycle file. It compares descriptor identity after the open so
-// a pathname swap between a cheap preflight check and the open cannot redirect
-// lifecycle records into a keyring, config, backup, or private-view file.
-func (l *Logger) RejectDurableFileAliases(protectedPaths ...string) error {
-	if l.fileHandle == nil || l.filePath == "" {
-		return errors.New("durable audit log file is not open")
-	}
-	handleInfo, err := l.fileHandle.Stat()
-	if err != nil {
-		return fmt.Errorf("stat open audit log file: %w", err)
-	}
-	for _, protectedPath := range protectedPaths {
-		if protectedPath == "" || protectedPath == "-" {
-			continue
-		}
-		info, err := os.Stat(filepath.Clean(protectedPath))
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return fmt.Errorf("stat protected lifecycle file: %w", err)
-		}
-		if os.SameFile(handleInfo, info) {
-			return errors.New("logging.file must not refer to the commitment keyring or a lifecycle input/output file")
-		}
-	}
-	return l.verifyDurableFileBinding()
-}
-
 // LogAllowed logs a successful, allowed request.
 func (l *Logger) LogAllowed(ctx LogContext, statusCode, sizeBytes int, duration time.Duration) {
 	if !l.includeAllowed {
@@ -1035,6 +282,7 @@ func (l *Logger) LogAllowed(ctx LogContext, statusCode, sizeBytes int, duration 
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		intField("status_code", statusCode).
 		intField("size_bytes", sizeBytes).
 		durMS(duration).
@@ -1042,7 +290,7 @@ func (l *Logger) LogAllowed(ctx LogContext, statusCode, sizeBytes int, duration 
 	e.msg("request allowed")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAllowed), e.fields)
+		l.emitEvent(string(EventAllowed), e.fields)
 	}
 }
 
@@ -1069,6 +317,12 @@ type BlockDetail struct {
 	// so SIEMs can pivot on dns_timeout / dns_no_such_host /
 	// dns_resolver_error directly.
 	DNSErrorKind string
+	// Header and Patterns identify a header DLP finding without logging its value.
+	Header   string
+	Patterns []string
+	// Cookies names the Cookie pairs that carried a header DLP match. Names
+	// only; a cookie value is never logged.
+	Cookies []string
 }
 
 // Class string constants kept in lockstep with internal/scanner ResultClass.
@@ -1128,14 +382,25 @@ func (l *Logger) LogBlockedDetail(ctx LogContext, scanner, reason string, detail
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		str("scanner", scanner).
 		str("reason", reason).
+		optStr("header", detail.Header).
 		agentField(ctx.agent, ctx.agentAuth).
 		optStr("subject_discriminator", l.subjectDiscriminator(ctx.dowSubjectKey)).
 		optStr("subject_trust", ctx.dowSubjectTrust).
 		optStr("display_label", displayLabel).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scanner, reason)).
 		optStr("mitre_technique", technique)
+	if ctx.mcp {
+		e.optStr("block_class", detail.Class).str("protocol", "mcp").optStr("transport", ctx.mcpTransport).optStr("direction", ctx.mcpDirection)
+	}
+	if len(detail.Patterns) > 0 {
+		e.strs("patterns", detail.Patterns)
+	}
+	if len(detail.Cookies) > 0 {
+		e.strs("cookies", detail.Cookies)
+	}
 
 	// includeBlocked gates local audit log only - external emission always fires
 	// so SIEM/webhook consumers see blocked events regardless of local verbosity.
@@ -1143,7 +408,7 @@ func (l *Logger) LogBlockedDetail(ctx LogContext, scanner, reason string, detail
 		e.msg("request blocked")
 	}
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventBlocked), e.fields)
+		l.emitEvent(string(EventBlocked), e.fields)
 	}
 }
 
@@ -1156,12 +421,13 @@ func (l *Logger) LogError(ctx LogContext, err error) {
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		errField(err)
 	e.msg("request error")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventError), e.fields)
+		l.emitEvent(string(EventError), e.fields)
 	}
 }
 
@@ -1186,6 +452,7 @@ func (l *Logger) LogAnomaly(ctx LogContext, scanner, reason string, score float6
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		optStr("subject_discriminator", l.subjectDiscriminator(ctx.dowSubjectKey)).
 		optStr("subject_trust", ctx.dowSubjectTrust).
@@ -1197,7 +464,7 @@ func (l *Logger) LogAnomaly(ctx LogContext, scanner, reason string, score float6
 	e.msg("anomaly detected")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAnomaly), e.fields)
+		l.emitEvent(string(EventAnomaly), e.fields)
 	}
 }
 
@@ -1214,7 +481,7 @@ func (l *Logger) LogContainmentMetricsDeny(endpoint, sourceIP, configuredListene
 	e.msg("containment metrics access denied")
 
 	if l.emitter != nil {
-		l.emitter.EmitWithSeverity(context.Background(), emit.SeverityWarn, string(EventContainmentMetricsDeny), e.fields)
+		l.emitEventWithSeverity(emit.SeverityWarn, string(EventContainmentMetricsDeny), e.fields)
 	}
 }
 
@@ -1231,6 +498,7 @@ func (l *Logger) LogAgentIdentityCollision(ctx LogContext, reservedAgent string)
 		optStr("resource", ctx.resource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		str("scanner", scanner).
 		optStr("mitre_technique", technique).
@@ -1241,7 +509,7 @@ func (l *Logger) LogAgentIdentityCollision(ctx LogContext, reservedAgent string)
 	e.msg("agent identity collision")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAnomaly), e.fields)
+		l.emitEvent(string(EventAnomaly), e.fields)
 	}
 }
 
@@ -1325,11 +593,14 @@ func (l *Logger) logResponseScanExempt(ctx LogContext, hostname, effect string) 
 		if ctx.requestID != "" {
 			fields["request_id"] = ctx.requestID
 		}
+		if !ctx.correlation.IsZero() {
+			fields[FieldCorrelationID] = ctx.correlation.value
+		}
 		if ctx.agent != "" {
 			fields["agent"] = sanitizeString(ctx.agent)
 			fields["agent_auth"] = ctx.agentAuthOrUnknown()
 		}
-		l.emitter.Emit(context.Background(), string(EventResponseScanExempt), fields)
+		l.emitEvent(string(EventResponseScanExempt), fields)
 	}
 }
 
@@ -1395,11 +666,14 @@ func (l *Logger) LogResponseScanExemptOverCapUnscanned(ctx LogContext, hostname,
 		if ctx.requestID != "" {
 			fields["request_id"] = ctx.requestID
 		}
+		if !ctx.correlation.IsZero() {
+			fields[FieldCorrelationID] = ctx.correlation.value
+		}
 		if ctx.agent != "" {
 			fields["agent"] = sanitizeString(ctx.agent)
 			fields["agent_auth"] = ctx.agentAuthOrUnknown()
 		}
-		l.emitter.Emit(context.Background(), string(EventResponseScanExempt), fields)
+		l.emitEvent(string(EventResponseScanExempt), fields)
 	}
 }
 
@@ -1439,9 +713,10 @@ func (l *Logger) LogMediaExposure(ctx LogContext, info MediaExposureInfo) {
 		str("url", ctx.url).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		str("transport", info.Transport).
-		str("content_type", info.ContentType).
+		str("content_type", MediaContentType(info.ContentType)).
 		optStr("format", info.Format).
 		intField("size_bytes", info.SizeBytes)
 	if info.MetadataRemoved > 0 {
@@ -1465,7 +740,7 @@ func (l *Logger) LogMediaExposure(ctx LogContext, info MediaExposureInfo) {
 	}
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventMediaExposure), e.fields)
+		l.emitEvent(string(EventMediaExposure), e.fields)
 	}
 }
 
@@ -1479,17 +754,20 @@ func (l *Logger) LogResponseScan(ctx LogContext, action string, matchCount int, 
 
 	e := newLogEntry(l.zl.Warn(), EventResponseScan).
 		optStr("method", ctx.method).
+		optStr("transport", ctx.scanTransport).
+		optStr("mcp_server", ctx.mcpServer).
 		optStr("url", loggedURL).
 		optStr("target", loggedTarget).
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		str("scanner", scanner).
 		str("action", action).
 		intField("match_count", matchCount).
 		strs("patterns", patternNames).
 		str("mitre_technique", technique).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditResponseScan, strings.Join(patternNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(scannerpkg.AuditResponseScan, patternNames)).
 		agentField(ctx.agent, ctx.agentAuth)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)
@@ -1497,7 +775,7 @@ func (l *Logger) LogResponseScan(ctx LogContext, action string, matchCount int, 
 	e.msg("response scan detected prompt injection")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventResponseScan), e.fields)
+		l.emitEvent(string(EventResponseScan), e.fields)
 	}
 }
 
@@ -1515,6 +793,7 @@ func (l *Logger) LogResponseScanSuppressed(ctx LogContext, patternName, surface,
 		optStr("resource", loggedResource).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		str("scanner", scanner).
 		str("mode", "informational").
 		str("pattern", patternName).
@@ -1525,7 +804,57 @@ func (l *Logger) LogResponseScanSuppressed(ctx LogContext, patternName, surface,
 	e.msg("response scan finding suppressed by policy")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventResponseScanSuppressed), e.fields)
+		l.emitEvent(string(EventResponseScanSuppressed), e.fields)
+	}
+}
+
+// CoreObserveAuthorization carries the declared exception that withheld a
+// core-floor block, so the audit record names who accepted the risk and when
+// the acceptance ends rather than only that something was observed.
+type CoreObserveAuthorization struct {
+	Host    string
+	Reason  string
+	Owner   string
+	Expires string
+}
+
+// LogCoreResponseObserved records a core-floor finding that an operator's
+// declared exception downgraded from block to observe.
+//
+// It reuses the response_scan_suppressed event so existing SIEM routing and
+// severity mapping keep working, and separates itself by the core_observed
+// classification plus the authorization fields. Ordinary suppression cannot
+// reach the immutable floor at all, so those two cases must never look alike
+// in an audit trail: an auditor reading this needs the pattern, the host it
+// was allowed on, who authorized that, and the date it lapses.
+func (l *Logger) LogCoreResponseObserved(ctx LogContext, patternName, surface string, auth CoreObserveAuthorization) {
+	const scanner = scannerpkg.AuditResponseScan
+	technique := TechniqueForScanner(scanner)
+	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, scanner)
+
+	e := newLogEntry(l.zl.Warn(), EventResponseScanSuppressed).
+		optStr("method", ctx.method).
+		optStr("url", loggedURL).
+		optStr("target", loggedTarget).
+		optStr("resource", loggedResource).
+		optStr("client_ip", ctx.clientIP).
+		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
+		str("scanner", scanner).
+		str("mode", "informational").
+		str("pattern", patternName).
+		str("surface", surface).
+		str("reason", "core_observed").
+		optStr("observe_host", auth.Host).
+		optStr("observe_owner", auth.Owner).
+		optStr("observe_expires", auth.Expires).
+		optStr("observe_reason", auth.Reason).
+		str("mitre_technique", technique).
+		agentField(ctx.agent, ctx.agentAuth)
+	e.msg("core response finding observed under a declared operator exception")
+
+	if l.emitter != nil {
+		l.emitEvent(string(EventResponseScanSuppressed), e.fields)
 	}
 }
 
@@ -1550,6 +879,7 @@ func (l *Logger) LogTaintDecision(ctx LogContext, d TaintDecision) {
 		str("url", ctx.url).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		str("session_taint_level", d.TaintLevel).
 		str("action_class", d.ActionClass).
@@ -1563,119 +893,7 @@ func (l *Logger) LogTaintDecision(ctx LogContext, d TaintDecision) {
 	e.msg("taint policy decision")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventTaintDecision), e.fields)
-	}
-}
-
-// LogTunnelOpen logs a CONNECT tunnel establishment.
-func (l *Logger) LogTunnelOpen(ctx LogContext) {
-	if !l.includeAllowed {
-		return
-	}
-	e := newLogEntry(l.zl.Info(), EventTunnelOpen).
-		optStr("target", ctx.target).
-		optStr("client_ip", ctx.clientIP).
-		optStr("request_id", ctx.requestID).
-		agentField(ctx.agent, ctx.agentAuth)
-	e.msg("tunnel opened")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventTunnelOpen), e.fields)
-	}
-}
-
-// LogTunnelClose logs a CONNECT tunnel teardown with traffic stats.
-func (l *Logger) LogTunnelClose(ctx LogContext, totalBytes int64, duration time.Duration) {
-	if !l.includeAllowed {
-		return
-	}
-	e := newLogEntry(l.zl.Info(), EventTunnelClose).
-		optStr("target", ctx.target).
-		optStr("client_ip", ctx.clientIP).
-		optStr("request_id", ctx.requestID).
-		agentField(ctx.agent, ctx.agentAuth).
-		int64Field("total_bytes", totalBytes).
-		durMS(duration)
-	e.msg("tunnel closed")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventTunnelClose), e.fields)
-	}
-}
-
-// LogForwardHTTP logs a forward proxy HTTP request (absolute-URI).
-func (l *Logger) LogForwardHTTP(ctx LogContext, statusCode, sizeBytes int, duration time.Duration) {
-	if !l.includeAllowed {
-		return
-	}
-	e := newLogEntry(l.zl.Info(), EventForwardHTTP).
-		str("method", ctx.method).
-		optStr("url", ctx.url).
-		optStr("target", ctx.target).
-		optStr("resource", ctx.resource).
-		optStr("client_ip", ctx.clientIP).
-		optStr("request_id", ctx.requestID).
-		agentField(ctx.agent, ctx.agentAuth).
-		intField("status_code", statusCode).
-		intField("size_bytes", sizeBytes).
-		durMS(duration)
-	e.msg("forward proxy request")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventForwardHTTP), e.fields)
-	}
-}
-
-// LogRedirect logs a redirect hop in the chain.
-func (l *Logger) LogRedirect(originalURL, redirectURL, clientIP, requestID, agent string, hop int) {
-	e := newLogEntry(l.zl.Info(), EventRedirect).
-		str("original_url", originalURL).
-		str("redirect_url", redirectURL).
-		str("client_ip", clientIP).
-		str("request_id", requestID).
-		agentField(agent, string(envelope.ActorAuthUnknown)).
-		intField("hop", hop)
-	e.msg("redirect followed")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventRedirect), e.fields)
-	}
-}
-
-// ToolRedirectEvent bundles the per-event fields LogToolRedirect emits.
-// SessionID is local-log only; the remaining fields surface to external
-// emission sinks.
-type ToolRedirectEvent struct {
-	SessionID       string
-	ToolName        string
-	ArgsDigest      string
-	RedirectProfile string
-	RedirectReason  string
-	PolicyRule      string
-	Result          string
-	LatencyMs       int64
-}
-
-// LogToolRedirect logs an MCP tool call redirect event. Distinct from
-// LogRedirect (HTTP redirect hops). Result is "redirected" or "blocked"
-// (on failure).
-func (l *Logger) LogToolRedirect(ev ToolRedirectEvent) {
-	e := newLogEntry(l.zl.Info(), EventToolRedirect).
-		str("tool_name", ev.ToolName).
-		str("args_digest", ev.ArgsDigest).
-		str("redirect_profile", ev.RedirectProfile).
-		str("redirect_reason", ev.RedirectReason).
-		str("policy_rule", ev.PolicyRule).
-		str("result", ev.Result).
-		int64Field("latency_ms", ev.LatencyMs)
-	// session_id is local-log only - not emitted to external sinks.
-	if ev.SessionID != "" {
-		e.event = e.event.Str("session_id", sanitizeString(ev.SessionID))
-	}
-	e.msg("tool call redirected")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventToolRedirect), e.fields)
+		l.emitEvent(string(EventTaintDecision), e.fields)
 	}
 }
 
@@ -1688,7 +906,7 @@ func (l *Logger) LogConfigReload(status, detail, configHash string) {
 	e.msg("configuration reloaded")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventConfigReload), e.fields)
+		l.emitEvent(string(EventConfigReload), e.fields)
 	}
 }
 
@@ -1727,7 +945,7 @@ func (l *Logger) LogRuleBundleDegraded(ev RuleBundleDegradedEvent) {
 	e.msg("rule bundle coverage degraded")
 
 	if l.emitter != nil {
-		l.emitter.EmitWithSeverity(context.Background(), emitSeverity, string(EventRuleBundleDegraded), e.fields)
+		l.emitEventWithSeverity(emitSeverity, string(EventRuleBundleDegraded), e.fields)
 	}
 }
 
@@ -1766,7 +984,7 @@ func (l *Logger) LogLicenseExpiry(warning LicenseExpiryWarning) {
 	e.msg(warning.Message)
 
 	if l.emitter != nil {
-		l.emitter.EmitWithSeverity(context.Background(), emitSeverity, string(EventLicenseExpiry), e.fields)
+		l.emitEventWithSeverity(emitSeverity, string(EventLicenseExpiry), e.fields)
 	}
 }
 
@@ -1780,7 +998,7 @@ func (l *Logger) LogStartup(listenAddr, mode, version, configHash string) {
 	e.msg("pipelock started")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventStartup), e.fields)
+		l.emitEvent(string(EventStartup), e.fields)
 	}
 }
 
@@ -1791,7 +1009,7 @@ func (l *Logger) LogShutdown(reason string) {
 	e.msg("pipelock stopping")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventShutdown), e.fields)
+		l.emitEvent(string(EventShutdown), e.fields)
 	}
 }
 
@@ -1803,318 +1021,16 @@ func (l *Logger) LogAgentListener(addr, agent string) {
 	e.msg("agent listener started")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAgentListener), e.fields)
+		l.emitEvent(string(EventAgentListener), e.fields)
 	}
 }
 
-// LogWSOpen logs a WebSocket proxy connection establishment.
-func (l *Logger) LogWSOpen(target, clientIP, requestID, agent string) {
-	if !l.includeAllowed {
-		return
-	}
-	e := newLogEntry(l.zl.Info(), EventWSOpen).
-		str("target", target).
-		str("client_ip", clientIP).
-		str("request_id", requestID).
-		agentField(agent, string(envelope.ActorAuthUnknown))
-	e.msg("websocket opened")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventWSOpen), e.fields)
-	}
-}
-
-// WSCloseEvent bundles the per-event fields LogWSClose emits.
-type WSCloseEvent struct {
-	Target    string
-	ClientIP  string
-	RequestID string
-	Agent     string
-	// AgentAuth is how the agent label was established. It travels with the
-	// label so the pair is emitted together; an empty value is recorded as the
-	// fail-closed unknown grade rather than omitted.
-	AgentAuth      string
-	ClientToServer int64
-	ServerToClient int64
-	TextFrames     int64
-	BinaryFrames   int64
-	Duration       time.Duration
-}
-
-// LogWSClose logs a WebSocket proxy connection teardown with traffic stats.
-func (l *Logger) LogWSClose(ev WSCloseEvent) {
-	if !l.includeAllowed {
-		return
-	}
-	e := newLogEntry(l.zl.Info(), EventWSClose).
-		str("target", ev.Target).
-		str("client_ip", ev.ClientIP).
-		str("request_id", ev.RequestID).
-		agentField(ev.Agent, ev.AgentAuth).
-		int64Field("client_to_server_bytes", ev.ClientToServer).
-		int64Field("server_to_client_bytes", ev.ServerToClient).
-		int64Field("text_frames", ev.TextFrames).
-		int64Field("binary_frames", ev.BinaryFrames).
-		durMS(ev.Duration)
-	e.msg("websocket closed")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventWSClose), e.fields)
-	}
-}
-
-// WSBlockedEvent bundles the per-event fields LogWSBlocked emits.
-//
-// This is a struct rather than a parameter list because the event needs the
-// agent label and its provenance grade, and a block decision is exactly where
-// an auditor needs to know whether the label was infrastructure-bound or merely
-// caller-supplied. Adding two more positional parameters would have pushed the
-// call past the project's six-parameter limit at twenty-one call sites.
-type WSBlockedEvent struct {
-	Target    string
-	Direction string
-	Scanner   string
-	Reason    string
-	ClientIP  string
-	RequestID string
-	Agent     string
-	// AgentAuth is how the agent label was established. An empty value is
-	// recorded as the fail-closed unknown grade.
-	AgentAuth string
-}
-
-// LogWSBlocked logs a blocked WebSocket frame or connection.
-func (l *Logger) LogWSBlocked(ev WSBlockedEvent) {
-	target, direction, scannerName := ev.Target, ev.Direction, ev.Scanner
-	reason, clientIP, requestID := ev.Reason, ev.ClientIP, ev.RequestID
-	technique := TechniqueForScanner(scannerName)
-
-	e := newLogEntry(l.zl.Warn(), EventWSBlocked).
-		str("target", target).
-		str("direction", direction).
-		str("scanner", scannerName).
-		str("reason", reason).
-		str("client_ip", clientIP).
-		str("request_id", requestID).
-		agentField(ev.Agent, ev.AgentAuth).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerName, reason)).
-		optStr("mitre_technique", technique)
-
-	// includeBlocked gates local audit log only - external emission always fires.
-	if l.includeBlocked {
-		e.msg("websocket blocked")
-	}
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventWSBlocked), e.fields)
-	}
-}
-
-// WSScanEvent bundles the per-event fields LogWSScan emits.
-// Direction is one of DirectionClientToServer / DirectionServerToClient.
-type WSScanEvent struct {
-	Target    string
-	Direction string
-	ClientIP  string
-	RequestID string
-	Agent     string
-	// AgentAuth is how the agent label was established. See WSCloseEvent.
-	AgentAuth    string
-	Action       string
-	Scanner      string
-	MatchCount   int
-	PatternNames []string
-	BundleRules  []BundleRuleHit
-}
-
-// LogWSScan logs a WebSocket frame scan hit (warn/strip action).
-// Direction determines the MITRE technique: client_to_server is DLP/exfil (T1048),
-// server_to_client is prompt injection detection (T1059).
-// When BundleRules is non-empty, bundle provenance is included in the audit event.
-func (l *Logger) LogWSScan(ev WSScanEvent) {
-	scanner := ev.Scanner
-	if scanner == "" {
-		scanner = scannerpkg.AuditResponseScan
-		if ev.Direction == DirectionClientToServer {
-			scanner = scannerpkg.ScannerDLP
-		}
-	}
-	technique := TechniqueForScanner(scanner)
-	ctx := LogContext{target: ev.Target}
-	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, scanner)
-
-	e := newLogEntry(l.zl.Warn(), EventWSScan).
-		optStr("url", loggedURL).
-		optStr("target", loggedTarget).
-		optStr("resource", loggedResource).
-		str("direction", ev.Direction).
-		str("client_ip", ev.ClientIP).
-		str("request_id", ev.RequestID).
-		agentField(ev.Agent, ev.AgentAuth).
-		str("action", ev.Action).
-		str("scanner", scanner).
-		intField("match_count", ev.MatchCount).
-		strs("patterns", ev.PatternNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scanner, strings.Join(ev.PatternNames, ", "))).
-		str("mitre_technique", technique)
-	if len(ev.BundleRules) > 0 {
-		e.bundleRulesField(ev.BundleRules)
-	}
-	e.msg("websocket scan hit")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventWSScan), e.fields)
-	}
-}
-
-// LogSessionAnomaly logs a session behavioral anomaly detection.
 // copyRemediationHint copies remediation_hint from a log entry's fields into an
 // external-emitter fields map when the entry set one, so the emitted event and
 // the structured log carry the same operator guidance.
 func copyRemediationHint(dst, src map[string]any) {
 	if hint, ok := src["remediation_hint"]; ok {
 		dst["remediation_hint"] = hint
-	}
-}
-
-func (l *Logger) LogSessionAnomaly(sessionKey, anomalyType, detail, clientIP, requestID string, score float64) {
-	technique := TechniqueForScanner("session_anomaly")
-
-	e := newLogEntry(l.zl.Warn(), EventSessionAnomaly).
-		str("session", sessionKey).
-		str("anomaly_type", anomalyType).
-		str("detail", detail).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditSessionAnomaly, anomalyType)).
-		str("client_ip", clientIP).
-		str("request_id", requestID).
-		scoreField(score).
-		str("mitre_technique", technique)
-	e.msg("session anomaly detected")
-
-	if l.emitter != nil {
-		// Emit fields: omit client_ip and request_id when empty.
-		fields := map[string]any{
-			"session":         e.fields["session"],
-			"anomaly_type":    e.fields["anomaly_type"],
-			"detail":          e.fields["detail"],
-			"score":           score,
-			"mitre_technique": technique,
-		}
-		copyRemediationHint(fields, e.fields)
-		if clientIP != "" {
-			fields["client_ip"] = clientIP
-		}
-		if requestID != "" {
-			fields["request_id"] = requestID
-		}
-		l.emitter.Emit(context.Background(), string(EventSessionAnomaly), fields)
-	}
-}
-
-// LogAdaptiveEscalation logs an enforcement level escalation.
-func (l *Logger) LogAdaptiveEscalation(sessionKey, from, to, clientIP, requestID string, score float64) {
-	e := newLogEntry(l.zl.Warn(), EventAdaptiveEscalation).
-		str("session", sessionKey).
-		str("from", from).
-		str("to", to).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditAdaptiveEnforcement, to)).
-		str("client_ip", clientIP).
-		str("request_id", requestID).
-		scoreField(score)
-	e.msg("enforcement escalated")
-
-	if l.emitter != nil {
-		// Emit fields: omit client_ip and request_id when empty.
-		fields := map[string]any{
-			"session": e.fields["session"],
-			"from":    from,
-			"to":      to,
-			"score":   score,
-		}
-		copyRemediationHint(fields, e.fields)
-		if clientIP != "" {
-			fields["client_ip"] = clientIP
-		}
-		if requestID != "" {
-			fields["request_id"] = requestID
-		}
-		l.emitter.EmitWithSeverity(context.Background(), emit.EscalationSeverity(to), string(EventAdaptiveEscalation), fields)
-	}
-}
-
-// LogAdaptiveRecoveryOptions contains the fields for an adaptive recovery event.
-type LogAdaptiveRecoveryOptions struct {
-	SessionKey string
-	Scope      string
-	From       string
-	To         string
-	Reason     string
-	ClientIP   string
-	RequestID  string
-}
-
-// LogAdaptiveRecovery logs an adaptive enforcement de-escalation.
-func (l *Logger) LogAdaptiveRecovery(opts LogAdaptiveRecoveryOptions) {
-	e := newLogEntry(l.zl.Info(), EventAdaptiveRecovery).
-		str("session", opts.SessionKey).
-		optStr("scope", opts.Scope).
-		str("from", opts.From).
-		str("to", opts.To).
-		str("reason", opts.Reason).
-		optStr("client_ip", opts.ClientIP).
-		optStr("request_id", opts.RequestID)
-	e.msg("adaptive enforcement recovered")
-
-	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAdaptiveRecovery), e.fields)
-	}
-}
-
-// LogAdaptiveUpgrade logs an adaptive enforcement action upgrade - when the
-// session's escalation level causes a stronger action to be applied to a
-// request than would otherwise have been (e.g. warn → block).
-func (l *Logger) LogAdaptiveUpgrade(sessionKey, level, fromAction, toAction, scanner, clientIP, requestID string) {
-	// Derive severity from toAction (block=critical, else warn).
-	derivedSev := severityWarn
-	if toAction == actionBlock {
-		derivedSev = severityCritical
-	}
-
-	e := newLogEntry(l.zl.Warn(), EventAdaptiveUpgrade).
-		str("session", sessionKey).
-		str("escalation_level", level).
-		str("from_action", fromAction).
-		str("to_action", toAction).
-		str("scanner", scanner).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditAdaptiveEnforcement, scanner)).
-		str("client_ip", clientIP).
-		str("request_id", requestID)
-	e.msg("adaptive enforcement upgrade")
-
-	if l.emitter != nil {
-		sev := emit.SeverityWarn
-		if toAction == actionBlock && scanner != "session_deny" {
-			// Actual escalation transitions emit at critical.
-			// session_deny (enforcement of existing block_all) stays at warn
-			// to prevent webhook flood - one critical on escalation, not
-			// one per denied request.
-			sev = emit.SeverityCritical
-		}
-		fields := map[string]any{
-			"session":          e.fields["session"],
-			"escalation_level": level,
-			"from_action":      fromAction,
-			"to_action":        toAction,
-			"scanner":          scanner,
-			"severity":         derivedSev,
-		}
-		copyRemediationHint(fields, e.fields)
-		if clientIP != "" {
-			fields["client_ip"] = clientIP
-		}
-		if requestID != "" {
-			fields["request_id"] = requestID
-		}
-		l.emitter.EmitWithSeverity(context.Background(), sev, string(EventAdaptiveUpgrade), fields)
 	}
 }
 
@@ -2130,7 +1046,7 @@ func (l *Logger) LogMCPUnknownTool(toolName, action string) {
 	e.msg("tool not in session baseline")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventMCPUnknownTool), e.fields)
+		l.emitEvent(string(EventMCPUnknownTool), e.fields)
 	}
 }
 
@@ -2152,29 +1068,58 @@ func (l *Logger) LogSNIMismatch(connectHost, sniHost, clientIP, requestID, agent
 	e.msg("SNI verification failed")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventSNIMismatch), e.fields)
+		l.emitEvent(string(EventSNIMismatch), e.fields)
 	}
 }
 
 // LogKillSwitchDeny logs a request denied by the kill switch.
-func (l *Logger) LogKillSwitchDeny(transport, endpoint, source, message, clientIP string) {
+func (l *Logger) LogKillSwitchDeny(transport, endpoint, source, message, clientIP, requestID string) {
 	e := newLogEntry(l.zl.Info(), EventKillSwitchDeny).
 		str("transport", transport).
 		str("endpoint", endpoint).
 		str("source", source).
 		str("deny_message", message).
+		optStr("request_id", requestID).
 		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditKillSwitch, source)).
 		str("client_ip", clientIP)
 	e.msg("kill switch denied request")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventKillSwitchDeny), e.fields)
+		l.emitEvent(string(EventKillSwitchDeny), e.fields)
 	}
 }
 
 // LogBodyDLP logs a request body DLP scan detection.
 // When bundleRules is non-empty, bundle provenance is included in the audit event.
-func (l *Logger) LogBodyDLP(ctx LogContext, action string, matchCount int, patternNames []string, bundleRules []BundleRuleHit) {
+func (l *Logger) LogBodyDLP(ctx LogContext, action string, matchCount int, patternNames []string, bundleRules []BundleRuleHit, mismatches ...scannerpkg.CredentialAudienceMismatch) {
+	l.logRequestDLP(ctx, requestDLPLog{
+		action: action, matchCount: matchCount, patternNames: patternNames,
+		bundleRules: bundleRules, mismatches: mismatches,
+		guidanceLabel: scannerpkg.ScannerBodyDLP, message: "request body DLP scan hit",
+	})
+}
+
+// LogReverseURLDLP preserves the historical body_dlp event while selecting
+// guidance for the reverse proxy's URL text scan rather than its body scan.
+func (l *Logger) LogReverseURLDLP(ctx LogContext, action string, matchCount int, patternNames []string, bundleRules []BundleRuleHit, mismatches ...scannerpkg.CredentialAudienceMismatch) {
+	l.logRequestDLP(ctx, requestDLPLog{
+		action: action, matchCount: matchCount, patternNames: patternNames,
+		bundleRules: bundleRules, mismatches: mismatches,
+		guidanceLabel: scannerpkg.AuditReverseURLDLP, message: "reverse proxy URL DLP scan hit",
+	})
+}
+
+type requestDLPLog struct {
+	action        string
+	matchCount    int
+	patternNames  []string
+	bundleRules   []BundleRuleHit
+	mismatches    []scannerpkg.CredentialAudienceMismatch
+	guidanceLabel string
+	message       string
+}
+
+func (l *Logger) logRequestDLP(ctx LogContext, info requestDLPLog) {
 	technique := TechniqueForScanner(ScannerDLP)
 	loggedURL, loggedTarget, loggedResource := redactedContentFields(ctx, string(EventBodyDLP))
 
@@ -2183,21 +1128,26 @@ func (l *Logger) LogBodyDLP(ctx LogContext, action string, matchCount int, patte
 		optStr("url", loggedURL).
 		optStr("target", loggedTarget).
 		optStr("resource", loggedResource).
-		str("action", action).
+		str("action", info.action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
-		intField("match_count", matchCount).
-		strs("patterns", patternNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.ScannerBodyDLP, "")).
+		intField("match_count", info.matchCount).
+		strs("patterns", info.patternNames).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(info.guidanceLabel, info.patternNames)).
 		str("mitre_technique", technique)
-	if len(bundleRules) > 0 {
-		e.bundleRulesField(bundleRules)
+	if len(info.bundleRules) > 0 {
+		e.bundleRulesField(info.bundleRules)
 	}
-	e.msg("request body DLP scan hit")
+	if len(info.mismatches) > 0 {
+		e.event = e.event.Interface("credential_audience_mismatches", info.mismatches)
+		e.fields["credential_audience_mismatches"] = info.mismatches
+	}
+	e.msg(info.message)
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventBodyDLP), e.fields)
+		l.emitEvent(string(EventBodyDLP), e.fields)
 	}
 }
 
@@ -2214,21 +1164,22 @@ func (l *Logger) LogBodyScan(ctx LogContext, eventType EventType, action string,
 		str("action", action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		intField("match_count", matchCount).
 		strs("findings", findingNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(string(eventType), strings.Join(findingNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(string(eventType), findingNames)).
 		optStr("mitre_technique", technique)
 	e.msg("request body " + string(eventType) + " scan hit")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(eventType), e.fields)
+		l.emitEvent(string(eventType), e.fields)
 	}
 }
 
 // LogHeaderDLP logs a request header DLP scan detection.
 // When bundleRules is non-empty, bundle provenance is included in the audit event.
-func (l *Logger) LogHeaderDLP(ctx LogContext, headerName, action string, patternNames []string, bundleRules []BundleRuleHit) {
+func (l *Logger) LogHeaderDLP(ctx LogContext, headerName, action string, patternNames []string, bundleRules []BundleRuleHit, mismatches ...scannerpkg.CredentialAudienceMismatch) {
 	technique := TechniqueForScanner(ScannerDLP)
 
 	e := newLogEntry(l.zl.Warn(), EventHeaderDLP).
@@ -2240,17 +1191,22 @@ func (l *Logger) LogHeaderDLP(ctx LogContext, headerName, action string, pattern
 		str("action", action).
 		optStr("client_ip", ctx.clientIP).
 		optStr("request_id", ctx.requestID).
+		correlationField(ctx.correlation).
 		agentField(ctx.agent, ctx.agentAuth).
 		strs("patterns", patternNames).
-		optStr("remediation_hint", scannerpkg.OperatorHintForResult(scannerpkg.AuditHeaderDLP, strings.Join(patternNames, ", "))).
+		optStr("remediation_hint", scannerpkg.OperatorHintForPatterns(scannerpkg.AuditHeaderDLP, patternNames)).
 		str("mitre_technique", technique)
 	if len(bundleRules) > 0 {
 		e.bundleRulesField(bundleRules)
 	}
+	if len(mismatches) > 0 {
+		e.event = e.event.Interface("credential_audience_mismatches", mismatches)
+		e.fields["credential_audience_mismatches"] = mismatches
+	}
 	e.msg("request header DLP scan hit")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventHeaderDLP), e.fields)
+		l.emitEvent(string(EventHeaderDLP), e.fields)
 	}
 }
 
@@ -2284,7 +1240,7 @@ func (l *Logger) LogChainDetection(pattern, patternSeverity, action, toolName, s
 		if action == actionBlock {
 			sev = emit.SeverityCritical
 		}
-		l.emitter.EmitWithSeverity(context.Background(), sev, string(EventChainDetection), e.fields)
+		l.emitEventWithSeverity(sev, string(EventChainDetection), e.fields)
 	}
 }
 
@@ -2299,7 +1255,7 @@ func (l *Logger) LogSessionAdmin(action, clientIP, sessionKey, result string, st
 	e.msg("session admin API")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventSessionAdmin), e.fields)
+		l.emitEvent(string(EventSessionAdmin), e.fields)
 	}
 }
 
@@ -2322,7 +1278,7 @@ func (l *Logger) LogAirlockEnterForScope(sessionKey, scope, tier, trigger, clien
 	e.msg("session entered airlock")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAirlockEnter), e.fields)
+		l.emitEvent(string(EventAirlockEnter), e.fields)
 	}
 }
 
@@ -2371,7 +1327,7 @@ func (l *Logger) LogAirlockDenyReason(opts AirlockDenyOptions) {
 	e.msg("airlock denied request")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAirlockDeny), e.fields)
+		l.emitEvent(string(EventAirlockDeny), e.fields)
 	}
 }
 
@@ -2386,7 +1342,7 @@ func (l *Logger) LogAirlockDeescalate(sessionKey, from, to, clientIP, requestID 
 	e.msg("airlock de-escalated")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventAirlockDeescalate), e.fields)
+		l.emitEvent(string(EventAirlockDeescalate), e.fields)
 	}
 }
 
@@ -2402,7 +1358,7 @@ func (l *Logger) LogShieldRewrite(category string, hits int, transport, targetUR
 	e.msg("browser shield rewrote content")
 
 	if l.emitter != nil {
-		l.emitter.Emit(context.Background(), string(EventShieldRewrite), e.fields)
+		l.emitEvent(string(EventShieldRewrite), e.fields)
 	}
 }
 
@@ -2416,6 +1372,7 @@ func (l *Logger) With(key, value string) *Logger {
 		includeBlocked:     l.includeBlocked,
 		emitter:            l.emitter,
 		identifierRedactor: l.identifierRedactor,
+		correlation:        l.correlation,
 	}
 }
 
@@ -2427,4 +1384,16 @@ func (l *Logger) Close() {
 		_ = l.fileHandle.Close()
 		l.fileHandle = nil
 	}
+}
+
+// LogMCPBlocked records a terminal MCP refusal with an explicit evidence class.
+// The typed context marker, rather than a request method, enables MCP fields.
+func (l *Logger) LogMCPBlocked(ctx LogContext, label, reason string, detail BlockDetail) {
+	if !ctx.mcp {
+		return
+	}
+	if detail.Class == "" {
+		detail.Class = BlockClassThreat
+	}
+	l.LogBlockedDetail(ctx, label, reason, detail)
 }

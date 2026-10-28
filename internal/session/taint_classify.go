@@ -4,7 +4,6 @@
 package session
 
 import (
-	"encoding/json"
 	"maps"
 	"net"
 	"net/http"
@@ -14,7 +13,9 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/luckyPipewrench/pipelock/internal/extract"
 	"github.com/luckyPipewrench/pipelock/internal/mcp/chains"
+	"github.com/luckyPipewrench/pipelock/internal/normalize"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
 
@@ -83,6 +84,20 @@ func ClassifyMCPResponseObservation(kind string, external bool, promptHit bool) 
 		},
 		PromptHit: promptHit,
 	}
+}
+
+// ClassifyHTTPResponseFindings classifies the same HTTP source with attributed evidence.
+func ClassifyHTTPResponseFindings(rawURL, contentType string, allowlistedDomains []string, kinds []HostileFindingKind) RiskObservation {
+	observation := ClassifyHTTPResponseObservation(rawURL, contentType, allowlistedDomains, len(kinds) > 0)
+	observation.FindingKinds = MergeFindingKinds(kinds)
+	return observation
+}
+
+// ClassifyMCPResponseFindings classifies the same MCP source with attributed evidence.
+func ClassifyMCPResponseFindings(kind string, external bool, kinds []HostileFindingKind) RiskObservation {
+	observation := ClassifyMCPResponseObservation(kind, external, len(kinds) > 0)
+	observation.FindingKinds = MergeFindingKinds(kinds)
+	return observation
 }
 
 // IsMediaContentType reports whether a response content type is image/audio/video.
@@ -181,6 +196,16 @@ func ClassifyMCPToolCallWithOptions(toolName, argsJSON string, protectedPatterns
 		targets.urls = compactNonEmpty(legacyURL)
 	}
 	pathClass := classifyMCPPathTargets(targets.refs, legacyPath, protectedPatterns, elevatedPatterns, opts)
+	if !parsed && argsJSON != "" {
+		// Retain fallback references for compatibility, but unparsed arguments
+		// cannot establish that a write target is outside protected paths.
+		// Empty input is excluded: the MCP frame parser normalizes absent and
+		// null arguments to "", which names no target, exactly like {}. Both
+		// stay under fail_safe_classification rather than splitting one
+		// request's outcome by wire spelling.
+		pathClass.Sensitivity = SensitivityProtected
+		pathClass.Confident = false
+	}
 	targetPath := pathClass.ActionRef
 	targetURL := compatibleFirstTarget(targets.urls, legacyURL)
 	category := chains.ClassifyTool(toolName, argsJSON, nil)
@@ -201,15 +226,28 @@ func ClassifyMCPToolCallWithOptions(toolName, argsJSON string, protectedPatterns
 		return ActionClassification{Class: ActionClassExec, Sensitivity: SensitivityProtected, ActionRef: targetPath, OverrideRefs: targets.refs, Confident: true}
 	}
 
+	// Unparsed arguments carry no trustworthy intent, so a write-named tool
+	// keeps its protected, low-confidence write classification instead of
+	// being reclassified from raw-text matches below.
+	if !parsed && argsJSON != "" && (looksLikeWriteTool(name) || category == "write") {
+		return ActionClassification{Class: ActionClassWrite, Sensitivity: pathClass.Sensitivity, ActionRef: pathClass.ActionRef, OverrideRefs: pathClass.OverrideRefs, Confident: false}
+	}
+
+	// Explicit network mutation intent must retain publication protection even
+	// when the tool name or other arguments also describe a generic write.
+	if hasMutatingNetworkMethod(argsJSON) {
+		return ActionClassification{Class: ActionClassPublish, Sensitivity: SensitivityElevated, ActionRef: targetURL, OverrideRefs: targets.urls, Confident: true}
+	}
+
 	if looksLikeWriteTool(name) || category == "write" || hasWriteIntent(argsJSON) {
 		return ActionClassification{Class: ActionClassWrite, Sensitivity: pathClass.Sensitivity, ActionRef: pathClass.ActionRef, OverrideRefs: pathClass.OverrideRefs, Confident: pathClass.Confident}
 	}
 
-	if looksLikePublishTool(name, argsJSON) || hasMutatingNetworkIntent(argsJSON) {
+	if looksLikePublishTool(toolName, argsJSON) || hasMutatingNetworkIntent(argsJSON) {
 		return ActionClassification{Class: ActionClassPublish, Sensitivity: SensitivityElevated, ActionRef: targetURL, OverrideRefs: targets.urls, Confident: true}
 	}
 
-	if looksLikeBrowseTool(name) || category == "network" {
+	if looksLikeBrowseTool(name) || (category == "network" && hasMCPNetworkNameEvidence(toolName, argsJSON)) {
 		if hasMutatingNetworkIntent(argsJSON) {
 			return ActionClassification{Class: ActionClassPublish, Sensitivity: SensitivityElevated, ActionRef: targetURL, OverrideRefs: targets.urls, Confident: true}
 		}
@@ -412,6 +450,63 @@ func mcpArgumentRoleForKey(key string) mcpArgumentRole {
 	return mcpArgumentUnknown
 }
 
+// readOnlyOperationNames are complete tool names whose words merely CONTAIN a
+// publish or network needle ("put" in input/output, "post" in postgres,
+// "request" as a noun). Only the exact word sequence qualifies: any extra word,
+// a different order, or a concatenated spelling keeps the conservative
+// substring evidence, so get_and_set_input or mcp__input__get_status are
+// unaffected. The namespace prefix is kept by the caller.
+var readOnlyOperationNames = [][]string{
+	{"get", "input", "schema"},
+	{"read", "output"},
+	{"get", "output"},
+	{"get", "request", "log"},
+	{"list", "feature", "requests"},
+	{"list", "postgres", "tables"},
+	{"list", "pending", "requests"},
+	{"pull", "request", "read"},
+}
+
+func readOnlyOperationName(operation []string, argsJSON string) bool {
+	for _, known := range readOnlyOperationNames {
+		if slices.Equal(operation, known) {
+			if slices.Equal(operation, []string{"pull", "request", "read"}) {
+				return hasReadOnlyPullRequestMethod(argsJSON)
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// hasReadOnlyPullRequestMethod follows the method enum and handler in
+// github/github-mcp-server pkg/github/pullrequests.go (PullRequestRead) and
+// the read-method normalizer in consolidated_pull_request_types.go, at tree
+// 07e24668f8708a143bdbec700c20f5e6c4942e28.
+// Only a top-level, case-sensitive published method admits the name exception;
+// missing, malformed, or unknown methods retain conservative name evidence.
+func hasReadOnlyPullRequestMethod(argsJSON string) bool {
+	decoded, ok := decodeJSONValue(argsJSON)
+	if !ok {
+		return false
+	}
+	args, ok := decoded.(map[string]any)
+	if !ok {
+		return false
+	}
+	method, ok := args["method"].(string)
+	if !ok {
+		return false
+	}
+	switch method {
+	case "get", "get_diff", "get_status", "get_files", "get_commits",
+		"get_review_comments", "get_reviews", "get_comments", "get_check_runs":
+		return true
+	default:
+		return false
+	}
+}
+
 func splitArgumentKey(key string) []string {
 	var words []string
 	var word []rune
@@ -595,8 +690,8 @@ func flattenJSONStrings(raw string) []string {
 	if raw == "" {
 		return nil
 	}
-	var decoded any
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+	decoded, ok := decodeJSONValue(raw)
+	if !ok {
 		return []string{raw}
 	}
 	var out []string
@@ -671,9 +766,42 @@ func looksLikeBrowseTool(name string) bool {
 	return containsAny(name, "browse", "fetch", "scrape", "crawl")
 }
 
+// Preserve conservative substring evidence, including concatenated verbs. Only
+// remove known object words behind an explicit read operation.
 func looksLikePublishTool(name, argsJSON string) bool {
-	return containsAny(name, "http", "request", "post", "put", "patch", "publish", "send", "webhook") ||
+	return containsAny(mcpOperationEvidenceName(name, argsJSON), "http", "request", "post", "put", "patch", "publish", "send", "webhook") ||
 		hasMutatingNetworkMethod(argsJSON)
+}
+
+func hasMCPNetworkNameEvidence(name, argsJSON string) bool {
+	return containsAny(mcpOperationEvidenceName(name, argsJSON), "fetch", "curl", "wget", "http", "request", "post", "put", "send", "upload", "download", "api")
+}
+
+// Only a complete, known read-object shape can remove noun evidence. Any
+// additional token retains the original conservative substring classification.
+func mcpOperationEvidenceName(name, argsJSON string) string {
+	alias, ok := normalize.MCPToolNameAlias(name)
+	if !ok {
+		return strings.ToLower(name)
+	}
+	operation := splitArgumentKey(alias)
+	if readOnlyOperationName(operation, argsJSON) {
+		return strings.ToLower(strings.TrimSuffix(name, alias)) + "read"
+	}
+	if len(operation) < 2 || !slices.Contains([]string{"read", "get", "list", "search", "find", "query", "fetch", "show", "describe", "check"}, operation[0]) {
+		return strings.ToLower(name)
+	}
+	object := operation[1:]
+	knownObject := len(object) == 1 && (object[0] == "posts" || object[0] == "input")
+	if len(object) == 3 && object[0] == "thread" {
+		object = object[1:]
+	}
+	knownObject = knownObject || (len(object) == 2 && object[0] == "pull" && (object[1] == "request" || object[1] == "requests"))
+	if !knownObject {
+		return strings.ToLower(name)
+	}
+	// Keep namespace bytes unchanged, including any mutation-bearing nouns.
+	return strings.ToLower(strings.TrimSuffix(name, alias)) + operation[0]
 }
 
 func looksLikePath(value string) bool {
@@ -749,7 +877,7 @@ func decodeJSONValue(raw string) (any, bool) {
 		return nil, false
 	}
 	var decoded any
-	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+	if err := extract.DecodeJSON([]byte(raw), &decoded); err != nil {
 		return nil, false
 	}
 	return decoded, true

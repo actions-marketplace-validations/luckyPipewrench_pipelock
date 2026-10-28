@@ -22,14 +22,19 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/destination"
 	guardfs "github.com/luckyPipewrench/pipelock/internal/guard"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
+	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/sandbox"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 )
 
 func TestLaunchGuardBuildsEnforcedStandaloneLaunch(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := filepath.Join(t.TempDir(), "workspace")
+	if err := os.Mkdir(workspace, 0o750); err != nil {
+		t.Fatal(err)
+	}
 	cfg := config.Defaults()
+	cfg.DestinationGrants = []config.DestinationGrant{{Protocol: "tcp", Host: "preview.vendor.example", Port: 8443}}
 	var got sandbox.StandaloneLaunchConfig
 	err := launchGuard(GuardLaunchOptions{
 		Context:   t.Context(),
@@ -48,9 +53,13 @@ func TestLaunchGuardBuildsEnforcedStandaloneLaunch(t *testing.T) {
 		t.Fatalf("launch requirements = %+v", got)
 	}
 	wantRuntimeConfig := cfg.Clone()
+	wantRuntimeConfig.DestinationGrants = nil
 	wantRuntimeConfig.ForwardProxy.Enabled = true
 	if got.GuardDeclaration == nil || got.GuardPolicyHash != wantRuntimeConfig.CanonicalPolicyHash() {
 		t.Fatalf("guard binding declaration=%v hash=%q", got.GuardDeclaration, got.GuardPolicyHash)
+	}
+	if len(cfg.DestinationGrants) != 1 {
+		t.Fatal("Guard changed ordinary proxy grants in the input config")
 	}
 	if got.ProxyHandler == nil || got.Policy == nil {
 		t.Fatalf("launch omitted proxy or policy: %+v", got)
@@ -557,7 +566,10 @@ func TestGuardHelpersCoverAbsentAndInvalidInputs(t *testing.T) {
 		cfg.FlightRecorder.SignCheckpoints = true
 		cfg.FlightRecorder.RequireReceipts = true
 		t.Setenv("PIPELOCK_POSTURE_PROOF", "relative-proof.json")
-		if _, err := newGuardEvidence(t.Context(), cfg, nil, metrics.New(), io.Discard); err == nil || !strings.Contains(err.Error(), "loading Guard posture binding") {
+		// Receipt redaction binds the recorder to a scanner generation.
+		sc := scanner.MustNew(cfg)
+		t.Cleanup(sc.Close)
+		if _, err := newGuardEvidence(t.Context(), cfg, sc, metrics.New(), io.Discard); err == nil || !strings.Contains(err.Error(), "loading Guard posture binding") {
 			t.Fatalf("posture binding error = %v", err)
 		}
 	})
@@ -707,6 +719,7 @@ func TestGuardEvidenceRecordsPreExecApplicationWithoutClaimingCommandStart(t *te
 	if err != nil {
 		t.Fatalf("newGuardEvidence: %v", err)
 	}
+	evidence.onRequiredFailure = func(error) {}
 	wantHash := strings.Repeat("a", 64)
 	wantExecutionHash := strings.Repeat("b", 64)
 	if err := evidence.activate(guardfs.ExecutionProof{ConfigPolicyHash: wantHash, EffectivePolicyHash: wantExecutionHash, Binary: "/usr/bin/true"}); err != nil {
@@ -762,6 +775,50 @@ func TestGuardEvidenceRecordsPreExecApplicationWithoutClaimingCommandStart(t *te
 	}
 }
 
+func TestGuardRequiredReceiptGroupNeedsHeartbeatCancellationAndCloses(t *testing.T) {
+	_, key, err := signing.GenerateKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(t.TempDir(), "evidence")
+	keyPath := filepath.Join(t.TempDir(), "receipt.key")
+	if err := signing.SavePrivateKey(key, keyPath); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.FlightRecorder.Enabled = true
+	cfg.FlightRecorder.Dir = dir
+	cfg.FlightRecorder.SigningKeyPath = keyPath
+	cfg.FlightRecorder.RequireReceipts = true
+	cfg.FlightRecorder.ReceiptChains = 2
+	sc, err := scanner.New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sc.Close()
+	evidence, err := newGuardEvidence(t.Context(), cfg, sc, metrics.New(), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer evidence.close()
+	if evidence.shards == nil {
+		t.Fatal("Guard did not prepare a receipt group")
+	}
+	proof := guardfs.ExecutionProof{ConfigPolicyHash: strings.Repeat("a", 64), EffectivePolicyHash: strings.Repeat("b", 64), Binary: "/usr/bin/true"}
+	if err := evidence.activateReceipts(proof); err == nil || !strings.Contains(err.Error(), "cancellation callback") {
+		t.Fatalf("required group accepted a nil heartbeat callback: %v", err)
+	}
+	evidence.onRequiredFailure = func(error) {}
+	if err := evidence.activate(proof); err != nil {
+		t.Fatal(err)
+	}
+	group, _ := evidence.shards.Opening()
+	evidence.close()
+	if result := receipt.VerifyReceiptGroup(dir, group.GroupID, []string{group.SignerKey}); result.Verdict != receipt.GroupValid {
+		t.Fatalf("Guard group verification: %+v", result)
+	}
+}
+
 func TestGuardEvidenceActivationHandlesUnhealthyEmitter(t *testing.T) {
 	_, privateKey, err := signing.GenerateKeyPair()
 	if err != nil {
@@ -789,6 +846,7 @@ func TestGuardEvidenceActivationHandlesUnhealthyEmitter(t *testing.T) {
 				t.Fatalf("newGuardEvidence: %v", evidenceErr)
 			}
 			defer evidence.close()
+			evidence.onRequiredFailure = func(error) {}
 			evidence.emitter.MarkUnhealthy(errors.New("test failure"))
 			proof := guardfs.ExecutionProof{ConfigPolicyHash: strings.Repeat("a", 64), EffectivePolicyHash: strings.Repeat("b", 64), Binary: "/usr/bin/true"}
 			activationErr := evidence.activate(proof)

@@ -5,13 +5,18 @@ the full command tree and `pipelock <command> --help` for any command's flags.
 
 | Command | Purpose |
 |---|---|
+| [`pipelock check`](check.md) | Validate config, test a URL, or check config using the local service's configuration environment. |
+| [`pipelock verify-receipt`](verify-receipt.md) | Verify signatures, chain integrity, and the declared evidence endpoint. |
+| [`pipelock exec`](exec.md) | Check a running proxy and launch a cooperative client with proxy and CA settings. |
 | [`pipelock guard`](guard.md) | Run one Linux command with filesystem and HTTP/HTTPS egress enforcement, or inspect its declarations. |
 | [`pipelock baseline`](baseline.md) | Inspect, ratify, and relearn behavioral-baseline profiles through the admin API. |
 | [`pipelock demo`](demo.md) | Run self-contained attack scenarios that show what Pipelock catches. |
 | [`pipelock status`](operator.md) | Read-only operator setup and local inspection commands. |
+| [`pipelock reload`](reload.md) | Synchronous daemon reload verdict, active identity, and pending restart fields. |
 | [`pipelock git scan-diff`](git.md) | Scan a unified diff on stdin for credentials before it is committed or merged. |
 | [`pipelock scan`](scan.md) | Scan files for invisible-Unicode and bidi-control injection. |
 | [`pipelock skill-scan`](skill-scan.md) | Inventory skill files, compare lock drift, and flag conservative source-to-sink combinations. |
+| [`pipelock discover`](discover.md) | Inventory MCP configurations, apply checked project overrides, and report unconfirmed launch coverage. |
 | [`pipelock doctor`](doctor.md) | Audit whether configured protections are actually enforceable in the current topology. |
 | [`pipelock explain`](explain.md) | Explain a URL verdict and the exact, per-scanner remediation knob for a block. |
 | [`pipelock verify-install`](verify-install.md) | Deterministic smoke checks that scanning is wired plus direct-egress probes with explicit exposed or inconclusive outcomes. |

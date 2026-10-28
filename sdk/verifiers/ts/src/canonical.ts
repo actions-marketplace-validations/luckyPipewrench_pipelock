@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ActionRecord, Receipt, JSONValue } from "./types.js";
+import { extSourceBytes } from "./rawjson.js";
 
 type FieldSpec = readonly [name: string, omitempty: boolean, nested?: NestedKind];
 type NestedKind =
@@ -12,6 +13,7 @@ type NestedKind =
   | "key_transition"
   | "session_control"
   | "session_open"
+  | "group_binding"
   | "session_heartbeat"
   | "session_close";
 
@@ -160,6 +162,17 @@ const sessionOpenFields: readonly FieldSpec[] = [
   ["posture_signer_key_id", true],
   ["containment_nonce", true],
   ["contained_uid", true],
+  ["group_binding", true, "group_binding"],
+];
+
+const groupBindingFields: readonly FieldSpec[] = [
+  ["group_id", false],
+  ["shard_index", false],
+  ["session_id", false],
+  ["open_manifest_sha256", false],
+  ["signer_key", false],
+  ["previous_group_id", false],
+  ["previous_open_manifest_sha256", false],
 ];
 
 const sessionHeartbeatFields: readonly FieldSpec[] = [
@@ -225,6 +238,8 @@ function orderStruct(
       fieldValue = orderStruct(fieldValue, sessionControlFields);
     } else if (nested === "session_open" && isPlainObject(fieldValue)) {
       fieldValue = orderStruct(fieldValue, sessionOpenFields);
+    } else if (nested === "group_binding" && isPlainObject(fieldValue)) {
+      fieldValue = orderStruct(fieldValue, groupBindingFields);
     } else if (nested === "session_heartbeat" && isPlainObject(fieldValue)) {
       fieldValue = orderStruct(fieldValue, sessionHeartbeatFields);
     } else if (nested === "session_close" && isPlainObject(fieldValue)) {
@@ -304,8 +319,21 @@ export function canonicalizeActionRecord(actionRecord: ActionRecord): Buffer {
   );
 }
 
+// canonicalizeReceipt reproduces Go's json.Marshal(Receipt), the chain link
+// preimage. Go appends the unsigned top-level ext bag (a json.RawMessage) after
+// signer_key whenever it is present, including an explicit null, so ext bytes
+// take part in the link hash even though they never take part in the
+// signature. Those bytes come from the ext value's source text when the
+// receipt was read from a recorder line; re-serializing the parsed value is a
+// fallback for receipts built in memory and matches Go only for ext values
+// whose Go encoding survives a parse and re-serialize.
 export function canonicalizeReceipt(receipt: Receipt): Buffer {
-  return Buffer.from(goHTMLEscape(stringifyCompact(orderStruct(receipt, receiptFields))), "utf8");
+  const base = goHTMLEscape(stringifyCompact(orderStruct(receipt, receiptFields)));
+  const ext = receipt["ext"];
+  if (ext === undefined) return Buffer.from(base, "utf8");
+  const extBytes = extSourceBytes(receipt) ?? goHTMLEscape(stringifyCompact(ext));
+  const head = base === "{}" ? "{" : `${base.slice(0, -1)},`;
+  return Buffer.from(`${head}"ext":${extBytes}}`, "utf8");
 }
 
 export function canonicalJSONString(value: JSONValue): string {

@@ -133,6 +133,31 @@ func TestForMatching_Parity(t *testing.T) {
 	}
 }
 
+func TestMatchingNormalizePrintableASCIIReferenceParity(t *testing.T) {
+	inputs := []string{"", "plain receipt JSON {\"action_record\":\"allow\"}", "https://api.vendor.example/ok?id=1", "a\u200bb", "\ufffd", "a\u00a0b", "e\u0301", "\xff"}
+	for value := byte(0); ; value++ {
+		inputs = append(inputs, string([]byte{value}), "left"+string([]byte{value})+"right")
+		if value == 255 {
+			break
+		}
+	}
+	for _, recompose := range []bool{false, true} {
+		for _, input := range inputs {
+			want := StripZeroWidth(input)
+			want = norm.NFKC.String(want)
+			want = ConfusableToASCII(want)
+			want = StripCombiningMarks(want)
+			if recompose {
+				want = norm.NFC.String(want)
+			}
+			want = Whitespace(want)
+			if got := matchingNormalize(input, recompose); got != want {
+				t.Fatalf("matchingNormalize(%q, %t) = %q, want %q", input, recompose, got, want)
+			}
+		}
+	}
+}
+
 // TestForPolicy_Parity verifies ForPolicy matches the old NormalizeForPolicy.
 func TestForPolicy_Parity(t *testing.T) {
 	tests := []struct {
@@ -366,6 +391,39 @@ func TestConfusableToASCII_IPASmallCaps(t *testing.T) {
 			got := ConfusableToASCII(tt.input)
 			if got != tt.want {
 				t.Errorf("ConfusableToASCII(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestForToolTextSpaced keeps a word boundary wherever ForToolText removes a
+// control or invisible character, and otherwise normalizes the same way.
+func TestForToolTextSpaced(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		stripped string
+		spaced   string
+	}{
+		{"plain", "fetch a URL", "fetch a URL", "fetch a URL"},
+		{"newline", "yolo\nmode", "yolomode", "yolo mode"},
+		{"crlf", "yolo\r\nmode", "yolomode", "yolo  mode"},
+		{"tab", "yolo\tmode", "yolomode", "yolo mode"},
+		{"vertical tab", "yolo\vmode", "yolomode", "yolo mode"},
+		{"form feed", "yolo\fmode", "yolomode", "yolo mode"},
+		{"next line", "yolo\u0085mode", "yolomode", "yolo mode"},
+		{"nul", "yolo\x00mode", "yolomode", "yolo mode"},
+		{"zero width space", "yolo\u200Bmode", "yolomode", "yolo mode"},
+		{"line separator", "yolo\u2028mode", "yolo mode", "yolo mode"},
+		{"leetspeak and confusable", "y0l\u043E\nmode", "yolomode", "yolo mode"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ForToolText(tt.input); got != tt.stripped {
+				t.Errorf("ForToolText(%q) = %q, want %q", tt.input, got, tt.stripped)
+			}
+			if got := ForToolTextSpaced(tt.input); got != tt.spaced {
+				t.Errorf("ForToolTextSpaced(%q) = %q, want %q", tt.input, got, tt.spaced)
 			}
 		})
 	}

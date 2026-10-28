@@ -164,6 +164,28 @@ func (f *evidenceFixture) writeEvidenceJSONL(t *testing.T, path string) {
 	}
 }
 
+func (f *evidenceFixture) writeRecorderEvidenceJSONL(t *testing.T, path string) {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := recorder.GenesisHash
+	for i, r := range f.receipts {
+		entry := recorder.Entry{
+			Version: recorder.CurrentWriteEntryVersion, Sequence: uint64(i),
+			Timestamp: time.Date(2026, 5, 10, 14, 0, i, 0, time.UTC),
+			SessionID: "proxy", Type: "evidence_receipt", Transport: tHTTPS,
+			Summary: verdictAllowed, Detail: r, PrevHash: prev,
+		}
+		entry.Hash = recorder.ComputeHash(entry)
+		if err := json.NewEncoder(&buf).Encode(entry); err != nil {
+			t.Fatal(err)
+		}
+		prev = entry.Hash
+	}
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func newFixture(t *testing.T, n int) *fixture {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -335,13 +357,9 @@ func (f *fixture) basePacket(n int) auditpacket.Packet {
 // stdout, stderr, and the resolved exit code.
 func runRoot(t *testing.T, args ...string) (string, string, int) {
 	t.Helper()
-	root := newRootCmd()
 	var stdout, stderr bytes.Buffer
-	root.SetOut(&stdout)
-	root.SetErr(&stderr)
-	root.SetArgs(args)
-	err := root.Execute()
-	return stdout.String(), stderr.String(), exitCodeFor(err)
+	code := execute(args, &stdout, &stderr)
+	return stdout.String(), stderr.String(), code
 }
 
 func runAuditPacketWithKey(t *testing.T, key string, args ...string) (string, string, int) {
@@ -436,8 +454,7 @@ func TestAuditPacketPreservesChainFailureInsteadOfRelabelingItAsLifecycle(t *tes
 		t.Fatalf("read evidence: %v", err)
 	}
 	// Flip one signature nibble after the packet is written. The recorder
-	// envelope and signature encoding remain valid, so this reaches
-	// cryptographic signature verification rather than the parser.
+	// hash chain must reject the edited entry before lifecycle assessment.
 	const signaturePrefix = `"signature":"ed25519:`
 	signatureOffset := bytes.Index(raw, []byte(signaturePrefix))
 	if signatureOffset < 0 {
@@ -471,15 +488,14 @@ func TestAuditPacketPreservesChainFailureInsteadOfRelabelingItAsLifecycle(t *tes
 		t.Fatalf("tampered chain report = %+v, want failed chain and invalid packet", report)
 	}
 	errorsText := strings.Join(report.Errors, "\n")
-	if !strings.Contains(errorsText, "signature verification failed") ||
+	if !strings.Contains(errorsText, "recorder entry hash chain") ||
 		strings.Contains(errorsText, "lifecycle:") {
-		t.Fatalf("chain failure must preserve signature detail without lifecycle label: %q", errorsText)
+		t.Fatalf("chain failure must preserve recorder detail without lifecycle label: %q", errorsText)
 	}
 	if report.LifecycleAssessment != lifecycleNotAssessed || report.LifecycleStatus != "" || report.LifecycleReason != "" {
 		t.Fatalf("invalid chain must not receive lifecycle assessment: %+v", report)
 	}
-	if err == nil || !strings.Contains(err.Error(), "packet chain rejected") ||
-		!strings.Contains(err.Error(), "signature verification failed") ||
+	if err == nil || !strings.Contains(err.Error(), "recorder entry hash chain") ||
 		strings.Contains(err.Error(), "packet lifecycle broken") {
 		t.Fatalf("terminal error must preserve chain failure without lifecycle label: %v", err)
 	}
@@ -512,11 +528,30 @@ func TestAuditPacket_OfflineMode(t *testing.T) {
 	}
 
 	stdout, stderr, code := runRoot(t, "audit-packet", "--offline", pkt)
-	if code != cliutil.ExitOK {
-		t.Fatalf("offline mode failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	if code == cliutil.ExitOK {
+		t.Fatalf("offline mode unexpectedly succeeded: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if !strings.Contains(stdout, "chain:        skipped") {
 		t.Errorf("expected chain skipped marker, got %s", stdout)
+	}
+	if !strings.Contains(stdout, "schema_checked_trust_unverified") {
+		t.Fatalf("missing unverified status: %s", stdout)
+	}
+}
+
+func TestAuditPacket_OfflineSharedFixture(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join("..", "..", "sdk", "audit-packet", "example.json")
+	stdout, _, code := runRoot(t, "audit-packet", "--offline", "--json", path)
+	if code == cliutil.ExitOK {
+		t.Fatal("schema-only check returned success")
+	}
+	var report auditPacketReport
+	if err := json.Unmarshal([]byte(stdout), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.SchemaCheck != statusPass || report.Verdict != statusSchemaCheckedTrustUnverified || report.Valid || report.Trusted {
+		t.Fatalf("offline report = %+v", report)
 	}
 }
 
@@ -792,11 +827,11 @@ func TestChain_Valid(t *testing.T) {
 	_ = pkt
 	evidence := filepath.Join(dir, "evidence.jsonl")
 
-	stdout, _, code := runRoot(t, "chain", "--key", fix.keyHex, evidence)
+	stdout, _, code := runRoot(t, "chain", "--allow-prefix", "--key", fix.keyHex, evidence)
 	if code != cliutil.ExitOK {
 		t.Fatalf("valid chain should pass, stdout=%q", stdout)
 	}
-	if !strings.Contains(stdout, "CHAIN VALID") {
+	if !strings.Contains(stdout, "VALID PREFIX, END UNPROVEN") {
 		t.Errorf("missing CHAIN VALID marker, got %q", stdout)
 	}
 }
@@ -820,6 +855,225 @@ func TestIndependent_ValidLocalAnchor(t *testing.T) {
 	}
 	if !strings.Contains(stdout, "does not prove real-time truth") {
 		t.Fatalf("stdout missing honest limit:\n%s", stdout)
+	}
+}
+
+// writeIndependentPrefixFixture writes a chain of total receipts and a local
+// anchor bundle covering only the first covered of them, the state of an early
+// bundle after the live chain has grown.
+func writeIndependentPrefixFixture(t *testing.T, fix *fixture, covered int) (evidencePath, bundlePath, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	fix.writePacketDir(t, dir, nil)
+	evidencePath = filepath.Join(dir, "evidence.jsonl")
+	checkpoint, err := anchorpkg.BuildCheckpoint("proxy", fix.receipts[:covered], []string{fix.keyHex})
+	if err != nil {
+		t.Fatalf("BuildCheckpoint: %v", err)
+	}
+	logPath = filepath.Join(dir, "anchor.jsonl")
+	log := anchorpkg.LocalLog{Path: logPath, LogID: "verifier-test-log"}
+	proof, err := log.Submit(checkpoint)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	bundlePath = filepath.Join(dir, "anchor-bundle.json")
+	if err := anchorpkg.WriteBundle(bundlePath, anchorpkg.NewBundle(checkpoint, proof)); err != nil {
+		t.Fatalf("WriteBundle: %v", err)
+	}
+	return evidencePath, bundlePath, logPath
+}
+
+func TestIndependent_EarlyAnchorStillVerifiesAfterChainGrows(t *testing.T) {
+	t.Setenv("PIPELOCK_ANCHOR_TEST_NOW", "2026-06-28T14:00:00Z")
+	fix := newFixture(t, 5)
+	evidence, bundle, logPath := writeIndependentPrefixFixture(t, fix, 3)
+
+	stdout, stderr, code := runRoot(t, "independent", evidence,
+		"--bundle", bundle,
+		"--key", fix.keyHex,
+		"--local-log", logPath,
+		"--log-id", "verifier-test-log",
+	)
+	if code != cliutil.ExitOK {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Receipts:      3") || !strings.Contains(stdout, "Final seq:     2") {
+		t.Fatalf("stdout should report the covered prefix:\n%s", stdout)
+	}
+	if !strings.Contains(stderr, "2 later receipts are chain-verified but not anchored") {
+		t.Fatalf("stderr should say the later receipts are not anchored, got %q", stderr)
+	}
+	if !strings.Contains(stdout, "receipts 0..2 of 5 anchored, 3..4 chain-verified") {
+		t.Fatalf("OK output should name the coverage:\n%s", stdout)
+	}
+}
+
+// tamperIndependentTail edits the last receipt line of the evidence file so its
+// signature no longer verifies.
+func tamperIndependentTail(t *testing.T, evidence string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Clean(evidence))
+	if err != nil {
+		t.Fatalf("read evidence: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	last := lines[len(lines)-1]
+	edited := strings.Replace(last, "example.com", "examplf.com", 1)
+	if edited == last {
+		t.Fatalf("tail line has no example.com to tamper with: %s", last)
+	}
+	lines[len(lines)-1] = edited
+	if err := os.WriteFile(evidence, []byte(strings.Join(lines, "\n")+"\n"), 0o600); err != nil {
+		t.Fatalf("write evidence: %v", err)
+	}
+}
+
+func TestIndependent_TamperedTailIsNotValid(t *testing.T) {
+	t.Setenv("PIPELOCK_ANCHOR_TEST_NOW", "2026-06-28T14:00:00Z")
+	fix := newFixture(t, 5)
+	evidence, bundle, logPath := writeIndependentPrefixFixture(t, fix, 3)
+	tamperIndependentTail(t, evidence)
+
+	for _, jsonMode := range []bool{false, true} {
+		args := []string{"independent", evidence, "--bundle", bundle, "--key", fix.keyHex, "--local-log", logPath, "--log-id", "verifier-test-log"}
+		if jsonMode {
+			args = append(args, "--json")
+		}
+		stdout, stderr, code := runRoot(t, args...)
+		if code == cliutil.ExitOK {
+			t.Fatalf("json=%v: tampered tail exited 0, stdout=%q stderr=%q", jsonMode, stdout, stderr)
+		}
+		if strings.Contains(stdout, "INDEPENDENT VERIFY OK") || strings.Contains(stdout, `"valid": true`) {
+			t.Fatalf("json=%v: tampered tail presented as valid:\n%s", jsonMode, stdout)
+		}
+		if jsonMode {
+			var verdict map[string]any
+			if err := json.Unmarshal([]byte(stdout), &verdict); err != nil {
+				t.Fatalf("decode verdict: %v\n%s", err, stdout)
+			}
+			if verdict["valid"] != false || verdict["covered_receipts"] != float64(3) || verdict["chain_length"] != float64(5) {
+				t.Fatalf("verdict = %v, want valid=false covered_receipts=3 chain_length=5", verdict)
+			}
+			if !strings.Contains(fmt.Sprint(verdict["error"]), "after the anchored prefix") {
+				t.Fatalf("error should name the tail: %v", verdict["error"])
+			}
+		}
+	}
+}
+
+func TestIndependent_JSONVerdictReportsCoverage(t *testing.T) {
+	t.Setenv("PIPELOCK_ANCHOR_TEST_NOW", "2026-06-28T14:00:00Z")
+	fix := newFixture(t, 5)
+	for _, tc := range []struct {
+		covered  int
+		wantTail bool
+	}{{3, true}, {5, false}} {
+		evidence, bundle, logPath := writeIndependentPrefixFixture(t, fix, tc.covered)
+		stdout, stderr, code := runRoot(t, "independent", evidence, "--bundle", bundle, "--key", fix.keyHex,
+			"--local-log", logPath, "--log-id", "verifier-test-log", "--json")
+		if code != cliutil.ExitOK {
+			t.Fatalf("covered=%d code=%d stdout=%q stderr=%q", tc.covered, code, stdout, stderr)
+		}
+		var verdict map[string]any
+		if err := json.Unmarshal([]byte(stdout), &verdict); err != nil {
+			t.Fatalf("decode verdict: %v\n%s", err, stdout)
+		}
+		if verdict["valid"] != true || verdict["receipt_count"] != float64(tc.covered) ||
+			verdict["covered_receipts"] != float64(tc.covered) || verdict["chain_length"] != float64(5) ||
+			verdict["tail_chain_verified"] != tc.wantTail {
+			t.Fatalf("covered=%d verdict = %v", tc.covered, verdict)
+		}
+	}
+}
+
+// TestIndependent_RequireFullCoverage pins the opt-in strict stance: with
+// --require-full-coverage a chain longer than the anchor fails (non-zero exit,
+// valid false) the way the dashboard treats a stale anchor, while the default
+// and a fully covered chain are unchanged.
+func TestIndependent_RequireFullCoverage(t *testing.T) {
+	t.Setenv("PIPELOCK_ANCHOR_TEST_NOW", "2026-06-28T14:00:00Z")
+	fix := newFixture(t, 5)
+	for _, tc := range []struct {
+		name    string
+		covered int
+		strict  bool
+		wantOK  bool
+	}{
+		{"partial coverage, default", 3, false, true},
+		{"partial coverage, strict", 3, true, false},
+		{"full coverage, strict", 5, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			evidence, bundle, logPath := writeIndependentPrefixFixture(t, fix, tc.covered)
+			args := []string{
+				"independent", evidence, "--bundle", bundle, "--key", fix.keyHex,
+				"--local-log", logPath, "--log-id", "verifier-test-log", "--json",
+			}
+			if tc.strict {
+				args = append(args, "--require-full-coverage")
+			}
+			stdout, stderr, code := runRoot(t, args...)
+			var verdict map[string]any
+			if err := json.Unmarshal([]byte(stdout), &verdict); err != nil {
+				t.Fatalf("decode verdict: %v\nstdout=%q stderr=%q", err, stdout, stderr)
+			}
+			if tc.wantOK {
+				if code != cliutil.ExitOK || verdict["valid"] != true {
+					t.Fatalf("code=%d verdict=%v, want exit 0 valid=true", code, verdict)
+				}
+				return
+			}
+			if code == cliutil.ExitOK || verdict["valid"] != false ||
+				verdict["covered_receipts"] != float64(tc.covered) || verdict["chain_length"] != float64(5) {
+				t.Fatalf("code=%d verdict=%v, want non-zero exit valid=false covered=%d chain_length=5", code, verdict, tc.covered)
+			}
+			if !strings.Contains(fmt.Sprint(verdict["error"]), "--require-full-coverage") {
+				t.Fatalf("error should name the flag: %v", verdict["error"])
+			}
+		})
+	}
+}
+
+func TestIndependent_AnchorRejectsChangesToCoveredPrefix(t *testing.T) {
+	t.Setenv("PIPELOCK_ANCHOR_TEST_NOW", "2026-06-28T14:00:00Z")
+	fix := newFixture(t, 5)
+	evidence, bundlePath, logPath := writeIndependentPrefixFixture(t, fix, 3)
+	bundle, err := anchorpkg.LoadBundle(bundlePath)
+	if err != nil {
+		t.Fatalf("LoadBundle: %v", err)
+	}
+
+	cases := []struct {
+		name    string
+		mutate  func(*anchorpkg.Bundle)
+		wantErr string
+	}{
+		{"root hash edited", func(b *anchorpkg.Bundle) { b.Checkpoint.RootHash = strings.Repeat("0", 64) }, "does not match anchor bundle"},
+		{"count claims more than the chain holds", func(b *anchorpkg.Bundle) { b.Checkpoint.ReceiptCount = 6 }, "covers 6 receipts but the supplied chain has only 5"},
+		{"count widened over uncovered receipts", func(b *anchorpkg.Bundle) { b.Checkpoint.ReceiptCount = 4 }, "does not match anchor bundle"},
+		{"count zero", func(b *anchorpkg.Bundle) { b.Checkpoint.ReceiptCount = 0 }, "covers no receipts"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := bundle
+			tc.mutate(&mutated)
+			path := filepath.Join(t.TempDir(), "mutated-bundle.json")
+			if err := anchorpkg.WriteBundle(path, mutated); err != nil {
+				t.Fatalf("WriteBundle: %v", err)
+			}
+			stdout, stderr, code := runRoot(t, "independent", evidence,
+				"--bundle", path,
+				"--key", fix.keyHex,
+				"--local-log", logPath,
+				"--log-id", "verifier-test-log",
+			)
+			if code == cliutil.ExitOK {
+				t.Fatalf("mutated bundle verified: stdout=%q stderr=%q", stdout, stderr)
+			}
+			if !strings.Contains(stderr, tc.wantErr) {
+				t.Fatalf("stderr = %q, want %q", stderr, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -1086,12 +1340,12 @@ func TestChain_ActionWithoutKeyFailsUnpinned(t *testing.T) {
 	fix.writePacketDir(t, dir, nil)
 	evidence := filepath.Join(dir, "evidence.jsonl")
 
-	stdout, stderr, code := runRoot(t, "chain", evidence)
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("unpinned action chain should fail, stdout=%q stderr=%q", stdout, stderr)
 	}
 	if !strings.Contains(stderr, "CHAIN UNPINNED") {
-		t.Fatalf("stderr = %q, want CHAIN UNPINNED", stderr)
+		t.Fatalf("stderr = %q, want prefix status", stderr)
 	}
 	if !strings.Contains(stderr, unpinnedReceiptBanner) {
 		t.Fatalf("stderr = %q, want unpinned warning", stderr)
@@ -1192,12 +1446,12 @@ func TestChain_ActionAllowUnpinned(t *testing.T) {
 	fix.writePacketDir(t, dir, nil)
 	evidence := filepath.Join(dir, "evidence.jsonl")
 
-	stdout, stderr, code := runRoot(t, "chain", "--allow-unpinned", evidence)
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--allow-unpinned", evidence)
 	if code != cliutil.ExitOK {
 		t.Fatalf("allow-unpinned action chain should pass, stdout=%q stderr=%q", stdout, stderr)
 	}
-	if !strings.Contains(stdout, "CHAIN UNPINNED") {
-		t.Fatalf("stdout = %q, want CHAIN UNPINNED", stdout)
+	if !strings.Contains(stdout, "VALID PREFIX, END UNPROVEN") {
+		t.Fatalf("stdout = %q, want prefix status", stdout)
 	}
 	if !strings.Contains(stdout, "warning:") {
 		t.Fatalf("stdout = %q, want warning", stdout)
@@ -1224,7 +1478,7 @@ func TestChain_TamperedSignature(t *testing.T) {
 		t.Fatalf("write tampered: %v", err)
 	}
 
-	_, stderr, code := runRoot(t, "chain", evidence)
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("tampered chain should fail")
 	}
@@ -1240,7 +1494,7 @@ func TestChain_JSONOutput(t *testing.T) {
 	fix.writePacketDir(t, dir, nil)
 	evidence := filepath.Join(dir, "evidence.jsonl")
 
-	stdout, _, code := runRoot(t, "chain", "--key", fix.keyHex, "--json", evidence)
+	stdout, _, code := runRoot(t, "chain", "--allow-prefix", "--key", fix.keyHex, "--json", evidence)
 	if code != cliutil.ExitOK {
 		t.Fatalf("valid chain --json should pass")
 	}
@@ -1256,7 +1510,7 @@ func TestChain_JSONOutput(t *testing.T) {
 func TestChain_DirAsFileFails(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	_, stderr, code := runRoot(t, "chain", dir)
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", dir)
 	if code == cliutil.ExitOK {
 		t.Fatalf("passing a dir without --dir should fail, stderr=%q", stderr)
 	}
@@ -1264,7 +1518,7 @@ func TestChain_DirAsFileFails(t *testing.T) {
 
 func TestChain_NotFound(t *testing.T) {
 	t.Parallel()
-	_, _, code := runRoot(t, "chain", filepath.Join(t.TempDir(), "missing.jsonl"))
+	_, _, code := runRoot(t, "chain", "--allow-prefix", filepath.Join(t.TempDir(), "missing.jsonl"))
 	if code == cliutil.ExitOK {
 		t.Fatalf("missing file should fail")
 	}
@@ -1830,7 +2084,7 @@ func TestUsageErrorsExit64(t *testing.T) {
 		args []string
 	}{
 		{name: "missing subcommand", args: []string{"audit-packet"}},
-		{name: "unknown flag", args: []string{"chain", "--definitely-not-a-flag", "evidence.jsonl"}},
+		{name: "unknown flag", args: []string{"chain", "--allow-prefix", "--definitely-not-a-flag", "evidence.jsonl"}},
 		{name: "unknown command", args: []string{"definitely-not-a-command"}},
 	}
 
@@ -2007,7 +2261,7 @@ func TestChain_DirMode(t *testing.T) {
 	if err := os.Rename(src, dst); err != nil {
 		t.Fatalf("rename: %v", err)
 	}
-	stdout, _, code := runRoot(t, "chain", "--key", fix.keyHex, "--dir", dir)
+	stdout, _, code := runRoot(t, "chain", "--allow-prefix", "--key", fix.keyHex, "--dir", dir)
 	if code != cliutil.ExitOK {
 		t.Fatalf("--dir mode should pass, stdout=%q", stdout)
 	}
@@ -2037,8 +2291,7 @@ func TestChain_DirModeSelectedParentWithNestedLocation(t *testing.T) {
 		t.Fatalf("write nested evidence: %v", err)
 	}
 
-	stdout, stderr, code := runRoot(t,
-		"chain", "--dir",
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir",
 		"--location", filepath.ToSlash(locationID),
 		"--key", fix.keyHex,
 		root,
@@ -2058,7 +2311,7 @@ func TestChain_WithExplicitKey(t *testing.T) {
 		t.Fatalf("write key: %v", err)
 	}
 	evidence := filepath.Join(dir, "evidence.jsonl")
-	_, _, code := runRoot(t, "chain", "--key", keyPath, evidence)
+	_, _, code := runRoot(t, "chain", "--allow-prefix", "--key", keyPath, evidence)
 	if code != cliutil.ExitOK {
 		t.Fatalf("chain --key should pass")
 	}
@@ -2071,8 +2324,7 @@ func TestChain_EvidenceV2PinnedKey(t *testing.T) {
 	evidence := filepath.Join(dir, "evidence.jsonl")
 	fix.writeEvidenceJSONL(t, evidence)
 
-	stdout, stderr, code := runRoot(t,
-		"chain",
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix",
 		"--key", fix.keyHex,
 		"--expect-signer-id", fix.keyHex,
 		"--expect-payload-kind", string(contractreceipt.PayloadShadowDelta),
@@ -2094,12 +2346,12 @@ func TestChain_EvidenceV2WithoutKeyFailsUnpinned(t *testing.T) {
 	evidence := filepath.Join(dir, "evidence.jsonl")
 	fix.writeEvidenceJSONL(t, evidence)
 
-	stdout, stderr, code := runRoot(t, "chain", evidence)
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("unpinned v2 chain should fail, stdout=%q stderr=%q", stdout, stderr)
 	}
 	if !strings.Contains(stderr, "CHAIN UNPINNED") {
-		t.Fatalf("stderr = %q, want CHAIN UNPINNED", stderr)
+		t.Fatalf("stderr = %q, want prefix status", stderr)
 	}
 }
 
@@ -2110,12 +2362,12 @@ func TestChain_EvidenceV2AllowUnpinned(t *testing.T) {
 	evidence := filepath.Join(dir, "evidence.jsonl")
 	fix.writeEvidenceJSONL(t, evidence)
 
-	stdout, stderr, code := runRoot(t, "chain", "--allow-unpinned", evidence)
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--allow-unpinned", evidence)
 	if code != cliutil.ExitOK {
 		t.Fatalf("allow-unpinned v2 chain should pass, stdout=%q stderr=%q", stdout, stderr)
 	}
-	if !strings.Contains(stdout, "CHAIN UNPINNED") {
-		t.Fatalf("stdout = %q, want CHAIN UNPINNED", stdout)
+	if !strings.Contains(stdout, "VALID PREFIX, END UNPROVEN") {
+		t.Fatalf("stdout = %q, want prefix status", stdout)
 	}
 	if !strings.Contains(stdout, "signatures: not checked") {
 		t.Fatalf("stdout = %q, want signatures not checked", stdout)
@@ -2126,9 +2378,9 @@ func TestChain_EvidenceAliasDirMode(t *testing.T) {
 	t.Parallel()
 	fix := newEvidenceFixture(t, 2)
 	dir := t.TempDir()
-	fix.writeEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
+	fix.writeRecorderEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
 
-	stdout, stderr, code := runRoot(t, "evidence", "--dir", "--key", fix.keyHex, dir)
+	stdout, stderr, code := runRoot(t, "evidence", "--allow-prefix", "--dir", "--key", fix.keyHex, dir)
 	if code != cliutil.ExitOK {
 		t.Fatalf("v2 evidence alias dir mode should pass, stdout=%q stderr=%q", stdout, stderr)
 	}
@@ -2145,7 +2397,7 @@ func TestChain_EvidenceV2WrongPinnedKey(t *testing.T) {
 	evidence := filepath.Join(dir, "evidence.jsonl")
 	forged.writeEvidenceJSONL(t, evidence)
 
-	_, stderr, code := runRoot(t, "chain", "--key", legit.keyHex, evidence)
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", "--key", legit.keyHex, evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("v2 chain signed by wrong key should fail, stderr=%q", stderr)
 	}
@@ -2157,7 +2409,7 @@ func TestChain_BadKey(t *testing.T) {
 	dir := t.TempDir()
 	fix.writePacketDir(t, dir, nil)
 	evidence := filepath.Join(dir, "evidence.jsonl")
-	_, _, code := runRoot(t, "chain", "--key", "not-a-key", evidence)
+	_, _, code := runRoot(t, "chain", "--allow-prefix", "--key", "not-a-key", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("invalid key should fail")
 	}
@@ -2170,7 +2422,7 @@ func TestChain_EmptyChain(t *testing.T) {
 	if err := os.WriteFile(evidence, []byte(""), 0o600); err != nil {
 		t.Fatalf("write empty: %v", err)
 	}
-	_, _, code := runRoot(t, "chain", evidence)
+	_, _, code := runRoot(t, "chain", "--allow-prefix", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("empty chain should fail")
 	}
@@ -2462,7 +2714,7 @@ func TestChain_EvidenceV2MalformedLine(t *testing.T) {
 	_, _ = f.WriteString(`{"type":"evidence_receipt","detail":"not-an-object"}` + "\n")
 	_ = f.Close()
 
-	_, stderr, code := runRoot(t, "chain", evidence)
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("malformed evidence line should cause chain failure, stderr=%q", stderr)
 	}
@@ -2472,10 +2724,9 @@ func TestChain_EvidenceV2DirHappyPath(t *testing.T) {
 	t.Parallel()
 	fix := newEvidenceFixture(t, 3)
 	dir := t.TempDir()
-	fix.writeEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
+	fix.writeRecorderEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
 
-	stdout, stderr, code := runRoot(t,
-		"chain", "--dir",
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir",
 		"--key", fix.keyHex,
 		"--expect-signer-id", fix.keyHex,
 		dir,
@@ -2488,6 +2739,78 @@ func TestChain_EvidenceV2DirHappyPath(t *testing.T) {
 	}
 }
 
+func TestChain_DirRejectsDisconnectedNonReceiptShard(t *testing.T) {
+	t.Parallel()
+	fix := newEvidenceFixture(t, 2)
+	dir := t.TempDir()
+	fix.writeRecorderEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir", "--key", fix.keyHex, dir)
+	if code != cliutil.ExitOK {
+		t.Fatalf("positive control: %s", stderr)
+	}
+	entry := recorder.Entry{
+		Version: recorder.CurrentWriteEntryVersion, Sequence: 99,
+		Timestamp: time.Now().UTC(), SessionID: "proxy", Type: "decision",
+		PrevHash: recorder.GenesisHash,
+	}
+	entry.Hash = recorder.ComputeHash(entry)
+	line, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "evidence-proxy-9999.jsonl"), append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir", "--key", fix.keyHex, dir)
+	if code == cliutil.ExitOK || strings.Contains(stdout, "VALID PREFIX, END UNPROVEN") || !strings.Contains(stderr, "chain break: PrevHash") {
+		t.Fatalf("disconnected shard: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+}
+
+func TestChain_BareEvidenceDirectoryCompatibility(t *testing.T) {
+	t.Parallel()
+	fix := newEvidenceFixture(t, 2)
+	dir := t.TempDir()
+	fix.writeEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-0.jsonl"))
+	stdout, stderr, code := runRoot(t, "evidence", "--allow-prefix", "--dir", "--key", fix.keyHex, dir)
+	if code != cliutil.ExitOK || !strings.Contains(stdout, "record_type: evidence_receipt_v2") {
+		t.Fatalf("bare evidence directory: code=%d stdout=%s stderr=%s", code, stdout, stderr)
+	}
+}
+
+func TestChain_BareEvidenceCannotHideRecorderEntries(t *testing.T) {
+	t.Parallel()
+	for _, extra := range []string{"metadata", "mixed", "decision", "duplicate"} {
+		t.Run(extra, func(t *testing.T) {
+			fix := newEvidenceFixture(t, 2)
+			dir := t.TempDir()
+			path := filepath.Join(dir, "evidence-proxy-0.jsonl")
+			fix.writeEvidenceJSONL(t, path)
+			data, err := os.ReadFile(filepath.Clean(path))
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch extra {
+			case "metadata":
+				data = bytes.Replace(data, []byte(`{"`), []byte(`{"v":null,"`), 1)
+			case "mixed":
+				fix.writeRecorderEvidenceJSONL(t, filepath.Join(dir, "evidence-proxy-99.jsonl"))
+			case "decision":
+				data = append(data, []byte("{\"type\":\"decision\",\"detail\":{}}\n")...)
+			case "duplicate":
+				data = bytes.Replace(data, []byte(`{"`), []byte(`{"type":"decision","`), 1)
+			}
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runRoot(t, "evidence", "--allow-prefix", "--dir", "--key", fix.keyHex, dir)
+			if code == cliutil.ExitOK || strings.Contains(stdout, "VALID PREFIX, END UNPROVEN") {
+				t.Fatalf("invalid evidence accepted: stdout=%s stderr=%s", stdout, stderr)
+			}
+		})
+	}
+}
+
 func TestChain_EvidenceV2DirLocationSelector(t *testing.T) {
 	t.Parallel()
 	fix := newEvidenceFixture(t, 3)
@@ -2497,10 +2820,9 @@ func TestChain_EvidenceV2DirLocationSelector(t *testing.T) {
 	if err := os.MkdirAll(locationDir, 0o750); err != nil {
 		t.Fatalf("create selected location: %v", err)
 	}
-	fix.writeEvidenceJSONL(t, filepath.Join(locationDir, "evidence-proxy-0.jsonl"))
+	fix.writeRecorderEvidenceJSONL(t, filepath.Join(locationDir, "evidence-proxy-0.jsonl"))
 
-	stdout, stderr, code := runRoot(t,
-		"chain", "--dir",
+	stdout, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir",
 		"--location", filepath.ToSlash(locationID),
 		"--key", fix.keyHex,
 		"--expect-signer-id", fix.keyHex,
@@ -2512,7 +2834,7 @@ func TestChain_EvidenceV2DirLocationSelector(t *testing.T) {
 	if !strings.Contains(stdout, "signatures: verified") {
 		t.Errorf("expected signatures verified, got stdout=%q", stdout)
 	}
-	stdout, stderr, code = runRoot(t, "chain", "--dir", "--key", fix.keyHex, root)
+	stdout, stderr, code = runRoot(t, "chain", "--allow-prefix", "--dir", "--key", fix.keyHex, root)
 	if code != cliutil.ExitOK {
 		t.Fatalf("implicit location should pass, stdout=%q stderr=%q", stdout, stderr)
 	}
@@ -2520,8 +2842,8 @@ func TestChain_EvidenceV2DirLocationSelector(t *testing.T) {
 	if err := os.MkdirAll(nestedDir, 0o750); err != nil {
 		t.Fatalf("create nested location: %v", err)
 	}
-	fix.writeEvidenceJSONL(t, filepath.Join(nestedDir, "evidence-proxy-0.jsonl"))
-	stdout, stderr, code = runRoot(t, "chain", "--dir", "--location", filepath.ToSlash(locationID), "--key", fix.keyHex, root)
+	fix.writeRecorderEvidenceJSONL(t, filepath.Join(nestedDir, "evidence-proxy-0.jsonl"))
+	stdout, stderr, code = runRoot(t, "chain", "--allow-prefix", "--dir", "--location", filepath.ToSlash(locationID), "--key", fix.keyHex, root)
 	if code != cliutil.ExitOK {
 		t.Fatalf("selected parent location should not be resolved twice, stdout=%q stderr=%q", stdout, stderr)
 	}
@@ -2548,7 +2870,7 @@ func TestChain_EvidenceV2DirMalformed(t *testing.T) {
 	if err := os.WriteFile(bad, []byte("not valid jsonl\n"), 0o600); err != nil {
 		t.Fatalf("write bad: %v", err)
 	}
-	_, stderr, code := runRoot(t, "chain", "--dir", dir)
+	_, stderr, code := runRoot(t, "chain", "--allow-prefix", "--dir", dir)
 	if code == cliutil.ExitOK {
 		t.Fatalf("malformed dir evidence should fail, stderr=%q", stderr)
 	}
@@ -2584,7 +2906,7 @@ func TestChain_EvidenceV2ExpectMismatch(t *testing.T) {
 			dir := t.TempDir()
 			evidence := filepath.Join(dir, "evidence.jsonl")
 			fix.writeEvidenceJSONL(t, evidence)
-			args := append([]string{"chain", "--key", fix.keyHex}, tt.args...)
+			args := append([]string{"chain", "--allow-prefix", "--key", fix.keyHex}, tt.args...)
 			args = append(args, evidence)
 			_, stderr, code := runRoot(t, args...)
 			if code == cliutil.ExitOK {
@@ -2784,7 +3106,7 @@ func TestChain_EvidenceV2WithExpectFlagsOnV1Fails(t *testing.T) {
 
 	// Pass --expect-signer-id on a v1 chain. The chain subcommand should
 	// reject the mismatch and exit non-zero.
-	_, _, code := runRoot(t, "chain", "--expect-signer-id", "some-id", evidence)
+	_, _, code := runRoot(t, "chain", "--allow-prefix", "--expect-signer-id", "some-id", evidence)
 	if code == cliutil.ExitOK {
 		t.Fatalf("v2 expect flags on v1 chain should fail")
 	}

@@ -6,7 +6,6 @@ package config
 import (
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidateReload_ForwarderDestinationAllowlistExpanded(t *testing.T) {
@@ -282,6 +281,9 @@ func TestValidateReload_QueryEntropyParamExclusionsAdded(t *testing.T) {
 		if !strings.Contains(w.Message, "only query-value entropy coverage is reduced") {
 			t.Fatalf("reload warning message = %q, want query-value-only warning", w.Message)
 		}
+		if w.Disposition != "" {
+			t.Fatalf("addition disposition = %q, want rejectable zero value", w.Disposition)
+		}
 	}
 	if !found {
 		t.Fatal("expected query entropy param exclusion reload warning")
@@ -289,16 +291,7 @@ func TestValidateReload_QueryEntropyParamExclusionsAdded(t *testing.T) {
 }
 
 func TestValidateReload_QueryEntropyParamExclusionsMetadataOnlyNoWarning(t *testing.T) {
-	// Read the clock ONCE and derive the earlier date from the later one. Two
-	// independent calls can straddle a UTC midnight and return the same day,
-	// which silently collapses the distinct Expires values this test relies on
-	// to prove that an expiry change is metadata.
 	expires := temporaryExpiryDate(MaxQueryEntropyParamExclusionHorizon)
-	expiresAt, err := time.Parse(time.DateOnly, expires)
-	if err != nil {
-		t.Fatalf("parse generated expiry %q: %v", expires, err)
-	}
-	earlier := expiresAt.AddDate(0, 0, -1).Format(time.DateOnly)
 
 	old := Defaults()
 	old.FetchProxy.Monitoring.QueryEntropyParamExclusions = []QueryEntropyParamExclusion{{
@@ -308,7 +301,7 @@ func TestValidateReload_QueryEntropyParamExclusionsMetadataOnlyNoWarning(t *test
 		Param:   "query",
 		Reason:  "initial reason",
 		Owner:   "platform-security",
-		Expires: earlier,
+		Expires: expires,
 	}}
 	updated := Defaults()
 	updated.FetchProxy.Monitoring.QueryEntropyParamExclusions = []QueryEntropyParamExclusion{{
@@ -351,9 +344,24 @@ func TestValidateReload_QueryEntropyParamExclusionsRemoved(t *testing.T) {
 		if !strings.Contains(w.Message, "again be subject to query-value entropy blocks") {
 			t.Fatalf("reload warning message = %q, want restored entropy-block warning", w.Message)
 		}
+		if w.Disposition != ReloadWarningDispositionAdvisory {
+			t.Fatalf("removal disposition = %q, want advisory", w.Disposition)
+		}
 	}
 	if !found {
 		t.Fatal("expected query entropy param exclusion removal reload warning")
+	}
+}
+
+func TestReloadWarningDispositionDefaultsRejectable(t *testing.T) {
+	unknown := ReloadWarning{Field: "future.warning", Message: "unclassified"}
+	if unknown.Disposition != "" {
+		t.Fatalf("unknown disposition = %q, want rejectable zero value", unknown.Disposition)
+	}
+
+	advisory := advisoryReloadWarning("startup.only", "requires restart")
+	if advisory.Disposition != ReloadWarningDispositionAdvisory {
+		t.Fatalf("advisory disposition = %q, want %q", advisory.Disposition, ReloadWarningDispositionAdvisory)
 	}
 }
 

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -32,6 +33,28 @@ const (
 	testTrustedProviderHost = "api.vendor.example"
 	testTrustedProviderPath = "/v1/provider/responses"
 )
+
+func TestBodyEntropyOnlyAdaptiveClassification(t *testing.T) {
+	finding := &ContentEntropyFinding{}
+	cases := []struct {
+		name   string
+		result BodyScanResult
+		want   bool
+	}{
+		{"entropy", BodyScanResult{EntropyFinding: finding}, true},
+		{"mixed DLP", BodyScanResult{EntropyFinding: finding, DLPMatches: []scanner.TextDLPMatch{{}}}, false},
+		{"mixed injection", BodyScanResult{EntropyFinding: finding, InjectionMatches: []scanner.ResponseMatch{{}}}, false},
+		{"fail closed", BodyScanResult{EntropyFinding: finding, RedactionBlockReason: "failed"}, false},
+		{"redacted DLP", BodyScanResult{EntropyFinding: finding, RedactedDLPOnly: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.result.IsEntropyOnly(); got != tc.want {
+				t.Fatalf("IsEntropyOnly() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
 
 // testScannerConfig returns a config suitable for body scan tests.
 // SSRF is disabled (Internal=nil) to avoid DNS lookups in unit tests.
@@ -53,6 +76,13 @@ func testScannerConfig() *config.Config {
 // on the test source itself.
 func fakeAPIKey() string {
 	return "AKIA" + "IOSFODNN7EXAMPLE"
+}
+
+// fakeNonCoreAPIKey returns a critical credential that is outside the core
+// floor (Anthropic API Key), so audit-mode tests can observe it without the
+// core-credential block that applies to fakeAPIKey (AWS Access ID).
+func fakeNonCoreAPIKey() string {
+	return "sk-ant-" + "IOSFODNN7EXAMPLE1234567890abcdef"
 }
 
 func TestScanRequestBodyCanceledScanIsNotInjection(t *testing.T) {
@@ -195,7 +225,7 @@ func TestScanRequestBody_ContentEntropy(t *testing.T) {
 			host: "uploads.vendor.example",
 			body: fmt.Sprintf(`{"blob":%q}`, opaqueHighEntropyBodyValue()),
 			modify: func(cfg *config.Config) {
-				cfg.RequestBodyScanning.ContentEntropyExclusions = []string{"uploads.vendor.example"}
+				cfg.RequestBodyScanning.ContentEntropyExclusions = config.EntropyHostExclusions("uploads.vendor.example")
 			},
 			wantHit: false,
 		},
@@ -302,7 +332,7 @@ func TestScanRequestBody_ContentEntropyWarnDoesNotHidePromptInjectionBlock(t *te
 		ContentEntropyThreshold:  cfg.RequestBodyScanning.ContentEntropyThreshold,
 		ContentEntropyMinLength:  cfg.RequestBodyScanning.ContentEntropyMinLength,
 		ContentEntropyTrusted:    cfg.TrustedDomains,
-		ContentEntropyExclusions: cfg.RequestBodyScanning.ContentEntropyExclusions,
+		ContentEntropyExclusions: config.ActiveEntropyExclusionHosts(cfg.RequestBodyScanning.ContentEntropyExclusions, time.Now()),
 	})
 
 	if result.Clean {
@@ -344,7 +374,7 @@ func TestScanRequestBody_DLPWarnDoesNotHideEntropyBlock(t *testing.T) {
 		ContentEntropyThreshold:  cfg.RequestBodyScanning.ContentEntropyThreshold,
 		ContentEntropyMinLength:  cfg.RequestBodyScanning.ContentEntropyMinLength,
 		ContentEntropyTrusted:    cfg.TrustedDomains,
-		ContentEntropyExclusions: cfg.RequestBodyScanning.ContentEntropyExclusions,
+		ContentEntropyExclusions: config.ActiveEntropyExclusionHosts(cfg.RequestBodyScanning.ContentEntropyExclusions, time.Now()),
 	})
 
 	if result.Clean {
@@ -680,6 +710,103 @@ func TestRequestDLPPatternControlsAcrossTransports(t *testing.T) {
 	t.Run("reverse", func(t *testing.T) {
 		runReverseHeaderDLPPatternControls(t)
 	})
+}
+
+func TestHeaderDLPDecisionJWTSessionCookieFollowsConfiguredAction(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Mode = config.ModeStrict
+	cfg.RequestBodyScanning.Action = config.ActionBlock
+
+	jwt := scanner.TextDLPMatch{PatternName: "JWT Token", Severity: config.SeverityCritical}
+	// A JWT in Cookie follows the configured header action like any other
+	// finding. The only automatic exception for session cookies is the
+	// issuer-bound omission, which removes the pair before a decision is made.
+	encodedJWT := jwt
+	encodedJWT.Encoded = "base64"
+	// A warn-level match is not hard-blocked regardless of severity, so it
+	// shows the configured action being honored rather than the critical floor.
+	softJWT := jwt
+	softJWT.Warn = true
+	aws := scanner.TextDLPMatch{PatternName: "AWS Access ID", Severity: config.SeverityCritical}
+
+	tests := []struct {
+		name       string
+		result     *BodyScanResult
+		wantAction string
+		wantHard   bool
+	}{
+		{
+			name:       "nil result is clean",
+			wantAction: "",
+		},
+		{
+			name: "JWT in Cookie follows a configured block",
+			result: &BodyScanResult{
+				Action:     config.ActionBlock,
+				DLPMatches: []scanner.TextDLPMatch{jwt},
+				HeaderName: "Cookie",
+			},
+			wantAction: config.ActionBlock,
+			wantHard:   true,
+		},
+		{
+			name: "JWT in Cookie with no result action takes the config action",
+			result: &BodyScanResult{
+				DLPMatches: []scanner.TextDLPMatch{jwt},
+				HeaderName: "Cookie",
+			},
+			wantAction: config.ActionBlock,
+			wantHard:   true,
+		},
+		{
+			name: "JWT in Cookie follows a configured warn",
+			result: &BodyScanResult{
+				Action:     config.ActionWarn,
+				DLPMatches: []scanner.TextDLPMatch{softJWT},
+				HeaderName: "Cookie",
+			},
+			wantAction: config.ActionWarn,
+		},
+		{
+			name: "JWT in Authorization still blocks",
+			result: &BodyScanResult{
+				Action:     config.ActionBlock,
+				DLPMatches: []scanner.TextDLPMatch{jwt},
+				HeaderName: "Authorization",
+			},
+			wantAction: config.ActionBlock,
+			wantHard:   true,
+		},
+		{
+			name: "encoded JWT in Cookie still blocks",
+			result: &BodyScanResult{
+				Action:     config.ActionBlock,
+				DLPMatches: []scanner.TextDLPMatch{encodedJWT},
+				HeaderName: "Cookie",
+			},
+			wantAction: config.ActionBlock,
+			wantHard:   true,
+		},
+		{
+			name: "another secret alongside Cookie JWT still blocks",
+			result: &BodyScanResult{
+				Action:     config.ActionBlock,
+				DLPMatches: []scanner.TextDLPMatch{jwt, aws},
+				HeaderName: "Cookie",
+			},
+			wantAction: config.ActionBlock,
+			wantHard:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action, hard := headerDLPDecision(tt.result, cfg)
+			if action != tt.wantAction || hard != tt.wantHard {
+				t.Fatalf("headerDLPDecision() = (%q, %v), want (%q, %v)", action, hard, tt.wantAction, tt.wantHard)
+			}
+		})
+	}
 }
 
 func requestDLPPatternControlCases() []struct {
@@ -1384,6 +1511,41 @@ func TestScanRequestBody_SeedPhraseDoesNotSpanJSONFields(t *testing.T) {
 	})
 	if !result.Clean {
 		t.Fatalf("seed phrase detector must not synthesize mnemonic across fields: %+v", result)
+	}
+}
+
+// TestScanRequestBody_SeedPhraseQuoted covers request body scanning when the
+// phrase arrives with quotes glued to its first and last word: a text body
+// carrying JSON, and a JSON field whose value is itself serialized JSON.
+func TestScanRequestBody_SeedPhraseQuoted(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	phrase := "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+	cases := []struct {
+		name        string
+		body        string
+		contentType string
+	}{
+		{"text body JSON string", `"` + phrase + `"`, "text/plain"},
+		{"text body JSON object", `{"mnemonic":"` + phrase + `"}`, "text/plain"},
+		{"text body single quotes", "'" + phrase + "'", "text/plain"},
+		{"JSON field holding serialized JSON", `{"payload":"{\"mnemonic\":\"` + phrase + `\"}"}`, contentTypeJSON},
+		{"JSON field holding quoted phrase", `{"payload":"\"` + phrase + `\""}`, contentTypeJSON},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, result := scanRequestBody(context.Background(), BodyScanRequest{
+				Body:        strings.NewReader(tc.body),
+				ContentType: tc.contentType,
+				MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
+				Scanner:     sc,
+			})
+			if result.Clean {
+				t.Fatalf("quoted seed phrase in request body not detected: %s", tc.body)
+			}
+		})
 	}
 }
 
@@ -3117,7 +3279,7 @@ func TestForwardProxy_BodyScan_WarnMode(t *testing.T) {
 	})
 	defer cleanup()
 
-	body := `{"key": "` + fakeAPIKey() + `"}`
+	body := `{"key": "` + fakeNonCoreAPIKey() + `"}`
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, upstream.URL+"/test", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
@@ -3218,6 +3380,35 @@ func TestForwardProxy_GzipContentEncoding_Blocked(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Fatalf("expected 403 for gzip body, got %d", resp.StatusCode)
+	}
+}
+
+func TestForwardProxy_RepeatedContentEncodingBlocked(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	proxyAddr, cleanup := setupForwardProxy(t, func(cfg *config.Config) {
+		cfg.RequestBodyScanning.Enabled = true
+		cfg.RequestBodyScanning.Action = config.ActionBlock
+	})
+	defer cleanup()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, upstream.URL+"/test", strings.NewReader("encoded body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Add("Content-Encoding", "identity")
+	req.Header.Add("Content-Encoding", "gzip")
+	client := &http.Client{Transport: &http.Transport{Proxy: func(_ *http.Request) (*url.URL, error) {
+		return &url.URL{Scheme: "http", Host: proxyAddr}, nil
+	}}}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("repeated encoding should block, got %d", resp.StatusCode)
 	}
 }
 
@@ -3458,7 +3649,7 @@ func TestFetchHandler_HeaderDLPMetricUsesProfileLabel(t *testing.T) {
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+upstream.URL, nil)
 	req.Header.Set(AgentHeader, "arbitrary-attacker-chosen-name")
-	req.Header.Set("Authorization", "Bearer "+fakeAPIKey())
+	req.Header.Set("Authorization", "Bearer "+fakeNonCoreAPIKey())
 	w := httptest.NewRecorder()
 
 	p.handleFetch(w, req)
@@ -3500,7 +3691,7 @@ func TestFetchHandler_HeaderScan_WarnMode(t *testing.T) {
 	}
 
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/fetch?url="+upstream.URL, nil)
-	req.Header.Set("Authorization", "Bearer "+fakeAPIKey())
+	req.Header.Set("Authorization", "Bearer "+fakeNonCoreAPIKey())
 	w := httptest.NewRecorder()
 
 	p.handleFetch(w, req)
@@ -3616,6 +3807,31 @@ func TestScanRequestBody_OverDepthJSON_FailClosed(t *testing.T) {
 	}
 	if result.Reason != "JSON body exceeds maximum inspectable nesting depth" {
 		t.Fatalf("Reason = %q, want over-depth JSON reason", result.Reason)
+	}
+}
+
+// TestScanRequestBody_BeyondDecoderDepthJSON_FailClosed covers nesting past
+// Go 1.27's json.Decoder limit of 10000 levels. There the body is refused by a
+// decoder error rather than by the inspectable-depth check, so the reason text
+// differs by Go release; the block must not.
+func TestScanRequestBody_BeyondDecoderDepthJSON_FailClosed(t *testing.T) {
+	cfg := testScannerConfig()
+	sc := scanner.MustNew(cfg)
+	defer sc.Close()
+
+	const depth = 12000
+	body := strings.Repeat("[", depth) + `"depth-regression-sentinel"` + strings.Repeat("]", depth)
+	_, result := scanRequestBody(context.Background(), BodyScanRequest{
+		Body:        strings.NewReader(body),
+		ContentType: "application/json",
+		MaxBytes:    cfg.RequestBodyScanning.MaxBodyBytes,
+		Scanner:     sc,
+	})
+	if result.Clean {
+		t.Fatal("expected fail-closed block for JSON nested past the decoder limit")
+	}
+	if result.Action != config.ActionBlock {
+		t.Fatalf("Action = %q, want %q", result.Action, config.ActionBlock)
 	}
 }
 

@@ -10,9 +10,13 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
 	"github.com/luckyPipewrench/pipelock/internal/config"
@@ -23,6 +27,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/mcp/policy"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
+	"github.com/luckyPipewrench/pipelock/internal/testwait"
 )
 
 const (
@@ -111,6 +116,12 @@ func mcpLiveLockOpts(t *testing.T, mode contractruntime.Mode, rules ...contract.
 
 func mcpLiveLockConfig(t *testing.T) *config.Config {
 	t.Helper()
+	cfg, _ := mcpLiveLockConfigWithFixture(t)
+	return cfg
+}
+
+func mcpLiveLockConfigWithFixture(t *testing.T) (*config.Config, contractruntimetest.Fixture) {
+	t.Helper()
 	fixture := contractruntimetest.NewFixture(t)
 	storeDir := t.TempDir()
 	env := contractruntimetest.Env()
@@ -129,7 +140,7 @@ func mcpLiveLockConfig(t *testing.T) *config.Config {
 	cfg.LearnLock.PinnedRootFingerprint = fixture.RootFingerprint()
 	cfg.LearnLock.Environment = config.LearnLockEnvironment{ID: env.ID, Tenant: env.Tenant, DeploymentID: env.DeploymentID}
 	cfg.LearnLock.MinimumSignatures = 1
-	return cfg
+	return cfg, fixture
 }
 
 func mcpToolCall(tool, args string) string {
@@ -271,26 +282,27 @@ func TestMCPContractBlockReasonHelpers(t *testing.T) {
 		t.Fatalf("default scanner reason = %s", got)
 	}
 	for _, tt := range []struct {
-		scanner string
-		want    blockreason.Reason
+		result scanner.Result
+		want   blockreason.Reason
 	}{
-		{scanner.ScannerScheme, blockreason.SchemeBlocked},
-		{scanner.ScannerBlocklist, blockreason.DomainBlocklist},
-		{scanner.ScannerSSRFMetadata, blockreason.SSRFMetadata},
-		{scanner.ScannerSSRF, blockreason.SSRFPrivateIP},
-		{scanner.ScannerCoreSSRF, blockreason.SSRFPrivateIP},
-		{scanner.ScannerEntropy, blockreason.PathEntropy},
-		{scanner.ScannerSubdomainEntropy, blockreason.SubdomainEntropy},
-		{scanner.ScannerLength, blockreason.URLLength},
-		{scanner.ScannerRateLimit, blockreason.RateLimit},
-		{scanner.ScannerDataBudget, blockreason.DataBudget},
-		{scanner.ScannerDLP, blockreason.DLPMatch},
-		{scanner.ScannerCoreDLP, blockreason.DLPMatch},
-		{"unknown", blockreason.ParseError},
+		{scanner.Result{Scanner: scanner.ScannerScheme}, blockreason.SchemeBlocked},
+		{scanner.Result{Scanner: scanner.ScannerBlocklist}, blockreason.DomainBlocklist},
+		{scanner.Result{Scanner: scanner.ScannerSSRFMetadata}, blockreason.SSRFMetadata},
+		{scanner.Result{Scanner: scanner.ScannerSSRF}, blockreason.SSRFPrivateIP},
+		{scanner.Result{Scanner: scanner.ScannerCoreSSRF}, blockreason.SSRFPrivateIP},
+		{scanner.Result{Scanner: scanner.ScannerEntropy}, blockreason.PathEntropy},
+		{scanner.Result{Scanner: scanner.ScannerEntropy, Reason: `high entropy query param "sig"`}, blockreason.QueryEntropy},
+		{scanner.Result{Scanner: scanner.ScannerSubdomainEntropy}, blockreason.SubdomainEntropy},
+		{scanner.Result{Scanner: scanner.ScannerLength}, blockreason.URLLength},
+		{scanner.Result{Scanner: scanner.ScannerRateLimit}, blockreason.RateLimit},
+		{scanner.Result{Scanner: scanner.ScannerDataBudget}, blockreason.DataBudget},
+		{scanner.Result{Scanner: scanner.ScannerDLP}, blockreason.DLPMatch},
+		{scanner.Result{Scanner: scanner.ScannerCoreDLP}, blockreason.DLPMatch},
+		{scanner.Result{Scanner: "unknown"}, blockreason.ParseError},
 	} {
-		t.Run("url_reason_"+tt.scanner, func(t *testing.T) {
-			if got := mcpURLBlockReason(tt.scanner); got != tt.want {
-				t.Fatalf("mcpURLBlockReason(%q) = %s, want %s", tt.scanner, got, tt.want)
+		t.Run("url_reason_"+tt.result.Scanner+"_"+string(tt.want), func(t *testing.T) {
+			if got := mcpURLBlockReason(tt.result); got != tt.want {
+				t.Fatalf("mcpURLBlockReason(%#v) = %s, want %s", tt.result, got, tt.want)
 			}
 		})
 	}
@@ -505,7 +517,7 @@ func TestMCPHTTPListenerLiveLock_ToolCallDenialReturnsStructuredError(t *testing
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
-		<-done
+		t.Logf("goroutine result: %v", <-done)
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+ln.Addr().String(), strings.NewReader(mcpToolCall(mcpDeniedTool, "")))
@@ -678,7 +690,8 @@ func TestRunHTTPProxyLiveLock_PerMessageUpstreamEvaluationErrorReturnsStructured
 	}
 }
 
-func TestRunWSProxyLiveLock_DeniedUpstreamExitsBeforeTraffic(t *testing.T) {
+func TestRunWSProxyLiveLock_DeniedUpstreamExitsBeforeTrafficAudit(t *testing.T) {
+	logger, events := newListenerEventLogger(t)
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		upstreamHits.Add(1)
@@ -688,6 +701,7 @@ func TestRunWSProxyLiveLock_DeniedUpstreamExitsBeforeTraffic(t *testing.T) {
 	rule := contractruntimetest.HTTPEnforceRule("r-other", "api.example.com", "/", http.MethodPost)
 	err := RunWSProxy(context.Background(), strings.NewReader(mcpToolCall(mcpAllowedTool, "")+"\n"), ioDiscard{}, ioDiscard{}, wsURL(upstream),
 		MCPProxyOpts{
+			AuditLogger:    logger,
 			Scanner:        testScannerForHTTP(t),
 			ContractLoader: mcpLiveLockLoader(t, contractruntime.ModeLive, rule),
 			ContractAgent:  mcpLiveLockAgent,
@@ -699,11 +713,16 @@ func TestRunWSProxyLiveLock_DeniedUpstreamExitsBeforeTraffic(t *testing.T) {
 	if upstreamHits.Load() != 0 {
 		t.Fatalf("upstream hits = %d, want 0", upstreamHits.Load())
 	}
+	if strings.Count(events.String(), `"event":"blocked"`) != 1 || !strings.Contains(events.String(), `"transport":"mcp_ws"`) || !strings.Contains(events.String(), `"direction":"startup"`) {
+		t.Fatal(events.String())
+	}
 }
 
-func TestRunWSProxyLiveLock_UpstreamEvaluationErrorExitsBeforeTraffic(t *testing.T) {
+func TestRunWSProxyLiveLock_UpstreamEvaluationErrorExitsBeforeTrafficAudit(t *testing.T) {
+	logger, events := newListenerEventLogger(t)
 	err := RunWSProxy(context.Background(), strings.NewReader(mcpToolCall(mcpAllowedTool, "")+"\n"), ioDiscard{}, ioDiscard{}, "wss://api.example.com/mcp",
 		MCPProxyOpts{
+			AuditLogger:    logger,
 			ContractLoader: mcpLiveLockLoader(t, contractruntime.ModeLive, mcpToolRule("r-allow", nil)),
 			ContractAgent:  mcpLiveLockAgent,
 			ContractServer: mcpLiveLockServer,
@@ -711,9 +730,13 @@ func TestRunWSProxyLiveLock_UpstreamEvaluationErrorExitsBeforeTraffic(t *testing
 	if err == nil || !strings.Contains(err.Error(), mcpUpstreamEval) {
 		t.Fatalf("RunWSProxy err = %v, want %s", err, mcpUpstreamEval)
 	}
+	if strings.Count(events.String(), `"event":"blocked"`) != 1 || !strings.Contains(events.String(), `"transport":"mcp_ws"`) || !strings.Contains(events.String(), `"direction":"startup"`) {
+		t.Fatal(events.String())
+	}
 }
 
-func TestRunHTTPListenerProxyLiveLock_StartupEvaluationErrorExitsBeforeTraffic(t *testing.T) {
+func TestRunHTTPListenerProxyLiveLock_StartupEvaluationErrorExitsBeforeTrafficAudit(t *testing.T) {
+	logger, events := newListenerEventLogger(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
@@ -726,12 +749,16 @@ func TestRunHTTPListenerProxyLiveLock_StartupEvaluationErrorExitsBeforeTraffic(t
 
 	err = RunHTTPListenerProxy(ctx, ln, "https://api.example.com/mcp", ioDiscard{},
 		MCPProxyOpts{
+			AuditLogger:    logger,
 			ContractLoader: mcpLiveLockLoader(t, contractruntime.ModeLive, mcpToolRule("r-allow", nil)),
 			ContractAgent:  mcpLiveLockAgent,
 			ContractServer: mcpLiveLockServer,
 		})
 	if err == nil || !strings.Contains(err.Error(), mcpUpstreamEval) {
 		t.Fatalf("RunHTTPListenerProxy err = %v, want %s", err, mcpUpstreamEval)
+	}
+	if strings.Count(events.String(), `"event":"blocked"`) != 1 || !strings.Contains(events.String(), `"transport":"mcp_http_listener"`) || !strings.Contains(events.String(), `"direction":"startup"`) {
+		t.Fatal(events.String())
 	}
 }
 
@@ -768,7 +795,7 @@ func TestRunHTTPListenerProxyLiveLock_PerRequestUpstreamDenialReturnsStructuredE
 	t.Cleanup(func() {
 		cancel()
 		_ = ln.Close()
-		<-done
+		t.Logf("goroutine result: %v", <-done)
 	})
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+ln.Addr().String(), strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`))
@@ -991,3 +1018,55 @@ func TestMCPToolLiveLock_HTTPWarnScannerThenContractBlocks(t *testing.T) {
 type ioDiscard struct{}
 
 func (ioDiscard) Write(p []byte) (int, error) { return len(p), nil }
+
+// TestMCPContractLoaderFromConfigWatchAppliesPromotion builds the loader the
+// way `pipelock mcp proxy` does and shows a promoted manifest applying with no
+// restart once the watcher runs, and a corrupt manifest keeping the last good
+// contract.
+func TestMCPContractLoaderFromConfigWatchAppliesPromotion(t *testing.T) {
+	cfg, fixture := mcpLiveLockConfigWithFixture(t)
+	loader, err := NewContractLoaderFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("NewContractLoaderFromConfig: %v", err)
+	}
+	good := loader.Current()
+	if good == nil || good.Generation() != 1 {
+		t.Fatalf("initial current = %+v, want generation 1", good)
+	}
+	var reportedMu sync.Mutex
+	var reported []error
+	stop, err := loader.StartWatch(context.Background(), func(e error) {
+		reportedMu.Lock()
+		defer reportedMu.Unlock()
+		reported = append(reported, e)
+	})
+	if err != nil {
+		t.Fatalf("StartWatch: %v", err)
+	}
+	t.Cleanup(stop)
+
+	contractruntimetest.WriteSignedActiveStore(t, fixture, cfg.LearnLock.StoreDir, contractruntimetest.ActiveStoreOptions{
+		Agent:       mcpLiveLockAgent,
+		Rules:       []contract.Rule{mcpToolRule("r-allow", nil)},
+		Generation:  2,
+		PriorHash:   good.ManifestHash(),
+		Environment: contractruntimetest.Env(),
+	})
+	testwait.For(t, 10*time.Second, func() bool {
+		s := loader.Current()
+		return s != nil && s.Generation() == 2
+	}, "generation 2 to apply live")
+
+	applied := loader.Current()
+	if err := os.WriteFile(filepath.Join(cfg.LearnLock.StoreDir, "active.json"), []byte("{corrupt"), 0o600); err != nil {
+		t.Fatalf("write corrupt: %v", err)
+	}
+	testwait.For(t, 10*time.Second, func() bool {
+		reportedMu.Lock()
+		defer reportedMu.Unlock()
+		return len(reported) > 0
+	}, "corrupt manifest to be reported")
+	if loader.Current() != applied {
+		t.Fatal("corrupt manifest changed the enforced contract")
+	}
+}

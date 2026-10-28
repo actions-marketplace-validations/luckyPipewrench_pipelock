@@ -112,7 +112,7 @@ The combination means a tombstoned contract is operationally dead: it cannot be 
 
 ## Capture metadata hardening
 
-Every capture record carries a fixed metadata header so an offline `pipelock learn compile` or `pipelock learn shadow` run reproduces the live decision exactly: `session_id`, `event_kind`, `type: capture`, `surface`, `subsurface`, `config_hash`, `profile`, `agent`, `effective_action`, and `outcome`. The capture pipeline stamps these at every observer call site (forward, intercept, reverse, fetch, MCP HTTP, MCP stdio) so a record's policy provenance is unambiguous regardless of which transport produced it.
+Every capture record carries a fixed metadata header so an offline `pipelock learn compile` or `pipelock learn shadow` run reproduces the live decision exactly: `session_id`, `event_kind`, `type: capture`, `surface`, `subsurface`, `config_hash`, `profile`, `agent`, `effective_action`, and `outcome`. The capture pipeline stamps these at every observer call site (forward, intercept, reverse, fetch, MCP HTTP, MCP stdio) so a record's policy provenance is unambiguous regardless of which transport produced it. A cross-request (CEE) finding on MCP adds `cee_contributors`, the bounded list of JSON-RPC `id` values whose retained fragments contributed to the match; it is omitted entirely when any contributor's id cannot be recovered, so it never looks exhaustive when it is partial.
 
 When the logical session key is path-safe (printable ASCII, no traversal, fits within `captureSessionKeyMaxLen`), the on-disk session directory uses the raw key and `session_id_original` is omitted from the record — keeping it would leak the raw key (often a client IP) into every capture line for path-safe traffic. When the raw key is unsafe or overlength, the on-disk directory is hashed and `session_id_original` preserves the raw logical key inline so offline replay binds to the correct session even though the directory name is a hash.
 
@@ -225,12 +225,14 @@ pipelock signing roster build \
   --root /etc/pipelock/keys/fleet-root.json \
   --include id=activation-primary,key=/etc/pipelock/keys/activation.json,purpose=contract-activation-signing,role=operator \
   --include id=receipt-signing,key=/etc/pipelock/keys/receipt-signing.json,purpose=receipt-signing,role=runtime \
-  --include id=compile-agent-a,key=$HOME/.pipelock/agents/agent-a/id_ed25519.pub,purpose=contract-compile-signing \
-  --include id=compile-agent-b,key=$HOME/.pipelock/agents/agent-b/id_ed25519.pub,purpose=contract-compile-signing \
+  --include id=agent-a,key=$HOME/.pipelock/agents/agent-a/id_ed25519.pub,purpose=contract-compile-signing \
+  --include id=agent-b,key=$HOME/.pipelock/agents/agent-b/id_ed25519.pub,purpose=contract-compile-signing \
   --out /etc/pipelock/roster.json
 
 pipelock signing roster verify --path /etc/pipelock/roster.json --root-fingerprint sha256:<from-key-generate-output>
 ```
+
+A compile key's roster `id=` must equal the keystore agent name, because that name is the key ID that `learn compile` records in the candidate and that `learn ratify` and `learn promote` later look up in the roster. The key from `pipelock keygen agent-a` is `agent-a`, so its entry is `id=agent-a`. A different id, such as `compile-agent-a`, builds a valid roster that the later steps cannot match.
 
 The roster MUST include a `receipt-signing` entry. `pipelock learn promote` signs the lifecycle receipts with this key, and the runtime verifies them against the roster on load; if the roster does not name a `receipt-signing` key, the runtime rejects the receipts the operator just produced. The same applies to any compile signing key whose contracts you intend to promote: the agent's compile key must be in the roster the deploying runtime trusts.
 
@@ -243,7 +245,7 @@ A new contract is not enforced the moment you ratify it. Pipelock's recommended 
 1. **Observe ≥7 days of representative traffic** before compiling. Short windows produce thin-sample rules.
 2. **Run the candidate in shadow ≥3 days.** Watch the shadow-delta report for `would_have_blocked` events that match real legitimate traffic. Adjust `learn.inference.floors` or `accept_tail` annotations as needed.
 3. **Ratify per rule.** Sign each rule individually. The operator-facing review tells you which rules cleared the confidence floor and which are thin-sample.
-4. **Promote.** The active manifest swap is atomic with a compare-and-swap on `prior_manifest_hash` and a monotonic generation counter. v2.4 records the promoted manifest, the `contract_promote_intent` / `contract_promote_committed` lifecycle receipts, and the activation journal entry. Once the swap commits, the runtime picks up the new active manifest via fsnotify (100ms debounce, 2s maximum-debounce cap, fail-closed on initial reload, missed-promote recovery via accepted-history chain walk) and starts enforcing it on every gated transport. See ["Live enforcement"](#live-enforcement) below.
+4. **Promote.** The active manifest swap is atomic with a compare-and-swap on `prior_manifest_hash` and a monotonic generation counter. v2.4 records the promoted manifest, the `contract_promote_intent` / `contract_promote_committed` lifecycle receipts, and the activation journal entry. Pipelock watches the active-manifest store, so a running `pipelock run` or `pipelock mcp proxy` picks up a committed promotion within a moment, with no restart and no config reload. A promotion that the loader rejects (bad signature, generation downgrade, wrong environment, unreadable or corrupt `active.json`) is logged and the previous manifest stays in force, so a bad promote never drops a process to no contract. Loading at startup is fail-closed (an unreadable manifest stops startup rather than falling back to no contract). A loader that already holds a manifest recovers a skipped promotion by walking the accepted-history chain; a fresh start reads and validates `active.json` directly. See ["Live enforcement"](#live-enforcement) below.
 5. **Watch the receipt stream.** A spike in `contract_drift` receipts means the contract is over-fit. A spike in `opportunity_missing` health alerts means parent opportunity dropped (the agent stopped doing the thing the rule covers); auto-demotion is BLOCKED in this case so a benign change doesn't silently weaken the contract.
 
 ### Ratify safety guard
@@ -286,8 +288,9 @@ tar c -C /etc/pipelock/contracts/store \
     'cat > /tmp/store.tar && tar xf /tmp/store.tar -C /active/'
 
 # 4. Delete the shuttle pod. Pipelock pods will pick up the new
-#    active.json on next start (or on fsnotify reload if they are
-#    already running with the PVC attached).
+#    active.json on next start. Pods that are already running pick up the
+#    manifest they loaded until their watcher sees the new active.json,
+#    which normally takes under a second.
 kubectl delete pod -n <ns> shuttle
 ```
 
@@ -299,7 +302,7 @@ Once an active manifest is promoted, the runtime gates every URL-bearing transpo
 
 **Decision sequence (every gated path):**
 
-1. **Kill switch.** Any of the four kill-switch sources (config, API, SIGUSR1, sentinel file) blocks the request before any other check.
+1. **Kill switch.** Any active kill-switch source (config, API, Conductor remote kill, Conductor stale bundle, uncertain Conductor apply, SIGUSR1, or sentinel file) blocks the request before any other check.
 2. **Scanner verdict.** DLP / SSRF / injection / blocklist run as today. A scanner block returns 403 with the existing `X-Pipelock-Block-Reason` and skips contract evaluation. **Scanner block always wins over contract allow.**
 3. **No active contract.** If no manifest is active for the agent, the scanner verdict passes through unchanged.
 4. **Contract verdict.** With an active manifest, the runtime evaluates the request against the matching rule kind (`http_destination` for URL transports; `mcp_tool_call` for MCP). An allow rule passes the request; an unmatched destination is **default-deny**.
@@ -316,9 +319,17 @@ Once an active manifest is promoted, the runtime gates every URL-bearing transpo
 | Intercept proxy | yes | n/a | TLS-intercepted CONNECT path. |
 | `/fetch` | yes | n/a | Target URL from query parameter. |
 | WebSocket `/ws` | yes (handshake) | n/a | Per-frame scanning unchanged. |
-| MCP HTTP listener (`--listen --upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed; cloud metadata endpoints blocked. |
-| MCP stdio-to-HTTP bridge (`--upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed; cloud metadata endpoints blocked. |
+| MCP HTTP listener (`--listen --upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed with no active contract, or when `ssrf.ip_allowlist` covers them; see [MCP upstream URL under an active contract](#live-enforcement). Cloud metadata endpoints blocked. |
+| MCP stdio-to-HTTP bridge (`--upstream`) | yes (configured upstream) | yes (per `tools/call`) | Local/private upstreams allowed with no active contract, or when `ssrf.ip_allowlist` covers them; see [MCP upstream URL under an active contract](#live-enforcement). Cloud metadata endpoints blocked. |
 | MCP stdio subprocess wrap (`-- COMMAND`) | n/a (no remote URL) | yes (per `tools/call`) | Denied tool calls return a JSON-RPC error with block-reason metadata; subprocess is not invoked. |
+
+**MCP upstream URL under an active contract:**
+
+The upstream rows above accept a local or private upstream without any extra setting only while no contract is active. Once a manifest is active for the agent, the configured upstream URL goes through the same scanner check as any other destination, and a scanner block wins over the contract. A scanner-blocked loopback or private upstream such as `http://127.0.0.1/mcp` is refused with block reason `parse_error` and the log line `contract upstream denied` in every contract mode, until `ssrf.ip_allowlist` covers its address (for example `127.0.0.0/8`) or, for an upstream given by hostname, `trusted_domains` names that host (an IP literal never matches `trusted_domains`). Cloud metadata addresses stay blocked either way.
+
+If the scanner allows the URL, for example because `ssrf.ip_allowlist` covers a private upstream, contract-only denials apply only in live mode. Shadow and capture mode keep the scanner verdict, so that upstream passes there.
+
+In live mode, an allowed upstream also needs a contract rule for its host, and that rule is evaluated on the default port only. When a rule for the upstream's host exists and the URL carries a non-default port (for example `:8080`), the request is refused with `contract_non_default_port`, even if `ssrf.ip_allowlist` allows the address. A contract cannot permit an upstream on a non-default port, so put the upstream behind the scheme's default port (80 or 443) before enforcing a contract for it.
 
 **Block-reason vocabulary additions:**
 
@@ -330,7 +341,7 @@ Every contract decision (allow OR block) emits an EvidenceReceipt v2 envelope wi
 
 **Active-manifest reload:**
 
-The runtime watches the active-manifest store via fsnotify with a 100ms debounce window and a 2s maximum-debounce cap. Reload is fail-closed on initial load (an unreadable manifest blocks rather than silently falling back to no-contract). A missed promote (crash between `promote-intent` and `promote-committed`) is recovered by walking the accepted-history chain on next reload, so the runtime cannot strand on a stale manifest.
+Pipelock watches the active-manifest store directory (fsnotify, 100ms debounce, with a 2 second cap under sustained writes) for every process that enforces a contract, so a manifest promoted while `pipelock run` or `pipelock mcp proxy` is running applies live without a restart. The watcher swaps the loader's active set in place; every gated transport reads the current set on each decision. When a `pipelock run` config reload builds a new contract loader, its watcher replaces the previous loader's watcher and the old one is stopped. The watcher reads the store once when it arms, so a promotion committed between loader construction and watcher start isn't missed. Loading is fail-closed on startup (an unreadable manifest stops the process rather than running with no contract). After startup a rejected or unreadable promotion (bad signature, generation downgrade, wrong environment, corrupt or unreadable `active.json`) is logged and the loader keeps the last accepted manifest, so enforcement never falls back to no contract. A watcher that can't start, or that stops later because the store directory was removed, is logged and the loader keeps serving its last accepted manifest. A missed promote (crash between `promote-intent` and `promote-committed`) is recovered on the next reload of a loader that already holds a manifest, by walking the accepted-history chain. A fresh start reads and validates `active.json` directly and doesn't run that walk. Changing `learn_lock` settings is still restart-only.
 
 ## Anti-patterns
 

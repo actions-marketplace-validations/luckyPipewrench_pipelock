@@ -18,8 +18,8 @@ Pipelock sits inline. It scans MCP `tools/call` arguments outbound for DLP, scan
 ## Quick Start
 
 ```bash
-# 1. Install pipelock (requires Go 1.25+)
-git clone --branch v3.5.0 --depth 1 https://github.com/luckyPipewrench/pipelock.git
+# 1. Install pipelock (requires Go 1.26+)
+git clone --branch v3.7.0 --depth 1 https://github.com/pipelab-org/pipelock.git
 make -C pipelock install
 # or (macOS): brew install luckyPipewrench/tap/pipelock
 
@@ -29,7 +29,7 @@ pipelock cline install
 # 3. Reload VS Code so Cline picks up the wrapped configuration
 ```
 
-`pipelock cline install` discovers Cline's MCP server configuration, rewrites each entry to launch through `pipelock mcp proxy`, and is idempotent — re-running it on an already-installed setup is a no-op. Add or remove an MCP server in Cline's settings as usual, then re-run `pipelock cline install` to wrap any new entries.
+`pipelock cline install` discovers Cline's MCP server configuration, rewrites each entry to launch through `pipelock mcp proxy`, and is idempotent — re-running it on an already-installed setup is a no-op. Add or remove an MCP server in Cline's settings as usual, then re-run `pipelock cline install` to wrap any new entries. Re-running after upgrading Pipelock also recovers and re-wraps an older Pipelock-authored entry using the current binary's invocation shape; an entry it cannot safely normalize (for example one still carrying a `headers` field outside the wrapped command) is refused with a message identifying the file and entry, and nothing is changed.
 
 ## What Gets Scanned
 

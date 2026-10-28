@@ -20,9 +20,23 @@ notes and output-file confirmations go to stderr.
 
 ## Hot Reload
 
-Config changes are picked up automatically via a file watcher or a SIGHUP signal (100ms debounce). Most fields reload without restart. Fields that require a restart are marked below. Strict mode and required security controls can reject security downgrades, including expanded `trusted_domains` or `ssrf.ip_allowlist` lists. A rejected reload keeps the running configuration active and logs the refusal. Restart Pipelock to apply a refused trust expansion.
+Config changes are picked up automatically via a file watcher or a SIGHUP signal (100ms debounce). Most fields reload without restart. Fields that require a restart are marked below. Strict mode and required security controls, such as `flight_recorder.require_receipts`, can reject security downgrades, including expanded `trusted_domains` or `ssrf.ip_allowlist` lists and added entropy exclusions such as `fetch_proxy.monitoring.query_entropy_param_exclusions`. A rejected reload keeps the running configuration active, and the warning and audit event name the field that caused the refusal. Restart Pipelock to apply a refused trust expansion.
 
-What `systemctl reload pipelock` tells you depends on which unit `contain install` wrote. On a `Type=notify-reload` unit (systemd 253 or newer) the command waits until the daemon has finished evaluating the SIGHUP reload, so exit status 0 means the evaluation completed; it still does not mean a rejected candidate became active. On the legacy `Type=simple` unit (older systemd, or a version the installer could not read) the command returns as soon as the signal is delivered and the evaluation continues asynchronously, so exit status 0 says nothing about the outcome. Either way the daemon reports `config reload applied` or `config reload rejected: ...` in the journal, and the notify-reload unit also carries it on the unit Status line (`systemctl status pipelock`). Filesystem-triggered reloads are always asynchronous and report only to the journal.
+What `systemctl reload pipelock` tells you depends on which unit `contain install` wrote. On a `Type=notify-reload` unit (systemd 253 or newer) the command waits until the daemon has finished evaluating the SIGHUP reload, so exit status 0 means the evaluation completed; it still does not mean a rejected candidate became active. On the legacy `Type=simple` unit (older systemd, or a version the installer could not read) the command returns as soon as the signal is delivered and the evaluation continues asynchronously, so exit status 0 says nothing about the outcome. The daemon logs `configuration reloaded` or a rejection message; the notify-reload unit reports `config reload applied` or `config reload rejected: ...` on its Status line (`systemctl status pipelock`). Filesystem-triggered reloads are always asynchronous and report only to the journal.
+
+For a loopback smoke check, save this complete config as `pipelock.yaml` and run it:
+
+```yaml
+mode: balanced
+fetch_proxy:
+  listen: 127.0.0.1:18080
+```
+
+```bash
+pipelock run --config ./pipelock.yaml
+```
+
+From another terminal, request `http://127.0.0.1:18080/health`; its JSON reports `"mode": "balanced"`. Change `mode` to `audit` in the same file; the file watcher reloads it automatically. Wait for `configuration reloaded` in the startup terminal, then request `/health` again and confirm `"mode": "audit"`. A reload rejection leaves the previous config active. Enabling the forward proxy requires a restart, so it can't be used for this reload check.
 
 On reload, the scanner and session manager are atomically swapped. Runtime
 kill-switch state is preserved, including the API, signal, Conductor remote,
@@ -37,12 +51,16 @@ The Sentry crash-report sanitizer also captures the DLP pattern list at startup 
 
 **Strict parsing:** Pipelock rejects unknown top-level and nested YAML fields at startup, and it only accepts a single YAML document per config file. Trailing `---` documents are a hard error. This prevents typos from silently disabling controls and blocks shadow-config bypasses.
 
+Temporary expiry limits are checked when configuration loads and reloads. The eleven bounded fields are `request_body_scanning.sigv4_credential_routes[].expires` (30 days), `response_scanning.core_observe_exceptions[].expires` (30 days), `sandbox.best_effort_expiry` (30 days), `request_body_scanning.content_entropy_warn_routes[].expires` (90 days), the mapping form of `request_body_scanning.content_entropy_exclusions[].expires` and `websocket_proxy.content_entropy_exclusions[].expires` (90 days each; a plain host string never expires), `response_scanning.unscannable_passthrough[].expires` (90 days), `response_scanning.size_exempt_scan_limits[].expires` (90 days), `fetch_proxy.monitoring.path_entropy_exclusions[].expires` (180 days), `fetch_proxy.monitoring.query_entropy_param_exclusions[].expires` (180 days), and `fetch_proxy.monitoring.oauth_authorization_endpoints[].expires` (180 days). Examples use relative placeholders; replace them with a future date inside the listed window before loading the file.
+
+A valid expired path or query entropy exclusion, request-body entropy warning route, request-body or WebSocket content-entropy host mapping, native OAuth authorization endpoint grant, or SigV4 credential route lapses with a warning at startup or reload. Only the expired entry is removed; valid siblings remain active, and normal scanning resumes for the lapsed scope. Malformed entries still reject the configuration, including expired entries with invalid hosts, paths, metadata, or overlapping routes. Dates remain active through their entire UTC day. Running scanners stop applying these exceptions after expiry without a reload; warnings are emitted during startup or reload, with no separate clock-triggered notification. Permanent path/query entries and plain host strings keep their existing behavior. An explicitly empty path exclusion list still disables shipped routes; lapsing the final temporary entry retains the shipped routes that accompanied it.
+
 ## Top-Level Fields
 
 ```yaml
 version: 1                    # Config schema version (currently 1)
 mode: balanced                # "strict", "balanced", or "audit"
-enforce: true                 # false = detect without blocking (warning-only)
+enforce: true                 # false = ordinary findings warn; independent controls can block
 explain_blocks: false         # true = include fix hints in block responses
 ```
 
@@ -50,7 +68,7 @@ explain_blocks: false         # true = include fix hints in block responses
 |-------|------|---------|-------------|
 | `version` | int | `1` | Config schema version |
 | `mode` | string | `"balanced"` | Operating mode (see [Modes](#modes)) |
-| `enforce` | bool | `true` | When false, all blocks become warnings |
+| `enforce` | bool | `true` | When false, normal policy blocks become warnings; SSRF, fail-closed transport checks, and adaptive escalation can still block |
 | `explain_blocks` | bool | `false` | Include actionable hints in block responses |
 
 ### Sentry Crash Reporting
@@ -85,7 +103,7 @@ explain_blocks: true
 |------|----------|----------|
 | **strict** | Allowlist-only. Only `api_allowlist` domains pass. | Regulated industries, high-security |
 | **balanced** | Blocks known-bad, detects suspicious. All domains reachable. | Most developers (default) |
-| **audit** | Logs everything, blocks nothing. | Evaluation before enforcement |
+| **audit** | Warns on ordinary findings. Core credentials, SSRF, fail-closed transport checks, and explicit tool-policy rules can still block. The audit preset disables adaptive escalation; operators can enable it explicitly. | Evaluation before enforcement |
 
 ## API Allowlist
 
@@ -101,7 +119,7 @@ api_allowlist:
   - "registry.npmjs.org"
 ```
 
-Supports wildcards (`*.example.com` matches `api.example.com` **and** the apex `example.com` itself). Case-insensitive.
+Supports wildcards (`*.example.com` matches `api.example.com` **and** the apex `example.com` itself). Case-insensitive. A wildcard over a whole TLD or registry suffix (`*.com`, `*.co.uk`) is refused; see [Trusted Domains](#trusted-domains) for the full spelling and breadth rules shared across host lists.
 
 Generated defaults and presets intentionally omit messaging/collaboration
 platforms such as Slack, Discord, and Telegram because they are common
@@ -146,14 +164,37 @@ fetch_proxy:
 | `user_agent` | `Pipelock Fetch/1.0` | User-Agent header sent upstream |
 | `monitoring.max_url_length` | `2048` | URLs longer than this are blocked |
 | `monitoring.entropy_threshold` | `4.5` | Shannon entropy threshold for path segments. A configured value must be greater than 0; omit the field to take the default. No upper bound is enforced. |
-| `monitoring.max_requests_per_minute` | `60` | Per-domain rate limit |
-| `monitoring.max_data_per_minute` | `0` | Per-domain byte budget (0 = disabled) |
-| `monitoring.blocklist` | 6 domains | Blocked exfiltration targets |
+| `monitoring.max_requests_per_minute` | `60` | Per-base-domain rate limit; every subdomain shares one budget. Per-agent override: `agents.<name>.rate_limit` (Pro), which replaces both ceilings |
+| `monitoring.max_data_per_minute` | `0` | Per-base-domain byte budget (0 = disabled); every subdomain shares one budget. Per-agent override: `agents.<name>.rate_limit` (Pro), which replaces both ceilings |
+| `monitoring.blocklist` | 6 domains | Blocked exfiltration targets. Omit the field to keep the shipped list; override to replace it, or set an empty list to disable it. Removing entries on hot reload is a security downgrade: strict mode and required-contract modes refuse it, so apply it with a restart |
 | `monitoring.subdomain_entropy_exclusions` | `files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com` | Domains excluded from subdomain and path entropy checks; override to replace defaults, or set an empty list to disable exclusions entirely (query entropy still checked) |
-| `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query parameter values as destinations |
+| `monitoring.scan_nested_urls` | `true` (nil) | Evaluate URL-shaped query keys and values as destinations |
+| `monitoring.oauth_authorization_endpoints` | `[]` | Operator-authorized exact HTTPS authorization endpoints for native OAuth GET requests. Grants state/nonce entropy relief and literal HTTP loopback callback descriptor relief; see below. No automatic discovery grant. |
 | `monitoring.query_entropy_exclusions` | `[]` | Host-wide query-string entropy exclusions for hosts whose query values are broadly opaque by contract |
-| `monitoring.path_entropy_exclusions` | 5 document-sharing routes | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply. Optional `expires` is temporary and capped at 180 days. Ships with Google Docs, Sheets, Slides, Forms and Drive file routes; override to replace the defaults, or set an empty list to disable them |
+| `monitoring.path_entropy_exclusions` | 6 vendor routes | Host plus literal path-prefix exemptions for the URL-path entropy gate only; subdomain entropy, query entropy, DLP and SSRF still apply. An omitted scheme matches HTTPS. An explicit `http` entry matches that cleartext route only, and the path is visible on the network. The two schemes do not exempt each other. Optional `expires` is temporary and capped at 180 days. Ships with Google Docs, Sheets, Slides, Forms and Drive file routes and the Cloudflare challenge route; your own entries are added to the shipped routes, and an empty list disables them |
 | `monitoring.query_entropy_param_exclusions` | `[]` | Exact HTTPS endpoint+parameter query-value entropy exclusions; DLP, SSRF, query-key entropy, adjacent parameters, path/subdomain entropy, rate limits, and data budgets still apply. Optional `expires` is temporary and capped at 180 days |
+
+Native OAuth clients can generate random `state` and `nonce` values and register an HTTP loopback callback whose port changes between logins (RFC 6749 sections 4.1.1 and 10.12, RFC 8252 sections 7.3 and 8.3, OpenID Connect Core section 3.1.2.1). For an authorization endpoint you trust to handle these parameters as protocol data, configure an exact endpoint grant:
+
+```yaml
+fetch_proxy:
+  monitoring:
+    oauth_authorization_endpoints:
+      - host: auth.vendor.example
+        path: /oauth/authorize
+        reason: Native client authorization-code login
+        owner: operator
+```
+
+A grant matches HTTPS on the default port and the exact escaped path. Wildcards and host-wide grants aren't accepted. `reason`, `owner`, and `expires` use the same metadata and optional expiry contract as `query_entropy_param_exclusions`. Expired grants lapse; adding or extending one is a reload security downgrade and is refused when the active reload policy requires that. An existing TLS-intercepted connection must satisfy both its original grant and the current policy for each request, so removal also revokes relief on that connection. Reconnect to acquire a newly added grant.
+
+The upstream method must be GET. The request must contain one `response_type=code`, a nonempty `client_id`, an absolute `redirect_uri` without userinfo or a fragment, and either a valid S256 PKCE challenge or a nonempty `state`. Duplicate parameters, malformed query encoding, semicolon separators, empty query components, hybrid response types, and `request`/`request_uri` overrides receive no relief. Only state and nonce query-value entropy is exempted. The existing `max_url_length` bounds the entire request; OAuth doesn't define a universal state or nonce length limit. DLP, query-key entropy, other query values, path/subdomain entropy, rate limits, and data budgets still apply.
+
+The `redirect_uri` must stay on the client's machine: a literal HTTP loopback callback (RFC 8252 section 7.3) or a private-use scheme written as a reverse-order domain name such as `com.vendor.app:/callback` (RFC 8252 section 7.1). The authorization server sends `state` back to `redirect_uri`, even on an error redirect that needs no user (RFC 6749 section 4.1.2.1), and anyone who can register a client there can name a remote callback. So HTTPS callbacks, HTTP callbacks to other hosts, and other schemes receive no grant. Only a literal `http://127.0.0.1`, `http://[::1]`, or `http://localhost` callback descriptor, with a valid optional port, can skip nested-destination checks. RFC 8252 recommends loopback IP literals over localhost. Alternate numeric spellings, IPv4-mapped IPv6, trailing dots, userinfo and encoded authorities receive no relief. Callback path/query entropy and DLP still run, as do destination checks for URLs embedded inside the callback query. The grant never allows Pipelock to fetch a loopback callback as a destination.
+
+This is explicit trust in an endpoint. An agent can put unknown stolen data in `state` or `nonce`; request structure, PKCE and discovered authorization metadata can't prove those values are random. Grant only endpoints whose handling you accept, and keep the list empty otherwise. This policy applies to fetch, forward HTTP, and HTTPS inspected through TLS interception. Encrypted CONNECT passthrough doesn't expose OAuth parameters. WebSocket and MCP protocol messages receive no native authorization URL grant; an MCP client's separate browser authorization request must traverse a supported HTTP path. Fetch and forward redirect preflight can still refuse an actual loopback callback destination. The native client should receive that callback locally.
+
+In strict mode, the allowlist is checked before the blocklist. A host that is on the blocklist but not the allowlist is reported as an allowlist denial first.
 
 **Entropy guidance:**
 - English text: 3.5-4.0 bits/char
@@ -164,6 +205,42 @@ fetch_proxy:
 A configured `entropy_threshold` must be greater than 0. Setting it to 0 or a negative value is REFUSED at load rather than silently replaced by the default, because an operator who writes 0 usually means "turn this off" and would otherwise get a fully enabled gate at 4.5 while believing it was disabled. To run without the path-entropy gate, exempt the routes you mean with `path_entropy_exclusions` or `subdomain_entropy_exclusions` instead. Omitting the field takes the default.
 
 The default threshold (4.5) allows typical commit hashes while flagging encrypted blobs. Vendor resource identifiers in URL paths commonly exceed that threshold (the measured base64url range above) and are blocked. Lower it (3.5) for strict mode. For known API routes, prefer a narrow `request_policy` path rule over raising the global threshold.
+
+**What the URL entropy gate measures in protocol-shaped values.** Several protocol-shaped values are measured more precisely, with no configuration needed. These shapes include:
+
+- A query value that is an `http` or `https` URL, such as an OAuth `redirect_uri` or a login `next` link, is percent-decoded and scored part by part: host labels, userinfo, path segments, query keys and values, and the fragment, each with the same length floor and threshold. A URL inside that URL's query is scored the same way, and anything nested deeper is scored as one string. Values in any other scheme, including `data:` and `javascript:`, are scored as one string. A structured callback URL no longer trips the gate as a whole, while a long random token anywhere inside it still does. A block names the part, for example `high entropy query param "next" nested URL path segment`. A query value containing ASCII whitespace (space, tab, CR, LF, VT, FF), such as search syntax, is scored with its ASCII punctuation and whitespace removed, or whole when too few letters and digits remain, and then word by word, so dense search operators pass while random text split by spaces still blocks. Unicode whitespace does not split, so values in that scheme are still scored as one string.
+- A `code_challenge` value is not scored when it is exactly 43 unpadded base64url characters (the size of an S256 challenge, RFC 7636) and the same query carries exactly one `code_challenge_method`, which is exactly `S256`, and exactly one `code_challenge`. A missing method, `plain`, a lower-case `s256`, a second method value, or a second `code_challenge` keeps the challenge scored, and so does any `code_challenge` value of another shape. OAuth `state`, `nonce` and `code` get no name-based relief; they pass only as server-issued values, described next.
+- A query value that an intercepted HTTPS response issued is not scored when the same trusted agent session sends it back where it was issued. A value counts as issued when a response that was allowed and delivered carried it in a URL on its own HTTPS origin: a string value in a JSON body, a link attribute of an HTML page (`src`, `srcset`, `href`, `poster`, `data-src`, `data-srcset`, `imagesrcset`), or the `Location` header of a 201 Created, 202 Accepted, 204 No Content, or 3xx response. When `response_scanning.enabled` is on, Pipelock streams a response from a host in `response_scanning.exempt_domains` without reading its body unless it is a declared SVG image, so only that response's `Location` header issues evidence; its JSON values and HTML links do not. A `text/event-stream` response issues no query or path evidence from any host. Relative links resolve against the page URL, or against its first `<base href>` when that names the same scheme, host and port as the page; a base on another origin is ignored and grants nothing to either host. A document in an encoding that does not keep ASCII markup as-is (UTF-16, or a shift-state encoding such as ISO-2022-JP, declared by header or `<meta>`) issues no link at all, because a browser may decode its URLs differently from the bytes Pipelock read. A `srcset` is read as the HTML specification reads it, so a comma inside a candidate URL belongs to the URL. The later request must go to that scheme, host, port and path, under the same parameter name, with the exact value; a page linking to another host issues nothing for that host, and nothing is exempted by parameter name. A path works the same way: when an HTML page, JSON body or a Location header on a 201, 202, 204 or 3xx response from an origin links to an exact path on that same origin, path-segment entropy is not scored for a later request to that exact path (a bundler asset such as a hashed image file name), but a longer path, another host, another port, or another session is. The evidence is capped per agent session as the issuer-bound cookie store is, a page past 4 MiB issues links only from its first 4 MiB, and an evicted entry returns to ordinary scoring. A hostile origin can therefore have the agent request high-entropy URLs on that origin, which tells the origin only what it already holds; the agent chooses among the links the origin issued, at most 256 query values and, counted separately, 256 exact paths per response, and cannot compose a new value for that origin or issue one for another. This takes effect only with `tls_interception.enabled`, request body and header scanning, `request_body_scanning.issuer_bound_session_cookies` and an operator-established agent identity (see below), and the evidence is held in memory, so a restart, or a reload that turns a prerequisite off, forgets it. Plain-HTTP forward proxying and `/fetch` hold no such evidence, so they keep scoring every value.
+- An `application/xhtml+xml` response issues no HTML-link evidence because browsers parse it as XML. A `Referer` or `Origin` named in `Connection` cannot support page-origin entropy relief: the proxy strips that hop-by-hop header before forwarding.
+- A URL path segment that is an object ID the destination origin introduced is not scored when TLS interception, request-body scanning, header scanning and `issuer_bound_session_cookies` are enabled, and the request's resolved actor grade is `bound` or `config-default`. `unknown`, `self-declared` and `matched` callers receive no learned-ID allowance and cannot add send history or taint a trusted caller's bucket. A declared header does not inherit learned-ID authority from the default identity's detection-state projection. Evidence uses the existing trusted agent-and-client-address session key; distinct bound agents sharing an address stay separate. A configured default is an operator-assigned identity for callers using that listener, not proof that individual processes sharing it are distinct. See [identity diagnostics](identity-diagnostics.md) to inspect the grade a running listener resolves for a request.
+  - An allowed, delivered JSON response must carry the ID as a string value, not an object key. The scheme, host and port bind its later use. Only exact segments of 16 to 512 characters from `[A-Za-z0-9._~=+-]` qualify. Other high-entropy segments and query values remain scored; DLP and other checks stay active. Each allowance writes an `entropy_issuer_query_allow` receipt naming `server_issued_id`.
+  - Lookup also recognizes one trailing colon as a path-addressing delimiter: `/items/{issued-id}:/folder/report.txt:/content`. This follows the documented [relative path addressing](https://learn.microsoft.com/en-us/graph/onedrive-addressing-driveitems) and [content upload](https://learn.microsoft.com/en-us/graph/api/driveitem-put-content) forms. Only the exact issued ID and its delimiter receive relief; every filename and other segment remains scored. An embedded colon, a second trailing colon, or content attached after the colon receives no ID allowance. Standard URL percent encoding is decoded once before segment lookup; another encoding layer receives no additional decoding for this allowance. This doesn't enable ID learning or relief on `/fetch`, plain-HTTP forward requests, or encrypted CONNECT passthrough.
+  - The same trusted caller must never have sent that exact string to the host, over any scheme or port, in a path, query, header, cookie, URL userinfo, form field or request body. Raw, URL-decoded and JSON-decoded forms count, including JSON text nested in those fields. `/fetch` URLs and plain-HTTP forward requests count too. A tunnel open across an enabled reload records into the live store. Another identity's sends do not revoke this caller's evidence. This is a per-caller reflection check, not a claim that an ID is absent from every other caller's traffic. A value the origin transforms before returning is not recognized as sent.
+  - An unread outgoing body, more than 4,096 tokens in one request, more than 8,192 distinct sent tokens in a bucket, or a WebSocket stream whose frames are not recorded token by token revokes only that caller's IDs and stops its future ID learning. Taint affects all destinations within that caller's bucket. Unknown callers cannot cause this transition for a trusted caller.
+  - History is retained independently of query-evidence cache eviction. At 4,096 ID-history buckets, new buckets fail closed while existing buckets remain usable. At 131,072 total sent digests, a caller requiring another digest is tainted; existing peers keep their IDs. No negative evidence is evicted to make room. A restart or disabling and re-enabling `issuer_bound_session_cookies` clears IDs and history; enabled reloads preserve them.
+  - IDs have no timed expiry. Each caller's bounded ID list evicts its oldest ID when full; that ID returns to ordinary scoring. After eviction, restart, or a reload that disables a prerequisite, obtain a fresh listing through interception before using an ID that would otherwise fail path entropy.
+  - `pipelock_issuer_id_blocks_total{scope="session"}` counts newly tainted buckets; `scope="capacity"` counts the transition to refusing new buckets. Audit warnings coalesce caller-taint logs and report capacity once per store lifetime, with recovery guidance. Neither sink includes identities, addresses, hosts or IDs.
+- A query value that is exactly the base64 encoding of the origin of the request's own `Referer` or `Origin` header is not scored, in a TLS-intercepted request that meets the prerequisites above, including an operator-established agent identity (`default_agent_identity`, a bound listener, or `source_cidrs`), but only when that origin served the same agent session an HTML document (`text/html` or `application/xhtml+xml`) through an intercepted, delivered response. A captcha frame sends the embedding page's origin this way, and the embedding page was loaded through the proxy. Those headers are written by the agent, so on their own they admit nothing: an origin the session never received a document from, one served to a different session, or one whose record was evicted keeps the value scored. The document record is held per session, keyed by that operator-established identity: with no such identity, or an identity the agent only declared through a header or `?agent=`, nothing is recorded and the value stays scored, and with an unbound `default_agent_identity` every header-carrying request shares the default identity's record, so sessions are not isolated from each other. It lives in the same bounded, in-memory store as the issued values (3,000 origins per session, 32 sessions, least recently used evicted first). Only an origin is accepted (scheme, host and optional port, with the default port spelled either way); a path, a second header, userinfo, a different origin, or non-canonical base64 keeps the value scored. The parameter name is not consulted. What this buys a hostile agent: it can only skip the entropy gate for the origins of documents it actually received (at most one choice per such origin, spelled in a few base64 forms), and the destination already receives the same origin in the `Referer` or `Origin` header it must send. It cannot compose a value, and an origin it made up carries no relief.
+- The only cross-host cases are the two redirects of the OAuth authorization-code flow (RFC 6749 section 4.1), each carrying values the redirecting server issued. An authorization request here is a query carrying, each exactly once, a `response_type` that includes `code`, a `client_id`, and an `https` `redirect_uri` with no fragment. First, when the client's delivered redirect sends the browser to an authorization request on another host and that request's `redirect_uri` is on the client's own origin, its `state` and `nonce` values are issued for that authorization endpoint. Second, when the session's allowed authorization request declared a `redirect_uri` to the authorization server and a later delivered redirect from that same server origin points at exactly that `redirect_uri` origin and path, its `code`, `state` and `iss` values (RFC 9207) are issued for the callback. No other parameter on either redirect crosses hosts, so a value under any other name keeps the ordinary gate. A link in a response body never crosses hosts, and an authorization URL a single-page app builds in script issues nothing, so its `state` and `nonce` keep the ordinary gate. The relief ends at the query entropy gate: DLP, SSRF, blocklists, path (beyond a path the same origin linked to) and subdomain entropy, rate limits and data budgets still apply to the callback. Each allowance writes an `entropy_issuer_query_allow` audit event and a receipt whose extension names the rule: `observed_issuer`, `declared_oauth_redirect`, or `page_origin_echo` for the page-origin value above. A flow that does not put `redirect_uri` in the authorization request's query, such as a pushed authorization request (RFC 9126), a signed request object, or an authorization request sent as a POST, declares nothing and keeps the ordinary gate; for those, use an exact `query_entropy_param_exclusions` entry. With `request_body_scanning.content_entropy_action: block`, neither cross-host hop applies, including to values recorded before a reload turned it on, because a server that echoes request-body data into a redirect would otherwise carry that data past the block; use exact `query_entropy_param_exclusions` entries for sign-in callbacks in that mode.
+- A path segment ending in `.js`, `.mjs`, `.css`, `.woff2` or `.map` (including a source map such as `.js.map`) has a dot-delimited trailing build-hash token of one to eight characters from `[A-Za-z0-9_-]` left out of its score, so `ChunkVendorsMap-webpack.Dk3mN8pQ.js` is scored on `ChunkVendorsMap-webpack`. A hyphen-delimited hash is also left out when it contains one to eight hexadecimal characters, or exactly eight URL-safe base64 characters, and follows a non-empty stem. The eight-character form follows [Rollup's default chunk naming](https://rollupjs.org/configuration-options/#output-chunkfilenames) and [hash alphabet](https://rollupjs.org/configuration-options/#output-hashcharacters); hyphens within that hash are accepted. For example, `ApplicationSettings-Nr9Qw7Er.js` is scored on `ApplicationSettings`. This is a bounded filename heuristic, not proof that the suffix is a hash: it leaves up to eight characters of each matching path segment unscored on any destination, and a path can hold several such segments. The stem, other path segments, and query values remain scored; DLP and other URL checks still apply. Longer delimiter-free tokens aren't partly trimmed, the extension match is case-sensitive, and a name that is all hash is scored whole.
+- A DNS-over-HTTPS request (RFC 8484), either a GET whose only query parameter is `dns` carrying unpadded base64url or a POST with media type `application/dns-message`, is parsed as a DNS message when it parses strictly: every name, record payload, EDNS option and fixed-width field is checked by DLP and, on the GET form, the URL entropy gate, first piece by piece and then as one joined view, so data split across many short labels is still measured. In a POST, the pieces go through request-body DLP and the request-body content-entropy detector (`request_body_scanning.content_entropy_*`, default action `warn`) instead of the URL gate; the POST path needs `request_body_scanning.enabled`, and TLS interception for HTTPS. DNS labels are compared case-insensitively. A message that does not parse strictly, including a trailing byte, a padded or duplicated `dns` value, or a query containing `;`, keeps the whole-value check. The message's pieces go through the same DLP pipeline as the rest of the request, so suppressions and credential-audience rules apply, and a critical credential match blocks even when request-body DLP or the content-entropy detector is set to warn.
+
+For example, enable the forward proxy to inspect a GET DoH request sent through Pipelock:
+
+```yaml
+forward_proxy:
+  enabled: true
+request_body_scanning:
+  enabled: true
+  content_entropy_enabled: true
+  content_entropy_action: block
+```
+
+A high-entropy message can be reported as `high entropy query param "dns" DNS message`. Request-body scanning and content-entropy blocking cover POST DoH bodies over HTTP. For HTTPS DoH, also enable TLS interception and install its CA for the client; otherwise the encrypted body is not visible to the scanner. A base32-encoded nested URL may be blocked earlier by query entropy, before the nested-destination check reports its verdict. To test nested-destination behavior specifically, use a value that stays below the query-entropy threshold or configure a narrow `query_entropy_param_exclusions` entry for that endpoint and parameter.
+
+For a benign GET example, `https://resolver.vendor.example/dns-query?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlBHRlc3QAAAEAAQ` encodes a query for `www.example.test`. Use a resolver you operate or trust when testing; the example hostname is reserved and does not resolve publicly.
+
+If a paging token or an upload URL returned in a response (for example, the blob-upload `Location` a container registry returns during `docker push`) is blocked by query entropy, the issuer-bound allowance requires `tls_interception.enabled`, `request_body_scanning.enabled`, `request_body_scanning.scan_headers: true`, `request_body_scanning.issuer_bound_session_cookies: true`, and an operator-established agent identity (`default_agent_identity`, a bound listener, or `source_cidrs`). Without those prerequisites, use an exact `query_entropy_param_exclusions` entry only when that parameter is governed by a known endpoint contract. An exclusion path may end in one slash (`/_next/image/`); the request path is matched exactly, so `/_next/image` and `/_next/image/` are different endpoints.
 
 **Subdomain entropy exclusions** skip subdomain and path entropy checks for specific domains, but query parameter entropy is still checked. Defaults cover package/object hosts that use hash-like routing paths (`files.pythonhosted.org`, `pypi.org`, `objects.githubusercontent.com`). This is also useful for APIs that embed tokens in URL paths (e.g., Telegram bot API). Supports wildcard matching (`*.example.com`).
 
@@ -180,7 +257,28 @@ Reach for this instead of `subdomain_entropy_exclusions` when a path false posit
 
 A `request_policy` route also suppresses path entropy, on exactly the paths it names, whenever it declares both an explicit host and path constraints. That is the right tool when you already govern the host's paths, because the exemption then follows rules you are enforcing anyway. Use `path_entropy_exclusions` when you want the one route quiet without adopting that enforcement rail.
 
-```yaml
+The expiry is checked when the configuration loads. To see the 180-day limit refuse an entry, generate a date 181 days ahead and validate a complete temporary config:
+
+```bash
+tmp_config=$(mktemp)
+trap 'rm -f "$tmp_config"' EXIT
+expiry=$(date -u -d '+181 days' +%F)
+cat >"$tmp_config" <<EOF
+fetch_proxy:
+  monitoring:
+    path_entropy_exclusions:
+      - host: docs.vendor.example
+        path_prefix: /document/d/
+        reason: local validation
+        owner: operator
+        expires: "$expiry"
+EOF
+pipelock check --config "$tmp_config"
+```
+
+The check reports that `expires` exceeds the maximum temporary horizon of 180 days. Replace the generated date with a future date no more than 180 days ahead for a valid entry.
+
+```yaml template (date-substitution required)
 fetch_proxy:
   monitoring:
     path_entropy_exclusions:
@@ -188,12 +286,12 @@ fetch_proxy:
         path_prefix: /document/d/      # literal prefix of the normalized path
         reason: service-issued document identifier
         owner: platform
-        expires: 2026-12-15            # optional; within the 180-day temporary window
+        expires: "<date within 180 days>" # optional; replace with a future date within the temporary window
 ```
 
-An entry asserts that on that exact route the opaque segment is a service-issued resource identifier. It is a policy assertion rather than a classifier, and it does not make the route safe: before exempting one, confirm an agent cannot place a chosen opaque segment there and later read that value back, because such a route can carry data out. `https` only, and an entry with no host, no path prefix, or the bare root prefix `/` is refused at load rather than treated as a wildcard, because each of those three would exempt far more than one route. The prefix must be a canonical path: an encoded slash or backslash, a query or fragment delimiter in either literal or percent-encoded form, a wildcard, a dot segment, and a traversal segment are all refused. Matching compares the prefix against the request's escaped path, so a request that spells the route differently, such as `/document%2Fd/`, is a different route and stays subject to path entropy. **End `path_prefix` with `/` when you mean one path segment.** The prefix is matched literally, so `/document/d` also exempts `/document/de`, `/document/detail`, and every other path starting with those characters, while `/document/d/` does not. Dropping one character widens the exemption. `reason`, `owner` and `expires` are governance metadata. When supplied, `expires` is a temporary incident control and may be at most 180 days ahead; shorten it, or use an exact `request_policy` route for a permanent governed path. Editing governance metadata does not change the policy hash a receipt carries.
+An entry asserts that on that exact route the opaque segment is a service-issued resource identifier. It is a policy assertion rather than a classifier, and it does not make the route safe: before exempting one, confirm an agent cannot place a chosen opaque segment there and later read that value back, because such a route can carry data out. An omitted scheme matches HTTPS. Set `scheme: http` only for a cleartext route; that entry matches the cleartext URL only, and anyone on the network path can read it. An https entry matches the HTTPS URL only. An entry with no host, no path prefix, or the bare root prefix `/` is refused at load rather than treated as a wildcard, because each of those three would exempt far more than one route. The prefix must be a canonical path: an encoded slash or backslash, a query or fragment delimiter in either literal or percent-encoded form, a wildcard, a dot segment, and a traversal segment are all refused. Matching compares the prefix against the request's escaped path, so a request that spells the route differently, such as `/document%2Fd/`, is a different route and stays subject to path entropy. **End `path_prefix` with `/` when you mean one path segment.** The prefix is matched literally, so `/document/d` also exempts `/document/de`, `/document/detail`, and every other path starting with those characters, while `/document/d/` does not. Dropping one character widens the exemption. `reason` and `owner` are governance metadata. When supplied, `expires` ends the exemption after that UTC date and changes the policy hash a receipt carries. It is a temporary incident control and may be at most 180 days ahead; shorten it, or use an exact `request_policy` route for a permanent governed path. Editing governance metadata does not change the policy hash a receipt carries.
 
-**Shipped defaults.** Five document-sharing routes ship enabled, because an ordinary Google Docs, Sheets, Slides, Forms or Drive link carries an opaque service-issued file ID by construction and was otherwise blocked on a fresh install:
+**Shipped defaults.** Six vendor routes ship enabled. Five are document-sharing routes, because an ordinary Google Docs, Sheets, Slides, Forms or Drive link carries an opaque service-issued file ID by construction and was otherwise blocked on a fresh install. The sixth is Cloudflare's challenge route: Turnstile and the managed challenge load from `challenges.cloudflare.com` and put per-challenge tokens in path segments under the reserved `/cdn-cgi/` path, so without it a browser workload loops on the bot check of every Cloudflare-fronted site. The host is Cloudflare's own, so a value placed in that path reaches Cloudflare rather than a site the agent chose, and the same path on any other host stays subject to path entropy:
 
 ```yaml
 - host: docs.google.com
@@ -206,15 +304,17 @@ An entry asserts that on that exact route the opaque segment is a service-issued
   path_prefix: /forms/d/e/
 - host: drive.google.com
   path_prefix: /file/d/
+- host: challenges.cloudflare.com
+  path_prefix: /cdn-cgi/challenge-platform/
 ```
 
-What a shipped entry encodes is the vendor's published route shape, never the identifier format. Google documents these product URL shapes; it documents the file ID itself as opaque, with no charset or length, so keying on the ID would be an invented value. A vendor route enters the shipped defaults only on that basis. Setting the field to an empty list removes them; setting your own list replaces them.
+What a shipped entry encodes is the vendor's published route shape, never the identifier format. Google documents these product URL shapes; it documents the file ID itself as opaque, with no charset or length, so keying on the ID would be an invented value. A vendor route enters the shipped defaults only on that basis. Your own entries are applied in addition to the shipped routes, so adding one route never drops the others. Setting the field to an explicitly empty list removes the shipped routes.
 
 Each entry still exempts only the path-entropy gate for that one host and prefix. It does not make the route safe to send secrets to, and the warning above applies with equal force to a shipped entry: an agent that can place a chosen opaque segment on one of these routes and read it back later can carry data out over it.
 
 **Query entropy parameter exclusions** skip only the raw query-value entropy gate for one exact HTTPS endpoint and one exact parameter key. Subdomain entropy, path entropy, query-key entropy, adjacent parameters, DLP, SSRF, rate limits, and data budgets still apply. Use this first when a structured query language or endpoint contract creates a false positive in one parameter.
 
-```yaml
+```yaml template (date-substitution required)
 fetch_proxy:
   monitoring:
     query_entropy_param_exclusions:
@@ -224,13 +324,16 @@ fetch_proxy:
         param: query
         reason: structured search grammar can contain dense operators
         owner: platform-security
-        expires: 2026-12-15            # optional; within the 180-day temporary window
+        expires: "<date within 180 days>" # optional; replace with a future date within the temporary window
 ```
 
 The endpoint-parameter matcher is intentionally strict: empty `scheme` defaults
 to `https`, `host` is an exact DNS hostname without a port or wildcard, `path`
 must match the URL's canonical escaped path exactly, and the raw query string
-must contain exactly one key with the same unescaped spelling as `param`.
+must contain exactly one key that decodes to `param`. That key may arrive
+percent-encoded, as in an OData continuation link that sends `%24skiptoken`
+for `$skiptoken`; a second key decoding to the same name, in any spelling,
+refuses the exclusion.
 
 An optional `expires` here is a temporary incident control and may be at most 180 days ahead. Shorten it when the endpoint is repaired; if the parameter contract is permanent, govern the endpoint with an exact `request_policy` route instead.
 
@@ -329,13 +432,15 @@ Enables TLS MITM on CONNECT tunnels, allowing pipelock to decrypt, scan, and re-
 
 Requires a CA certificate trusted by the agent. Generate one with `pipelock tls init` and install it with `pipelock tls install-ca`.
 
+For `pipelock contain`, `contain install` also establishes the interception CA in the contained user's NSS database because Chromium-family browsers on Linux do not consume `SSL_CERT_FILE` or the other CA environment variables used by command-line tools. The install requires `certutil` and fails closed if the exact CA cannot be confirmed with SSL CA trust; `contain verify` reports the same browser-consulted control. This trust step does not by itself configure or guarantee a browser automation runtime.
+
 **Upgrade note:** a config that previously loaded with a private-suffix wildcard in `tls_interception.passthrough_domains` (for example `*.github.io` or `*.s3.amazonaws.com`) now refuses to load. Replace the wildcard with its exact hosts (for example `mybucket.s3.amazonaws.com`); if the required host set is unbounded, no passthrough equivalent exists, so intercept the traffic with `tls_interception` and a trusted local CA or constrain it to a fixed host set. A JavaScript alias other than `text/javascript`/`application/javascript`/`application/ecmascript` in `response_scanning.unscannable_passthrough[].content_types` also now refuses to load; both changes are fail-closed, and neither affects `exempt_domains`, `trusted_domains`, or any other grant list.
 
 ```yaml
 tls_interception:
   enabled: false
-  ca_cert: ""                    # path to CA cert PEM (default: ~/.pipelock/ca.pem)
-  ca_key: ""                     # path to CA key PEM (default: ~/.pipelock/ca-key.pem)
+  ca_cert: ""                    # path to CA cert PEM (default: <pipelock home>/ca.pem, i.e. --home, PIPELOCK_HOME, or ~/.pipelock)
+  ca_key: ""                     # path to CA key PEM (default: <pipelock home>/ca-key.pem, same precedence)
   passthrough_domains:           # domains to splice (not intercept)
     - "*.googlevideo.com"
   cert_ttl: "24h"
@@ -346,9 +451,9 @@ tls_interception:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable TLS interception on CONNECT tunnels |
-| `ca_cert` | `""` | Path to CA certificate PEM. Empty resolves to `~/.pipelock/ca.pem` |
-| `ca_key` | `""` | Path to CA private key PEM. Empty resolves to `~/.pipelock/ca-key.pem` |
-| `passthrough_domains` | `["*.googlevideo.com"]` | Domains to splice (pass through without interception). Supports `*.example.com` wildcards (also matches apex `example.com`). Entries must be written exactly as the matcher reads them: no surrounding whitespace and at most one trailing DNS dot. A malformed entry is refused at load rather than accepted and then silently matching nothing. A wildcard over ANY public suffix, ICANN-operated (`*.com`, `*.co.uk`) or private-section (`*.github.io`, `*.s3.amazonaws.com`), is refused, because a passthrough host is spliced without decryption and that entry would turn body and response scanning off for every unrelated tenant under the suffix; this is stricter than the public-suffix rule for an ordinary exempt/trusted domain list, which still accepts a private-section wildcard because that list still scans what it exempts. An exact host under a private suffix (`mybucket.s3.amazonaws.com` with no wildcard) or a wildcard one label below it (`*.myorg.github.io`) is unaffected. |
+| `ca_cert` | `""` | Path to CA certificate PEM. Empty resolves to `<pipelock home>/ca.pem` (`--home`, `PIPELOCK_HOME`, or `~/.pipelock`) |
+| `ca_key` | `""` | Path to CA private key PEM. Empty resolves to `<pipelock home>/ca-key.pem` (same precedence) |
+| `passthrough_domains` | `["*.googlevideo.com"]` | Domains to splice (pass through without interception). Supports `*.example.com` wildcards, which match any subdomain but **not** the apex `example.com`; list the apex separately if it must be spliced. Entries must be written exactly as the matcher reads them: no surrounding whitespace and at most one trailing DNS dot. A malformed entry is refused at load rather than accepted and then silently matching nothing. A wildcard over ANY public suffix, ICANN-operated (`*.com`, `*.co.uk`) or private-section (`*.github.io`, `*.s3.amazonaws.com`), is refused, because a passthrough host is spliced without decryption and that entry would turn body and response scanning off for every unrelated tenant under the suffix; this is stricter than the public-suffix rule for an ordinary exempt/trusted domain list, which still accepts a private-section wildcard because that list still scans what it exempts. An exact host under a private suffix (`mybucket.s3.amazonaws.com` with no wildcard) or a wildcard one label below it (`*.myorg.github.io`) is unaffected. |
 | `cert_ttl` | `"24h"` | TTL for forged leaf certificates (Go duration string) |
 | `cert_cache_size` | `10000` | Max cached leaf certificates. Evicts oldest when full. |
 | `max_response_bytes` | `5242880` | Max response body to buffer for scanning. Responses exceeding this are blocked (fail-closed). |
@@ -372,15 +477,15 @@ pipelock tls show-ca
 - **Request header DLP:** same scanning as `request_body_scanning.scan_headers`
 - **Authority enforcement:** the `Host` header must match the CONNECT target. Mismatches are blocked (prevents domain fronting inside encrypted tunnels).
 - **Response injection scanning:** buffered responses scanned through the `response_scanning` pipeline before forwarding to the agent
-- **Compressed response blocking:** responses with non-identity `Content-Encoding` are blocked (fail-closed, since compressed bytes evade regex DLP)
+- **Compressed response handling:** single-layer gzip or deflate is decoded and then scanned; other encodings (br, zstd), stacked encodings, and malformed bodies are blocked fail-closed, since they evade regex DLP
 
 **Fail-closed behaviors:**
 - Responses exceeding `max_response_bytes` are blocked
-- Compressed responses (gzip, deflate, br) are blocked
+- Compressed responses: single-layer gzip or deflate is decoded and then scanned; other encodings (br, zstd), stacked encodings and malformed bodies are blocked
 - Response read errors are blocked
 - Authority mismatch (Host header differs from CONNECT target) is blocked
 
-**Passthrough domains:** Domains in `passthrough_domains` are spliced (bidirectional byte copy) without interception, preserving end-to-end TLS. Use this for domains where certificate pinning prevents interception or where you trust the destination. Supports exact match and wildcard prefix (`*.example.com` matches `sub.example.com` and the apex `example.com`).
+**Passthrough domains:** Domains in `passthrough_domains` are spliced (bidirectional byte copy) without interception, preserving end-to-end TLS. Use this for domains where certificate pinning prevents interception or where you trust the destination. Supports exact match and wildcard prefix (`*.example.com` matches `sub.example.com` and deeper subdomains, but not the apex `example.com`; list the apex separately if it must be spliced).
 
 **Best practice -- package registries and LLM providers:** Always add package registries (npm, pypi, Go proxy) and LLM API endpoints to `passthrough_domains`, not just `exempt_domains`. Using `exempt_domains` alone is a response-scanning decision, not a TLS-routing decision: the connection is still MITM-ed, clients that reject the generated certificate can still fail the TLS handshake, and pipelock still spends CPU generating certificates for traffic you do not intend to inspect. Passthrough skips interception entirely.
 
@@ -401,7 +506,7 @@ Scans request bodies and headers for secret exfiltration and prompt injection be
 
 **Scope:** Forward HTTP proxy (`HTTPS_PROXY` and `HTTP_PROXY` absolute-URI requests), reverse proxy, outbound WebSocket client text messages, fetch handler headers, and intercepted CONNECT tunnels (when `tls_interception.enabled` is true).
 
-```yaml
+```yaml template (date-substitution required)
 request_body_scanning:
   enabled: true
   action: warn              # warn or block (no strip for bodies)
@@ -410,6 +515,7 @@ request_body_scanning:
   disable_patterns: []      # optional exact DLP pattern names to skip on this surface
   max_body_bytes: 5242880   # 5MB; fail-closed above this
   scan_headers: true        # scan request headers for DLP
+  issuer_bound_session_cookies: true # skip a cookie returned to the HTTPS origin that issued it (TLS interception only)
   header_mode: sensitive    # "sensitive" (listed headers) or "all" (everything except ignore list)
   sensitive_headers:
     - Authorization
@@ -418,19 +524,32 @@ request_body_scanning:
     - X-Token
     - Proxy-Authorization
     - X-Goog-Api-Key
+    - Private-Token
+    - Job-Token
   content_entropy_enabled: true       # detect opaque high-entropy body content (exfil with no credential signature)
   content_entropy_action: block       # required for the exact route warning example below; general presets default warn
   content_entropy_threshold: 4.5      # Shannon bits/char above which a body/frame value is flagged
   content_entropy_min_length: 32      # ignore values shorter than this (limits false positives on short opaque IDs)
-  content_entropy_exclusions: []      # destination hosts whose bodies legitimately carry opaque content
-  content_entropy_warn_routes:        # optional exact HTTPS exceptions; valid only when the global action is block
+  content_entropy_exclusions:         # destination hosts whose bodies legitimately carry opaque content
+    - uploads.vendor.example           # a plain host string: permanent, no expiry
+    - host: challenge.vendor.example   # or a mapping: temporary, expires is required
+      expires: "<date within 90 days>" # replace with a future date within the maximum
+      reason: bot challenge payloads   # optional
+      owner: platform team             # optional
+  content_entropy_warn_routes:        # optional HTTPS exceptions; valid only when the global action is block
     - host: upload.vendor.example
       path: /v1/files
       content_types: [application/octet-stream]
       methods: [POST]                  # optional; omit to match every HTTP method
       reason: encrypted customer archives
       owner: storage team
-      expires: 2026-12-15              # temporary route warning; 90-day maximum
+      expires: "<date within 90 days>" # temporary route warning; replace with a future date within the maximum
+    - host: challenge.vendor.example   # a route with a per-request path segment names path_prefix instead of path
+      path_prefix: /cdn-cgi/challenge/
+      content_types: [application/x-www-form-urlencoded, application/json] # a prefix route may list textual types
+      reason: service-issued bot challenge
+      owner: platform team
+      expires: "<date within 90 days>"
   trusted_hosts:                       # optional destinations where injection-shaped request text and fully redacted critical DLP follow `action` instead of hard blocking
     - api.vendor.example
   sigv4_credential_routes:             # optional exact HTTPS body routes that carry presigned URLs
@@ -440,27 +559,28 @@ request_body_scanning:
       methods: [POST]
       reason: register attachment URL
       owner: platform team
-      expires: 2026-10-15              # credential-floor exception; 30-day maximum
+      expires: "<date within 30 days>" # credential-floor exception; replace with a future date within the maximum
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `true` | Enable request body/header DLP scanning and request body prompt-injection scanning |
-| `action` | `warn` | `warn` logs ordinary findings, `block` rejects ordinary findings (requires enforce mode). Immutable core DLP findings still reject in enforce mode on every destination; the one exception is a critical DLP finding whose every match the redactor rewrote (a `redaction` class from the redaction guide, so the forwarded body carries placeholders and no credential) on a host listed in `trusted_hosts`, which follows this action. Prompt-injection hard-blocks reject everywhere except `trusted_hosts`, where they follow this action; non-core DLP findings follow this action or a per-pattern override. |
+| `action` | `warn` | `warn` logs ordinary findings, `block` rejects ordinary findings (requires enforce mode). Immutable core DLP findings still reject in enforce mode on every destination, with two exceptions: a provider credential sent to the API that issued it (see the credential-audience allowance under Security hard-blocks), and a critical DLP finding whose every match the redactor rewrote (a `redaction` class from the redaction guide, so the forwarded body carries placeholders and no credential) on a host listed in `trusted_hosts`, which follows this action. In enforce mode, prompt-injection hard-blocks reject everywhere except `trusted_hosts`, where they follow this action; non-core DLP findings follow this action or a per-pattern override. |
 | `pattern_actions` | `{}` | Map of exact DLP pattern name to `warn` or `block` for request body/header DLP. The per-pattern action overrides `action` for that pattern only. Unknown pattern names and unsupported actions are rejected at config load. Immutable core DLP patterns cannot be downgraded to `warn`. |
-| `disable_patterns` | `[]` | Exact DLP pattern names to skip for request body/header DLP only. Unknown names are rejected at config load. Immutable core DLP patterns cannot be disabled. Disabling one pattern does not suppress other DLP matches in the same body or header set. |
+| `disable_patterns` | `[]` | Exact DLP pattern names to skip for request body/header DLP and WebSocket client-to-server frame DLP. Unknown names are rejected at config load. Immutable core DLP patterns cannot be disabled. Disabling one pattern does not suppress other DLP matches in the same body, header, or frame. |
 | `max_body_bytes` | `5242880` | Max body size to buffer; bodies exceeding this are always blocked (fail-closed) |
 | `scan_headers` | `true` | Scan request headers for DLP patterns |
+| `issuer_bound_session_cookies` | `true` | Leave a Cookie pair out of header DLP when the same session received that exact name and value in a `Set-Cookie` on an intercepted HTTPS response that was delivered, and returns it over HTTPS to the issuing host, or, for a valid `Domain` attribute that is not a public suffix, to a host inside that domain, within the cookie's path and expiry. Pipelock also requires the same port as the issuing response, a restriction browsers do not apply to cookies. The allowance applies only to an operator-established agent identity: a per-agent listener binding, a `source_cidrs` match, or `default_agent_identity`. Without a configured default, requests whose identity is self-declared through the agent header or `?agent=`, or that carry no identity, are scanned in full. With an unbound `default_agent_identity`, header-carrying requests share the default identity's allowance and state bucket; set `default_agent_identity` (or bind listeners) for the allowance to take effect. Every other cookie pair, header, URL and body is scanned as before. The same setting and prerequisites also let a query value through query-value entropy when an intercepted HTTPS response from that host issued it to the same trusted session: a JSON string, an HTML link attribute, or the `Location` header of a 201, 202, 204 or 3xx response (an upload URL or an API's next-page link), plus the exact same-origin paths those responses link to for path-segment entropy, and the origin of an HTML document it served for a page-origin echo in a `Referer` or `Origin` value; that evidence is memory-only and cleared on restart or when any prerequisite is disabled. Setting the option to `false` removes all of these allowances, and every such value, path and origin echo is scored again. Takes effect only with `request_body_scanning.enabled`, `tls_interception.enabled` and header scanning. Set `false` to scan every cookie and to also score issued query values. Keyed cookie evidence persists across enabled reloads and restarts at `$XDG_STATE_HOME/pipelock/proxy/issuer-cookies.json` (default `~/.local/state/pipelock/proxy/issuer-cookies.json`), mode `0600` in a `0750` directory. Disabled prerequisites reset evidence; a missing, invalid, or unreadable file scans all cookies. A plain unencoded JWT in a `Cookie` header follows `request_body_scanning.action` like any other header finding on every transport, including the critical-severity hard-block floor; this allowance is the only automatic exception for a session cookie. See [false-positive tuning](guides/false-positive-tuning.md#browser-session-cookies-on-intercepted-https). |
 | `header_mode` | `sensitive` | `sensitive`: scan only listed headers. `all`: scan all headers except ignore list |
 | `sensitive_headers` | (see above) | Headers to scan in `sensitive` mode |
 | `ignore_headers` | (hop-by-hop + structural) | Headers to skip in `all` mode |
 | `content_entropy_enabled` | `true` | Flag opaque high-entropy body content that matches no credential pattern (data exfiltration with no signature). Applies to request bodies, WebSocket client-to-server frames, and A2A message bodies. |
-| `content_entropy_action` | `warn` | `warn` audits, `block` rejects (requires enforce mode). General presets ship `warn` (observe-first); `strict` and `hostile-model` ship `block`. |
+| `content_entropy_action` | `warn` | `warn` audits and forwards opaque content; it does not prevent opaque exfiltration. `block` rejects (requires enforce mode). General presets ship `warn`; `strict` and `hostile-model` ship `block`. Entropy-only findings never raise the adaptive score or acquire a stronger action. |
 | `content_entropy_threshold` | `4.5` | Shannon entropy (bits/char) above which a value is flagged. A long all-hex value below this is still flagged as opaque-hex content. |
 | `content_entropy_min_length` | `32` | Minimum value length considered; shorter values are ignored to limit false positives on short opaque identifiers. |
-| `content_entropy_exclusions` | `[]` | Destination hosts exempt from per-message content entropy only (not from DLP). Use for endpoints that legitimately carry opaque content (content-addressed uploads, encrypted payloads). WebSocket has a parallel `websocket_proxy.content_entropy_exclusions`. |
-| `content_entropy_warn_routes` | `[]` | Exact, temporary HTTPS routes where request-body entropy findings warn instead of block. Each entry requires one exact host and canonical non-root path, one or more non-text content types, a reason, owner, and expiry no more than 90 days ahead; methods are optional. Shorten the exception, or use a permanent scanned upload design instead. Other findings retain their configured actions; size and redirect limits remain fail-closed. |
-| `sigv4_credential_routes` | `[]` | Exact, temporary HTTPS request-body routes allowed to carry a structurally valid AWS SigV4 presigned URL. Each entry requires one exact host and canonical non-root path, one or more methods and content types, a reason, owner, and expiry no more than 30 days ahead. Shorten the exception, or move the credential handoff out of the request body for a permanent integration. Only the access-key ID inside a complete presigned URL is exempted; bare keys, malformed URLs, extra credentials, headers, and every out-of-route destination still hit the immutable DLP floor. |
+| `content_entropy_exclusions` | `[]` | Destination hosts exempt from per-message content entropy only (not from DLP). Use for endpoints that legitimately carry opaque content (content-addressed uploads, encrypted payloads). WebSocket has a parallel `websocket_proxy.content_entropy_exclusions`. Cloudflare's challenge host `challenges.cloudflare.com` is always exempt in addition to this list, because bot-verification challenges post encrypted per-challenge data there by design. Each entry is either a plain host string (permanent, as before) or a mapping `{host, expires, reason, owner}` for a temporary exclusion: `expires` (`YYYY-MM-DD`) is required and no more than 90 days ahead, `reason` and `owner` are optional, and the two forms can be mixed in one list. A mapping entry stops applying after its `expires` date even in a running process, an expired date fails validation at load and reload, and the same shapes apply to `websocket_proxy.content_entropy_exclusions`. Prefer a mapping entry over a plain one for an exception you intend to remove. |
+| `content_entropy_warn_routes` | `[]` | Temporary HTTPS routes where request-body entropy findings warn instead of block. Each entry requires one exact host, exactly one of `path` or `path_prefix`, one or more content types, a reason, owner, and expiry no more than 90 days ahead; methods are optional. `path` is one exact canonical non-root path and accepts only non-text content types. `path_prefix` covers a service-issued route with a random per-request segment (for example `/cdn-cgi/challenge/`): it matches on a path-segment boundary, so `/cdn-cgi/challenge` matches itself and its children but not `/cdn-cgi/challengeX`, and a trailing slash matches children only. It follows the same canonical-path rules as `path_entropy_exclusions[].path_prefix` (leading `/`, not `/`, no URL, traversal, encoded slashes, wildcards, or controls) and may list text content types such as `application/x-www-form-urlencoded`, `application/json`, or `text/plain`, because the payloads it exists for are textual. Either way only the entropy finding is downgraded: DLP, injection, address, size, and redirect checks keep their configured actions. Two routes on one host that cover a common path with overlapping methods and content types are rejected. Shorten the exception, or use a permanent scanned upload design instead. |
+| `sigv4_credential_routes` | `[]` | Exact, temporary HTTPS request-body routes allowed to carry a structurally valid AWS SigV4 presigned URL. Requires `request_body_scanning.enabled`. Each entry requires one exact host and canonical non-root path, one or more methods and content types, a reason (≤200 characters), an owner (≤100 characters, no control characters in either), and expiry no more than 30 days ahead. Two entries for the same host and path whose methods and content types overlap are rejected. Shorten the exception, or move the credential handoff out of the request body for a permanent integration. Only the access-key ID inside a complete presigned URL is exempted; bare keys, malformed URLs, extra credentials, headers, and every out-of-route destination still hit the immutable DLP floor. |
 | `trusted_hosts` | `[]` | Destinations where two request-side hard blocks fall back to `action`: injection-shaped text found in a request body, and a critical credential finding that redaction fully rewrote. Every request-side scan still runs, other findings keep their configured actions, and `response_scanning.exempt_domains` never affects request-side decisions. Supports `*.example.com` wildcards. |
 
 **Content-type dispatch:** JSON bodies have string values and object keys extracted recursively. Form-urlencoded bodies are parsed as ordered key-value pairs so split instruction phrases preserve wire order. Multipart form data scans all part headers plus all part bodies regardless of declared `Content-Type` (max 100 parts), and decodes `Content-Transfer-Encoding: base64` / `quoted-printable` before scanning. Text/* and XML bodies are scanned as raw text. Unknown content types get a fallback raw-text scan (never skipped, preventing `Content-Type` spoofing bypass).
@@ -476,22 +596,22 @@ request_body_scanning:
 - Multipart part exceeding `max_body_bytes`
 - Multipart filename exceeding 256 bytes: prevents secret exfiltration via long filenames
 
-**Header scanning:** Headers are scanned regardless of destination host. An agent can exfiltrate secrets via `Authorization: Bearer <secret>` to any host, including allowlisted ones. The URL allowlist controls URL-level blocking, not header DLP bypass.
+**Header scanning:** Headers are scanned regardless of destination host. An agent can exfiltrate secrets via `Authorization: Bearer <secret>` to any host, including allowlisted ones. The URL allowlist controls URL-level blocking, not header DLP bypass. Exception: an `Authorization` header carrying one structurally valid SigV4 envelope (`AWS4-HMAC-SHA256` with exactly `Credential`, `SignedHeaders` and `Signature`, and a valid credential scope) sent over HTTPS/WSS to an `amazonaws.com` or `amazonaws.com.cn` host has only its access-key ID removed from the scan; the forwarded header is unchanged. A cleartext destination, another host, a repeated `Authorization` header, a malformed envelope, `Proxy-Authorization`, or a second credential elsewhere in the request still blocks. No route or suppression is needed for signed AWS API calls.
 
-**Security hard-blocks:** In enforce mode, immutable core DLP findings in request bodies and headers hard-block with `X-Pipelock-Block-Reason: dlp_match` even when `request_body_scanning.action: warn`; they cannot be disabled or downgraded by `pattern_actions`. The same immutable core floor also hard-blocks a core credential found in MCP input (`tools/call` arguments and other JSON-RPC fields) regardless of `mcp_input_scanning.action` — except a core credential that request-side redaction fully rewrites, which follows the configured action, as described under MCP Input Scanning — and in an A2A body regardless of `a2a_scanning.action`, including the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. The A2A floor covers a core credential carried in a URL field (query or path) and in an `A2A-Extensions` header URI, not only in text fields, so a URL-embedded core credential cannot be downgraded to warn. WebSocket frames still follow the generic body floor. Scan failures and incomplete scans fail closed. Findings the core predicate does not classify as core follow the configured action; a positive core match can only raise the action to block, never lower it. Non-body inbound MCP responses use the separate inbound-DLP path, not this floor. Request-body prompt-injection findings hard-block with `X-Pipelock-Block-Reason: prompt_injection` on every destination except those listed in `request_body_scanning.trusted_hosts`, where they follow `action`; a fully redacted critical credential follows `action` on a trusted host the same way. Operators that need audit-only rollout for selected non-core critical body-DLP patterns can set those exact names under `request_body_scanning.pattern_actions` with `warn`, or run the deployment with `enforce: false`.
+**Security hard-blocks:** In enforce mode, immutable core DLP findings in request bodies and headers hard-block with `X-Pipelock-Block-Reason: dlp_match` even when `request_body_scanning.action: warn`; they cannot be disabled or downgraded by `pattern_actions`. The core credential floor also blocks with `enforce: false`: on `/fetch`, the forward proxy, CONNECT, TLS interception, the reverse proxy, WebSocket, A2A scanning and setup hooks, a core credential in a URL, header, body, frame or A2A field blocks in audit mode exactly as in enforce mode, including the `trusted_hosts` carve-out for a fully redacted body. A JSON object or array that can't be inspected because it exceeds the typed number or depth budget (`Uninspectable JSON number`) is also refused in audit mode on the paths that apply the JSON card policy. Every other finding is observed and forwarded in audit mode. The same immutable core floor also hard-blocks a core credential found in MCP input (`tools/call` arguments and other JSON-RPC fields) regardless of `mcp_input_scanning.action` — except a core credential that request-side redaction fully rewrites, which follows the configured action, as described under MCP Input Scanning — and in an A2A body regardless of `a2a_scanning.action`, including the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. The A2A floor covers a core credential carried in a URL field (query or path) and in an `A2A-Extensions` header URI, not only in text fields, so a URL-embedded core credential cannot be downgraded to warn. WebSocket frames still follow the generic body floor. Scan failures and incomplete scans fail closed. Findings the core predicate does not classify as core follow the configured action; a positive core match can only raise the action to block, never lower it. Non-body inbound MCP responses use the separate inbound-DLP path, not this floor. A core credential's compiled destination audience (see the credential-audience allowance) does not relax this floor: MCP input carries no verified upstream authority to check a destination against, so a GitHub, GitLab or Slack token in `tools/call` arguments blocks even when the arguments name that provider's own API host. The audience allowance applies only to request bodies, headers and WebSocket client frames on the forward, CONNECT, intercept and reverse-proxy paths. In enforce mode, request-body prompt-injection findings hard-block with `X-Pipelock-Block-Reason: prompt_injection` on every destination except those listed in `request_body_scanning.trusted_hosts`, where they follow `action`; with `enforce: false` the injection hard-block is off and the finding is handled like any other request-body finding, so a `warn` deployment logs it and forwards the request unless another control blocks it, such as an adaptive enforcement escalation; a fully redacted critical credential follows `action` on a trusted host the same way. Operators that need audit-only rollout for selected non-core critical body-DLP patterns can set those exact names under `request_body_scanning.pattern_actions` with `warn`, or run the deployment with `enforce: false`. Adaptive enforcement can still escalate a warning to a block in either case, including with `enforce: false`, so an audit-only rollout that must not escalate also sets `adaptive_enforcement.enabled: false`.
 
-Some APIs accept an AWS presigned URL inside a JSON or form body so the server can fetch an attachment. The URL contains an AWS access-key ID, which belongs to the immutable DLP floor and cannot be handled with `suppress`, `disable_patterns`, or `pattern_actions`. Use `sigv4_credential_routes` only for the exact outbound HTTPS API request carrying that body; the route matches the outer request, not the embedded AWS URL. Routes apply to forward-proxy, intercepted CONNECT, and reverse-proxy requests. WebSocket frames never match a route, because a frame has no request method or declared content type; the embedded key stays blocked there. Pipelock separately requires the embedded URL to use an AWS-owned hostname and a complete SigV4 structure before exempting the key inside `X-Amz-Credential`; the same value anywhere else remains blocked. Long-lived presigned URLs keep the existing `SigV4 Long Expiry` warning.
+Some APIs accept an AWS presigned URL inside a JSON or form body so the server can fetch an attachment. The URL contains an AWS access-key ID, which belongs to the immutable DLP floor and cannot be handled with `suppress`, `disable_patterns`, or `pattern_actions`. Use `sigv4_credential_routes` only for the exact outbound HTTPS API request carrying that body; the route matches the outer request, not the embedded AWS URL. Routes apply to intercepted CONNECT requests, to forward-proxy absolute-URI requests with an `https` scheme (an `HTTP_PROXY` request to a plain `http://` URL never matches), and to reverse-proxy requests when the configured upstream is `https`. On the reverse proxy, `path` must name the path as sent upstream, including any upstream base path, not the inbound path; a route written for the bare inbound path silently never matches behind an upstream with a base path. WebSocket frames never match a route, because a frame has no request method or declared content type; the embedded key stays blocked there. Pipelock separately requires the embedded URL to use an AWS-owned hostname and a complete SigV4 structure before exempting the key inside `X-Amz-Credential`; the same value anywhere else remains blocked. Long-lived presigned URLs keep the existing `SigV4 Long Expiry` warning.
 
-**Adaptive enforcement interaction:** A body/header DLP action of `warn`, including a per-pattern `pattern_actions` downgrade, still enters the existing adaptive enforcement path and can be upgraded to `block` unless the destination is adaptive-exempt. `disable_patterns` removes only the named DLP finding from this request-body/header surface; it does not create a destination exemption and does not affect URL, response, MCP, or file DLP scanning.
+**Adaptive enforcement interaction:** A body/header DLP action of `warn`, including a per-pattern `pattern_actions` downgrade, still enters the existing adaptive enforcement path and can be upgraded to `block` unless the destination is adaptive-exempt. `disable_patterns` removes only the named DLP finding from this request-body/header/WebSocket-client-frame surface; it does not create a destination exemption and does not affect URL, response, MCP, or file DLP scanning.
 
-An entropy warning produced by `content_entropy_warn_routes` is not promoted back to block and does not add an adaptive signal. It remains a visible finding, so that request does not count as a clean recovery/decay event. Logs and receipts include the configured reason, owner, and expiry. A 307/308 body replay is allowed only while the redirected request still matches the same exact route; leaving that route fails closed.
+An entropy warning produced by `content_entropy_warn_routes` is not promoted back to block and does not add an adaptive signal. This now applies to every entropy-only finding, including routes without an override. It remains a visible finding, so that request does not count as a clean recovery/decay event. Informational card-run warnings also never raise the adaptive score or count as clean recovery/decay events. Logs and receipts include the configured reason, owner, and expiry for a matched route. A 307/308 body replay is allowed only while the redirected request still matches the same route (for a `path_prefix` route, any path under that prefix); leaving that route fails closed.
 
 Deploy binaries that understand these route fields across the fleet before publishing shared configuration that uses them. Config parsing rejects unknown fields, so an older process will refuse the new configuration instead of silently ignoring an exception.
 
 **Opaque content entropy (`content_entropy_*`):** DLP catches secrets that match a known pattern. A stolen canary-file value, an opaque token, or a hex-encoded blob has no signature, so a pattern scanner misses it. Content entropy closes that gap: a high-entropy value leaving in a request body, a WebSocket client-to-server frame, or an A2A message body to a destination that is not trusted is flagged, regardless of pattern. Destination trust comes from the parsed upstream authority (not a request-supplied `Host` header), and hosts in `trusted_domains` or `content_entropy_exclusions` are skipped. Entropy suppression never suppresses a DLP match in the same body. The shipped default is `warn` so the detector observes before it enforces; `strict` and `hostile-model` presets use `block`.
 
 Known limits, by design:
-- **Content-addressed uploads look like exfil.** A SHA-256 hash and a hex-encoded 32-byte secret are the same shape, so length alone cannot separate them. In `block` mode (strict/hostile presets), prefer an exact `content_entropy_warn_routes` entry for a known HTTPS upload endpoint. Host-wide `content_entropy_exclusions` and `trusted_domains` are broader exemptions.
+- **Content-addressed uploads look like exfil.** A SHA-256 hash and a hex-encoded 32-byte secret are the same shape, so length alone cannot separate them. In `block` mode (strict/hostile presets), prefer a `content_entropy_warn_routes` entry for a known HTTPS upload endpoint. Host-wide `content_entropy_exclusions` and `trusted_domains` are broader exemptions; if a host-wide exclusion is unavoidable, write it as a mapping with an `expires` date.
 - **Route warning exceptions are HTTP-only.** They apply to forward proxy HTTPS requests, intercepted HTTPS requests, and HTTPS reverse-proxy upstreams. They do not change WebSocket frame entropy or A2A's separate field-aware entropy checks. `Content-Type` narrows operator intent but is supplied by the sender and is not treated as proof that the body is safe.
 - **WebSocket detection is per-message.** A blob split across separate WebSocket messages, each under `content_entropy_min_length`, is not aggregated here; the cross-request data budget (`cross_request_detection`) is the net for sustained multi-message exfiltration.
 - **MCP-transport A2A** (stdio/HTTP MCP gateways) does not yet apply content entropy; those paths lack a parsed upstream authority to gate destination trust on. HTTP/CONNECT-proxied A2A message bodies are covered.
@@ -631,6 +751,8 @@ request_policy:
 - `reason:` operator-facing explanation surfaced on the block. Never logged with request content.
 - `route:` which requests the rule applies to (see below).
 - `graphql:` optional GraphQL operation predicate (see below).
+- `discriminator:` optional top-level JSON field predicate (see [Discriminator predicate](#discriminator-predicate)).
+- `except:` optional exact JSON string exception on an enforced `block` rule (see [Exact JSON exception on a block rule](#exact-json-exception-on-a-block-rule)).
 
 When a rule sets both `route` and `graphql`, **both must match**: the route selects the request, then the predicate is evaluated against the operations extracted from its body.
 
@@ -638,7 +760,7 @@ When a rule sets both `route` and `graphql`, **both must match**: the route sele
 
 | Field | Description |
 |-------|-------------|
-| `hosts` | Exact host or `*.suffix` wildcard. A `*.example.com` pattern matches the apex `example.com` and any subdomain. Normalized (lowercased, port and trailing dot stripped). |
+| `hosts` | Exact host or `*.suffix` wildcard. A `*.example.com` pattern matches the apex `example.com` and any subdomain. Lowercased and its trailing dot removed at load; a URL, `host:port`, interior wildcard, or malformed label is refused, not silently stripped. The request's host is compared without its port. |
 | `methods` | HTTP verbs, normalized to uppercase. Matched against the **effective** method (see method-override note below). |
 | `path_prefixes` | Literal prefixes of the normalized path. |
 | `path_patterns` | RE2 patterns against the normalized path. Path case is preserved during normalization (IDs are case-sensitive); use a `path_pattern` for case-insensitive matching. |
@@ -687,14 +809,35 @@ Semantics, all fail-closed:
 
 - A string value at `field` is matched against `value_patterns`; the predicate matches when any pattern matches.
 - An absent `field` does not match. The allow-by-default rail forwards unless another rule matches.
-- A present but non-string value, a top-level body that is not a JSON object, or a duplicated target key is opaque and fails closed via `on_opaque_operation`.
+- A present but non-string value, a top-level body that is not a JSON object, or a duplicated target key (including a case-insensitive alias) is opaque and fails closed via `on_opaque_operation`.
 - A body that is not valid JSON fails closed via `on_parse_error`.
 
 A rule may set both `graphql` and `discriminator`; when it does, both predicates must match (in addition to the route). The discriminator predicate is evaluated on every HTTP transport and per WebSocket text frame, the same surfaces as the GraphQL predicate, and it folds into the canonical policy hash.
 
+### Exact JSON exception on a block rule
+
+Use `except` when a narrowly scoped block rule must permit one exact top-level JSON string value. The exception applies only after the body is fully read and parsed. A missing or duplicate key (including a case-insensitive alias), different value or case, non-string value, malformed JSON, or unreadable body keeps the block active, even if `on_parse_error` or `on_opaque_operation` is `warn` or `allow`.
+
+```yaml
+  rules:
+    - name: "block-move-except-archive"
+      action: block
+      route:
+        hosts: ["api.service.example.com"]
+        methods: ["POST"]
+        path_patterns: ["/items/.+/move$"]
+      except:
+        field: "destinationId"
+        values: ["archive"]
+```
+
+`except` requires an enforced `block` rule scoped by host, a body-carrying method (`POST`, `PUT`, `PATCH`, `DELETE`, or `QUERY`), and path. It cannot be combined with `graphql` or `discriminator`. Values are compared after JSON decoding and must match exactly, including case. A batch sub-request is inspected with the same rule; but if the rule's route also matches a `batch` envelope, the envelope request itself is blocked unconditionally; its own JSON fields can never exempt it, because an envelope is not an individual request. The exception is evaluated only on extracted sub-requests. This exception is a narrow allowance within the named rule; other matching rules still apply.
+
+To exercise `except`, send a body-carrying request through the forward proxy. The `/fetch` endpoint accepts only GET requests, and `forward_proxy.enabled` defaults to `false`, so enable the forward proxy (or use the reverse proxy) for a POST test.
+
 ### Batch endpoints
 
-A JSON batch endpoint wraps multiple sub-requests in one outer request, each carrying its own method, URL, and body. When an outer request route-matches a `batch` entry, request policy parses the envelope and evaluates **every** sub-request against the full rule set: host inherited from the outer request, plus the sub-request's effective method, normalized path, and any GraphQL operation in its body or URL query. The strictest decision across all sub-requests wins, so a dangerous operation cannot evade a rule by being wrapped in a batch.
+A JSON batch endpoint wraps multiple sub-requests in one outer request, each carrying its own method, URL, and body. When an outer request route-matches a `batch` entry, request policy parses the envelope and evaluates **every** sub-request against the full rule set: host inherited from the outer request, plus the sub-request's effective method, normalized path, any GraphQL operation in its body or URL query, and its JSON body for `discriminator` and `except` predicates (a sub-request body that is absent or not valid JSON is uninspectable for those predicates: `on_parse_error` for a `discriminator` rule, always `block` for an `except` rule). The strictest decision across all sub-requests wins, so a dangerous operation cannot evade a rule by being wrapped in a batch.
 
 | Field | Default | Description |
 |-------|---------|-------------|
@@ -705,7 +848,7 @@ A JSON batch endpoint wraps multiple sub-requests in one outer request, each car
 | `body_field` | `"body"` | Sub-request body field. |
 | `max_sub_requests` | `64` | Cap on sub-requests evaluated per batch. Over the cap, the envelope fails closed via `on_parse_error`. |
 
-The envelope field names default to the common OData-style JSON batch shape (`requests[].{method,url,body}`); override them for a differently shaped envelope. A sub-request whose method or URL field is missing or not a string fails closed (it must not silently evaluate as `method="" path="/"`). Nested batches are expanded up to a fixed depth; beyond that depth a sub-request that itself targets a batch endpoint fails closed regardless of configuration. An unread, oversize, or unparseable envelope fails closed via `on_parse_error`.
+The envelope field names default to the common OData-style JSON batch shape (`requests[].{method,url,body}`); override them for a differently shaped envelope. A sub-request whose method or URL field is missing or not a string fails closed (it must not silently evaluate as `method="" path="/"`). Nested batches are expanded up to a fixed depth; beyond that depth a sub-request that itself targets a batch endpoint fails closed regardless of configuration. An unread, oversize, or unparseable envelope fails closed via `on_parse_error`. An envelope or sub-request object with an exact duplicated JSON key, or a case-insensitive alias of a configured envelope field, is blocked outright (rule `batch`, reason `batch contains duplicate JSON keys`) regardless of `on_parse_error`, on every configured batch endpoint.
 
 ### Transport coverage
 
@@ -719,7 +862,9 @@ A matched rule records a decision metric and an audit event with bounded, operat
 
 ## WebSocket Proxy
 
-Bidirectional WebSocket scanning via `/ws?url=ws://upstream:9090/path`. Text frames are scanned through the full DLP + injection pipeline. Fragment reassembly handles split messages in scan-only mode; when `redaction.enabled` is on, outbound fragmented client messages fail closed because the proxy only rewrites complete JSON messages.
+Before the upstream handshake, Pipelock scans the complete supplied target URL, including userinfo and fragments. Core credential findings in those components refuse the handshake with HTTP 403, even when enforcement is disabled. Admission and session evidence use the same URL.
+
+WebSocket scanning via `/ws?url=ws://upstream:9090/path`. Client-to-server text frames are scanned for DLP and prompt injection (governed by `request_body_scanning`); server-to-client text frames are scanned for prompt injection only, with no DLP in that direction. Content split across messages is scanned joined (DLP for client messages, prompt injection for server messages): raw text through a trailing window, and JSON messages per string field plus a stream-level text window (see `cross_message_field_limit`). Prompt injection in client messages is scanned per message. Per-field tails retain JSON strings; numeric values use the separate typed numeric scanning path. Fragment reassembly handles split messages in scan-only mode; when `redaction.enabled` is on, outbound fragmented client messages fail closed because the proxy only rewrites complete JSON messages.
 
 ```yaml
 websocket_proxy:
@@ -733,6 +878,7 @@ websocket_proxy:
   idle_timeout_seconds: 300
   origin_policy: rewrite        # rewrite, forward, or strip
   forward_cookies: false
+  cross_message_field_limit: 0  # 0 = default (512), max 4096
 ```
 
 | Field | Default | Restart? | Description |
@@ -747,10 +893,13 @@ websocket_proxy:
 | `idle_timeout_seconds` | `300` | No | Close established connections after this much inactivity |
 | `origin_policy` | `"rewrite"` | No | Origin header: rewrite, forward, or strip |
 | `forward_cookies` | `false` | No | Forward client Cookie headers to upstream |
+| `cross_message_field_limit` | `0` (512) | No | JSON fields per connection and direction whose trailing text is joined with the next text message, so a value split across messages is scanned as one. A message that cannot be joined within this budget closes the connection; raise it for clients that send large JSON messages such as tool schemas. Maximum 4096 |
+
+Cross-message joining keeps, per connection and direction, the trailing text of each JSON string field plus one stream-level window fed by text members (`text`, `delta`, `arguments`, `partial_json`, `thinking`, `input`, `output`, and a delta's `content`, `reasoning_content`, `reasoning` and `refusal`) and by changed string members of `choices`, `tool_calls` and content-block elements, and scans each new value joined with them. A message with more JSON leaves than the per-message limit (1024, or twice `cross_message_field_limit` if larger) is joined only as far as it was partitioned; after such a message, any later message that adds a string field the connection is not already tracking fails closed. The same applies to SSE responses, whose per-message limit is fixed at 1024 leaves. Neither the 1024-leaf limit nor the 512 default is taken from a provider specification; both are bounds chosen for observed message shapes, and the WebSocket budget is configurable.
 
 ## DLP (Data Loss Prevention)
 
-Scans URLs for secrets and sensitive data using regex patterns. Built-in patterns cover API keys, tokens, credentials, and prompt injection indicators. Runs before DNS resolution to prevent exfiltration via DNS queries. Matching is always case-insensitive.
+Scans URLs for secrets and sensitive data using regex patterns. Built-in patterns cover API keys, tokens, credentials, and prompt injection indicators. Runs before DNS resolution to prevent exfiltration via DNS queries. Matching is always case-insensitive, except `AWS Access ID`: a candidate containing lowercase letters counts only if it also contains an uppercase ID or an `AKIA`/`ASIA` run in any case. In the whitespace-joined view, which fuses words that were separated in the original text, a match must also contain a prefix followed by at least 16 letters or digits of a single case. IAM resource prefixes must not start in the middle of a same-case word; credential prefixes `AKIA` and `ASIA` remain detectable there. This reduces English false positives, but single-case prose beginning with an AWS prefix can still match.
 
 ```yaml
 dlp:
@@ -782,7 +931,7 @@ dlp:
 
 There is no top-level `dlp.action` setting. DLP enforcement is transport-specific:
 
-- URL/query scanning uses global `mode` plus `enforce` (`mode: audit` or `enforce: false` logs but does not block).
+- URL/query scanning uses global `mode` plus `enforce` (`mode: audit` or `enforce: false` logs but does not block, except a core credential, which blocks in every mode).
 - HTTP request body/header scanning uses `request_body_scanning.action`.
 - MCP input scanning uses `mcp_input_scanning.action`.
 - `response_scanning.action: strip` is for inbound prompt-injection response rewriting, not DLP.
@@ -792,7 +941,7 @@ There is no top-level `dlp.action` setting. DLP enforcement is transport-specifi
 Some patterns include a `validator` field for post-match checksum verification. When set, regex matches are passed through a checksum algorithm before being flagged. This eliminates false positives from random numbers that happen to match the pattern format.
 
 Built-in validated patterns:
-- **Credit Card Number** (`validator: luhn`) — Visa, Mastercard (including 2-series), Amex, Discover, JCB. Luhn checksum rejects ~90% of false positives.
+- **Credit Card Number** (`validator: luhn`) — Visa, Mastercard (including 2-series), Amex, Discover, JCB. Luhn checksum rejects ~90% of false positives. The shipped regex is greedy, so a card followed by a space or hyphen and another short number (an unlabelled expiry such as `12/27`, a quantity, or `-3`) first produces one longer match that fails validation. When that happens, Pipelock keeps the match's start and retries shorter candidates that end just before a space or hyphen already inside the match, longest first, and reports the first one that passes the issuer and Luhn checks. A retry never splits a run of contiguous digits, never moves the start, and keeps at least the rule's 15-digit floor. This retry applies only to the built-in rule; a custom pattern that sets `validator: luhn` keeps whole-match validation. It can still miss a card that begins inside a longer failed match, such as one preceded by an unrelated four-digit group, and it adds false positives where a separated prefix of a longer reference number happens to pass the card checks.
 - **IBAN** (`validator: mod97`) — International Bank Account Numbers. Validates ISO 13616 country codes and ISO 7064 mod-97 checksum. Rejects ~99% of false positives.
 - **Bitcoin WIF Private Key** (`validator: wif`) — Base58Check decoding with SHA-256d checksum verification. Validates mainnet version byte (0x80) and 32/33-byte payload. Eliminates false positives from text that happens to contain 51-52 characters of the base58 alphabet.
 
@@ -821,7 +970,7 @@ Use `exempt_domains` to skip a specific DLP pattern for specific destination dom
 
 This is useful for APIs that embed credentials in URL paths by design (e.g., Telegram bot API uses `/bot<token>/sendMessage`). The token should be allowed when talking to Telegram but blocked if it appears in requests to other domains.
 
-Built-in provider-key patterns cannot use `exempt_domains` to create or extend an audience. A legacy entry that only repeats a compiled audience host still loads, produces a warning, and is ignored. Remove the stale entry when you update the config. Use `exempt_domains` only with a custom pattern:
+On a built-in provider-key pattern, `exempt_domains` never extends the compiled audience and never removes it. An entry the audience already covers loads, produces a warning, and is ignored; remove the stale entry when you update the config. An entry outside the audience is honored for that destination only and produces a warning, because the credential can then leave for a host its vendor does not own. Changing a built-in's regex, severity, validator, or action replaces the built-in and drops its compiled audience, and `pipelock check` warns when that happens. For a credential class Pipelock does not ship, use a custom pattern:
 
 ```yaml
 dlp:
@@ -833,11 +982,21 @@ dlp:
         - "api.provider.example"
 ```
 
-Built-in provider-key patterns and the Discord bot-token pattern carry a compiled, immutable credential-audience host set. When one of those credentials is sent to its declared API authority, URL, request-body, request-header, and outbound WebSocket-frame DLP allow that one match and record `dlp_credential_audience_allow`; the counter is `pipelock_dlp_credential_audience_allows_total{pattern,surface}`. The same credential stays blocked for every other destination, including lookalike hosts. The set itself is not YAML configuration: it cannot be extended or cleared. The ordinary operator controls still apply to these patterns, so `suppress`, `disable_patterns`, and a `warn` action all continue to work and each one warns at config load, naming the entry and the audience it widens. That is a deliberate choice: refusing the config instead would stop a previously valid deployment from starting on upgrade. MCP input remains blocked because it has no verified upstream authority. See [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md) for included shapes, exclusions, and the custom provider-key path.
+Built-in provider-key patterns, the Google OAuth access-token pattern, and the messaging-platform token patterns (Discord and Slack) carry a compiled, immutable credential-audience host set. GitHub token classes (`GitHub Token`, `GitHub Fine-Grained PAT`), `GitLab PAT`, and `GitLab CI Job Token` do too. The other GitLab token classes (deploy, runner, trigger, OAuth application secret, SCIM, and service tokens) have no audience and block on every destination. When one of those credentials is sent to its API authority over an encrypted scheme, on the header that provider documents, the applicable request and WebSocket DLP checks allow that one match and record `dlp_credential_audience_allow`; the counter is `pipelock_dlp_credential_audience_allows_total{pattern,surface}`. For most non-core patterns the allowance also covers URL DLP. Google OAuth access tokens are limited to a Bearer Authorization header. GitHub tokens are limited to `Authorization: Bearer` or `Authorization: token` at `api.github.com` and `uploads.github.com`. `GitLab PAT` is limited to `PRIVATE-TOKEN` or `Authorization: Bearer` at `gitlab.com`. Git over HTTPS is a separate, narrower rule: `GitHub Token`, `GitHub Fine-Grained PAT`, and `GitLab PAT` may travel as `Authorization: Basic` (for example `x-access-token:<token>` or GitLab's `oauth2:<token>`) over `https` to `github.com`, `gitlab.com`, or a declared enterprise host, and only on a git smart-HTTP or Git LFS path: `<repo>/info/refs?service=git-upload-pack` or `?service=git-receive-pack`, `<repo>/git-upload-pack`, `<repo>/git-receive-pack`, or `<repo>/info/lfs/...`. The path is checked as forwarded, and a percent-encoded path or one with `..`, `.`, or `//` segments does not qualify. Basic on any other path, Basic at `api.github.com`, and Bearer or token at `github.com` block. GitLab Basic is held to the same git paths; GitLab Bearer and `PRIVATE-TOKEN` remain valid on any path. Any other Authorization scheme blocks for both. `GitLab CI Job Token` is limited to `JOB-TOKEN`. URL, body, other-header, and WebSocket-frame matches for those classes still block, including on the audience host. `JWT Token` carries one compiled audience of a different kind: `release-assets.githubusercontent.com`, the exact host GitHub redirects release downloads to with a GitHub-issued signed grant in the URL query. A JWT in the query of an `https` request to that host is allowed only when it has the exact shape of GitHub's grant: an HS256 header with no other fields, a 32-byte signature, claims limited to `aud`, `exp`, `iss`, `key`, `nbf`, and `path`, `github.com` as issuer, that host as audience, a `key` of the form `key` followed by up to three digits, a `path` naming GitHub's release-asset storage account, no repeated claim names, a lifetime of at most one hour, and a current time inside its validity window (allowing 15 minutes of clock skew, the tolerance Azure documents for this token format). A host clock off by more than that blocks GitHub release downloads, and the block reason says the grant is outside its validity window. It must also arrive as one whole query value, so `github.com/<owner>/<repo>/releases/download/...` works through the proxy. Every JWT in the query must pass that check: an unrelated token, or one riding beside a real grant, keeps the request blocked. The claims bind the token to its stated purpose; the signature is not verified, because GitHub signs the grant with HS256, a key only GitHub holds. A forged token that passes the claim check can only deliver its bytes to GitHub's own download storage, which the sender cannot read back. Only the query carries it: a JWT in the path, the host, a fragment, a header, a request body, or a WebSocket frame still blocks there, and so does the same JWT at any other host, including subdomains and lookalikes, unless an `exempt_domains` entry on the pattern names that host. Every other credential pattern still blocks in that URL. An `exempt_domains` entry on a `JWT Token` pattern that keeps the shipped regex, severity, validator and action follows the rule above: an entry that names the release host is ignored, and any other entry skips the pattern for that host only. Neither changes how the release host is judged. `Azure SAS Token` shares that exact host and is granted only next to a JWT this scanner has already verified as GitHub's release grant for that same host: GitHub's real redirect carries an Azure user-delegation SAS beside the grant, and the SAS itself cannot be verified by this proxy (it is an HMAC under an Azure key Pipelock does not hold), so it is trusted on the grant's claims and the destination, not on proof of issuance: a forged grant that passes the claim check can only deliver the SAS to GitHub's own storage, which the sender cannot read back. The SAS is allowed only over `https`, at that exact host, in the URL query, and only when the query also carries every signed parameter of Azure's user-delegation SAS shape (`sp`, `sv`, `sr`, `spr`, `se`, `skoid`, `sktid`, `skt`, `ske`, `sks`, `skv`, `sig`), with its expiry inside the same validity window; GitHub's unsigned response-header overrides (`rscd`, `rsct`, `response-content-disposition`, `response-content-type`) are not required. A SAS with no valid co-located grant, one whose grant names a different host, one on a lookalike or unrelated host (including a real Azure blob host), one missing a signed parameter, or one in the path, a header, a request body, or a WebSocket frame still blocks. A core-floor credential (`Slack Token`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`) placed in a URL query stays blocked, because the immutable core URL floor is evaluated first and a URL leaks the token into logs and history in ways a header does not. The same credential stays blocked for every other destination, including lookalike hosts. The compiled set itself is not YAML configuration: it cannot be extended or cleared. `dlp.github_enterprise_hosts` and `dlp.gitlab_hosts` name additional exact hosts for GitHub Enterprise Server, GHE.com, and self-managed or Dedicated GitLab. They do not accept wildcards, IP literals, ports, or URLs; name each exact API host (for GHE.com, the `api.` host of your subdomain). The git rule uses the same declared lists, so a declared host also accepts Basic on git transport paths; for GHE.com, git traffic goes to the subdomain itself, which must be declared separately. Adding a host widens the audience: config load warns, and a reload that adds a host warns and is refused in strict mode or while `flight_recorder.require_receipts` is on. Removing a host narrows the audience and reloads without a warning. A declared host is trusted with the credential: if that host is attacker-controlled, or later changes hands, it receives the token by design, so declare only instances your organization operates. In the default `header_mode: sensitive`, `PRIVATE-TOKEN` and `JOB-TOKEN` are in the scanned header list, like `Authorization`. A GitLab token on either header is therefore allowed only at `gitlab.com` or a host named in `dlp.gitlab_hosts`; for a self-managed or Dedicated GitLab instance, list its host there, or requests carrying those headers block by default, just as `Authorization: Bearer` does.
 
-Top-level `suppress`, `request_body_scanning.disable_patterns`, and a `warn` entry in `request_body_scanning.pattern_actions` remain operator controls and DO apply to built-in provider-key patterns. They do not edit the compiled audience set; they decide whether a match that falls outside it is enforced. Widening this way is a real security decision, so each one warns at load naming the entry and every match is audited. `exempt_domains` behaves differently on these patterns and is stricter: an entry naming any host outside the compiled audience is REJECTED at load, and an entry that only repeats compiled audience hosts loads with a warning and is ignored. For a custom provider-key pattern that you own, use a narrowly scoped pattern and the controls appropriate to the carrier: `exempt_domains` for URL DLP and `suppress` for request-body or request-header DLP.
+```yaml
+dlp:
+  github_enterprise_hosts:
+    - "github.corp.example"
+  gitlab_hosts:
+    - "gitlab.corp.example"
+```
 
-Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) cannot be exempted this way. A pattern that reuses one of those names with `exempt_domains` is rejected at startup and on reload, and the configured scanner ignores the field for those names even if one slipped through, so a core credential class is blocked on every destination regardless of overrides.
+AWS secret keys and private keys have no audience. For the non-core patterns the ordinary operator controls still apply, so `suppress`, `disable_patterns`, and a `warn` action all continue to work and each one warns at config load, naming the entry and the audience it widens; a core-floor member keeps its compiled audience but still refuses all three controls, as the core-floor note below describes. That is a deliberate choice: refusing the config instead would stop a previously valid deployment from starting on upgrade. This audience is not a license-gated detection feature. MCP input remains blocked because it has no verified upstream authority. See [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md) for included shapes, exclusions, and the custom provider-key path.
+
+Top-level `suppress`, `request_body_scanning.disable_patterns`, and a `warn` entry in `request_body_scanning.pattern_actions` remain operator controls and DO apply to non-core built-in provider-key patterns. They do not edit the compiled audience set; they decide whether a match that falls outside it is enforced. Widening this way is a real security decision, so each one warns at load naming the entry and every match is audited. `exempt_domains` behaves differently on these patterns: an entry naming a host outside the compiled audience is honored for that host only and loads with a warning, and an entry that only repeats compiled audience hosts loads with a warning and is ignored. Core safety-floor patterns still reject `exempt_domains` at load. For a custom provider-key pattern that you own, use a narrowly scoped pattern and the controls appropriate to the carrier: `exempt_domains` for URL DLP and `suppress` for request-body or request-header DLP.
+
+Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) cannot be exempted, suppressed, or downgraded by operator configuration. A pattern that reuses one of those names with `exempt_domains` is rejected at startup and on reload, and the configured scanner ignores the field for those names even if one slipped through. A core pattern may still carry a compiled audience. `Slack Token` is allowed at Slack's exact encrypted API authorities (`slack.com` and `mcp.slack.com`). `GitHub Token` and `GitHub Fine-Grained PAT` are allowed on an encrypted `Authorization` header at `api.github.com` and `uploads.github.com`. `GitLab PAT` is allowed on an encrypted `PRIVATE-TOKEN` or `Authorization` header at `gitlab.com`. `dlp.github_enterprise_hosts` and `dlp.gitlab_hosts` add exact enterprise hosts for those classes and do not replace the compiled public hosts. The credential stays blocked on every other destination. A declared host the operator does not control receives the credential by design. AWS secret keys and private keys never gain a destination allowance. The compiled hosts cannot be cleared from YAML.
 
 ### Built-in DLP Patterns (65)
 
@@ -850,10 +1009,10 @@ Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `
 | LLM Router API Key | `sk-or-v1-` + 20+ hex chars | critical |
 | Answer Engine API Key | `pplx-` + 20+ token chars | critical |
 | Web Research API Key | `tvly-` + 20+ token chars | critical |
-| AWS Access Key ID | `AKIA\|A3T\|AGPA\|AIDA\|AROA\|AIPA\|ANPA\|ANVA\|ASIA` | critical |
+| AWS Access ID | `AKIA\|A3T\|AGPA\|AIDA\|AROA\|AIPA\|ANPA\|ANVA\|ASIA` | critical |
 | Google API Key | `AIza` | high |
 | Google OAuth Client Secret | `GOCSPX-` | critical |
-| Google OAuth Token | `ya29.` | high |
+| Google OAuth Token | `ya29.` | critical |
 | Google OAuth Client ID | `*.apps.googleusercontent.com` | medium |
 | Stripe Key | `[sr]k_live\|test_` | critical |
 | Stripe Webhook Secret | `whsec_` | critical |
@@ -911,7 +1070,7 @@ Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `
 | System Override | `system:` | high |
 | Role Override | `you are now (DAN\|evil\|unrestricted)` | high |
 | New Instructions | `(new\|updated) (instructions\|directives)` | high |
-| Jailbreak Attempt | `DAN\|developer mode\|sudo mode` | high |
+| Jailbreak Attempt | `DAN` beside a word (`act as DAN`, `DAN mode`), `developer mode`, `sudo mode`, `unrestricted mode` | high |
 | Hidden Instruction | `do not reveal this to the user` | high |
 | Behavior Override | `from now on you (will\|must)` | high |
 | Encoded Payload | `decode this from base64 and execute` | high |
@@ -921,6 +1080,10 @@ Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `
 | Instruction Dismissal | `set the previous instructions aside` | high |
 | Priority Override | `prioritize the (task\|current) (request\|input)` | high |
 
+**JSON numbers and card matching:** Generic card detection inspects the written integer component of each complete JSON number. It excludes fraction and exponent digits within that one number because observed geometry telemetry produced a card-shaped false positive from a single decimal coordinate. [RFC 8259 section 6](https://www.rfc-editor.org/rfc/rfc8259#section-6) supplies the number grammar; the exclusion is Pipelock policy based on that observation. Exponents are not evaluated or rounded. A separate pass joins adjacent scalar pieces and reports only candidates accepted by the existing card pattern, issuer rules and Luhn check. A match assembled from at least two JSON numbers alone is recorded as a warning and forwarded, including numbers written with a fraction or exponent. String-containing runs use UNION: enforce when either ANCHORED or WINDOW finds a validated card. ANCHORED joins whole pieces with one ASCII space and accepts a complete piece-bounded candidate only when the shipped regex matches the whole candidate and the issuer and Luhn checks pass. WINDOW applies the shipped regex `\b\d{4}(?:[- ]?\d){11,15}\b` using ordinary greedy, non-overlapping `FindAll` over the typed scalar sequence joined with one ASCII space, then applies issuer and Luhn validation, with the same shorter-candidate retry as ordinary text only for the built-in rule. A WINDOW hit must overlap at least one string piece within the accepted candidate; a string elsewhere in the sequence does not promote a number-only hit. WINDOW preserves string context and separators. For example, a context-prefixed split can enforce through WINDOW, while ANCHORED retains complete-piece enforcement when extra digit pieces surround a card. Thus 4/4/4/4 and 8/8 string groups enforce; a 2/7/7 split found only by gluing pieces without separators is informational, recorded and forwarded through the same warning paths as number-only evidence. A later enforcing finding always wins. A single number whose own integer component matches a card also keeps normal enforcement, including fraction, exponent and over-budget scalar spellings. Whole-leaf and ordinary-text card matches, known secrets and other credential patterns retain normal enforcement. Redaction leaves informational joins unchanged. Array siblings and nested values can form a run; container delimiters are transparent. Object keys are skipped during card-piece assembly: they neither contribute digits or string provenance nor interrupt adjacent values. Labeled string splits therefore enforce under UNION, while runs assembled only from two or more number values in numeric-keyed maps remain informational. Unrelated labeled digit-string fields can also satisfy UNION and enforce; labels alone do not distinguish those records from a split card. Booleans and null also interrupt matches. A string piece may group its digits with single spaces or hyphens, as the shipped rule allows; doubled separators and intervening non-digit text are not compacted away. Strings, keys, encoded values and non-JSON text keep their ordinary checks. Known-value checks use the original numeric spelling. Malformed JSON retains conservative raw scanning or the transport's parsing refusal; a valid JSON object or array beyond the typed number or depth budget is refused, while a scalar or string value keeps its ordinary checks.
+
+HTTP JSON request bodies, MCP request envelopes, scan API tool arguments, hook payloads and A2A JSON retain scalar types before extraction. Complete JSON object or array payloads in WebSocket text messages and generic SSE events receive the number policy, as do JSON documents carried in MCP content blocks or embedded resource text. Scalar SSE events and WebSocket text messages keep the plain text view. Typed number boundaries also carry into A2A stream joins; string-valued SSE metadata and HTTP headers keep ordinary scanning. MCP structured numeric response values also retain their separate known-value channel. Fetch responses and server-to-client WebSocket messages scan for injection only; this card policy does not add DLP to those paths. Rules using the `luhn` validator receive the numeric policy regardless of their name. Digits carried only in a single number's fraction or exponent remain outside generic card matching; there is no canonical exponent-value detection.
+
 `Credential in URL` treats a line-start `key=value` as a credential only when `=` has no surrounding whitespace; spaced source or configuration assignments such as `token = value` are not this pattern's target. Query-style forms beginning with `?`, `&`, or `;` retain whitespace tolerance, so `? token = value` is still detected. Tabs are removed during DLP normalization before this grammar check, so tab-aligned assignments remain a documented false-positive residual. The whitespace-view refinement belongs to the unmodified built-in pattern; a renamed copy or a rule-bundle copy of the same regex keeps only the regex-level grammar.
 
 ### Environment Variable Leak Detection
@@ -928,9 +1091,18 @@ Core safety-floor patterns (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `
 When `scan_env: true`, pipelock reads all environment variables at startup and flags URLs containing any env value that is:
 - 16+ characters (configurable via `min_env_secret_length`)
 - Shannon entropy > 3.0 bits/char
-- Checked in raw form, base64, hex, and base32 encodings
+- Checked whole in raw, base64, base64url, hex, base32, and decimal-character-code form (comma- or space-separated, e.g. `65,75,73`)
+- Also checked as a contiguous 16-byte-or-longer piece when the value itself is 16+ bytes with entropy above 3.0 (partial-disclosure matching always needs 16 contiguous bytes, whatever `min_env_secret_length` is set to). For URL-shaped values, only the password, query values, fragment, and path segments are matched in part. The URL block reason ends in `(partial N)` and text findings carry `partial_len`.
+
+For text scanner findings, partial environment-value matches include `partial_len`. The Scan API's `dlp` findings do not expose that field, even with `include_evidence: true`; the encoded value is available in the finding's `evidence` instead.
 
 This catches leaked API keys even without a specific DLP pattern for that provider.
+
+Values shaped like a filesystem path are not collected, whatever the variable is named, because an agent mentioning its own install or config path is not leaking a secret. The recognised shapes are an absolute Unix path with at least two components (`/opt/app/bin`), a home-relative path (`~/.config/app`), a colon list of absolute Unix paths, an absolute Windows drive path with at least two components (`C:\Tools\App\app.exe`), and a UNC path with at least two components after the share (`\\server\share\team\app.exe`). Windows shapes use backslash separators only and reject `.` or `..` components, reserved filename characters, ASCII control characters, and `% & # ; + =`, so drive-relative, root-relative, device and list forms stay scanned. A secret stored in exactly one of these shapes is not matched by this check; other DLP patterns still apply to it.
+
+A copied fragment of a collected environment secret is caught too, starting at 16 bytes. A value longer than 4,096 bytes, such as an inline certificate or JSON key, is indexed at up to 4,081 evenly spaced 16-byte positions instead of every position, so a fragment is caught once it is long enough to cover one of them: about 18 bytes for an 8 KiB value and about 48 bytes for the largest single environment string Linux allows (128 KiB). Canary tokens use the same index. A single long value no longer stops Pipelock from starting.
+
+DLP decoding accepts hex, percent-encoding, standard and URL-safe base64, RFC 4648 base32 in any ASCII case, RFC 4648 base32hex, JSON `\uXXXX` escapes, and HTML character references in URL query values. It does not decode Crockford base32, z-base-32, base58, ascii85, rot13, or reversed text.
 
 ## Seed Phrase Detection
 
@@ -949,7 +1121,7 @@ seed_phrase_detection:
 | `min_words` | int | `12` | Minimum consecutive BIP-39 words to trigger. Must be 12, 15, 18, 21, or 24. |
 | `verify_checksum` | bool | `true` | Validate the BIP-39 SHA-256 checksum. Reduces false positives by 16x for 12-word phrases, 256x for 24-word. |
 
-The detector uses a dedicated scanner (not regex). It tokenizes text, runs a sliding window over the 2048-word BIP-39 English dictionary, and validates the checksum. Detection covers varied separators (spaces, commas, newlines, dashes, tabs, pipes).
+The detector uses a dedicated scanner (not regex). It tokenizes text, runs a sliding window over the 2048-word BIP-39 English dictionary, and validates the checksum. Detection covers varied separators (spaces, commas, newlines, dashes, tabs, pipes, `?`, `&`, `=`, and backslashes). Quotes, brackets, and markup angle brackets also split words, but a phrase must sit between the same pair, so words are never joined across JSON or markup structure.
 
 Action follows the transport-level DLP action: URL scan always blocks, MCP input uses `mcp_input_scanning.action`, body/header uses `request_body_scanning.action`.
 
@@ -978,11 +1150,67 @@ Recommended rollout flow:
 4. Remove the `action` line (or set it to empty string) to revert the pattern to normal DLP enforcement semantics — the actual verdict then follows the transport-level DLP action and the session's `mode`/`enforce` state rather than being unconditionally block.
 5. Roll out the change through your normal config-review process.
 
+## Prompt-injection wording detection
+
+Regex wording detection is enabled by default. The global
+`prompt_injection_detection` setting applies to core wording rules, configured
+response patterns, request bodies, MCP responses and inputs, MCP tool
+descriptions, A2A, and browser response wording scans across mediated transports.
+It does not change the existing per-surface actions unless you select warn-only.
+
+To disable the wording family:
+
+```yaml
+prompt_injection_detection:
+  enabled: false
+```
+
+To retain wording observations without blocking, stripping, asking, or producing
+injection-driven taint:
+
+```yaml
+prompt_injection_detection:
+  action: warn
+```
+
+Omitting the section, or using `enabled: true` with `action: block`, preserves the
+existing per-surface policy. A missing, blank, or null `enabled` value means true.
+The action accepts `block` and `warn`; `block` preserves the existing surface
+action rather than forcing every surface to block. `enabled: false` takes
+precedence over the action.
+
+With wording detection disabled on local stdio MCP servers, no injection-driven
+taint is produced, so no prompt-injection protection remains there until source
+trust is tracked separately from wording suspicion. Warn-only also produces no
+injection-driven taint. DLP, including the core credential floor, and destination
+controls still protect traffic leaving the machine through Pipelock. SSRF, tool
+policy, tool drift and structural checks, contracts, action limits, and the kill
+switch retain their existing behavior. Tool-name rules, dangerous-capability
+checks and parameter-name checks keep using `mcp_tool_scanning.action`, including
+when wording detection is off or warn-only. Browser shield structural protections
+also remain active. That includes `browser_shield.strip_hidden_traps`, which
+removes hidden HTML and SVG elements and comments that contain instruction words such
+as "ignore" or "instruction"; this setting does not change it. Set
+`browser_shield.strip_hidden_traps: false` to stop that stripping as well.
+
+Startup logs, `pipelock doctor`, and `pipelock explain` disclose the selected
+coverage reduction. Audit logs record the selected policy and warn-only pattern
+names without matched content. Action receipts include the wording policy in
+existing signed reason fields; their schema is unchanged. Hot reload updates the
+scanner snapshot; strict-mode security downgrade checks still apply, so a
+weakening rejected on reload requires an explicit restart with the new config.
+
+Warn-only observations carry the available destination, agent label, transport, and MCP server name. Audit destinations use the same content redaction as other response-scan events. Scans without request context omit unavailable attribution. Encrypted CONNECT tunnel payloads aren't scanned unless TLS interception is enabled.
+
 ## Response Scanning
 
 Scans fetched content for prompt injection before returning to the agent. Uses a 6-pass normalization pipeline: zero-width stripping, word boundary reconstruction, leetspeak folding, optional-whitespace matching, vowel folding, and encoding detection.
 
-```yaml
+Response scanning evaluates each HTTP response on its own. Forward, TLS-intercepted, and reverse proxy traffic refuses every partial (`206`) and not-modified (`304`) response with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. Fetch can return partial responses when its response policies permit them. A fetch client that joins partial responses should treat the completed document as untrusted and scan it before use, because content whose meaning appears only in the combined text may not be detected.
+
+Response text classification uses the body bytes, not the declared `Content-Type`: a body is treated as text when at least 80% of its decoded runes are printable. For opaque bodies, Pipelock scans maximal contiguous printable runs of at least 16 bytes, with hard separators between runs. Binary gaps never become whitespace in that retained view. Prose reconstruction can join runs only when each run meets the same 16-byte floor. Instructions embedded as a full phrase or split across long runs, whatever characters those runs contain, can still match; instructions split into short word-sized runs may no longer match. Reconstructed base64 and hex text is used only as decode input; decoded content is still scanned. Neither content types nor container signatures grant trust.
+
+```yaml template (date-substitution required)
 response_scanning:
   enabled: true
   action: warn                  # block, strip, warn, or ask
@@ -1001,7 +1229,7 @@ response_scanning:
       content_types: ["application/octet-stream"]
       reason: "opaque signed archive"
       added: "2026-07-04"
-      expires: "2026-12-15" # temporary opaque download; 90-day maximum
+      expires: "<date within 90 days>" # temporary opaque download; replace with a future date within the maximum
   authenticated_artifacts:      # exact signed rules artifacts verified by the proxy
     - host: "pipelab.org"
       path: "/rules/pipelock-community/bundle.yaml"
@@ -1009,6 +1237,12 @@ response_scanning:
   mcp_servers:                  # MCP response trust classes; default is untrusted/block
     - server: "analysis-server"
       trust: "reasoning"        # reasoning permits warn when action is warn; untrusted => block
+  core_observe_exceptions:      # declared, expiring observe valve on the immutable floor.
+    - host: "docs.vendor.example"
+      pattern: "Prompt Injection"
+      reason: "vendor prompt-injection guide read during rule authoring"
+      owner: "security-team"
+      expires: "<date within 30 days>" # replace with a future date within the maximum; see the note below
   patterns:
     - name: "Custom Injection"
       regex: 'override system prompt'
@@ -1016,20 +1250,22 @@ response_scanning:
 
 | Field | Default | Description |
 |-------|---------|-------------|
-| `enabled` | `true` | Enable response scanning |
+| `enabled` | `true` | Enable the configurable response-scanning layer. With `false`, the immutable core response patterns still run on fetch, forward, CONNECT, reverse, WebSocket and agent hooks, and their findings block unless a `core_observe_exceptions` entry covers that host and pattern. |
 | `action` | `"warn"` | block, strip, warn, or ask (HITL) |
 | `ask_timeout_seconds` | `30` | Timeout for human-in-the-loop approval |
-| `include_defaults` | `true` | Merge with 33 built-in patterns |
+| `include_defaults` | `true` | Merge with 34 built-in patterns |
 | `exempt_domains` | `[]` | Hosts to skip injection scanning for (DLP still applies on outbound). Supports `*.example.com` wildcards (also matches the apex `example.com`). |
 | `size_exempt_domains` | `[]` | Trusted hosts whose oversized forward-proxy, TLS-intercepted, or reverse-proxy responses use the larger bounded whole-buffer scan ceiling instead of failing the normal scan cap. Browser Shield also uses that bounded ceiling for whole-body rewriting. |
 | `size_exempt_scan_max_bytes` | `67108864` | Maximum bytes read into memory for one over-cap response from a `size_exempt_domains` host before the existing response scanners run. Exceeding this ceiling blocks fail-closed with no upstream bytes delivered. |
+| `size_exempt_scan_limits` | `[]` | Expiring exact-host overrides for the bounded, fully scanned ceiling. Each entry requires `host`, `max_bytes`, `owner`, `reason`, `added`, and `expires`. The host must already match `size_exempt_domains`; wildcards and duplicate hosts are refused. `max_bytes` must be at least the shared per-response ceiling and at most the existing aggregate in-flight budget. `added` and `expires` are RFC 3339 timestamps with an explicit timezone; the grant applies from `added` up to, but excluding, `expires`, for at most 90 days. Startup and reload reject active grants beyond that horizon. A response keeps the ceiling admitted before its body read through Browser Shield processing. Expired entries remain loadable with a warning and revert to the shared ceiling without a reload. Forward HTTP, intercepted TLS, reverse proxy, and their Browser Shield paths use the same selector. Fetch retains its ordinary cap. Every existing scanner and receipt requirement still applies. No host receives a grant by default. |
 | `size_exempt_scan_max_inflight_bytes` | `268435456` | Per-proxy-instance memory reservation budget for concurrent over-cap size-exempt scans. If a scan cannot reserve its ceiling immediately, the response blocks fail-closed instead of waiting. |
 | `unscannable_passthrough` | `[]` | Structured allowlist for deliberately unscannable opaque artifact responses. Matching entries stream unscanned and emit an audit warning plus an allow receipt on every use. Requires `host`, exact `paths`, non-textual `content_types`, `reason`, and non-expired `expires`; optional `added` documents the entry. The `expires` date may be no more than 90 days ahead; shorten it, or use a scanned delivery path or authenticated artifact for a permanent need. The host must also match `size_exempt_domains`, the response must exceed the normal scan cap, include a positive `Content-Length`, and declare `Content-Disposition: attachment`. Every RFC 9239 JavaScript media type and alias (`text/javascript`, `application/javascript`, `application/ecmascript`, `application/x-javascript`, `application/x-ecmascript`, `text/ecmascript`, and the rest of the section-6 list) is refused as a `content_types` entry, matching what the browser shield already treats as JavaScript, so an opaque-download exception cannot admit an equivalent script response under a less common alias. |
 | `authenticated_artifacts` | `[]` | Exact official signed rules artifacts which the forward proxy and decrypted CONNECT interceptor buffer and verify before bypassing only response prompt-injection matching. Each entry requires exact `host`, canonical non-root `path`, and signed `bundle_name`; no wildcard, prefix, query, userinfo, or non-default port matches. The proxy fetches the sidecar signature without forwarding caller credentials, refuses every redirect, verifies an embedded official Ed25519 key and the bundle identity, then records an audit event and artifact-labelled allow receipt. Any mismatch, redirect, oversized body, invalid signer/signature, or wrong bundle name blocks before upstream bytes reach the client. Request DLP, authority, SSRF, budgets, Browser Shield, and media policy remain active. Upgrade binaries before adding this field: older binaries reject unknown config fields. |
-| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by `pipelock mcp proxy --server-name`. A server that is omitted, missing, or does not match an entry is treated as `untrusted` and blocks response-injection findings. A malformed entry is not a fallback: an unknown trust value, an invalid server name, or a duplicate entry fails config validation, so the configuration does not load. `reasoning` permits warn-and-forward only when `response_scanning.action` is `warn`; a stricter section action still applies. |
-| `patterns` | 33 built-in | Injection and state/control poisoning patterns |
+| `mcp_servers` | `[]` | Per-MCP-server response trust classes keyed by the server name: the `pipelock mcp proxy --server-name` operator label, or the registered name when the launch matches an `mcp_identities` entry. The label is a name the operator chose, not proof of which server answers. A server that is omitted, missing, or does not match an entry is treated as `untrusted` and blocks response-injection findings. A malformed entry is not a fallback: an unknown trust value, an invalid server name, or a duplicate entry fails config validation, so the configuration does not load. `reasoning` permits warn-and-forward only when `response_scanning.action` is `warn`; a stricter section action still applies. |
+| `core_observe_exceptions` | `[]` | Declared, expiring per-host observe entries for ONE named core response pattern. The scan still runs and still matches; only the block is withheld, and the finding is recorded and emitted as evidence under the `core_observed` reason. Requires exact `host` (wildcards refused), a `pattern` naming one of the 13 core response pattern names (case-insensitive; the error lists them), `reason`, `owner`, and a non-expired `expires` no more than 30 days ahead. `host` must be a valid ASCII hostname; for MCP it is the server name. `reason` and `owner` are at most 200 characters with no control characters. A second entry for the same host and pattern is refused. An expired or malformed entry blocks again without waiting for a reload. Adding an entry takes effect on hot reload and is not itself refused in strict mode or under `require_receipts`, unlike adding an `exempt_domains` host. |
+| `patterns` | 34 built-in | Injection and state/control poisoning patterns |
 
-**Built-in patterns (33):** Prompt-injection and state/control poisoning coverage includes jailbreak phrases, system overrides, role overrides, instruction manipulation, encoded payloads, tool invocation commands, authority escalation, credential solicitation, credential path directives, auth material requirements, memory persistence directives, preference poisoning, covert-action directives, silent credential handling, and CJK-language override patterns. All patterns use DOTALL mode to match across newlines in multiline tool output.
+**Built-in patterns (34):** Prompt-injection and state/control poisoning coverage includes jailbreak phrases, system overrides, role overrides, instruction manipulation, encoded payloads, tool invocation commands, authority escalation, credential solicitation, credential path directives, auth material requirements, memory persistence directives, preference poisoning, covert-action directives, silent credential handling, and CJK-language override patterns. None of the shipped defaults set the `(?s)` DOTALL flag, so `.` in a pattern stops at a line break, while `\s` between words matches one; the core injection pattern still matches a phrase split across lines.
 
 **Actions:**
 - **block:** reject the response entirely, agent gets an error
@@ -1037,17 +1273,44 @@ response_scanning:
 - **warn:** log the match, return content unchanged
 - **ask:** pause and prompt the operator for approval (requires TTY)
 
-**MCP required control:** `response_scanning.enabled: false` is currently ignored in `pipelock mcp proxy` and `pipelock mcp scan` modes because MCP response scanning is required. Pipelock runs with default response scanning and prints a warning naming the overridden field. `pipelock mcp scan` scans stdin responses for prompt injection and generic inbound credential patterns, and, like `pipelock mcp proxy`, auto-enables tool-definition scanning (poisoning and drift detection) for `tools/list` responses unless `mcp_tool_scanning` is explicitly configured. It intentionally skips agent-owned environment and file-secret matching because receiving an agent-owned value is not exfiltration. Numeric leaves of a structured response travel on a separate channel that is compared only against known values: a registered canary token (as a plain number or spelled out as decimal character codes) and a configured environment or file secret disguised as decimal character codes. A character-code run is decoded before the comparison, so separators, letter case for canaries, and the integral float and exponent forms JSON permits do not change whether a planted value is found. Numbers never enter the prompt-injection or pattern-DLP scan, so ordinary telemetry, pixel data and metric samples cannot be joined into a credential-shaped string, while a protected value delivered entirely as numbers is still found. State the limit that buys plainly: because only known values are compared, a numeric run that spells something Pipelock was never told about is not detected. An instruction, or a credential shape that is not a registered canary or a configured environment or file secret, passes this channel when it is delivered as character codes. Register the values that matter as canaries if you need them caught in that form. It does not run tool call policy or request-side input scanning, because it only ever sees one side of the conversation: the response stream on stdin, never the paired request. JSON verdicts include `scanned: ["response_injection", "response_dlp"]`, plus `"tool_scanning"` whenever a `tools/list` response's definitions were inspected by the dedicated tool scanner, to make that scope explicit. A `tools/list` response scanned while `mcp_tool_scanning` is explicitly disabled reports `clean: false` with `unscanned: ["tool_scanning"]` rather than a false `clean: true`: a verdict never certifies content it did not inspect. The same applies to a `tools` array the tool scanner cannot read, such as one holding a non-object element. Disabling tool scanning takes both fields, because `enabled: false` with no action is indistinguishable from an unconfigured section and auto-enables:
+**MCP required control:** `response_scanning.enabled: false` is currently ignored in `pipelock mcp proxy` and `pipelock mcp scan` modes because MCP response scanning is required. Pipelock runs with default response scanning and prints a warning naming the overridden field. `pipelock mcp scan` scans stdin responses for prompt injection and generic inbound credential patterns, and, like `pipelock mcp proxy`, auto-enables tool-definition scanning (poisoning and drift detection) for `tools/list` responses unless `mcp_tool_scanning` is explicitly configured. It intentionally skips agent-owned environment and file-secret matching because receiving an agent-owned value is not exfiltration. Numeric leaves of a structured response retain a separate known-value channel for registered canaries and configured secrets disguised as decimal character codes. A character-code run is decoded before comparison, so separators, letter case for canaries, and the integral float and exponent forms JSON permits do not change whether a planted value is found. Generic card matching separately checks adjacent JSON scalar pieces, including separate numbers, against the configured card pattern, issuer rules and checksum. A single number's fraction and exponent remain excluded from that generic card view. Numbers do not enter the prompt-injection or other pattern-DLP scans. A non-card credential shape or instruction delivered as character codes still needs a registered known value to be found by the numeric channel. It does not run tool call policy or request-side input scanning, because it only ever sees one side of the conversation: the response stream on stdin, never the paired request. JSON verdicts include `scanned: ["response_injection", "response_dlp"]`, plus `"tool_scanning"` whenever a `tools/list` response's definitions were inspected by the dedicated tool scanner, to make that scope explicit. A `tools/list` response scanned while `mcp_tool_scanning` is explicitly disabled reports `clean: false` with `unscanned: ["tool_scanning"]` rather than a false `clean: true`: a verdict never certifies content it did not inspect. The same applies to a `tools` array the tool scanner cannot read, such as one holding a non-object element. An intentional disable requires `enabled: false` and a nonempty `action`. The action is inactive while the section is disabled. An omitted section, or legacy `enabled: false` with an omitted, null, or empty action, retains runtime defaults. Ambiguous legacy settings print a warning at startup and in `pipelock doctor` naming the config source, section, and the exact `action: warn` line to set for an intentional disable. Replace an existing `action: ""` or `action: null` line rather than adding a second `action` key, which fails to parse as a duplicate key. The same convention applies to `mcp_input_scanning` and `mcp_tool_policy`; policy sections with rules retain their configured state. For example:
 
 ```yaml
 mcp_tool_scanning:
   enabled: false
-  action: warn                # required: enabled:false alone is treated as unconfigured
+  action: warn
 ```
 
-This compatibility fallback will become a startup/reload error in a future release; remove the disable to silence the warning.
+`pipelock doctor` reports effective MCP controls for proxy, listener, and scan modes, including controls enabled by default. Its `mcp_wrapper_scanning` check reports `warn` when any mode has configured controls because configuration alone cannot prove that traffic reaches the wrapper; `reachable` and `enforcing` remain false until verified separately.
 
-**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs, and only the response injection scan is skipped; this list never loosens a request-side control. To let a destination's request bodies follow the configured action instead of the request-side hard blocks, use `request_body_scanning.trusted_hosts`. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers`, and a reasoning-model MCP server can warn only when the enclosing response action is also `warn`.
+**Exempt domains:** Trusted response APIs can return instruction-like text as part of normal operation, which can trigger false positives. Use `exempt_domains` to skip injection scanning for trusted providers. DLP scanning on the outbound request still runs, and only the response injection scan is skipped; this list never loosens a request-side control. To let a destination's request bodies follow the configured action instead of the request-side hard blocks, use `request_body_scanning.trusted_hosts`. Applies to fetch proxy, forward proxy, CONNECT (TLS intercept), WebSocket, and reverse proxy. Forward, TLS-intercepted, and reverse proxy traffic refuses every `206` and `304` with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. On forward proxy and CONNECT (TLS intercept), when `response_scanning.enabled` is true and the response is not declared SVG, an exempt host's complete response streams byte-intact with no scan and no size cap, so it is also the way to carry a trusted artifact larger than `size_exempt_scan_max_bytes`; every body that streams past the scan ceiling this way is logged as a `response_scan_exempt` warning, counted in `pipelock_response_scan_exempt_overcap_unscanned_total`, and, on TLS intercept, recorded in the outcome receipt with `reason=exempt_over_cap_unscanned`. Reverse proxy still buffers exempt responses and enforces its fixed ceiling. Does not affect MCP response scanning; MCP uses `response_scanning.mcp_servers`, and a reasoning-model MCP server can warn only when the enclosing response action is also `warn`.
+
+**Observing one core pattern on one host:** the core response patterns are the immutable floor: they cannot be disabled, removed, or suppressed, and `patterns[].exempt_domains` does not reach them. While `response_scanning.enabled` is `true` a core match follows `response_scanning.action`, so under `warn` the finding is logged and the response is forwarded; with `enabled: false` the floor still runs and a core match blocks whatever `action` says. Before this valve the only configuration that let a blocked page through was `exempt_domains`, which stops injection scanning for the whole host. `core_observe_exceptions` is the narrow alternative: it names one host, one core pattern, why, who authorized it, and when it ends.
+
+Use a separate `suppress` entry for a configured pattern on its exact path, while the core exception observes only the named built-in pattern on the named host:
+
+```yaml template (date-substitution required)
+response_scanning:
+  patterns:
+    - name: Vendor Prompt Pattern
+      regex: 'follow these instructions instead'
+  core_observe_exceptions:
+    - host: docs.vendor.example
+      pattern: Prompt Injection
+      reason: approved documentation review
+      owner: security-team
+      expires: "<date within 30 days>"
+suppress:
+  - rule: Vendor Prompt Pattern
+    path: /guide/
+    reason: reviewed vendor guide wording
+```
+
+The core exception does not suppress other core findings. Top-level `suppress` cannot name immutable core patterns; use it only for configurable patterns.
+
+Observing is not exempting. The pattern still runs on every normalization pass and the finding is still produced; Pipelock withholds only the block, records the finding, and emits it with the `core_observed` reason so it is distinguishable from an ordinary suppression in audit and metrics. Observing one pattern never masks another: if the same content also trips a second core pattern you did not declare, that one still blocks.
+
+Two limits worth knowing before you reach for it. A page often trips more than one pattern, so a real document may need several entries or may also need `suppress` for a configured (non-core) pattern, and you will discover that one refusal at a time. And the expiry is re-checked when the response is scanned, not only when the config loads, so a long-running proxy stops observing at the end of the `expires` date (UTC); the entry covers that whole day.
 
 **MCP response trust classes:** MCP response scanning defaults to `untrusted`, which blocks response-injection findings even if the generic `response_scanning.action` is `warn`. This protects web-relay servers such as fetch/search/scraping tools. A trust class can tighten the enclosing `response_scanning.action`, but it cannot weaken it. To allow a reasoning-model MCP server to answer security-analysis questions that quote canonical jailbreak strings, set the enclosing action to `warn` and opt in by server name:
 
@@ -1061,13 +1324,13 @@ response_scanning:
 
 `reasoning` maps to `warn`; `untrusted` maps to `block`. Pipelock applies the stricter of that mapping and `response_scanning.action`, so `block`, `ask`, and `strip` still apply to a reasoning server. Unknown trust values fail config validation, duplicate server entries fail validation, and entries are surfaced as warnings when `response_scanning.enabled` is false. The trust decision applies to MCP stdio, stdio-to-HTTP, reverse Streamable HTTP/SSE, and WebSocket surfaces because they share the MCP response scan gate. Block logs and JSON-RPC errors name the server, matched pattern, and trust class so operators can see whether a server needs an explicit trust-class review.
 
-Response trust does not make a server trusted for taint propagation. If a reasoning server is also an operator-trusted source whose clean responses should not contaminate the session, add the same `--server-name` value under `taint.trusted_mcp_servers`. Prompt-injection findings still raise hostile taint.
+Response trust does not make a server trusted for taint propagation. If a reasoning server is also an operator-trusted source whose clean responses should not contaminate the session, add the same `--server-name` value (or the registered `mcp_identities` name) under `taint.trusted_mcp_servers`. Prompt-injection findings still raise hostile taint.
 
-Launch MCP proxies with a stable server identity so the entry can match: use `pipelock mcp proxy --server-name analysis-server ...` for per-server wrappers, or `pipelock run --mcp-listen ... --mcp-upstream ... --mcp-server-name analysis-server` for the long-lived MCP listener.
+Launch MCP proxies with a stable server name so the entry can match (the name is an operator label unless the upstream is registered under `mcp_identities`): use `pipelock mcp proxy --server-name analysis-server ...` for per-server wrappers, or `pipelock run --mcp-listen ... --mcp-upstream ... --mcp-server-name analysis-server` for the long-lived MCP listener.
 
-For forward-proxy and TLS-intercepted traffic, an exempt host's response streams through untouched when `response_scanning.enabled` is true: no buffering, response scan-cap block, media metadata strip, Browser Shield rewrite, or injection scan is applied to that trusted response. Request-side DLP, redaction, SSRF, authority checks, and budget accounting still run. If a host needs full byte-preserving passthrough without MITM, prefer `tls_interception.passthrough_domains`.
+Forward, TLS-intercepted, and reverse traffic refuses every `206` and `304` with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. For forward-proxy and TLS-intercepted traffic, an exempt host's complete response streams through untouched when `response_scanning.enabled` is true and the response is not declared SVG: no buffering, response scan-cap block, media metadata strip, Browser Shield rewrite, or injection scan is applied to that trusted response. Request-side DLP, redaction, SSRF, authority checks, and budget accounting still run. If a host needs full byte-preserving passthrough without MITM, prefer `tls_interception.passthrough_domains`.
 
-Non-exempt responses that must be buffered for response scanning, Browser Shield, or media policy block fail-closed if they exceed the configured scan cap (`fetch_proxy.max_response_mb` or `tls_interception.max_response_bytes`). The block uses reason code `response_size` and names the host, observed size, scan ceiling, and the knob to raise. Data-budget truncation is separate and remains an explicit budget policy.
+Non-exempt responses that must be buffered for response scanning, Browser Shield, or media policy block fail-closed if they exceed the configured scan cap (`fetch_proxy.max_response_mb` or `tls_interception.max_response_bytes`). The block uses reason code `response_size` and names the host, observed size, scan ceiling, and only the remedies that path honors, narrowest first: raise the scan cap, add the host to `size_exempt_domains` (bounded scan), then, for a trusted artifact host whose downloads exceed that bound, `exempt_domains` (its responses are no longer scanned) or, on TLS intercept only, `tls_interception.passthrough_domains` (not intercepted or body-scanned, after an accepted configuration change and a new CONNECT). Data-budget truncation is separate and remains an explicit budget policy.
 
 Use `size_exempt_domains` for trusted large-download hosts when the default fail-closed scan ceiling blocks legitimate artifacts such as package headers, signed binaries, model weights, legal texts, or long specifications. This exemption is narrower than `exempt_domains`: response scanning uses its larger bounded path only after the normal scan cap, while Browser Shield uses the same bounded ceiling when a matching host exceeds `browser_shield.max_shield_bytes`. Pipelock then buffers the full response up to `size_exempt_scan_max_bytes`, runs the same whole-buffer response pipeline used for under-cap bodies, and gives Browser Shield the same bounded whole body instead of falling back to `oversize_action`. Bytes are delivered only after the verdict is clean or transformed by policy. Responses over that ceiling, read errors, scan errors, and exhausted `size_exempt_scan_max_inflight_bytes` reservations block fail-closed without delivering upstream bytes. Smaller responses from the same host still take the normal buffered scanning path. The exemption applies to forward proxy, TLS interception, and reverse proxy responses. It does not apply to fetch or MCP-HTTP responses; compressed (`Content-Encoding`) responses still fail closed when they cannot be fully scanned, regardless of this list.
 
@@ -1106,30 +1369,54 @@ See [`docs/guides/sse-streaming.md`](guides/sse-streaming.md) for the full guide
 
 Scans JSON-RPC requests from agent to MCP server for DLP leaks and injection in tool arguments.
 
+MCP blocked audit events distinguish `mcp_input_dlp`, `mcp_input_injection`,
+and `mcp_input_inspection`. The first two point to the MCP input controls below;
+inspection failures require correcting the request or scanner state. Tool-policy
+denials use `mcp_tool_policy` and point to the matched `mcp_tool_policy.rules`
+entry. Listener request-header findings use separate `mcp_header_*` labels:
+text DLP checks selected header names and values, while decoded `Mcp-Param-*`
+values also receive response injection scanning. `Last-Event-ID`,
+`Mcp-Param-*`, and `Mcp-Session-Id` are always selected; `Authorization` is
+selected by default. Other selection follows `request_body_scanning.scan_headers`,
+`header_mode`, `sensitive_headers`, and `ignore_headers`, not the MCP input
+action. A failed
+or unparseable MCP response uses `mcp_response_inspection` and an operational
+`block_class`; these events do not report an attack technique.
+Malformed upstream responses are blocked and classified as operational even when a raw fallback detects instruction-like content, matching the input inspection-failure rule.
+Tool-definition blocks preserve the released `tool_scanning` audit label and `[redacted]` resource; an inventory capacity or
+inspection refusal has an operational `block_class` and cannot be relaxed by
+`mcp_tool_scanning.action`.
+
 ```yaml
 mcp_input_scanning:
   enabled: true
   action: warn
   on_parse_error: block         # block or forward
-  response_timeout_seconds: 0   # 0 = disabled (stdio MCP proxy only)
+  response_timeout_seconds: 0   # 0 = disabled; see the table for scope
 ```
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable input scanning |
-| `action` | `"warn"` | warn or block. Immutable core DLP findings (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) in a request hard-block regardless of this action; the operator cannot downgrade the core floor here. The one exception is a core credential that top-level `redaction` fully rewrites, which follows this action instead — see the redaction note below. Non-core findings follow this action. |
-| `on_parse_error` | `"block"` | What to do with malformed JSON-RPC |
-| `response_timeout_seconds` | `0` | Per-read timeout (seconds) for upstream MCP server responses. `0` disables it (default). When set, a wrapped server that accepts a request but never replies no longer hangs the agent: the proxy fails closed, emitting a JSON-RPC `-32000` error for every pending request. The deadline is per complete response message (one JSON-RPC message, or one SSE data event on the bridge): it resets when each message arrives, so a steady stream of responses is never severed, but it does bound the wait for the *next* message — set it above your slowest legitimate tool's response latency. Applies to the **stdio subprocess proxy** (`-- COMMAND`, including sandboxed mode) and the **stdio-to-HTTP bridge** (`--upstream URL`). On the subprocess proxy a timeout **terminates the hung child** (a stuck subprocess cannot recover); on the HTTP bridge it **fails the affected request closed and the session keeps serving** (one slow response should not kill a shared HTTP upstream). The HTTP reverse-proxy listener (`--listen`) instead uses its own HTTP client/server timeouts. |
+| `action` | `"warn"` | warn or block. Immutable core DLP findings (`AWS Access ID`, `AWS Secret Key`, `GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`, `Private Key Header`, `GCP Service Account Key`) in a request hard-block regardless of this action; the operator cannot downgrade the core floor here. Two things happen before this stage rather than downgrading it: a core credential that top-level `redaction` fully rewrites follows this action instead (see the redaction note below), and a core-floor credential that carries a compiled audience (`GitHub Token`, `GitHub Fine-Grained PAT`, `GitLab PAT`, `Slack Token`) is removed from the finding set before enforcement when it is presented to its compiled audience on a permitted carrier (see [Provider-Key DLP Coverage](security/provider-key-dlp-coverage.md)), so it never reaches this hard-block. Non-core findings follow this action. |
+| `on_parse_error` | `"block"` | What to do with protocol parse errors in otherwise valid JSON: `block` or `forward`. Malformed JSON, invalid UTF-8, exact duplicate keys, and noncanonical aliases of protocol fields always block the request. |
+| `response_timeout_seconds` | `0` | Per-read timeout (seconds) for upstream MCP server responses. `0` disables it (default). When set, a wrapped server that accepts a request but never replies no longer hangs the agent: the proxy fails closed, emitting a JSON-RPC `-32000` error for every pending request. The deadline is per complete response message (one JSON-RPC message, or one SSE data event on the bridge): it resets when each message arrives, so a steady stream of responses is never severed, but it does bound the wait for the *next* message — set it above your slowest legitimate tool's response latency. Applies to the **stdio subprocess proxy** (`-- COMMAND`, including sandboxed mode) and the **stdio-to-HTTP bridge** (`--upstream URL`). On the subprocess proxy a timeout **terminates the hung child** (a stuck subprocess cannot recover); on the HTTP bridge it **fails the affected request closed and the session keeps serving** (one slow response should not kill a shared HTTP upstream). The HTTP reverse-proxy listener (`--listen`) instead uses its own HTTP client/server timeouts for the read path. On every MCP proxy mode, including `--listen`, a positive value also caps how long the A2A response scan and Agent Card scan may run for one response; a scan that exceeds it is treated as incomplete and the response is blocked. |
 
-Auto-enabled when running `pipelock mcp proxy`. `response_timeout_seconds` applies independently of `enabled`; it governs the response read path whenever the stdio-fronted proxy is running.
+The table shows section defaults before runtime resolution. `pipelock mcp proxy` and the MCP listener turn an unconfigured section on with `action: block`. Omitted, empty (`{}`), and null sections, and `enabled: null` without a nonempty action keep that runtime default. Intentional disabling requires `enabled: false` and a nonempty `action`, such as `action: warn`. Legacy false settings with an omitted, empty, or null action retain runtime defaults and print the compatibility warning described above. `response_timeout_seconds` applies independently of `enabled`; it governs the response read path whenever the stdio-fronted proxy is running.
 
-The stdio proxy always runs the full input content scan. When this section is disabled, the HTTP and WebSocket listeners skip configurable input findings but still scan for the immutable core credential floor; a core credential in `tools/call` arguments or another JSON-RPC field therefore hard-blocks on every MCP transport.
+Request key validation runs before content scanning on every MCP transport. Free-form tool arguments, environment maps, and JSON Schema properties keep case-sensitive keys; exact duplicate keys are refused throughout the request. A refusal preserves the JSON-RPC parse error code and raw content diagnostics.
+
+The stdio proxy runs the full input content scan while this section is enabled, including when it was turned on because the section was omitted. When this section is explicitly disabled (`enabled: false` with a nonempty `action`), every MCP transport (stdio, HTTP, and WebSocket) skips configurable input findings but still scans for the immutable core credential floor and hostname exfiltration; a core credential in `tools/call` arguments or another JSON-RPC field therefore hard-blocks on every MCP transport.
 
 If top-level `redaction.enabled` is also set, `tools/call` `params.arguments` are rewritten through the same matcher and the immutable core floor is evaluated on the redacted bytes rather than the original request. A core credential that redaction fully rewrites — so the forwarded request carries a placeholder and no credential — follows `mcp_input_scanning.action` instead of hard-blocking, matching the request-body floor's treatment of a fully redacted critical credential on a trusted destination; an MCP upstream is operator-configured, so no host list is consulted. Following the action is not the same as allowing: under the default warn action the scrubbed request forwards, but the pre-redaction finding is still recorded as a warn — logged with its pattern name and a redacted marker, captured on the input DLP verdict, and stamped on the action receipt as a warn — so a scrubbed core credential is never counted as a clean request or credited toward adaptive de-escalation. This matches the request-body floor, which keeps the pre-redaction DLP finding as a warn on a fully redacted body. The floor still hard-blocks, fail-closed, when redaction is disabled, when it leaves any part of the credential in place, or when the post-redaction rescan still finds a core match. A non-core credential in warn mode continues to forward its redacted payload instead of the original secret, and it is recorded as a warn the same way. The behavior is identical across stdio, HTTP/SSE upstream mode, HTTP listener mode, and MCP-over-WebSocket.
+
+For explicit MCP or sandbox child environment overrides, see [child environment restrictions](guides/sandbox.md#child-environment-restrictions). The verified-service control-environment pins don't exempt launch overrides from that contract.
 
 ## MCP Tool Scanning
 
 Scans `tools/list` responses for poisoned tool definitions and detects mid-session description changes (rug pulls). Extracts text from all schema fields that an LLM might ingest: `description`, `title`, `default`, `const`, `enum`, `examples`, `pattern`, `$comment`, and vendor extensions (`x-*`). Recurses through composition keywords (`allOf`, `anyOf`, `oneOf`, `$defs`, `if`/`then`/`else`) and extracts string leaves from nested objects and arrays.
+
+When tool scanning is enabled, schemas, annotations, `_meta` and extension values share the tool-definition depth bound: 62 levels from the field root, derived from the envelope extractor's 64-level limit. A deeper field refuses the entire list; nothing admitted at this gate is silently truncated by the later envelope scan. Tool-list shape and canonical-key validation also fail closed under both warn and block actions.
 
 ```yaml
 mcp_tool_scanning:
@@ -1148,6 +1435,8 @@ mcp_tool_scanning:
 | `listener_drift_reset_file` | `""` | One-shot signed reset-delegation control-file path for the HTTP reverse listener's upstream drift baseline |
 | `listener_drift_reset_authority_public_key_file` | `""` | Exported `mcp-reset-authority` public key used to verify listener reset delegations |
 | `listener_drift_reset_target` | `""` | Stable listener identity that a reset delegation must name |
+
+`pipelock mcp proxy`, the MCP listener, and `pipelock mcp scan` enable tool scanning when the section is omitted, empty, or null, or `enabled` is null, with no nonempty action. Intentional disabling requires `enabled: false` with a nonempty `action`. Legacy false settings with an omitted, empty, or null action retain tool scanning and print the compatibility warning described above. When intentionally disabled in scan mode, tool definitions remain unscanned and cannot be reported clean.
 
 When `detect_drift` is enabled, Pipelock hashes the canonical full tool object
 from `tools/list`, excluding only Pipelock's own provenance attestation in
@@ -1227,9 +1516,11 @@ mcp_tool_scanning:
 With `new_tool_admission: withhold`, a tool name absent from the established
 baseline is reported as drift (cue `new-tool`) and withheld — not promoted
 — exactly the way a changed definition is withheld under `action: block`.
-It is reported again on every later `tools/list` until an authorized
-operator re-baseline admits it, using the same signed listener drift reset
-mechanism described below (`listener_drift_reset_file`). This never affects
+It is reported again on every later `tools/list` until it is re-baselined.
+On the HTTP reverse listener, use the signed listener drift reset described
+below (`listener_drift_reset_file`). On stdio, sandboxed, WebSocket, and
+stdio-to-HTTP proxies the baseline is per process; restart the proxy to
+re-baseline. This never affects
 the first valid `tools/list` inventory a baseline ever receives: that
 response establishes the baseline for every name in it, matching the
 pre-existing `action` semantics for a first sighting. An empty inventory
@@ -1241,21 +1532,19 @@ it arrives. On the MCP HTTP listener the drift baseline is shared by every
 client, so two clients whose first `tools/list` responses overlap in time are
 both first inventories: each contributes its names, neither reads the other's
 names as new, and the baseline is established when the last of them finishes.
-A name that first appears after that point is withheld under `block`.
+A name that first appears after that point is withheld under `new_tool_admission: withhold`.
 
-`new_tool_admission` governs baseline admission, not the response verdict.
-The vocabulary is deliberately different from `action`'s `warn`/`block` so the
-two controls can never be misread as the same knob. Read the pair together:
-whether the `tools/list` response carrying a new tool is delivered to the
-agent is decided by `action` alone. Under `action: block` the response is
-refused, so the agent never sees the new tool. Under `action: warn` the
-response is still forwarded and the agent can call the new tool; what
-`new_tool_admission: withhold` buys there is that the name never becomes
-approved, so it is reported on every later `tools/list` instead of being
-trusted after one sighting. Session binding is not a second line of defense
-for this, because a forwarded response commits its tool names into the
-binding inventory. Set `action: block` if a new tool must not reach the
-agent at all.
+`new_tool_admission` governs baseline admission, not the response verdict. The vocabulary is deliberately different from `action`'s `warn`/`block` so the two controls can never be misread as the same knob. Read the pair together: whether the `tools/list` response carrying a new tool is delivered to the agent is decided by `action` alone. Under `action: block` the response is refused, so the agent never sees the new tool. Under `action: warn` the response is still forwarded and the agent can call the new tool; what `new_tool_admission: withhold` buys there is that the name never becomes approved, so it is reported on every later `tools/list` instead of being trusted after one sighting. Session binding is not a second line of defense for this, because a forwarded response commits its tool names into the binding inventory. Set `action: block` if a new tool must not reach the agent through the `tools/list` response. This does not stop a client that already knows the withheld name from sending `tools/call`; the call is forwarded when session binding is disabled or its unknown-tool action is `warn`. To block calls to names absent from the pinned inventory, also enable `mcp_session_binding` and set `unknown_tool_action: block`:
+
+```yaml
+mcp_tool_scanning:
+  enabled: true
+mcp_session_binding:
+  enabled: true
+  unknown_tool_action: block
+```
+
+Session binding blocks such a direct call after the first valid `tools/list` has established the session inventory. See [MCP Session Binding](#mcp-session-binding).
 
 The default (`admit`, including the omitted/unset value) preserves the
 behavior every existing deployment already had: a new tool is still
@@ -1358,9 +1647,211 @@ pipelock signing reset inspect \
 pipelock signing reset revoke --file /run/pipelock/mcp-tool-drift.reset
 ```
 
+### Acknowledged credential-request findings
+
+A Credential Request Directive finding refuses the whole `tools/list` under `action: block`. When you've reviewed a tool and its wording is fine, for example placeholder text or a server that does take a key as a parameter, you can acknowledge that exact tool instead of turning scanning down.
+
+An acknowledgment covers one finding in one tool from one configured server. It lifts only that finding. Every other finding on the tool and every other gate still applies. It doesn't say the text is harmless, only that someone reviewed this tool's complete content. Pipelock compares the whole definition after normalizing it to canonical JSON, so reordering object members doesn't change it and any other edit does.
+
+Acknowledgments need a key. Each entry is tied to the server's transport, and that transport often carries credentials (URL user info, headers, child environment). An unkeyed hash of those would let anyone who can read the configuration or the logs test a guessed credential offline, so Pipelock keys the binding with a secret you hold outside the configuration:
+
+1. Generate a separate random key of at least 32 bytes, used for nothing else, for example `head -c 32 /dev/urandom | base64 > /etc/pipelock/ack-binding.key` followed by `chmod 600` on it. Length alone isn't enough: the key must come from a cryptographic random source. A guessable key would let a configuration reader confirm a guess against the key ID and then recompute bindings.
+2. Point `mcp_tool_scanning.acknowledgment_key` at it, as `file:/absolute/path` (a regular file, mode 0600 or stricter, not a symlink) or `${ENV_VAR}`. On Windows only `${ENV_VAR}` is accepted, because Pipelock does not check NTFS permissions and so cannot verify who can read a key file. A literal key in the configuration is refused, since it would be readable by everyone who can read the entries it protects. Any configuration with `acknowledged_findings` and no usable key is refused at load. There is no unkeyed fallback.
+3. Run the proxy with `--server-name`, an operator label that names the server in the logged entry and in the policy lookups. For a local service whose port and token change on every start, register it under [`mcp_identities`](#registered-local-mcp-services-mcp_identities) and run the proxy against that upstream instead: the proxy takes the registered name, and the entry then carries `server_binding_mode: verified-local-session`. When a tool raises the finding and each match sits wholly within one field, Pipelock logs a one-line JSON entry to copy after you've reviewed the tool. Add `owner`, `reason` and `expires` to it. The entry holds the keyed binding, digests and field pointers, never field text, the key or the unkeyed transport digest. No entry is offered when a match spans two fields, sits in a name, title, output schema or metadata, or when there are more than 64 matches, or when no usable key is configured, and the finding keeps enforcing.
+
+The keyed binding has the form `hmac-sha256-v1:<key id>:<mac>`. The key ID is derived from the key and names which key an entry was written under, so a rotated key is reported as `binding_key_changed` rather than as a different server.
+
+```yaml pipelock-fragment
+# pipelock-fragment-id: mcp-acknowledged-findings
+mcp_tool_scanning:
+  enabled: true
+  action: block
+  acknowledgment_key: "file:/etc/pipelock/ack-binding.key"
+  acknowledged_findings:
+    - server: vault
+      server_binding_hmac: <from the logged entry>
+      tool: store_secret
+      finding: Credential Request Directive
+      family_revision: 2
+      tool_sha256: <from the logged entry>
+      occurrences:
+        - field: /inputSchema/properties/key/description
+          field_text_sha256: <from the logged entry>
+          pattern: 0
+          ordinal: 0
+          start: 0
+          end: 19
+          match_sha256: <from the logged entry>
+      owner: platform team
+      reason: placeholder parameter text, reviewed
+      expires: 2026-12-01
+```
+
+An entry stops applying when any of these change:
+
+- The tool definition: every member, including `_meta` and any provenance it carries, the text of a field holding a match, or the set of matches.
+- The detector's patterns. A maintainer raises `family_revision` by hand whenever the patterns change, and a test that pins the pattern sources fails until they do. Pipelock doesn't bump it automatically. After a release with a new revision, every entry for the finding goes stale. Review the tool again and add the entry Pipelock logs for the new revision.
+- The transport binding: the upstream URL (scheme, host, user info, path, the query exactly as written, fragment) or the subprocess command, the upstream headers Pipelock sends, and the child environment you set with `--env`, `--env-carrier`, `--env-file-carrier` and `--env-unset`. Rotating a credential held in one of those headers or variables changes the binding too. A server registered under `mcp_identities` uses the `verified-local-session` binding instead, which leaves out the port and the session credential and binds the kernel-verified service.
+- The acknowledgment key. Rotating it invalidates every entry; copy the entries Pipelock logs under the new key.
+- The expiry. `expires` is required: a UTC timestamp ending in `Z` at most 180 days ahead, or a `YYYY-MM-DD` date at most 180 days ahead that holds through the end of that UTC day. It's checked on every scan.
+
+An entry that exists for the server and tool but no longer matches refuses the `tools/list` under every action, `warn` included, and the log names the reason. With no entry, the finding follows `action` as usual, so removing an entry under `warn` goes back to warning.
+
+Limits worth knowing:
+
+- Environment the server inherits without you naming it isn't part of the binding.
+- A tool definition that isn't valid UTF-8, or has any text that decodes to the replacement character U+FFFD (including a literal one), can't be acknowledged. Different encodings of it would look identical after decoding, so no entry is offered and its findings keep enforcing.
+- Anyone who holds the key and can read the configuration can still test guesses against a binding. The key belongs to Pipelock alone: keep it out of reach of MCP server processes, out of the configuration and log readership, and don't reuse a signing key or a transport credential for it. An MCP server process receives only a fixed set of system variables plus the overrides you name, so a dedicated key variable isn't passed to it, and `pipelock mcp proxy` refuses to start when an `--env` override or environment carrier names the key variable, or when the key variable is one of those system variables (`PATH`, `HOME`, `USER`, `LANG`, `TERM`, `TZ`, `TMPDIR`, `SHELL`). A key file is protected only by file permissions: a server process running as the same user can read it unless process isolation specifically denies access to the key file, or the server runs as another account that also lacks read access to it. Don't assume a sandbox or read-only mount blocks the read on its own. A key held in Pipelock's own environment is not readable by a same-user server through `/proc` on Linux, where `pipelock mcp proxy` marks itself non-dumpable before starting the server; on other platforms Pipelock has no such protection, so there a same-user server may be able to read Pipelock's environment.
+- `pipelock mcp proxy` reads its configuration and key once per session. Revoking an entry or rotating or removing the key there takes a restart, though expiry still applies right away.
+- The HTTP listener under `pipelock run` applies a changed configuration on the next `tools/list`. Pipelock rereads the key when the configuration reloads, which happens when the configuration file changes or on `SIGHUP`; changing only the key file doesn't trigger it. If a reload fails while the key is gone, unreadable, too short, readable by others or different, the running configuration is kept for everything else, but every acknowledgment refuses until a reload succeeds with a usable key.
+- An acknowledged `tools/list` passes tool scanning with the finding present, and it's forwarded only if every later check passes too. Tool scanning logs it, captures it as warned and receipts it with an allow verdict, and it earns no adaptive-enforcement credit.
+
+### Registered local MCP services (`mcp_identities`)
+
+A loopback address names a place, not a program: any local process can bind `127.0.0.1:43111`. When an MCP server runs on the same machine and picks a fresh port and a fresh bearer token on every start, the default acknowledgment binding above changes on every launch, so a reviewed acknowledgment never survives a restart. `mcp_identities` registers such a service by what the kernel can observe about it, and Pipelock then checks that the process on the far end of each connection is that service before it sends anything.
+
+A registration is vendor-neutral. It describes a native binary, a Node, Python or JVM application, or anything else by the owning user, the executable's digest, the files the process must hold, and the control variables it may carry. Nothing in it names a product.
+
+```yaml
+# mcp-identities-example: native-binary
+mcp_identities:
+  - name: vendor-indexer
+    verified_local_service:
+      scheme: http
+      host: 127.0.0.1
+      path: /rpc/v1
+      principal_uid: 1000
+      executable_sha256: 1111111111111111111111111111111111111111111111111111111111111111
+      session_header:
+        name: Authorization
+        scheme: Bearer
+        carrier: PIPELOCK_VSCODE_INDEXER_AUTH
+```
+
+The service in the first example is a single native executable that hands each session a fresh bearer token, so the entry also declares which header carries it. Pipelock reads that header's value from the carrier variable on every launch and never logs it.
+
+An interpreter hosting an application is pinned through the files it loads. The executable digest alone would match every script that interpreter runs, so list the application entry point and any native module it loads under `mapped_files`:
+
+```yaml
+# mcp-identities-example: python-extension-module
+mcp_identities:
+  - name: vendor-analysis
+    verified_local_service:
+      scheme: ws
+      host: "::1"
+      path: /analysis
+      principal_uid: 1001
+      executable_sha256: 2222222222222222222222222222222222222222222222222222222222222222
+      mapped_files:
+        - path: /opt/vendor/analysis/server.py
+          sha256: 3333333333333333333333333333333333333333333333333333333333333333
+        - path: /opt/vendor/analysis/lib/native_ext.so
+          sha256: 4444444444444444444444444444444444444444444444444444444444444444
+      control_environment:
+        PYTHONPATH: /opt/vendor/analysis/site
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | The registered name. A launch that matches this entry takes this name for its policy lookups and its acknowledgments. Same character rules as `--server-name`; duplicate names are refused at load. |
+| `verified_local_service` | yes | The matcher and pins for one local service. An entry without it is refused at load. |
+| `verified_local_service.scheme` | yes | `http`, `https`, `ws` or `wss`. |
+| `verified_local_service.host` | yes | The literal `127.0.0.1` or `::1`. A hostname is refused: only a loopback service can be verified. |
+| `verified_local_service.path` | yes | The exact upstream path: it starts with `/`, is printable ASCII in its canonical escaped form, and has no query or fragment. The port is deliberately not registered, because an ephemeral-port service picks a new one on every start. A launch that omits the port is refused instead of being matched against the scheme's default. Two entries with the same scheme, host and path are refused at load. |
+| `verified_local_service.principal_uid` | yes | The effective user the service must run as. A pointer, so leaving it out is refused instead of being read as root. |
+| `verified_local_service.executable_sha256` | yes | 64 lowercase hex characters: the digest of the executable image the process is running. Pipelock hashes the image through the process's own `exe` link, so a binary replaced on disk after launch does not mask a different running image. |
+| `verified_local_service.mapped_files` | no | Absolute, clean paths with a `sha256` of 64 lowercase hex characters each. The process must hold every one open or mapped, as the very same device and inode Pipelock just opened and hashed. Duplicate paths are refused. |
+| `verified_local_service.control_environment` | no | Loader and interpreter control variables the process is allowed to carry, each with its exact value. Only names on the deny list below can be registered; another name is refused at load. A deny-listed variable on the process that isn't registered with exactly that value refuses the connection. |
+| `verified_local_service.session_header` | no | `name` (canonical header form), `scheme` (`Bearer`) and `carrier` (an environment variable in the `PIPELOCK_VSCODE_` namespace). Refused for `ws` and `wss`, because a WebSocket handshake header cannot be separated from the bound session. |
+
+#### Matching and refusals
+
+At every launch Pipelock resolves one identity from the effective upstream and `--server-name`, in this order, and prints the result on stderr:
+
+```text
+MCP identity: server=vendor-indexer source=verified-local-service binding=verified-local-session
+```
+
+`source` is `explicit` (an operator label that matched nothing registered), `unnamed` (no label, nothing registered) or `verified-local-service`. `--server-name` is an operator label, never a proof of identity. These launches refuse to start, and the message names the field to correct:
+
+- The upstream matches more than one registration.
+- `--server-name` names a registered service but the upstream does not match that registration.
+- `--server-name` names something different from the registration the upstream matches.
+- The upstream matches a registration but has no explicit port.
+- The upstream matches a registration that declares a `session_header`, but the header is missing, is supplied more than once, comes from a header flag or file instead of the registered carrier, or is not exactly `<scheme> <token>` with one token.
+- The host is not Linux. There is no weaker fallback: the check reads the kernel's socket table, so on macOS and Windows a matched launch refuses instead of proceeding unverified.
+
+Matching compares the URL as written: the registered scheme, the literal host (`127.0.0.1` and `::1` are distinct, and `localhost`, other spellings of the same address, or a trailing dot do not match), and the exact escaped path, with no user info, query or fragment. An upstream that reaches the same service through any other spelling matches nothing and runs as an ordinary unregistered launch: unnamed, or under its `--server-name` label if that label is not a registered name, with no owner check, no registered name and no `verified-local-session` acknowledgments, exactly as before the registry existed.
+
+#### What each connection proves
+
+Every new connection to a matched upstream is verified, including reconnects. After Pipelock dials and before it writes a byte, it asks the kernel which process owns the server end of that exact connection (matched by the connected four-tuple and then by socket inode) and compares the owner with the registration. A successful check proves, at that moment, that the owner:
+
+- runs as `principal_uid`;
+- is running an executable whose digest is `executable_sha256`;
+- holds every `mapped_files` entry, with a matching digest;
+- carries no deny-listed control variable that `control_environment` does not name with exactly that value;
+- is the same process incarnation before and after the checks.
+
+An HTTP keep-alive connection that the transport reuses for several requests is verified when it is dialed, not again per request. A replacement that takes over the port is caught on the next new connection.
+
+The deny list is a floor, not a proof that no hook exists. It covers these variables:
+
+- glibc loader: `GCONV_PATH`, `GLIBC_TUNABLES`, `LD_AUDIT`, `LD_LIBRARY_PATH`, `LD_ORIGIN_PATH`, `LD_PRELOAD`, `LD_PROFILE`
+- Node.js, Bun and Electron-as-Node: `BUN_OPTIONS`, `ELECTRON_EXTRA_LAUNCH_ARGS`, `ELECTRON_RUN_AS_NODE`, `NODE_EXTRA_CA_CERTS`, `NODE_OPTIONS`, `NODE_PATH`
+- Python: `PYTHONBREAKPOINT`, `PYTHONHOME`, `PYTHONINSPECT`, `PYTHONPATH`, `PYTHONPYCACHEPREFIX`, `PYTHONSTARTUP`, `PYTHONUSERBASE`
+- JVM: `CLASSPATH`, `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `_JAVA_OPTIONS`
+- Ruby, Perl, Lua and PHP: `LUA_CPATH`, `LUA_INIT`, `LUA_PATH`, `PERL5LIB`, `PERL5OPT`, `PERLLIB`, `PHPRC`, `PHP_INI_SCAN_DIR`, `RUBYLIB`, `RUBYOPT`
+- .NET: `CORECLR_ENABLE_PROFILING`, `CORECLR_PROFILER`, `CORECLR_PROFILER_PATH`, `DOTNET_ADDITIONAL_DEPS`, `DOTNET_SHARED_STORE`, `DOTNET_STARTUP_HOOKS`
+- POSIX shell startup: `BASH_ENV`, `ENV`
+
+A runtime that is not on the list is pinned only through its executable and bundle files.
+
+What this does not stop: code that already runs as `principal_uid` can load the same pinned files and impersonate the service, and the same user can already read that service's memory and files, so run a service whose identity matters under its own user. The environment check reads the process's initial environment; a process can change its own later, and an interpreter can load code from places the pins do not name. A pinned file the owner holds can be rewritten in place by the same user after the check, so the result describes the state at check time. Sole ownership is proven among the processes whose descriptor tables Pipelock can read; the kernel also records the creating user on the socket, and that user must equal `principal_uid`, so a holder Pipelock cannot see must have received the socket from a process of that user. On the `pipelock run` listener, a registration change refuses every later response message; a stream with no further messages stays open until it ends or times out, without delivering anything.
+
+#### Acknowledgments for a registered service
+
+A launch that resolves to a registered service uses the `verified-local-session` binding. An acknowledgment written for it sets `server` to the registered name and adds the mode:
+
+```text
+- server: vendor-indexer
+  server_binding_mode: verified-local-session
+  server_binding_hmac: <from the logged entry>
+  tool: ...
+```
+
+An empty or omitted `server_binding_mode` means `transport-v2`, the per-credential binding described above, and applies to every server that is not registered. `verified-local-session` is refused at load unless `server` names an `mcp_identities` entry with `verified_local_service`.
+
+One acknowledgment then covers every session of that one verified service instead of one credential. The binding includes the registered name and a revision of the whole entry, the pinned user, executable digest and every mapped file, the registered scheme, host and path, the session header's name, carrier name and authorization scheme, every other upstream header, and the child-environment overrides. It leaves out the port and the session header's value, since the port and token are new on every start and the kernel check already ties the connection to the same pins. Editing any pin changes the revision, so the acknowledgment goes stale and refuses until you review the tool again and copy the entry Pipelock logs.
+
+A registration always binds this way, even when it declares no session header. In that case the acknowledgment is tied to the service's pins alone, which means it covers every session of that service.
+
+A credential change on a server that is not registered still invalidates its acknowledgment, as before. Removing a registration makes any `verified-local-session` acknowledgment for it refuse at load.
+
+For HTTP listeners (`pipelock run` and `mcp proxy --listen`), the binding also covers the effective upstream headers selected for each request, including client credentials the listener forwards. A changed header invalidates the acknowledgment unless it is the declared session header. Operator-pinned headers take precedence over client values.
+
+#### Operator commands and diagnostics
+
+- `pipelock mcp identity register --upstream URL --name NAME [--mapped-file PATH ...] [--session-header NAME --carrier VAR]` dials a running service you trust right now, observes its owner and prints an `mcp_identities` entry to review. It never writes a configuration file. The other files the process holds are printed as comments, operating-system libraries last, and any deny-listed variable the process carries appears as a `control_environment` key whose value you fill in after review.
+- `pipelock mcp identity inspect --config FILE --upstream URL` resolves the upstream against the registry exactly as `pipelock mcp proxy` would, then verifies the live owner.
+- `pipelock explain mcp-response --upstream URL` resolves the same way and prints the identity, source, binding and revision it would use.
+- `pipelock doctor` reports the `mcp_identities` check: how many services are registered and, on a host that is not Linux, a warning that matched launches will refuse to start.
+
+#### Reload and restart behavior
+
+`pipelock mcp proxy` resolves the identity once at launch and keeps it for the life of the process, so editing a registration there takes a restart.
+
+The MCP listener under `pipelock run` pins the resolution at startup and re-checks it on every configuration reload. An unchanged reload has no effect. If a reload changes or removes the registration that startup matched, every MCP request on the listener is refused with a JSON-RPC error until you restart `pipelock run`, and acknowledgments for the pinned identity stop matching. The listener cannot carry a `session_header` registration, because it has no per-session carrier: a registration that matches the listener's upstream and declares one refuses startup.
+
+A configuration that carries `mcp_identities` or `server_binding_mode` is rejected by binaries that predate them, which fail on unknown fields. Add the registration and its acknowledgments only to a configuration that the upgraded binary alone loads.
+
 ## MCP Tool Policy
 
-Pre-execution rules that block or warn before tool calls reach the MCP server. Ships with 17 built-in rules covering destructive operations, credential access, network exfiltration, persistence mechanisms, and encoded command execution.
+Pre-execution rules that block or warn before tool calls reach the MCP server. Ships with 30 built-in rules covering destructive operations, credential access, network exfiltration, persistence mechanisms, protected-path and audit-log tampering, and encoded command execution.
+
+The policy's JSON key guard fails closed before rule matching. Duplicate keys and case aliases of protocol fields report `duplicate_json_object_key`; malformed or invalid-UTF-8 input reports `invalid_json_key_input`. Keys in tool arguments remain case-sensitive.
+
+A protected-path rule matches the tools that write a path and also the move, rename, copy, delete, permission-change and link-creation tools that reach the same destination, with forward or backslash separators. An `apply_patch` call is matched against the targets named in the patch headers, and an unparseable patch is blocked instead of passing unmatched. Audit-log rules cover the system log and Pipelock state directories rather than any file ending in `.log`. Operations that name only a parent directory, such as a recursive delete, and archive extraction are not matched, because their arguments do not name the protected file.
 
 ```yaml
 mcp_tool_policy:
@@ -1391,13 +1882,27 @@ mcp_tool_policy:
 |-------|---------|-------------|
 | `enabled` | `false` | Enable tool policy |
 | `action` | `"warn"` | Default action for rules without override |
-| `rules` | 17 built-in | Policy rule list |
+| `rules` | 30 built-in | Policy rule list |
+| `on_incomplete_check` | `"warn"` | Action when a rule's check can't rule out a match: its pairwise check could not cover every token pair it needs in a long argument list, or it matches only when separate commands in one string are read together. `warn` allows the call and records `incomplete_pair_check` with the rules it could not finish; `block` denies it. The `strict` and `hostile-model` presets set `block` |
+
+A single shell command string is split at `&&`, `||`, `;`, `|`, and newlines outside quotes, and token pairs are formed within each command first. A whole pipeline (`a | b | c`) stays one command, and a command that writes a file (`> f`, `>> f`, `tee f`) is joined with each later command that names that file (`< f`, `xargs -a f`, `cat f`). If no command matches but the whole string, read as one command, does, the rule is reported as `incomplete_pair_check`. Matches from the earlier whole-string check remain full rule matches: `rm old.tar && tar -xf new.tar` is blocked by the built-in Destructive File Delete rule, including with the default configuration. Strings that use `$`, backticks, backslashes, parentheses, or braces, and argument arrays, are matched as one command. Each command is also matched with redirections such as `2>&1` removed.
+
+Within one such command, when a rule's command word (`chmod`) comes after words that make the rule match only when two or more of them are given to it, as with `echo -R 777 /srv | xargs chmod` or `echo -R 777 /srv > /tmp/a; xargs chmod < /tmp/a`, the rule is reported as `incomplete_pair_check`. `echo 755 ./build | xargs chmod` is not, as the words before `chmod` do not complete the rule.
+
+For `xargs`, input can supply arguments absent from the command text. A relevant command rule remains incomplete unless the checker can establish the input for that command. The supported path-preserving form is a direct `find … -print0 | xargs -0 command …` pipeline (`--null` is also accepted). Starting points may be omitted (find defaults to `.`), or must be `.`, `./…`, or absolute paths; the supported find tests are `-type`, `-name`, `-iname`, `-path`, `-ipath`, `-wholename`, and `-perm`, with optional leading `-H`, `-L`, or `-P`. Ordinary whitespace-splitting xargs, file-fed input, replacement options, mixed delimiters, redirects, and unsupported syntax retain uncertainty. A direct literal `echo … | xargs command …` pipeline is checked using its visible words. Strict and hostile-model presets block incomplete checks; warning presets allow them with a warning. This is a bounded command analysis, not a shell interpreter or a guarantee about filesystem contents.
+
+The handoff check also retains uncertainty for command strings it can't split safely and checks words passed after a consumer's own arguments. Here-string data is included in matching. The find path exemption removes expression words only from the handoff check; it never removes a direct rule match.
+
+Above 64 tokens, a rule whose pattern needs some literal text (such as `rm`) checks every pair that includes a token holding that text, up to 4,032 checks per rule and view. Where the pattern needs the text at a word edge (`\brm\s`), a token holds it only at such an edge, so `format_x.go` or `farm0` does not count for `rm`; tokens that are the text, or whose base name is (`rm`, `/bin/rm`), are paired first. A rule without such text pairs each option and each short token (24 bytes or fewer, no path separator) with the other distinct tokens, within the same 4,032 checks, keeping at most 64 of those tokens and 2,016 others. When a rule does not match and its pair check stopped at the check limit or left a token out, the verdict names `incomplete_pair_check` and takes the `on_incomplete_check` action. The joined and single-token views always cover the whole list.
+
+`pipelock mcp proxy` and the MCP listener supply built-in rules when tool policy is unconfigured (an omitted, empty, or null section, or null `enabled`, with no action or rules). With no configured rules, intentional disabling requires `enabled: false` and a nonempty `action`. Legacy false settings with no action or rules retain built-in policy and print the compatibility warning described above. Sections containing rules retain their configured state. Explicit `enabled: true` requires at least one valid rule at config load; it doesn't request built-in rules. Its omitted action defaults to `warn`. Plain forward-proxy mode doesn't auto-enable these MCP sections, and scan mode only auto-enables tool scanning. Live reload still rejects disabling an active security control; restart with the intended configuration to apply that change.
 
 **Rule fields:**
 - `name:` rule identifier
 - `tool_pattern:` regex matching tool name
 - `arg_pattern:` regex matching argument values (optional; omit for tool-name-only rules)
 - `arg_key:` regex scoping `arg_pattern` or structural validators to specific top-level argument keys (optional for `arg_pattern`, required for structural validators). Without `arg_key`, `arg_pattern` checks values from all argument keys. Values under matching keys are extracted recursively for regex matching.
+- `arg_source:` `patch_targets` makes `arg_pattern` inspect file paths in an `apply_patch` call's parsed patch headers instead of text in the patch body. It requires `arg_pattern`; other values are rejected at config load. With `arg_key`, parsed patch targets are still inspected, while additional structured values and calls without patch headers are scoped to matching keys. See the [tool policy guide](guides/tool-policy.md) for an example.
 - `arg_type:` required JSON type guard for the value at `arg_key`: `string`, `number`, `integer`, `boolean`, `array`, or `object`. Type mismatch is dangerous and matches fail-closed. When used alone, `arg_type` means "match if this value is not this type." If combined with numeric bounds, it must be `number` or `integer`; if combined with length bounds, it must be `string` or `array`.
 - `arg_number_gt:` match when the numeric value at `arg_key` is strictly greater than this threshold.
 - `arg_number_lt:` match when the numeric value at `arg_key` is strictly less than this threshold.
@@ -1412,13 +1917,15 @@ Tool policy is a default-allow denylist: a rule describes the dangerous conditio
 
 Built-in rules and current presets include matching aliases for namespaced tool names. Custom `tool_pattern` expressions keep their regex semantics; upgrading the binary does not rewrite patterns already saved in YAML. To refresh an existing configuration, compare its tool-policy rules with the current preset and preserve any intentional local actions and argument constraints. Matching aliases do not change the tool name sent upstream or recorded as its identity.
 
+Path arguments are matched as the text the caller sends, and a link can make that text name a different file than the one the tool changes. When the tool acts on the same filesystem as Pipelock, as a subprocess MCP server running directly on this host (`pipelock mcp proxy -- COMMAND`, not a server inside a container or on another machine) or a Claude Code or Cursor hook does, rules also match the path each argument resolves to and the well-known protected location that is the same file: shell startup files in the home directory and `ZDOTDIR`, the SSH directory, cloud and netrc credentials, the cron, systemd and launchd directories, `/etc/profile`, `/etc/shadow`, and the audit log directories. That covers a symlink to a protected file, a protected name that is itself a symlink or hard link to a file the caller can name (including one whose target doesn't exist yet), and a new file under a linked directory. A hard link is found by walking the whole protected directory tree (not just its top level, so a systemd drop-in or a `.wants` entry is covered) and comparing device and inode. The walk does not follow symlinks, skips subdirectories that are on another filesystem (a hard link cannot cross one), examines at most 8192 entries per protected directory, and runs once per protected directory for each tool call however many path values the call carries. It fails closed: a directory on the same filesystem that cannot be listed, or a tree larger than the bound, is treated as holding the file. A file with more than one link that is on the same filesystem as such a protected directory is therefore refused even when it is unrelated, because the answer is unknown. When a block comes from this rule rather than from a real link, the decision's reason says the file could not be ruled out as a hard link into the named directory and why (the directory could not be listed, or it holds more entries than the walk examines). Check that Pipelock can list that directory, or that the file has only one link (`stat -c %h FILE`). A file on another filesystem than the protected directory is never refused on this basis. A relative name is resolved against Pipelock's working directory, each directory named in the server's arguments, and the sandbox workspace, since a server usually resolves relative names in one of those. It doesn't cover an HTTP or WebSocket upstream, which resolves paths on its own host, a protected-name link outside those locations, a link created or swapped between the policy decision and the write, or shell command text, which is matched as text: a redirect into a linked name isn't resolved. To keep a server's writes away from files it shouldn't change, run it with the sandbox (`pipelock mcp proxy --sandbox --workspace DIR -- COMMAND`), which on Linux enforces the workspace boundary in the kernel.
+
 Receipt action classification also recognizes these aliases. Authority grants retain raw-name action matching: receipt alias inference does not broaden the tool identities an existing grant authorizes. Name-based classification is a heuristic, not proof of a tool's actual effects.
 
 Shell obfuscation detection is built-in for `arg_pattern`: backslash escapes, `$IFS` substitution, brace expansion, and octal/hex escapes are decoded before matching. See [Redirect Action (v2.0)](#redirect-action-v20) for redirect profile configuration.
 
 ### Defer Action
 
-`action: defer` withholds a matched tool call instead of forwarding or blocking it, and resolves the held action to a terminal decision later. Defer is **fail-closed and affirmative-clearing**: the held action resolves to **allow only on an explicit positive signal**; timeout, cancellation, parse error, kill switch, capacity overflow, resolver error, process restart, and any non-affirmative result all resolve to **block**. The absence of an adverse signal is never treated as permission.
+`action: defer` withholds a matched tool call instead of forwarding or blocking it, and resolves the held action to a terminal decision later. Defer is **fail-closed and affirmative-clearing**: the held action resolves to **allow only on an explicit positive signal**; timeout, cancellation, parse error, kill switch, capacity overflow, resolver error, process restart, and any non-affirmative result all resolve to **block**. The absence of an adverse signal is never treated as permission. Kill-switch activation blocks every held call that has not yet claimed its upstream send (`resolution_source: kill_switch`); a send already claimed before activation is in flight and cannot be recalled. While anything is held, the proxy checks the kill switch about once a second, so every source, including `sentinel_file`, cancels held calls within about a second without waiting for the next request or for the resolver to finish.
 
 Defer is supported on **MCP stdio and the stdio-to-HTTP bridge**. On any other MCP transport, a `defer`-matched tool call is blocked (fail-closed) rather than held, because those transports cannot enforce a held-action resume.
 
@@ -1454,7 +1961,25 @@ When a new held action is admitted while another action from the same session is
 
 `max_cascade_depth` bounds that continuous same-session defer pressure. If the next hold would exceed the limit, Pipelock denies it before creating held state, emits a resolution receipt with `resolution_source: "cascade_limit"`, and records a terminal `resolved_block` row in `deferred-actions.jsonl` with the same cascade parent/depth metadata. If a parent later resolves to anything other than allow — including an `ask`/step-up outcome — still-held descendants block immediately with `resolution_source: "cascade"`; a non-allow parent is terminal for its whole descendant chain, and each descendant's receipt carries the parent defer ID so the triggering resolution stays traceable. A parent allow does not allow descendants; each descendant still needs its own affirmative resolution signal.
 
+An affirmative clearing doesn't send the call on its own. Pipelock checks the call again at release: if the kill switch activated first, the call is cancelled with the same `-32004` error as any other killed call and recorded as a block with `resolution_source: "kill_switch"` and receipt layer `kill_switch`. On the stdio-to-HTTP bridge, a call that the live upstream contract refuses, or can't be checked against, at release isn't sent and is recorded with `resolution_source: "upstream_contract"`.
+
 `resolution_policy.allow_on.policy_permits` is rejected on the supported defer transports because they do not own a live config-reload callback. Each held action emits a hash-chained defer receipt and a resolution receipt bound to the original call; `pipelock verify-receipt --clean-report` derives a minimal offline-verifiable report that fails closed on any incomplete, duplicate, identity-changed, or non-terminal defer pair. Defer is free-tier.
+
+#### Resolver program contract
+
+The configured `exec` runs as a child process with a restricted environment and no arguments from the tool call on its command line. Pipelock passes a JSON manifest in the `__PIPELOCK_DEFER_RESOLVER_MANIFEST` environment variable. It includes the profile, defer ID, target, method, surface, hold reason, authority/session metadata, argument digest, and deadline. Raw arguments are included only when the profile sets `include_args: true`. The resolver must write exactly one terminal token to stdout: `allow`, `block`, or `step_up`. Only `allow` is affirmative. A non-zero exit, timeout, launch error, oversized output, extra stdout text, or any other token resolves to block.
+
+#### Deferred operator API
+
+When defer is enabled, `kill_switch.api_listen` and an API token expose the operator-only deferred-action routes on a separate listener. `GET /api/v1/deferred` lists pending actions. Send `POST /api/v1/deferred/{id}/approve` or `/deny` with `Authorization: Bearer <token>` to resolve one. The API result reports the terminal decision actually applied, which may be `block` even after an approve request: if the rule does not allow operator approval, if the kill switch activated first, or if the stdio-to-HTTP bridge's release check refuses the call. In `pipelock mcp proxy`, this listener exposes the deferred routes only, so `POST /api/v1/killswitch`, `GET /api/v1/killswitch/status` and the session routes return 404 there; use `sentinel_file` to trigger the kill switch for an MCP proxy, or run the kill switch API on a `pipelock run` listener.
+
+To see `resolution_source: upstream_contract`, run a stdio-to-HTTP bridge with `pipelock mcp proxy --upstream https://api.vendor.example/mcp`, configure an applicable `action: defer` rule whose resolver returns `allow`, and start with an active [Learn and Lock contract](guides/learn-and-lock.md) that permits the configured upstream URL. The bridge checks the upstream URL as an HTTP `POST` with the effective action `mcp_upstream`, so a contract rule permits it with a selector whose `host` is the upstream host (and, optionally, `paths` and `methods`); adding `effective_action: mcp_upstream` to that selector limits the rule to the bridge's own upstream check instead of every request to that host. `mcp_upstream` is that label, not a separate contract section.
+
+The bridge runs the same upstream check again immediately before it forwards an approved call. A call that check refuses, or can't evaluate, resolves to block with `resolution_source: upstream_contract`.
+
+A standalone `pipelock mcp proxy` watches its contract store, so promoting a manifest that denies the upstream while a call is held takes effect for that call once the watcher picks up the promotion, which is debounced by a fraction of a second: the release check sees the promoted manifest, the call isn't forwarded, and it resolves with `resolution_source: upstream_contract`. A bridge started on a manifest that already denies the upstream exits at startup and never holds a call. The release check can also refuse a held call when something else in the check changes during the hold, such as the scanner's verdict on the upstream URL (for example, DNS for the upstream host now resolving to an address the SSRF check blocks) or the check becoming unevaluable.
+
+Resolution sources include `approval`, `operator`, `authority`, `timeout`, `cancel`, `context`, `restart_recovery`, `kill_switch`, `capacity`, `cascade`, `cascade_limit`, `duplicate_defer_id`, `policy_reload`, `tool_inventory`, and `upstream_contract`.
 
 ## MCP Session Binding
 
@@ -1482,7 +2007,19 @@ On the HTTP reverse listener, authenticated requests use persistent state owned 
 
 Protocol revision `2026-07-28` does not use `initialize` or protocol sessions. Each authenticated request uses the configured listener bearer or credentials resolved by the verifier, and principal-owned protection begins on the first authenticated request. No Pipelock-specific response header is required. `Mcp-Session-Id`, `_meta.clientInfo`, forwarded client-IP headers, routing names, and other client-declared values never select or rekey authenticated principal state; `Mcp-Session-Id` remains the isolated legacy compatibility partition when `listener_require_state_token` is omitted or false.
 
-Current HTTP requests carry `Mcp-Method` and, where applicable, `Mcp-Name` plus schema-selected `Mcp-Param-*` mirrors. Pipelock checks the standard routing headers against the body before forwarding. When tool scanning accepts a `tools/list` response for an authenticated principal, Pipelock records valid `x-mcp-header` contracts and checks each recognized parameter mirror against the exact body argument path. Missing, duplicate, malformed, or mismatched recognized mirrors fail locally. A contract from a warned or invalid definition is not trusted. Its parameter headers remain transparent intermediary data for protocol compatibility, but their raw and decoded values are always scanned. Base64 is transport encoding, not secrecy; do not mark credentials or personal data with `x-mcp-header`.
+Anonymous current-protocol listener calls are request-local only. Cross-request taint protection is **not active**, even when taint is enabled and a session store exists. A later call cannot use exposure history from an earlier anonymous call. Use verified caller identity and successful cross-request recorder admission for workflows that need that history. The opt-in identity requirement refuses anonymous calls before forwarding; a taint trust override cannot lift that identity refusal. A shared listener bearer gives all its holders one principal, not separate identities. The verifier-backed resolver is an integration interface; this does not imply a built-in OAuth or mTLS verifier.
+
+The stdio-to-HTTP bridge (`pipelock mcp proxy --upstream URL`) constructs `Mcp-Method`, the applicable `Mcp-Name`, and schema-selected `Mcp-Param-*` headers for protocol revision `2026-07-28` and later. It uses the final forwarded arguments, including any redaction, and the same property paths and value encoding as the HTTP listener. Null or absent arguments omit their mirrors. Body-derived headers replace operator-configured routing and parameter headers, so static values can't override them. This synthesis applies to JSON-RPC requests, including deferred calls at release; notifications and responses don't receive routing or parameter headers. MCP defines `tools/call`, `resources/read` and `prompts/get` only as requests, so the bridge refuses one sent without an `id` instead of forwarding it without its headers. Once the bridge negotiates `2026-07-28` or later through `initialize`, it keeps that revision for the life of the process and refuses a second `initialize` with the same JSON-RPC error. Earlier negotiated protocol revisions keep their existing behavior.
+
+The bridge uses its per-process tool-contract registry and privately discovers unknown contracts through its own upstream HTTP client, preserving the upstream credentials and session context. It shares the listener's pagination, combined 10 MiB response budget, 120-second discovery deadline, response inspection, and concurrent-discovery coordination. This private discovery doesn't mark tools client-seen, adopt definition drift, approve held actions, ask for operator approval, or count as untrusted-content exposure for taint policy. An invalid contract, discovery failure, or argument that can't be mirrored refuses the call locally with a JSON-RPC error; no upstream tool call is sent. With `require_receipts` enabled, a blocked outcome receipt at `mcp_header_contract` closes the call's allow intent, as on the HTTP listener. A deferred call refused at release is closed by its resolution receipt, with `resolution_source: "upstream_contract"` and pattern `tool_header_contract_unavailable`. When the operator configured no tool scanning, the bridge still collects current-protocol `tools/list` structure for header synthesis, so it excludes definitions with invalid `x-mcp-header` contracts from those lists as described below. That structural inventory is never the confirmed inventory that `allow_on.tool_inventory_baseline` waits for. No unchecked fallback or automatic tool-call replay occurs. See [MCP Request Metadata](https://modelcontextprotocol.io/specification/2026-07-28/basic/transports/streamable-http#request-metadata) for the routing, encoding, and null-omission rules.
+
+Current HTTP requests carry `Mcp-Method` and, where applicable, `Mcp-Name` plus schema-selected `Mcp-Param-*` mirrors. Pipelock checks the standard routing headers against the body before forwarding. When tool scanning accepts a `tools/list` response for an authenticated principal, Pipelock records valid `x-mcp-header` contracts and checks each recognized parameter mirror against the exact body argument path. Missing, duplicate, malformed, or mismatched recognized mirrors fail locally.
+
+When MCP tool scanning or session binding is configured, current-protocol HTTP lists exclude definitions with invalid `x-mcp-header` contracts and keep valid siblings and pagination metadata. A schema with no `x-mcp-header` annotation is never excluded for this reason. Pipelock reads an annotated parameter's type from the property itself: a `type` (optionally with `null`), an `enum` or `const`, or an `anyOf`/`oneOf` of one type plus `null`. It doesn't resolve `$ref`, so a tool whose annotated parameter gets its type only through a reference, such as an enum stored under `$defs`, is excluded; declaring the type on the property keeps it. Pipelock remembers each rejection for the authenticated principal whose list carried it, so that principal's calls naming the rejected tool fail locally until a later list carries a corrected definition. Anonymous current-protocol requests are request-local, so an anonymous call naming a rejected tool is handled like a call for a tool this proxy hasn't seen. A structurally valid definition forwarded under warn policy supplies its exact current bindings, so a scan warning doesn't switch off its header check; drift adoption follows the ordinary warn-policy rules. An excluded definition never becomes the drift baseline, because the agent never receives it.
+
+When tool scanning or session binding is configured, a current-protocol HTTP call for an unknown tool first triggers an internal upstream `tools/list` using the call's upstream credentials and protocol version. Pipelock follows pagination until it finds the tool or reaches a complete list, within a combined response budget of 10 MiB. Pages may be any size, including empty, and an empty-string cursor is followed like any other; only an absent `nextCursor` ends the list, and a repeated cursor is refused. A remaining cursor at any limit is incomplete discovery, never proof that the tool is absent. An unchanged definition repeated on a later page counts once; a conflicting repeat, or a repeat within one page, is treated as an invalid contract. Discovery shares the listener's upstream dialing and inspection policy, a 30-second response-header timeout, and a total 120-second discovery deadline. Concurrent misses for one authenticated principal on this listener share discovery. A waiting call takes a shared failure only when it names the same tool; if the initiating call is canceled, that discovery ends and the waiting calls start their own. Anonymous calls discover within each request. Discovery records structural contracts without marking tools client-seen, adopting definition drift, or approving held actions. The agent never receives the discovered list, so it isn't untrusted-content exposure for taint policy, whether the call then proceeds or is refused; the list is still scanned, and a later response the agent does receive is observed as usual. It never asks an operator for approval: a response finding whose action is `ask` refuses discovery, and a client `tools/list` takes the normal approval path. Configured session-binding gates still require the client-visible inventory they required before discovery.
+
+A discovered valid contract enforces mirrors before the call reaches upstream; a valid unannotated tool proceeds. An invalid contract returns HTTP 400 with `HeaderMismatch` (-32020), as for a tool excluded from a client-visible list. An absent tool, incomplete inventory, upstream refusal, timeout, cancellation, inspection block, or other discovery failure refuses execution with HTTP 503 and an explanation that Pipelock couldn't establish the contract. That explanation carries only Pipelock's own reason, such as an absent tool or an exhausted budget; an underlying transport or parser error can quote upstream bytes, so it goes to the operator log instead. Pipelock never forwards the call unchecked or replays it after a failure. Only current-protocol lists and discovery set these contracts. A server may omit `x-mcp-header` when answering an older protocol version, so a legacy-version list still counts as client-visible inventory but never replaces or stands in for a current contract. Discovered contracts use the same principal-owned registry and lifecycle as listed contracts: a later client-visible definition can replace them, credential revocation or state removal discards them, and no separate TTL is imposed. A discovery does not replace an already-known sibling contract. Unrecognized parameter headers remain transparent intermediary data; their raw and decoded values are always scanned. Pure stdio forwarding may ignore these annotations, as the protocol permits. Base64 is transport encoding, not secrecy; do not mark credentials or personal data with `x-mcp-header`.
 
 When `listener_require_state_token` is `true` and a request has neither an authenticated principal nor a Pipelock-issued session token, Pipelock performs its request-local scan and then refuses the request before it reaches the upstream. It does not silently remove the configured control. The omitted default is `false`, so existing MCP HTTP clients that do not perform the Pipelock handshake keep working; set the field to `true` to require a principal or token. Pure request scanning, tool-poison scanning, upstream-scoped tool drift, and network-grade denial-of-wallet remain usable without a principal.
 
@@ -1490,11 +2027,33 @@ Replacing a file-backed listener bearer starts a new credential epoch on the nex
 
 For migration, older clients may continue returning a Pipelock-issued `Pipelock-Session-Token` after a legacy `initialize` exchange. That compatibility capability is isolated from principal-owned state, is never forwarded upstream, and is never issued for a `2026-07-28` request. New integrations must use authenticated principal state instead.
 
-The registry holds at most 4,096 client states. Idle principal and legacy compatibility states expire after 24 hours. At capacity, a new authenticated principal evicts legacy state first but never pressure-evicts another live principal's security history; if every slot belongs to a live principal, admission fails closed. Stateless listener configurations do not allocate persistent client state.
+The registry holds at most 4,096 client states. Idle principal and legacy compatibility states expire after 24 hours. At capacity, a new client can replace inactive legacy state only when it carries no protected enforcement state. Live principal history and legacy airlock, adaptive restrictions, and policy-relevant taint are protected from pressure eviction. If no state can be safely dropped, admission fails closed. Without a session store, legacy compatibility state keeps its existing least-recently-used eviction behavior. Stateless listener configurations do not allocate persistent client state.
+
+With a session store, unauthenticated legacy `Mcp-Session-Id` values and Pipelock-issued tokens can each hold a separate slot. An anonymous client can obtain many tokens, so `listener_require_state_token: true` does not limit capacity. Upstream MCP responses count as external content, so taint policy can retain those slots even without an injection finding. In `pipelock run`, the listener shares `session_profiling.max_sessions` with the HTTP proxy and can exhaust capacity for other transports. Standalone `pipelock mcp proxy --listen` uses a private store, so only the listener's own capacity is affected.
+
+Session store slots still free on `session_ttl_minutes` idle expiry (airlock exempt); listener registry slots free on the listener idle expiry (24 hours) or session end. A store refusal names `max_sessions`; a registry refusal for an unauthenticated legacy client names the fixed 4,096-client limit. A verified principal refused at the registry limit is reported as `session_binding` (layer `mcp_listener_session`, pattern `listener_principal_state_capacity`), not `data_budget`. Raising `max_sessions` does not raise the registry limit.
+
+For multi-client listeners, configure listener bearer authentication to bind one principal to one slot. A shared listener bearer identifies one shared trust domain; use distinct verified principals when callers need separate histories. Authentication does not reserve capacity for another transport. Admin reset, terminate and new-task remain unavailable for invocation-scoped listener keys.
+
+The capacity note is startup-only; reload does not emit it. It requires a session store and either stateful controls or token mode, with no configured bearer or principal authentication. A listener with a store but no stateful controls and no token mode creates no persistent client partitions and emits no note.
+
+| Session store | Stateful controls | Token mode | Bearer or principal auth | Startup capacity note |
+|---|---|---|---|---|
+| absent | enabled | disabled | absent | no |
+| present | disabled | disabled | absent | no |
+| present | enabled | disabled | absent | yes |
+| present | disabled | enabled | absent | yes |
+| present | enabled | enabled | absent | yes |
+| present | enabled | disabled | configured | no |
+| present | disabled | enabled | configured | no |
+
+The emitted note is:
+
+> pipelock: unauthenticated legacy MCP listener session IDs and Pipelock-issued tokens can each hold a session slot; retained sessions can exhaust listener capacity. In pipelock run, session_profiling.max_sessions is shared with other transports; standalone pipelock mcp proxy --listen uses its own store. Session store slots free on session_ttl_minutes idle expiry (airlock exempt); listener registry slots free on listener idle expiry (24h) or session end. Configure listener bearer authentication to bind one principal to one slot. listener_require_state_token does not limit capacity: one anonymous client can obtain many tokens. This note is startup-only; reload does not emit it.
 
 ## MCP WebSocket Listener
 
-Controls inbound WebSocket connections when the MCP proxy runs in listener mode with a `ws://` or `wss://` upstream. Loopback origins are always allowed.
+These fields are reserved for an inbound WebSocket listener that the current CLI doesn't provide. `pipelock mcp proxy` refuses `--listen` with a `ws://` or `wss://` upstream, so a WebSocket upstream runs only in stdio mode (`pipelock mcp proxy --upstream wss://...`). Pipelock validates the fields at load and fills in the default below, but no listener reads them, and setting them doesn't change runtime behavior.
 
 ```yaml
 mcp_ws_listener:
@@ -1526,12 +2085,22 @@ session_profiling:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable profiling |
-| `anomaly_action` | `"warn"` | warn or block on anomaly |
+| `anomaly_action` | `"warn"` | Warn or block on anomaly. The default warning adds zero adaptive points; repeated warned bursts do not escalate. Enforced `block` anomalies retain their score contributions. |
 | `domain_burst` | `5` | New unique domains in window to flag |
 | `window_minutes` | `5` | Rolling window duration |
 | `max_sessions` | `1000` | Hard cap on concurrent sessions |
 | `session_ttl_minutes` | `30` | Idle session eviction |
 | `cleanup_interval_seconds` | `60` | Background cleanup interval |
+
+The adaptive `whoami` endpoint and session admin API require `session_profiling.enabled: true`, in addition to the API token and dedicated `kill_switch.api_listen` listener. Without profiling enabled, `adaptive whoami` returns a service-unavailable response and session administration is unavailable.
+
+`session_profiling.volume_spike_ratio` was removed because it had no enforcement behavior. Config files that still contain it are refused at load; remove the field.
+
+`max_sessions` fails closed. At the cap, Pipelock evicts the oldest session it can safely drop, and never one held in airlock, carrying an adaptive escalation or `block_all` restriction (global or destination-scoped), or carrying taint at a level used by taint policy (`external_untrusted` or higher). When no session can be dropped, the new request is refused with HTTP 503 and layer `session_capacity` instead of running without session state; proxy, MCP and Browser Shield admission all follow this rule.
+
+Capacity protection doesn't change `session_ttl_minutes`: a session idle beyond that limit can expire at the next cleanup, clearing its adaptive and taint history. Airlock sessions remain exempt from idle expiry. Committed MCP tool calls refresh activity unless the session-wide `block_all` latch is set; blocked retries don't keep that latch alive. Standalone MCP invocation records are removed when the invocation exits.
+
+Refusal has no fixed recovery deadline. Active tainted sessions can keep their state, and airlock timers can be disabled. Adaptive recovery uses its configured level timers; disabling `adaptive_enforcement` releases capacity held only by adaptive levels. Reset and terminate clear adaptive and airlock restrictions but preserve taint, so a tainted session keeps its slot; an identity session's new-task boundary (`POST /api/v1/sessions/{key}/task`) clears taint. MCP sessions reject admin reset and task boundaries, so end the invocation, use an applicable configured trust override for the refused action, or allow idle expiry where supported. A trust override doesn't release capacity while taint remains.
 
 ## Behavioral Baseline
 
@@ -1578,7 +2147,19 @@ The baseline admin endpoints (list, show, ratify, forget) are only mounted on th
 
 ## Adaptive Enforcement
 
-Per-session threat score that accumulates across scanner hits and decays on clean requests. When the score exceeds the threshold, the session escalates through levels (elevated → high → critical). At each level, the `levels` configuration upgrades warn and ask actions to block, or denies all traffic.
+**Audit deployments:** enabling adaptive enforcement allows eligible warnings to be refused after independent enforced findings elevate the session. Set `adaptive_enforcement.enabled: false` to disable adaptive upgrades. Immutable security floors still apply.
+
+**Upgrading an existing configuration:** warnings contribute zero points. A threshold previously tuned around repeated warnings no longer produces that escalation; lowering the threshold won't make warnings score. Configure the relevant scanner action to block when a finding must be enforced. Existing enforced findings retain their score contributions.
+
+Per-session threat score that accumulates across concrete scanner hits and decays on clean requests. When the score reaches the threshold, the session escalates through levels (elevated → high → critical). At each level, the `levels` configuration upgrades eligible warn and ask actions to block, or denies all traffic. URL, body, WebSocket, A2A/MCP content, and cross-request entropy findings remain visible and act at their configured warn or block action; entropy alone does not raise the score or acquire a stronger action. An enforced mixed finding with DLP, injection, SSRF, policy denial, or structural hostname exfiltration remains eligible for scoring; an eligible warned finding can be upgraded only after independent scored evidence raises the scope. A session already at `block_all` because of concrete findings still denies every request, including one with entropy alone. A repeated denial with the same scanner and reason at the same destination scores once; retries stay denied without adding score. Strip findings still score every time. Warning-only findings add no enforcement points, including when `levels.upgrade_warn` or `block_all` refuses a warning after independent evidence has elevated the session. The refusal still applies, but the warning cannot raise the score further. Past 1,024 remembered denial fingerprints per session, new fingerprints always score.
+
+A configured `warn` action records an observation. Repeated input, response, tool-inventory, URL, header, body, or cross-request warnings cannot create an adaptive quarantine or deny a later clean call. Allowed cross-agent taint propagation keeps its taint evidence without adding enforcement points; an enforced denial or unreadable risk state retains its fail-closed signal. Warnings recorded by adaptive enforcement interrupt a consecutive-clean recovery streak but neither increase nor decay the score. Anomaly findings also remain observations when `session_profiling.anomaly_action` is `warn` or `enforce` is false.
+
+Explicit blocks, immutable security floors, and active mitigations keep their existing enforcement and score contributions. `levels.upgrade_warn` still upgrades eligible findings after other scored evidence elevates the applicable scope. Enabling adaptive enforcement therefore permits those upgrades, even in an audit deployment; warning-only traffic cannot reach that state on its own. To keep warnings observational even after independent enforced findings, disable adaptive enforcement or explicitly disable the relevant level upgrades.
+
+An independent refusal policy still scores its findings even when another configured action is `warn`. For example, the MCP HTTP listener relays upstream `4xx` replies only when their headers and body pass scanning. A flagged reply is withheld and records a block in every response-scanning mode; this isn't an adaptive upgrade of a warning. Clean upstream errors retain their status without adding points. Ordinary warned tool results remain score-neutral. See [upstream status handling](guides/transport-modes.md) for the relay contract.
+
+A block that reports a resolver outcome rather than agent behavior is refused without adding to the score: a DNS timeout, a name that does not exist, a resolver error, and an answer made only of the unspecified address (`0.0.0.0` or `::`), which DNS filters return for a name they block. An answer that includes any other internal or metadata address, and an unspecified address written literally in the URL, still count as SSRF findings.
 
 ```yaml pipelock-fragment
 # pipelock-fragment-id: adaptive-enforcement
@@ -1610,27 +2191,24 @@ adaptive_enforcement:
 | `decay_per_clean_request` | `0.5` | Score reduction per clean request. Lower values slow trust recovery. |
 | `level_duration_seconds` | `300` | Time at one adaptive level before time-based recovery drops one level. |
 | `deescalation_check_seconds` | `30` | Background sweep interval for idle-session time-based recovery. |
-| `clean_requests_to_deescalate` | `0` | Consecutive clean requests required to drop one adaptive level. `0` disables this opt-in recovery path. Any block or near-miss resets the clean streak, so an attacker cannot interleave clean traffic to stay under enforcement. A session that runs fully clean for this many requests does earn back one level, so set it conservatively: lower values recover faster but give a patient, fully-clean attacker an easier path back down. |
-| `severity_weighted_signals` | `false` | Opt-in lower score contribution for known noisy low-severity block lanes such as entropy. Unknown, DLP, SSRF, prompt-injection, and other high-risk blocks keep the current hard-block contribution. |
-| `cooperative_tool_downweight` | `true` | Downweight domain-burst and IP-domain-burst adaptive signals from known cooperative tool user agents such as `yt-dlp`, package managers, `curl`, and `git`. |
+| `clean_requests_to_deescalate` | `0` | Consecutive clean requests required to drop one adaptive level. `0` disables this opt-in recovery path. Any scored signal or recorded warning resets the clean streak, so an attacker cannot interleave clean traffic to stay under enforcement. A session that runs fully clean for this many requests does earn back one level, so set it conservatively: lower values recover faster but give a patient, fully-clean attacker an easier path back down. |
+| `severity_weighted_signals` | `false` | Opt-in lower score contribution for selected low-severity block labels when they represent concrete evidence. Entropy-only findings contribute no score regardless of this setting. DLP, SSRF, prompt-injection, and other concrete blocks retain their signals. |
+| `cooperative_tool_downweight` | `true` | Downweight domain-burst and IP-domain-burst adaptive signals from known cooperative tool user agents such as `yt-dlp`, package managers, `curl`, and `git`. A bound or config-default identity is always downweighted, whatever this is set to. |
 | `levels` | *(see below)* | Per-level enforcement upgrades |
 
-By default, attack containment is unchanged: a hard block contributes the same
-score as before, adaptive levels recover only by time, and the 5-minute level
-duration plus 30-second sweep cadence are preserved. The clean-request recovery
-path is opt-in because it is intended for single interactive-agent
-false-positive recovery; it never advances on mixed traffic because every
-adaptive signal resets the consecutive-clean counter.
+Concrete hard blocks retain their score contribution; entropy-only blocks do not. By default, adaptive levels recover by time, using the configured level duration and sweep cadence. The clean-request recovery path is opt-in because it is intended for single interactive-agent false-positive recovery; it never advances on mixed traffic because every adaptive signal resets the consecutive-clean counter.
 
 ### Escalation Levels
 
-Sessions progress through three levels as threat score accumulates past `escalation_threshold` multiples. Each level can independently upgrade action severity.
+Sessions progress through three levels as threat score accumulates. The threshold doubles after each escalation, so the score needed for each level is `escalation_threshold` times 1, 2, then 4. Each level can independently upgrade action severity.
 
 | Level | Trigger | Description |
 |-------|---------|-------------|
 | `elevated` | Score ≥ threshold × 1 | First escalation. Session shows suspicious behavior. |
 | `high` | Score ≥ threshold × 2 | Second escalation. Session is actively concerning. |
-| `critical` | Score ≥ threshold × 3 | Third escalation. Session is high-confidence threat. |
+| `critical` | Score ≥ threshold × 4 | Third escalation. Session is high-confidence threat. |
+
+With the default `escalation_threshold` of 5.0 that is 5, 10, and 20. Scores move in whole signal steps, so a session first reports `critical` at the first score at or past 20.
 
 ### Level Actions
 
@@ -1646,7 +2224,7 @@ Each level accepts the following fields. All fields use **pointer semantics**:
 |-------|------|---------|-------------|
 | `upgrade_warn` | `*string` | `nil` → `"block"` at all levels | Upgrade `warn` actions to `block` at this level |
 | `upgrade_ask` | `*string` | `nil` → `""` at elevated; `"block"` at high and critical | Upgrade `ask` (HITL) actions to `block` at this level |
-| `block_all` | `*bool` | `nil` → `false` at elevated and high; `true` at critical | Deny all traffic for this session regardless of action |
+| `block_all` | `*bool` | `nil` → `false` at elevated and high; `true` at critical | Deny all traffic for the destination (or, for non-HTTP signals, the session) that reached this level, regardless of action |
 
 **Default behavior when `levels` is omitted:**
 
@@ -1656,23 +2234,44 @@ Each level accepts the following fields. All fields use **pointer semantics**:
 | high | block | block | false |
 | critical | block | block | true |
 
+### Destination scope
+
+Findings on the HTTP paths (fetch, forward proxy, CONNECT, TLS interception, reverse proxy, WebSocket, redirect hops) are scored per destination host as well as on the session. The `levels` table, `block_all`, and airlock triggers are evaluated against the level of the destination a request is headed to, so one noisy destination is quarantined without cutting off the agent's other destinations. Signals that have no destination, such as MCP traffic, still act on the whole session. Warning-only destinations do not allocate enforcement scopes or consume the scope limit.
+
+The session's own score and level are an aggregate that sums every destination, and they are what `pipelock session risk` and `session list` show. Aggregate `critical` does not by itself deny anything: when findings are spread over many destinations and none of them reaches critical, the session reads `critical` with `block_all: false` and airlock tier `none`, and clean requests keep flowing. `pipelock session explain` lists the destination scopes that are actually elevated or quarantined. A destination that reaches critical on its own latches `block_all` and takes the configured `on_critical` airlock tier for that destination, and a request to it is refused until the scope recovers or `session reset` clears it. Loopback clients and loopback upstreams get no exemption from this: only `adaptive_enforcement.exempt_domains` exempts a destination. If more than 1,024 destinations are tracked for one session, new destinations fall back to the session-wide lane, which is stricter.
+
 ### De-escalation
 
-Sessions at `block_all` recover autonomously via a background sweep that runs
-every 30 seconds. If a session has been at its current escalation level for
-longer than 5 minutes, it is automatically stepped down one level. Recovery
-also triggers on the next incoming request, WebSocket frame, or MCP message
-after the timer expires (on-entry fast path). The session must accumulate new real signals to re-escalate.
+Sessions at `block_all` recover autonomously via a background sweep that runs every 30 seconds. If a session has been at its current escalation level for longer than 5 minutes, it is automatically stepped down one level. Warnings do not restart that timer. Recovery also triggers on the next incoming request, WebSocket frame, or MCP message after the timer expires (on-entry fast path). The session must accumulate new real signals to re-escalate.
 
 De-escalation drops one level per 5-minute period. A session at critical with no activity takes 15 minutes (3 periods) to return to normal. Each de-escalation resets the threat score to half the current threshold to prevent immediate re-escalation from stale points.
 
 When a session is at a `block_all` level, blocked retries do not refresh the session's idle timer. This allows idle eviction to eventually clean up sessions that are no longer generating traffic, preventing zombie sessions from persisting indefinitely.
 
+### Session lifetime and reload
+
+Adaptive state belongs to the proxy's session identity, rather than a client conversation window. MCP stdio keeps state for the wrapped proxy invocation. A shared MCP HTTP proxy keeps separate state for its authenticated principals; multiple conversations using the same identity can share state. Restarting the proxy creates fresh in-memory sessions. Do not use a client-controlled name as an authenticated identity.
+
+Unchanged and unrelated configuration reloads retain existing security state. Disabling adaptive enforcement stops adaptive upgrades immediately; it does not turn off explicit scanner blocks or immutable floors. Re-enabling it can reuse retained session state. Changing a scanner from block to warn stops new warning points but does not erase prior enforced evidence. Sessions already elevated before an upgrade recover through the configured timers, opt-in clean streak, or an operator session reset; scores are not retroactively attributed to old warning findings.
+
+### Block diagnostics
+
+An adaptive or upgraded block gives the caller its category and guidance to ask the operator to inspect or reset the session. Exact scores, thresholds, levels, and recovery settings stay in operator diagnostics; they are not included in caller errors or headers. The full audit explanation is a `blocked` event with scanner `adaptive_enforcement` or `airlock` that carries the request ID and client IP but not the URL or target. Entering quarantine is recorded as `airlock_enter`, not as a block. HTTP paths with a fixed error body use `X-Pipelock-Adaptive-Detail` for the explanation. MCP JSON-RPC errors carry it in `error.message`. MCP proxy diagnostics go to stderr in stdio mode, including when `logging.output` is `stdout`; stdout carries only protocol messages.
+
+WebSocket close frames carry the block category and request ID within the RFC 6455 byte budget. They contain no adaptive score, threshold, or timer settings. The complete explanation remains in the audit log. See the [block-reason wire contract](specs/block-reason-header.md#adaptive-decision-details). Clean-request score decay alone does not clear an active level, and blocked retries do not earn clean-request recovery. At the default critical level, time recovery clears `block_all` after the first level drop; lower-level upgrades remain until their own blocking levels clear. Airlock quarantine has separate tier timers, which its operator diagnostics report. A zero airlock timer disables that automatic transition; an operator session reset can clear it.
+
+Quarantine that starts after a CONNECT tunnel or WebSocket relay has been established cancels the connection. An opaque CONNECT tunnel can't carry an HTTP error after its 200 handshake, so the audit log records the `airlock_enter` transition with its scope, tier and trigger, and `pipelock session explain` shows the scope's score. The next request receives the normal admission refusal and recovery guidance.
+
 ### Domain Burst Scoring
 
-Session profiling detects domain bursts (many unique domains in a short window). When the burst threshold is crossed, the anomaly is signaled once per window with the configured score. Subsequent requests in the same window still trigger the configured `anomaly_action` (block or warn) but do not add further adaptive score, preventing burst detection from driving sessions to critical on its own. IP-wide domain bursts are tracked separately to catch agent-identity rotation from a single client IP. When `cooperative_tool_downweight` is enabled, burst signals from known cooperative tool user agents are reduced instead of scored at full browser-like weight.
+Session profiling detects domain bursts (many unique domains in a short window). When the burst threshold is crossed, an enforced anomaly is signaled once per window with the configured score. A warned anomaly adds no enforcement points. Subsequent requests in the same window still trigger the configured `anomaly_action` (block or warn) but do not add further adaptive score, preventing burst detection from driving sessions to critical on its own. IP-wide domain bursts are tracked separately to catch agent-identity rotation from a single client IP; bound and config-default identities are not request-controlled, so they are never written to the IP-level counter. When `cooperative_tool_downweight` is enabled, burst signals from known cooperative tool user agents are reduced instead of scored at full browser-like weight.
 
 ## Metrics listener
+
+
+## Contained CA trust
+
+The runtime contract points every supported client, including `NODE_EXTRA_CA_CERTS`, at `/etc/pipelock/combined-ca.pem`. Install refreshes `/etc/pipelock/ca.pem` from the CA in the contain-managed keystore on every run, rebuilds the combined bundle, and refuses success when the export does not match it. Two Pipelock CAs can share a subject name, so the comparison is on certificate material; a check that compares subject names reports agreement between a stale export and a current CA. After an intentional CA rotation, run `sudo pipelock contain ca-refresh` and confirm `pipelock contain verify` is green before launching tools.
 
 Set `metrics_listen` to place `/metrics` and `/stats` on a dedicated address and port. The metrics port must differ from the proxy port. An ordinary deployment may use its own network controls for that listener.
 
@@ -1695,9 +2294,45 @@ containment:
 
 The proxy will not dial its own configured metrics address and port. That rule runs before trusted domains, `ssrf.ip_allowlist`, and grants, so a generic SSRF exception cannot expose metrics to a contained agent through the proxy.
 
+### Contained agent display (containment)
+
+`containment.display` installs an agent-owned X display for browser tools. With no display settings, installation uses Xvfb only when it is present, as before. `enabled: false` disables provisioning; `number` defaults to `99` and accepts `0` through `999`. `geometry` defaults to `1280x1024` and accepts one `WxH` token with width 320–32768 and height 200–32768, with at most 16,777,216 pixels (64 MiB at four bytes per pixel).
+
+Changes to the display backend, geometry, or viewer settings require `pipelock contain install`. Configuration reload retains the installed display settings and does not apply those changes.
+
+```yaml
+containment:
+  display:
+    enabled: true
+    backend: xvnc
+    geometry: 1280x1024
+    viewer:
+      enabled: true
+      operator_user: operator
+      clipboard: false
+```
+
+`backend` accepts `xvfb` or `xvnc`; enabling the viewer defaults the backend to `xvnc`, and an explicit `xvfb` conflicts with it. Xvnc disables TCP RFB and creates `/run/pipelock-agent-display/rfb.sock`. A managed `/etc/tmpfiles.d/pipelock-agent-display.conf` rule creates that directory at boot as root:`pipelock-viewer` with mode `0730`, before the display unit's bind mount needs it. Xvnc runs with the viewer group and can create the socket; contained agent processes cannot enter or change the directory. The socket is `0600` without a viewer and `0660` with one. The viewer service runs as the dedicated `pipelock-viewer` user, never as the proxy user. Its own directory under `/run/pipelock-contain-viewer/` remains private to that user; the control socket has an exact operator `rw-` ACL and a peer-UID check. The operator must have a different identity from the agent, proxy, and viewer accounts. The viewer enforces view-only mode and the control lease. `pipelock contain view` exposes a local Unix socket for a standard VNC client. `clipboard: false` disables clipboard transfer in both directions at the Xvnc display server.
+
+Rerun `pipelock contain install` after upgrading a host that uses the old home-directory RFB socket. Install moves Xvnc to the root-owned runtime directory, removes obsolete named ACL grants and the old socket from the agent home, and restarts the viewer under its dedicated identity. This cleanup runs again on every install, disable, and rollback, even after the unit has been migrated; verify and doctor fail if old access remains. An install failure restores the previous managed units and their active state. `pipelock contain rollback` stops both services and removes the viewer account only when install created that same account, unless `--keep-users` is set. A pre-existing viewer account is preserved. Configuration reload does not change this access model; use `contain install` for display or viewer changes.
+
+### Contained agent identity (containment)
+
+A contained agent reaches the proxy through its namespace doorway, which by default delivers to the shared proxy listener. Traffic there is attributed by the usual rules, so a profile whose `source_cidrs` covers loopback claims the contained agent along with every other local client. Set `containment.agent_listener` to one of the agent's own `agents.<name>.listeners` to deliver the doorway to that listener instead:
+
+```yaml
+agents:
+  contained-agent:
+    listeners: ["127.0.0.1:8889"]
+containment:
+  agent_listener: "127.0.0.1:8889"
+```
+
+The proxy attributes traffic to that profile through the listener binding, so its per-agent policy, receipts and audit records name it. Processes inside the agent namespace reach the listener only through the doorway. On the host, the managed nftables output rule permits only the doorway relay's `pipelock-proxy` account and root to connect to this address and port; the kernel logs and drops connections from other local accounts. The value must be a numeric loopback address matching a declared listener and must differ from the shared proxy port; `contain install` refuses anything else. Inside the namespace the agent's proxy address does not change.
+
 ### Declared loopback services (containment)
 
-The contained agent's only implicit loopback destination is the proxy port. `containment.loopback_services` declares any additional loopback TCP service the agent may reach, with the same reviewable lifecycle as `containment.metrics_exposure`:
+The contained agent runs in a private network namespace. Its own loopback listeners work on any port, while host loopback services are absent unless the operator declares them. `containment.loopback_services` declares each host loopback TCP service that Pipelock should expose as a socket inside the agent namespace:
 
 ```yaml
 containment:
@@ -1709,21 +2344,67 @@ containment:
       expires_at: 2026-12-01T00:00:00Z
 ```
 
-`host` must be a loopback literal, `127.0.0.1` or `::1`; a hostname, wildcard, or CIDR is rejected. `port` is a single TCP port (1-65535) distinct from the proxy port -- the proxy allow is implicit and does not need a declared entry. `owner`, `reason`, and `expires_at` (RFC3339, must remain in the future) are required, and an expired, malformed, duplicate, or proxy-port-colliding entry fails config validation, so `pipelock check` and `contain install` both fail closed rather than loading a ruleset that does not match the declaration.
+`host` must be `127.0.0.1` or `::1`; Pipelock rejects a hostname, wildcard, or CIDR. `port` is a single TCP port from 1 through 65535 and can't equal the proxy port. `owner`, `reason`, and a future RFC3339 `expires_at` value are required. A malformed, duplicate, or proxy-port entry fails config validation, even when its date has passed.
 
-`contain install` renders each declared entry as a forward allow and a narrow established-reply allow. The reply path is limited to `lo`, the declared loopback address and source port, and reply-direction traffic.
+An expired entry is a lapsed grant, not a broken file. Pipelock drops it from the effective set at startup and on every reload, so it is never exposed or rendered, and the unexpired entries beside it keep working. It prints a warning that names the entry and its owner, writes an audit log error with the method `CONTAINMENT_GRANT_LAPSED`, and emits a `containment_grant_lapsed` event. The warning repeats on every start and reload until you renew or remove the entry. `pipelock check` and `pipelock contain verify` still report it, and verify fails until you act.
 
-**Every add, remove, or expiry of an entry needs a reconciliation pass to reach the kernel: run `pipelock contain reload-nft-rules` as root after editing this list.** Editing the config alone is not enough -- the managed nftables chain and the persisted rules file only change on the next reconciliation, which is what that command (and the boot-time unit that runs it automatically on every boot) does. If the managed config is missing or unreadable, or the declared set as a whole contains a malformed or expired entry, reconciliation fails closed to zero declared loopback services and logs the config path and why (naming `pipelock contain install` as the recovery command for a missing config); it does not fail the reload. See "Declared loopback services" under `contain-cli.md` for how `contain install`, `contain reload-nft-rules`, and `contain verify` each honor this list.
+`contain install` creates a socket with the declared address and port inside the agent namespace. A socket-activated service in the host namespace forwards accepted connections to the same host loopback address and port. This exposes one listening socket without adding a network interface, gateway, or route.
+
+`pipelock contain install` warns when no TCP listener is reachable at the declared host address. The declaration is still installed because the host service may start later, but it immediately reserves the same address inside the agent namespace. Remove the declaration when the contained tool owns that port; otherwise the tool's bind fails with an address-in-use error even though no host TCP listener exists.
+
+This declaration isn't needed for a listener that the contained tool starts. The tool and its child processes share the private namespace's loopback interface, so they can connect to a kernel-assigned port there. A listener on the host's loopback interface remains unreachable, including one owned by `pipelock-agent`.
+
+The built-in proxy uses a host pathname doorway: `pipelock-agent-proxy.socket` creates `/run/pipelock-agent-proxy/doorway.sock`, and the host `pipelock-agent-proxy.service` relay forwards it to the Pipelock listener. `pipelock-agent-netns-forward.service` creates the `127.0.0.1:<proxy-port>` listener inside the private namespace and connects it to the doorway. The runtime proxy URL stays `http://127.0.0.1:<proxy-port>`.
+
+Run `sudo pipelock contain reload-nft-rules` after every add, removal, or expiry. The command also reconciles the namespace socket units and their root-owned inventory. If the managed config is missing or unreadable, or the set contains a malformed, duplicate, or proxy-port entry, reconciliation removes all declared forwarders and logs the reason. An expired entry removes only itself: its namespace socket and host relay are stopped and its units are deleted, the warning names it, and unexpired siblings keep their forwarders. The same service can then be declared again. The base namespace and proxy socket stay active. See "Declared loopback services" in `contain-cli.md` for install, verification, and service-launch details.
+
+### Published services (containment)
+
+`containment.loopback_services` lets the agent reach a host service. `containment.published_services` works the other way: it publishes one listener that the agent runs on its own namespace loopback to one operator on the host.
+
+```yaml
+containment:
+  published_services:
+    - name: viewer
+      agent_port: 5900
+      operator_user: operator
+      owner: platform-team
+      reason: operator watches the agent's display through its own viewer
+      expires_at: 2026-12-01T00:00:00Z
+```
+
+`name` is 1 to 32 lowercase letters, digits, or hyphens and names the systemd units. `agent_host` defaults to `127.0.0.1` and may only be `127.0.0.1` or `::1`. `agent_port` can't equal the proxy port, a declared `loopback_services` port, or another publication's port. `operator_user` names the one local account allowed to connect. `owner`, `reason`, and a future RFC3339 `expires_at` value are required, with the same validation and expiry handling as `loopback_services`: an expired publication is dropped from the effective set with a warning, its doorway closes at the next reconciliation, and other publications are unaffected.
+
+By default the host endpoint is the unix socket `/run/pipelock-contain-published/<name>.sock`, owned by `operator_user` with mode `0600`, so only that account and root can connect. `host_socket` overrides the path; it must be a clean absolute path under `/run/` ending in `.sock`, and Pipelock refuses paths inside its own containment directories. `host_listen: 127.0.0.1:<port>` (or `[::1]:<port>`) adds a loopback TCP endpoint as an explicit opt-in. Any local account can connect to a TCP endpoint, so prefer the socket.
+
+A reverse proxy in front of the socket can change what the service sees. `tailscale serve unix:<path>` rewrites the request `Host` header to `localhost` and moves the original into `X-Forwarded-Host`, so a service that checks `Host` against the browser's `Origin` or `Referer` refuses every request. Point that proxy at a `host_listen` TCP endpoint instead, which keeps the original `Host`, and rely on the service's own authentication for the wider local reach.
+
+Treat everything that crosses a published service as untrusted agent content. The agent chooses what it shows the operator and sees everything the operator sends. Pipelock provides the endpoint only. It doesn't ship a viewer, and it doesn't serve the endpoint beyond the host. If you need remote access, put your own authenticated service in front of the socket.
+
+See "Published agent services" in `contain-cli.md` for install, verification, and reconciliation details.
 
 ## Kill Switch
 
-Emergency deny-all with six independent activation sources: `enabled`,
-`sentinel_file`, API, `SIGUSR1`, Conductor remote kill, and Conductor
-stale-bundle detection. Any one active denies normal traffic (OR-composed)
-except for configured exemptions (`health_exempt`, `metrics_exempt`,
-`api_exempt`, `allowlist_ips`). The two Conductor-driven sources are activated
-by the enterprise follower runtime. See [Kill Switch](../README.md#operability)
-for operational details.
+Emergency deny-all with seven independent activation sources: `enabled`,
+`sentinel_file`, API, `SIGUSR1`, Conductor remote kill, Conductor
+stale-bundle detection, and uncertain Conductor apply. Any one active denies
+normal traffic (OR-composed) except for configured exemptions (`health_exempt`,
+`metrics_exempt`, `api_exempt`, `allowlist_ips`). Exemptions are honored only on
+the HTTP front door: the three endpoint exemptions cover requests made to
+Pipelock's own `/health` and `/metrics` paths and its kill-switch and session
+admin routes under `/api/v1` (on the main port only when the API has no
+separate port), never a forward-proxy
+or CONNECT request that happens to name those paths on another host, and
+`allowlist_ips` matches the client address of HTTP, forward-proxy and
+intercepted CONNECT requests. MCP transports (stdio, the stdio-to-HTTP bridge
+and the HTTP listener), the reverse proxy and established relay or WebSocket
+connections ignore every exemption. `allowlist_ips` is not consulted during
+uncertain Conductor apply. The three Conductor-driven sources
+are activated by the enterprise follower runtime. See [Kill Switch](../README.md#operability)
+for operational details. Activation blocks every deferred (`action: defer`)
+tool call held on MCP stdio or the stdio-to-HTTP bridge that has not yet
+claimed its upstream send (`resolution_source: kill_switch`); a send already
+claimed before activation is in flight and cannot be recalled.
 
 > **Heads-up on `enabled`:** the `enabled` field is a source, not a subsystem switch. Setting `enabled: true` immediately activates the kill switch and denies all traffic from startup (all requests return HTTP 503). To configure the API/signal/sentinel sources for future activation without engaging the kill switch at startup, leave `enabled: false`.
 
@@ -1747,10 +2428,11 @@ kill_switch:
 | `message` | `"Emergency deny-all active"` | No | Rejection message |
 | `health_exempt` | `true` | No | /health bypasses kill switch |
 | `metrics_exempt` | `true` | No | /metrics bypasses kill switch |
-| `api_exempt` | `true` | No | /api/v1/* bypasses kill switch |
+| `api_exempt` | `true` | No | The kill switch and session admin routes under `/api/v1` on the main port bypass it; other `/api/v1` routes do not. Ignored when `api_listen` is set |
 | `api_token` | `""` | No | Bearer token for API endpoints. Can be overridden by `PIPELOCK_KILLSWITCH_API_TOKEN` env var. |
+| `api_token_file` | `""` | No | Native token file, mutually exclusive with `api_token`. Supports `$CREDENTIALS_DIRECTORY/ID`; see [service credentials](guides/service-credentials.md) for permissions, precedence, reload, and migration. |
 | `api_listen` | `""` | **Yes** | Separate listen address for API |
-| `allowlist_ips` | `[]` | No | IPs always allowed through |
+| `allowlist_ips` | `[]` | No | Client IPs or CIDRs exempt on the HTTP front door (not MCP, reverse proxy or relay paths; not during uncertain Conductor apply) |
 
 **Port isolation:** When `api_listen` is set, the kill switch, session, adaptive, and baseline admin APIs run on a dedicated port. The main proxy port has no API routes, preventing agents from deactivating their own kill switch, resetting their own sessions, or ratifying their own behavioral baseline.
 
@@ -1791,7 +2473,7 @@ The `{key}` parameter is URL-encoded. For example, `my-agent|10.0.0.1` becomes `
 
 **Reset scope:** identity-family scoped. Resetting a session clears the session's threat score, escalation level, and block_all flag. It also clears shared IP-level burst tracking for the client IP and cross-request exfiltration (CEE) state. Other sessions on the same IP will have their burst state cleared as a side effect.
 
-**Rate limiting:** every mutating action (`reset`, `airlock`, `task`, `trust`, `terminate`, baseline `ratify`, baseline `forget`) and every detail lookup (`inspect`, `explain`) is rate-limited to 10 requests per minute per action. Each action tracks its own sliding-window counter so abuse of one endpoint cannot starve another — an operator can still hit `/reset` or `/airlock` during incident response even if `/task` or `/trust` is under load. Only `GET /api/v1/sessions` and `GET /api/v1/baseline` (the list endpoints) are unbounded; they are used as entry points for recovery tooling and have no destructive side effect. Responses that hit the limit return `429 Too Many Requests` with `Retry-After: 60`.
+**Rate limiting:** every mutating action (`reset`, `airlock`, `task`, `trust`, `terminate`, baseline `ratify`, baseline `forget`) and every detail lookup (`inspect`, `explain`) is rate-limited to 10 requests per minute per action. Each action tracks its own sliding-window counter so abuse of one endpoint cannot starve another — an operator can still hit `/reset` or `/airlock` during incident response even if `/task` or `/trust` is under load. Only `GET /api/v1/sessions` and `GET /api/v1/baseline` (the list endpoints) are unbounded; they are used as entry points for recovery tooling and have no destructive side effect. Responses that hit the limit return `429 Too Many Requests` with `Retry-After: 60`. **Failed authentication:** separately, a client address that presents 10 wrong bearer tokens within 60 seconds gets `429` with `Retry-After` before any further token is compared, on every endpoint including the list endpoints. The same bound applies to the kill-switch API, the Scan API, and the MCP HTTP listener bearer.
 
 Sessions are classified as `identity` (operator-targetable, e.g. `my-agent|10.0.0.1`) or `invocation` (internal MCP sessions, e.g. `mcp-stdio-42`). Only identity sessions can be reset, mutated, or terminated.
 
@@ -1801,7 +2483,7 @@ Sessions are classified as `identity` (operator-targetable, e.g. `my-agent|10.0.
 
 ### Airlock
 
-Per-session graduated quarantine with timer-based recovery. When adaptive enforcement escalates a session, the airlock state machine can transition the session through `soft` (observe-only), `hard` (reads allowed, writes blocked, long-lived connections torn down), and `drain` (no new traffic, existing in-flight requests complete within `drain_timeout_seconds`). At hard tier, Pipelock blocks MCP `tools/call` requests for the affected client across subprocess stdio, HTTP upstream, WebSocket upstream, and HTTP listener modes. Protocol setup and discovery requests, including `initialize` and `tools/list`, remain available for diagnosis and recovery. All three tiers are **timed quarantines** that auto-recover back down through lower tiers as `soft_minutes`/`hard_minutes`/`drain_minutes` expire — `drain` is not a terminal state and is not equivalent to `POST /api/v1/sessions/{key}/terminate`. Operators can override the tier at any time through the session admin API or the `pipelock session` CLI; explicit termination (the destructive operation, distinct from `session reset`) lives behind the dedicated `terminate` endpoint. Airlock is destination-scoped, and every airlock read and teardown hook is evaluated against the same raw adaptive session the escalation writes the tier to, never a request-folded key. Admission for a quarantined destination is enforced across fetch, forward-proxy, WebSocket, TLS-intercepted requests, opaque CONNECT tunnels, and redirect hops, regardless of how the agent declares its name; an in-flight opaque CONNECT, TLS-intercepted, or WebSocket tunnel to that destination is torn down when its tier escalates, because the teardown hook is registered on that same session; and an operator override through the session admin API or the `pipelock session` CLI is command-specific: `session release` sets the session-wide airlock tier and every destination scope's tier to the requested value, while `session reset` additionally clears the destination-scoped adaptive score and `block_all`. Reach for `release` to lift an airlock tier, and for `reset` when a destination is still denying traffic because of its own accumulated score rather than its tier.
+Per-session graduated quarantine with timer-based recovery. When adaptive enforcement escalates a session, the airlock state machine can transition the session through `soft` (observe-only), `hard` (reads allowed, writes blocked, long-lived connections torn down), and `drain` (no new traffic, existing in-flight requests complete within `drain_timeout_seconds`). At hard tier, Pipelock blocks MCP `tools/call` requests for the affected client across subprocess stdio, HTTP upstream, WebSocket upstream, and HTTP listener modes. Protocol setup and discovery requests, including `initialize` and `tools/list`, remain available for diagnosis and recovery. All three tiers are **timed quarantines** that auto-recover back down through lower tiers as `soft_minutes`/`hard_minutes`/`drain_minutes` expire — `drain` is not a terminal state and is not equivalent to `POST /api/v1/sessions/{key}/terminate`. Operators can override the tier at any time through the session admin API or the `pipelock session` CLI; explicit termination (the destructive operation, distinct from `session reset`) lives behind the dedicated `terminate` endpoint. Airlock is destination-scoped, and every airlock read and teardown hook is evaluated against the same raw adaptive session the escalation writes the tier to, never a request-folded key. Admission for a quarantined destination is enforced across fetch, forward-proxy, reverse proxy, WebSocket, TLS-intercepted requests, opaque CONNECT tunnels, and redirect hops, regardless of how the agent declares its name; an in-flight opaque CONNECT, TLS-intercepted, or WebSocket tunnel to that destination is torn down when its tier escalates, because the teardown hook is registered on that same session; and an operator override through the session admin API or the `pipelock session` CLI is command-specific: `session release` sets the session-wide airlock tier and every destination scope's tier to the requested value, while `session reset` additionally clears the destination-scoped adaptive score and `block_all`. Reach for `release` to lift an airlock tier, and for `reset` when a destination is still denying traffic because of its own accumulated score rather than its tier.
 
 > **Airlock requires triggers:** `airlock.enabled: true` alone is a no-op. Configure at least one trigger (`triggers.on_high`, `triggers.on_critical`) to specify which tier fires at each adaptive escalation level. All shipped presets wire `on_high: soft` + `on_critical: hard` by default. Freehand configs that set `enabled: true` with no triggers will reach critical escalation without ever entering airlock.
 
@@ -1840,6 +2522,7 @@ Forward audit events to external systems. Three independent sinks (webhook, sysl
 ```yaml
 emit:
   instance_id: "prod-agent-1"
+  correlation_header: ""  # e.g. X-Correlation-Id; empty disables
   webhook:
     url: "https://your-siem.example.com/webhook"
     min_severity: warn
@@ -1866,6 +2549,7 @@ emit:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `instance_id` | hostname | Identifies this instance in events |
+| `correlation_header` | `""` | Name of one client request header whose value is copied into emitted events as `correlation_id`. Empty disables it. See [SIEM correlation](#siem-correlation). |
 | `webhook.url` | `""` | Webhook endpoint URL |
 | `webhook.min_severity` | `"warn"` | info, warn, or critical |
 | `webhook.auth_token` | `""` | Bearer token for webhook |
@@ -1884,12 +2568,80 @@ emit:
 | `otlp.queue_size` | `256` | Async buffer size (overflow = drop) |
 | `otlp.gzip` | `false` | Compress request bodies with gzip |
 
+MCP proxy input DLP and injection blocks emit `blocked` events. Response scan
+blocks emit `blocked`; response strip and warn decisions emit `response_scan`.
+These events use scanner pattern names or fixed block reasons, without matched
+request or response text. They apply to subprocess, HTTP upstream, WebSocket
+upstream, and HTTP listener modes, including `run --mcp-listen`. In listener
+modes this includes credential or injection findings in request headers and
+upstream HTTP error replies withheld by response scanning.
+
+Each `pipelock mcp proxy` process builds its sinks from `emit` once at startup
+(it does not hot-reload) and refuses to start if a configured sink cannot be
+created or activated. Every wrapper process has its own sinks, so a destination
+that allows only one writer cannot be shared: the Enterprise `emit.forwarder`
+takes an exclusive lock on its `spool_file`, and a second process pointed at the
+same spool, such as another wrapped MCP server or `pipelock run`, fails to start.
+
 OTLP events are sent as log records over HTTP/protobuf. Each pipelock audit event maps to one OTLP LogRecord with `service.name=pipelock` as a resource attribute. Retries on 429, 502, 503, 504, and network errors with bounded exponential backoff (3 attempts, 1s/2s/4s). 500 and 501 are not retried. No gRPC, no batching timer.
 
 **Severity levels** (hardcoded per event type, not configurable):
 - **critical:** kill switch deny, adaptive escalation to critical level (enforcement upgraded across all transports)
 - **warn:** blocked requests, anomalies, session events, MCP unknown tools, scan hits
 - **info:** allowed requests, tunnel open/close, WebSocket open/close, config reload
+
+### SIEM Correlation
+
+`correlation_header` lets a client tag its own requests and find Pipelock's matching allow and block events in a SIEM. A tester sends each attack request with a unique value, such as `X-Correlation-Id: case-0042`, and joins on `correlation_id` instead of matching timestamps and URLs.
+
+```yaml
+emit:
+  correlation_header: X-Correlation-Id
+  webhook:
+    url: "https://your-siem.example.com/webhook"
+    min_severity: info   # include allowed requests, not only blocks
+```
+
+The value appears in each format as follows:
+
+| Format | Location |
+|--------|----------|
+| JSON (webhook, syslog) | `fields.correlation_id` |
+| CEF | `cs3=<value> cs3Label=correlationId` |
+| OCSF | `metadata.correlation_uid` |
+| OTLP | `correlation_id` log record attribute |
+
+The header value comes from the client, so Pipelock treats it as untrusted. The value is used only when the header appears exactly once, is at most 128 bytes after trimming surrounding spaces and tabs, and contains only visible printable ASCII (`!` through `~`, bytes 0x21 to 0x7E). A value with an interior space, a control character, or any non-ASCII byte is dropped, because an unescaped space ends a CEF extension value for many parsers and would cut off the field. A value that fails any check is left out of the event. The request itself is never blocked or changed because of this setting, and the header is still forwarded and scanned like any other header.
+
+A value that passes these checks is copied verbatim into every sink the operator configured under `emit`. The client chooses only the value; it cannot choose or add a destination. Before copying, Pipelock runs a quiet text DLP scan over the value, including environment and file secret matching, and drops the value on any match. That scan reduces the chance of a secret landing in a SIEM but is not a guarantee: an encoded, split, or partial secret that matches no pattern passes. Don't send anything in this header that you wouldn't want stored in your SIEM.
+
+The header name must be a valid HTTP token. Hop-by-hop headers (`Connection`, `Upgrade`, `Proxy-Authorization`, and similar), `Host`, `Content-Length`, credential headers (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and similar), and any name listed in `request_body_scanning.sensitive_headers` are rejected at config load. Names that look credential-bearing are rejected too. The check lowercases the name, splits it into words on `-`, `_`, and `.`, and rejects the name when any word or run of adjacent words joined together is a credential word such as `auth`, `token`, `secret`, `password`, `pass`, `pwd`, `cookie`, `credential`, `apikey`, `accesskey`, `signature`, `sig`, `session`, `sessionid`, `jwt`, `bearer`, `assertion`, `csrf`, `xsrf`, `otp`, `totp`, or `private`. So `X-Session-Id`, `X-Api_Key`, and `Cf-Access-Jwt-Assertion` are rejected, while `X-Author` and `X-Authority` are allowed. A single word that starts with a credential word such as `token` or `secret`, or ends with one such as `token`, `session`, or `auth`, is rejected as well, so `X-Sessiontoken` and `X-Oauth` fail.
+
+The value is added to emitted events only. It does not appear in the local audit log, signed action receipts, evidence receipts, mediation envelopes, or flight recorder entries. Like the rest of the `emit` block, changing `correlation_header` requires a restart; a hot reload that changes it is ignored with a warning.
+
+Coverage by transport:
+
+| Transport | Carries `correlation_id` |
+|-----------|--------------------------|
+| Fetch (`/fetch`) | Yes |
+| Forward proxy (absolute-URI HTTP) | Yes |
+| Reverse proxy | Yes |
+| WebSocket (`/ws`) | Yes, from the upgrade request, on every event for that connection including frame scans and close |
+| CONNECT with TLS interception | Yes. Each inner request uses its own header value; when an inner request has none, the CONNECT request's value is used. Tunnel-level events use the CONNECT request's value. |
+| CONNECT passthrough (no interception) | Only from headers on the CONNECT request itself (for example `curl --proxy-header`). Headers inside the encrypted tunnel are not visible. |
+| MCP HTTP listener (`--listen`) | Yes, after the correlation header is vetted, including SSE responses to that request. Earlier refusals omit it; see the known gaps below. |
+| MCP stdio, MCP to an HTTP or WebSocket upstream from stdio | No. There are no inbound request headers, so the field is absent. |
+
+Allow and block decisions carry the field on the transports marked Yes above, subject to the known gaps below. On fetch, WebSocket, TLS-intercepted requests, and the MCP HTTP listener, the request's session-level events (such as `session_anomaly` and adaptive escalation) carry it too; on the forward proxy, CONNECT, and reverse proxy paths those session-level events do not. Warn-mode DLP findings (`dlp_warn`) do not carry it on any transport. Events not tied to a request, such as startup and config reload, never carry it.
+
+Known gaps, where an event for a tagged request has no `correlation_id`:
+
+- MCP HTTP listener refusals before header vetting: Origin, authentication, Host, HTTP method, protocol headers, scanner availability, and server identity checks. These events omit the unvetted client value. Later header-DLP, tool-policy, and response refusals carry the vetted value.
+
+- MCP stdio, and stdio to an HTTP or WebSocket upstream: no inbound request headers exist.
+- CONNECT passthrough: headers inside the encrypted tunnel are not visible.
+- Session-level events (`session_anomaly`, adaptive escalation) on the forward proxy, CONNECT, and reverse proxy paths.
+- Warn-mode DLP findings (`dlp_warn`) on every transport.
 
 ## Tool Chain Detection
 
@@ -1924,7 +2676,7 @@ Ships with 10 built-in patterns covering reconnaissance, credential theft, data 
 
 ## Cross-Request Exfiltration Detection
 
-Detects secrets split across multiple requests within a session. Two independent mechanisms (entropy budget and fragment reassembly) can run together or separately. Both feed into adaptive enforcement scoring.
+Detects secrets split across multiple requests within a session. Two independent mechanisms (entropy budget and fragment reassembly) can run together or separately. Entropy-budget findings are heuristic and do not feed adaptive scoring; fragment-reassembly DLP findings remain concrete signals.
 
 ```yaml
 cross_request_detection:
@@ -1956,11 +2708,11 @@ Tracks cumulative Shannon entropy of all outbound payloads (URLs, request bodies
 | `entropy_budget.bits_per_window` | `4096` | Max entropy bits allowed per session per window before triggering |
 | `entropy_budget.window_minutes` | `5` | Sliding window duration in minutes |
 | `entropy_budget.action` | `"warn"` | Action when budget is exceeded (warn or block) |
-| `entropy_budget.exempt_domains` | `[]` | Domains excluded from entropy budget recording. DLP pattern matching still runs on exempt domains. Supports exact hostnames and `*.example.com` wildcards (also matches apex `example.com`). |
+| `entropy_budget.exempt_domains` | `[]` | Domains excluded from entropy budget recording. DLP pattern matching still runs on exempt domains. `challenges.cloudflare.com` is always excluded in addition to this list, for the same reason as `content_entropy_exclusions`. Supports exact hostnames and `*.example.com` wildcards (also matches apex `example.com`). |
 
 **Tuning:** The default 4096 bits per 5-minute window allows roughly 500 characters of random data across URL query parameters and path segments. This is appropriate when scanning URL-level traffic only.
 
-`entropy_budget.action: warn` records a threshold crossing but forwards the request. Set it to `block` to make the budget an enforcement limit. Lower `bits_per_window` or increase `window_minutes` to reduce the amount of opaque data a session can send before a block. Both settings can block legitimate uploads, identifiers, hashes, or encoded media, so tune them against expected traffic before enforcing them.
+`entropy_budget.action: warn` records a threshold crossing but forwards the request, including opaque exfiltration with no concrete detector match. Set it to `block` to make the budget an enforcement limit. Neither action adds adaptive score or gets upgraded by adaptive escalation. Lower `bits_per_window` or increase `window_minutes` to reduce the amount of opaque data a session can send before a block. Both settings can block legitimate uploads, identifiers, hashes, or encoded media, so tune them against expected traffic before enforcing them.
 
 **With TLS interception enabled**, request bodies are also scanned for entropy. A single LLM API call body (conversation context) can contain 100,000+ bits of entropy. Set `bits_per_window` to `500000` or higher when using `tls_interception` with cross-request detection, and add your LLM provider to `exempt_domains`:
 
@@ -1987,7 +2739,7 @@ Buffers outbound payloads (URLs, request bodies, MCP JSON-RPC payloads, WebSocke
 | `fragment_reassembly.max_sessions` | `10000` | Maximum sessions holding fragment evidence. Each transport keeps its own ledger of this size. Requests are denied when a ledger is full and the session is not already in it. |
 | `fragment_reassembly.window_minutes` | `5` | Fragment retention window in minutes. Fragments older than this are pruned. |
 
-The configured action applies to fragment DLP findings. Requests that cannot be inspected because the ledger is full, fragment ownership is inconsistent, or a path exceeds the supported depth are denied even when `cross_request_detection.action` is `warn`.
+The configured action applies to fragment DLP findings. Requests that cannot be inspected because the ledger is full, fragment ownership is inconsistent, a path exceeds the supported depth, or a reconstructed JSON document exceeds the typed number or depth budget are denied even when `cross_request_detection.action` is `warn`.
 
 **Memory:** A session's evidence is grouped into stream classes, and each class retains at most `max_buffer_bytes`. A forward-proxy session has four: the raw body, the query-key stream, the path stream, and the JSON body buckets, which share one budget between them however many buckets a body occupies. So one session retains at most `4 * max_buffer_bytes`, and at the default caps the worst-case payload memory per transport ledger is `4 * 65536 * 10000` = 2,621,440,000 bytes (2.44 GiB, or 2.62 GB decimal). An MCP session has two classes, the raw frame and the argument streams.
 
@@ -2005,7 +2757,7 @@ Fragment reassembly detects known DLP patterns inside the configured byte and ti
 
 Suppress known false positives by rule name and path/URL pattern.
 
-Top-level suppressions cannot name immutable core DLP or core response patterns. Pipelock rejects those entries at startup and reload so a scoped exception cannot remove the minimum safety floor. Use `dlp.patterns[].exempt_domains` for a URL destination exception on a configurable DLP pattern. The core URL floor does not consult that field, and core body, header, URL, and response false positives require a pattern precision fix.
+Top-level suppressions cannot name immutable core DLP or core response patterns. Pipelock rejects those entries at startup and reload so a scoped exception cannot remove the minimum safety floor. Use `dlp.patterns[].exempt_domains` for a URL destination exception on a configurable DLP pattern. The core URL floor does not consult that field, and core body, header, and URL false positives require a pattern precision fix. A core response false positive can instead be observed, not blocked, on one host with `response_scanning.core_observe_exceptions` (reason, owner, expiry ≤30 days); see "Observing one core pattern on one host" above.
 
 ```yaml
 suppress:
@@ -2017,7 +2769,7 @@ suppress:
 | Field | Description |
 |-------|-------------|
 | `rule` | Non-core pattern/rule name to suppress (required). Core floor names fail validation. |
-| `path` | Exact path, glob, or URL suffix (required) |
+| `path` | Exact path or URL, trailing-slash prefix, glob, or scheme-less URL path suffix (required) |
 | `reason` | Human-readable justification |
 
 **Path matching:** exact (`foo.txt`), glob (`*.txt`, `vendor/**`), directory prefix (`vendor/`), basename glob (`*.txt` matches `dir/foo.txt`).
@@ -2115,11 +2867,13 @@ A pattern whose base is a suffix from the list's *private* section is accepted, 
 
 On `trusted_domains` specifically, such a pattern gets a startup advisory rather than a refusal, because that list exempts a hostname from the internal-IP check and the two ends of this look identical in a config file. Some of these shared boundaries let anyone choose their own subdomain and point it wherever they like, so the exemption reaches names you do not control. Others are the opposite: with a cloud private endpoint the public hostname resolves to an address inside your own network, and this list is the documented way to allow it. Nothing in the suffix list distinguishes those two cases, which is why this is an advisory for you to judge rather than a rule. `pipelock check` prints it alongside any other advisory.
 
-The breadth rule is not applied everywhere, and where it stops is deliberate. It governs `trusted_domains`, the entropy and content exemption lists, and DLP `exempt_domains` -- the fields that hand out trust or turn a detector off. It does not govern a list that matches or denies traffic, such as a `request_policy` route or the domain blocklist, where a deliberately broad wildcard is a policy rather than a mistake. It DOES govern `api_allowlist`, including a per-agent one, because that list grants reachability: in strict mode `*.com` there would permit every host under an entire registry, which reads like strict mode is enabled and behaves as though it is not.
+The breadth rule is not applied everywhere, and where it stops is deliberate. It governs `trusted_domains`, the entropy and content exemption lists, and DLP `exempt_domains` -- the fields that hand out trust or turn a detector off. It does not govern a list that matches or denies traffic, such as a `request_policy` route or the domain blocklist, where a deliberately broad wildcard is a policy rather than a mistake. It DOES govern `api_allowlist`, including a per-agent one, because that list grants reachability: in strict mode `*.com` there would permit every host under an entire registry, which reads like strict mode is enabled and behaves as though it is not. `tls_interception.passthrough_domains` applies a **stricter** version of this rule: a wildcard over any public suffix, private section included (`*.github.io`, `*.s3.amazonaws.com`), is refused, because spliced traffic is not scanned at all. `forward_proxy.redirect_websocket_hosts` has no breadth rule, because redirected traffic is still scanned.
 
-**Every host list is checked for spelling, in every direction.** A pattern must be ASCII (write an internationalized name in its `xn--` form) and must be a legal hostname: no URL, no `host:port`, no fragment, no interior wildcard, and no malformed DNS label. The full list, and it is exhaustive rather than illustrative: `api_allowlist` and a per-agent `api_allowlist`; `fetch_proxy.monitoring.blocklist`; `request_policy` route hosts; `trusted_domains`; `browser_shield.tracking_domains`; the `host` of a `fetch_proxy.monitoring.path_entropy_exclusions` entry; `subdomain_entropy_exclusions` and `query_entropy_exclusions`; `websocket_proxy.content_entropy_exclusions` and `request_body_scanning.content_entropy_exclusions`; and a DLP pattern's `exempt_domains`. It is separate from the breadth rule above and is not directional, because a misspelled pattern is compared literally and therefore matches nothing: on a deny list that is a rule that never denies, and on an allowlist it refuses traffic you meant to permit. An exact IP literal, IPv4 or IPv6, stays valid on the lists that match one.
+**Every host list is checked for spelling, in every direction.** A pattern must be ASCII (write an internationalized name in its `xn--` form) and must be a legal hostname: no URL, no `host:port`, no fragment, no interior wildcard, and no malformed DNS label. The list below is not exhaustive: `api_allowlist` and a per-agent `api_allowlist` and `trusted_domains`; `fetch_proxy.monitoring.blocklist`; `request_policy` route hosts; `trusted_domains`; `browser_shield.tracking_domains`, `exempt_domains`, and `tls_interception.passthrough_domains`; `forward_proxy.redirect_websocket_hosts`; the `host` of a `fetch_proxy.monitoring.path_entropy_exclusions` entry; `subdomain_entropy_exclusions` and `query_entropy_exclusions`, and the `host` of a `query_entropy_param_exclusions` entry; `websocket_proxy.content_entropy_exclusions` and `request_body_scanning.content_entropy_exclusions`; a DLP pattern's `exempt_domains`, plus `dlp.github_enterprise_hosts` and `dlp.gitlab_hosts`; `response_scanning.exempt_domains` and `size_exempt_domains`, and the `host` of `unscannable_passthrough` and `core_observe_exceptions` entries; `request_body_scanning.trusted_hosts`, and the `host` of its `content_entropy_warn_routes` and `sigv4_credential_routes` entries; `adaptive_enforcement.exempt_domains`; `cross_request_detection.entropy_budget.exempt_domains`; `taint.allowlisted_domains`; and a `suppress` entry's path host. Redaction `providers.host_patterns` and `emit.forwarder.destination_allowlist` have their own, stricter validators (no uppercase, no trailing dot for the former). It is separate from the breadth rule above and is not directional, because a misspelled pattern is compared literally and therefore matches nothing: on a deny list that is a rule that never denies, and on an allowlist it refuses traffic you meant to permit. An exact IP literal, IPv4 or IPv6, stays valid on the lists that match one, but it never matches on `trusted_domains`, because trust there applies to hostnames only; use `ssrf.ip_allowlist` for an address.
 
-Two families of list handle a *sloppy but recognizable* spelling differently, and the difference is worth knowing before you file a bug. `trusted_domains`, `request_policy` route hosts, the entropy exclusion lists and `tracking_domains` **canonicalize** on load: `*.vendor.example..` is accepted and stored as `*.vendor.example`. The lists that are matched verbatim -- `api_allowlist`, a per-agent `api_allowlist`, and `fetch_proxy.monitoring.blocklist` -- instead **refuse** it, because matching those trims only a single trailing dot, so the entry would be compared as a different string than the one validation approved. In both families a single trailing dot is fine. If you want one rule that is always safe, write the host exactly as it will be compared: no surrounding whitespace, at most one trailing dot.
+Two families of list handle a *sloppy but recognizable* spelling differently, and the difference is worth knowing before you file a bug. `trusted_domains`, `request_policy` route hosts, and the entropy exclusion lists **canonicalize** on load: `vendor.example..` is accepted and stored as `vendor.example`. `tracking_domains` refuses a wildcard entirely, so it is not in this family. The lists that are matched verbatim -- `api_allowlist`, a per-agent `api_allowlist`, and `fetch_proxy.monitoring.blocklist` -- instead **refuse** it, because matching those trims only a single trailing dot, so the entry would be compared as a different string than the one validation approved. `tls_interception.passthrough_domains` and `forward_proxy.redirect_websocket_hosts` sit in neither family: they refuse the same malformed spellings the verbatim lists refuse (`x..`, whitespace), then store the lowercase form without its trailing dot. In both families a single trailing dot is fine. If you want one rule that is always safe, write the host exactly as it will be compared: no surrounding whitespace, at most one trailing dot.
+
+A request whose destination host carries an empty DNS label (an extra trailing dot, a leading dot, or `..`) is refused on fetch, forward, CONNECT, and WebSocket as `invalid destination host or port` (layer `parser`, reason `parse_error`); a single trailing root dot on the request URL itself is accepted.
 
 **Important:** This is a **top-level** config field, not nested under `forward_proxy`. Placing it under `forward_proxy` will silently do nothing. DLP and other content scanning still runs on trusted domains -- only the SSRF IP check is bypassed.
 
@@ -2146,7 +2900,26 @@ trusted_domains:
 |-------|---------|-------------|
 | `dns.host_overrides` | `{}` | Map of exact hostnames to one or more IP addresses. Hostname keys are normalized case-insensitively with a single trailing DNS dot stripped; a key carrying an empty label (`host.example..`, a leading dot) is refused, because it could never match a lookup. URL, wildcard, host:port, and IP-literal keys are rejected. |
 
-Host overrides do not exempt a destination from SSRF blocking by themselves. If an override resolves to an internal IP, the hostname must also be present in `trusted_domains` or the target IP must be covered by `ssrf.ip_allowlist`. Raw IP targets never use `dns.host_overrides`.
+Host overrides do not exempt a destination from SSRF blocking by themselves. If an override resolves to an internal IP, authorize the exact host and port with `destination_grants`, add the hostname to `trusted_domains`, or cover the target IP with `ssrf.ip_allowlist`. Raw IP targets never use `dns.host_overrides`.
+
+### Exact Destination Grants
+
+Use `destination_grants` to let the ordinary proxy reach one operator-approved private preview or internal service without trusting every port on its hostname.
+
+```yaml
+destination_grants:
+  - protocol: tcp
+    host: preview.vendor.example
+    port: 8443
+```
+
+Each entry requires `protocol: tcp`, an exact hostname or IP literal, and a port from 1 to 65535. Wildcards, CIDRs, URLs, and port ranges are refused. Hostnames are normalized for case and a single trailing dot; duplicate destinations have the same effect as one entry. Omitted, null, or empty lists grant nothing. Existing `api_allowlist`, `trusted_domains`, and `ssrf.ip_allowlist` behavior stays unchanged for destinations without an exact grant.
+
+An exact grant satisfies strict-mode destination admission and exempts that host and port from ordinary private-IP checks. It does not grant sibling ports, subdomains, aliases, or direct requests to a hostname's resolved IP. Domain blocklists, DLP, entropy, request and response scanning, kill switches, and other controls still apply where the transport exposes traffic to them. Cloud metadata, link-local, multicast, unspecified addresses, and the proxy's own configured metrics endpoint remain blocked. DNS answers are checked during scanning and again before dialing; a hostname grant's private-address exception requires an admitted scan snapshot for the same host, port, and private address. A newly returned private address is refused until a new request scans it, unless a separate `trusted_domains` or `ssrf.ip_allowlist` rule already permits it.
+
+Grants apply to mediated fetch, forward HTTP, HTTPS CONNECT, and WebSocket destinations through the shared scanner and dialer. A TCP grant does not create a raw TCP listener or support UDP. CONNECT without TLS interception carries encrypted application traffic: Pipelock checks the destination and the configured TLS/SNI controls, but cannot inspect the encrypted HTTP paths, headers, request bodies, or responses. A grant does not change that visibility. TLS interception requires a configured local CA trusted by the client.
+
+Removing a grant on reload revokes it for new requests and connections; unrelated reloads preserve it. Already established CONNECT tunnels and WebSocket sessions are not terminated, and requests already admitted may finish under their captured policy. In balanced or audit mode, adding a grant on reload emits a trust-expansion warning. Strict mode and required security contracts refuse this widening on reload; restart with the validated config to apply it. Invalid grant declarations reject the config or reload as a whole, leaving the previous runtime active. Conductor policy bundles preserve follower-local grants. Guard launches use only `guard.services`, so ordinary proxy grants do not widen Guard's declared service access.
 
 ### SSRF IP Allowlist
 
@@ -2200,13 +2973,25 @@ them.
 ## Presets
 
 Seven starter configs are selectable with `pipelock generate config --preset <name>`.
+All presets use the bundled files in `configs/`. The `strict`, `balanced`, and `audit` presets apply the configuration loader's security defaults and inherit built-in DLP and response patterns. Supplemental response patterns with different expressions use `Preset` names so both sets remain active. These names appear in findings; a suppression for the original name does not suppress its supplemental pattern. Core patterns remain unsuppressible. The four named presets retain their existing parsing defaults for `init` and sidecar generation.
+
+Generated YAML for `strict`, `balanced`, and `audit` is the bundled file verbatim, including comments and regular expressions. Older generated output serialized an assembled configuration, so text, layout, and explicit fields can differ. Scripts that compare generated files byte for byte need updated expectations.
+
+The mode presets use `Preset Tool Invocation`, `Preset Instruction Boundary`, `Preset Instruction Dismissal`, and `Preset Priority Override` for their supplemental expressions. Audit also uses `Preset Covert Action Directive`. These names identify the supplemental expressions in configuration and any findings they produce. Existing built-in identities remain active alongside them. Immutable core matches take precedence. Audit text covered by `Preset Covert Action Directive` reports the core `Covert Action Directive` identity, which can't be suppressed.
+
+For example, `set system instructions aside` matches `Instruction Dismissal`, while `cast all previous directives aside` matches `Preset Instruction Dismissal`. A suppression for one doesn't cover the other. Use the `Preset` name when updating alerts or suppressions for supplemental findings.
+
+Each preset sets a five-minute tool-chain window. `pipelock init` preserves preset scanning actions, disabled sections, drift settings, and tool-chain windows when it discovers MCP servers. In audit mode, ordinary MCP input and tool-policy findings use `warn` by default. The bundled audit preset retains explicit built-in tool-policy blocks and disables adaptive escalation. Compared with the previous bundled audit YAML and configurations generated from it, users gain these explicit blocks and lose adaptive escalation. Core and transport safety protections can still block, and individual tool rules can override the tool-policy default, including with `block`. Malformed MCP messages (`mcp_input_scanning.on_parse_error: block`) and binary WebSocket frames (`websocket_proxy.allow_binary_frames: false`) are refused, even during evaluation. Regenerating an older audit configuration replaces its previous parse-error forwarding and binary-frame allowance with these refusals. MCP input scanning blocks findings in the `strict` and `balanced` presets. The response and default tool-policy actions in the table below describe those separate scanning paths; individual tool rules can override that default.
+
 Run `pipelock presets` or `pipelock generate config --list` to list the current built-in names with mode, default action, and reachability posture:
+
+The audit listing label is `warn (ordinary findings; safety rules still block)`, replacing `warn (log-only)`. This human-readable label distinguishes ordinary warnings from safety refusals. Scripts that match the previous label need to accept the updated text.
 
 | Preset | Mode | Response Action | MCP Policy | Best For |
 |--------|------|----------------|------------|----------|
 | `balanced` | balanced | warn | warn | General purpose |
 | `strict` | strict | block | block | High-security |
-| `audit` | audit | warn | warn | Log-only monitoring |
+| `audit` | audit | warn | warn | Evaluate ordinary policy; safety protections can block |
 | `claude-code` | balanced | block | warn | Claude Code (unattended) |
 | `cursor` | balanced | block | warn | Cursor IDE |
 | `generic-agent` | balanced | warn | warn | New agents (tuning) |
@@ -2235,7 +3020,7 @@ What it enables beyond `strict`:
 - **Aggressive entropy threshold (3.0):** catches more encoded secrets at the cost of higher false-positive rates
 - **Lower rate limit (15/min):** constrains exfiltration bandwidth
 - **Shorter URL limit (300 chars):** reduces data budget per request
-- **All MCP tool policy rules enabled:** blocks shell obfuscation, file writes outside allowed paths, and network access patterns
+- **All MCP tool policy rules enabled:** blocks shell obfuscation, writes to protected paths such as shell startup files, credentials and persistence directories, and network access patterns
 - **TLS interception pre-configured** (disabled by default; enable and generate a CA to activate)
 
 The core principle: the model won't protect you, so the network layer must.
@@ -2256,6 +3041,10 @@ Resolution precedence with binding disabled: context override > `X-Pipelock-Agen
 
 Resolution precedence with binding enabled: context override > `default_agent_identity` > `anonymous`.
 
+With binding disabled, the stateful controls (adaptive enforcement, airlock, cross-request detection, response taint, behavioral baselines and issuer-bound cookie evidence) key a request that carries `X-Pipelock-Agent` as the configured default, so one peer address keeps one bucket, `<default_agent_identity>|<client address>`, whether or not it sends the header. The header still decides the attribution recorded in logs, receipts and policy, and the per-IP domain tracker still treats it as an untrusted self-declared name. A request on a per-agent listener or matched by `source_cidrs` is bound and keeps its own bucket. Releases before 3.7 kept a header-carrying request in the bare client-address bucket instead; the `session_key` reported by `adaptive whoami` for such a request is now the default's key, and resetting the old client-address key does not clear the named one.
+
+Changing either identity setting on reload requires existing non-bound intercepted HTTPS and WebSocket connections to reconnect. They retain their admission-time policy and recorders, so traffic is denied instead of splitting state between the old and new identity buckets. Bound connections keep their identity.
+
 `pipelock init sidecar` sets both fields automatically from the workload kind and name (e.g., `deployment/my-agent`). Override the identity with `--agent-identity`.
 
 | Field | Type | Default | Description |
@@ -2265,7 +3054,7 @@ Resolution precedence with binding enabled: context override > `default_agent_id
 
 ## Agent Profiles
 
-Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` overrides individual rate limit fields (non-zero values win). DLP merging follows separate rules (see below).
+Per-agent policy overrides. When multiple agents share one pipelock instance, each agent can have its own mode, allowlist, DLP patterns, rate limits, and request budgets. Scalar fields (mode, enforce) inherit from the base config when unset. `mcp_tool_policy` replaces the base section entirely when set on an agent profile (no deep merge). `session_profiling` replaces the per-agent fields (`domain_burst`, `anomaly_action`) unconditionally while preserving global-only fields (`max_sessions`, `session_ttl_minutes`, `cleanup_interval_seconds`). `rate_limit` replaces both base per-minute ceilings when set: an omitted or zero `max_requests_per_minute` or `max_data_per_minute` means unlimited for that agent, so set both fields if the base config limits both. DLP merging follows separate rules (see below).
 
 Per-agent burst detection separates callers only when their identity is infrastructure-bound. Domain-burst detection runs a second, IP-level counter that catches a single caller rotating a self-declared `X-Pipelock-Agent` header to evade the per-agent counter: it emits an `ip_domain_burst` anomaly and, with `anomaly_action: block`, returns HTTP 403 once `domain_burst` unique domains are seen within `window_minutes`. That IP-level counter groups all self-declared and header-matched callers on one client IP together, because a request-supplied name cannot be trusted to partition state. Distinct callers that share one client IP are counted separately only when each is bound by its own per-agent listener; a `source_cidrs` match separates distinct source addresses, not callers that share one address (see the [mediation envelope guide](guides/mediation-envelope.md) for identity grades). Several listener-bound callers on one host therefore do not false-positive as one bursting agent.
 
@@ -2283,7 +3072,7 @@ agents:
           regex: 'internal_[a-zA-Z0-9]{32}'
           severity: critical
     rate_limit:
-      max_requests_per_minute: 30
+      max_requests_per_minute: 30 # replaces both ceilings for this agent; max_data_per_minute is unlimited here since it is omitted
     session_profiling:
       domain_burst: 3
       anomaly_action: block
@@ -2785,6 +3574,8 @@ rules:
 | `trust_embedded_keys` | `true` | Trust the compiled official rules keyring. Set to `false` for private-root-only deployments that trust only `trusted_keys`; unsigned local bundles are rejected in this mode. |
 | `trusted_keys` | `[]` | Additional Ed25519 public keys to trust for signature verification |
 
+**One-shot consumers:** Claude Code, Cursor and Hermes hooks and `pipelock mcp scan` apply the same startup rule: strict mode denies the hook action, or makes `mcp scan` exit with status 1 and the error on stderr before it reads any input, when an installed bundle fails integrity checks unless `rules.allow_degraded: true` is set. Other modes and optional-store availability failures keep scanning with the available policy and warn on stderr. Hook denials use each host's normal hook response format.
+
 **Hot reload:** rule directory changes are re-resolved when config reload runs. A clean uninstall that removes live bundle patterns is rejected in strict mode unless `allow_degraded` is set; non-strict modes allow it and emit degraded-state telemetry. Installing or updating bundles still normally uses the `pipelock rules` commands and a config reload or restart to re-resolve the runtime policy.
 
 ## Sandbox
@@ -2823,9 +3614,11 @@ If `filesystem` is omitted, the default Landlock policy is used (safe for Python
 **Containment layers:**
 - **Landlock LSM:** Restricts filesystem access to declared paths. Allowlist model. Protected directories (`~/.ssh`, `~/.aws`, `~/.kube`, etc.) are denied. Only dirs that exist on the system are checked.
 - **Network namespaces:** Agent runs in an isolated network namespace. All HTTP/HTTPS traffic is kernel-confined to the namespace and routed through pipelock's bridge proxy. Raw socket direct egress is impossible. MCP stdio servers that act as HTTP bridges receive `HTTP_PROXY`/`HTTPS_PROXY` pointing at the in-namespace bridge, so upstream calls still traverse Pipelock's forward-proxy scanner.
-- **Seccomp BPF (`linux/amd64` only):** Syscall allowlist (~130 safe syscalls for Go/Python/Node.js). Blocks ptrace, mount, module loading, kexec (KILL). io_uring returns EPERM (allows runtimes like Node.js 22 to fall back to epoll). Clone flags filtered to prevent namespace escape.
+- **Seccomp BPF (`linux/amd64` only):** Syscall allowlist curated for Go, Python and Node.js runtimes, including the legacy path-based forms glibc issues on x86_64; Landlock still decides which paths those calls may touch. Blocks ptrace, mount, module loading, kexec (KILL). io_uring returns EPERM (allows runtimes like Node.js 22 to fall back to epoll). Clone flags filtered to prevent namespace escape.
 
 For sandboxed MCP stdio servers on Linux, the bridge enables forward-proxy handling internally even when `forward_proxy.enabled` is false in YAML. This is scoped to the sandbox bridge only and does not expose the normal forward proxy listener.
+
+The in-namespace bridge closes a connection once no bytes have moved in either direction for the largest of `forward_proxy.idle_timeout_seconds`, `websocket_proxy.idle_timeout_seconds`, and `fetch_proxy.timeout_seconds` (300 seconds with shipped defaults), so it never closes a connection before the parent proxy's own timer would. Traffic in either direction keeps the connection open, so a long download while the agent sends nothing is not cut. The value is read when the sandbox launches; a config reload does not change it for a sandbox that is already running.
 
 In `--best-effort` mode (for containers without user-namespace support), the bridge still scans traffic but network enforcement is cooperative: a child process that clears `HTTP_PROXY` / `HTTPS_PROXY` can bypass Pipelock. This is an advisory override, not a contained launch: supply all three values from one source—`--best-effort`, `--best-effort-reason`, and `--best-effort-expiry`, or the matching YAML fields. Its expiry bounds launch admission only: an expired override refuses that launch, a running child is not stopped at expiry, and every later launch requires re-authorization. YAML requires an RFC3339 expiry; command-line durations are evaluated at admission and are not stored in configuration.
 
@@ -2860,9 +3653,11 @@ pipelock sandbox --dry-run --json -- python agent.py
 | Containers, non-amd64 (authorized `--best-effort`) | advisory-override + partial | Landlock only. Direct egress may bypass Pipelock; seccomp is separately unavailable. |
 | macOS | sandbox-exec | Apple SBPL profiles for filesystem + network restriction |
 
-**Requirements:** Linux 5.13+ (Landlock ABI v1). Unprivileged on bare metal. macOS 13+ for sandbox-exec. Containers may need `--best-effort` if default seccomp blocks `CLONE_NEWUSER`.
+**Requirements:** Linux 5.13+ (Landlock ABI v1). Unprivileged on bare metal. macOS 13+ for sandbox-exec. Containers may need `--best-effort` if default seccomp blocks `CLONE_NEWUSER`. On Ubuntu 24.04 and later, AppArmor's user-namespace restriction can make the launch fail even though `--dry-run` reports the capabilities as available; see [Ubuntu and AppArmor user-namespace restriction](guides/sandbox.md#ubuntu-and-apparmor-user-namespace-restriction).
 
 **Seccomp is built for `linux/amd64` only.** On other Linux architectures, including the published `linux/arm64` binaries, Pipelock does not contain a seccomp filter to install, so the layer reports unavailable and containment is 2/3 rather than 3/3. This is reported rather than silently absent: `pipelock diagnose` shows the seccomp check as `FAIL … unavailable`, and under `--strict`, preflight refuses the launch instead of starting with fewer layers than strict promises. Landlock and the network namespace, which carry the filesystem and egress guarantees, are unaffected.
+
+**Strict native-thread compatibility:** On `linux/amd64`, strict seccomp denies `clone3` with `ENOSYS`, allowing runtimes such as glibc to retry ordinary thread creation through the existing argument-filtered `clone` syscall. `clone3` remains unavailable, and legacy `clone` requests for new namespaces remain denied. Any inherited denial of `clone3` still prevents executing that syscall, although stacked seccomp filters can select a different errno. Higher-priority inherited deny actions, inherited restrictions on legacy `clone`, and process limits can still prevent thread creation. Runtimes that require `clone3` without a fallback remain unsupported.
 
 **`--best-effort` is a degraded mode with a known bypass vector.** When user namespaces are unavailable — either the container runtime's seccomp profile blocks `CLONE_NEWUSER` or the host has `kernel.unprivileged_userns_clone=0` (default on some Debian-derivative kernels) — pipelock cannot create a network namespace for the child, so outbound traffic is enforced only by `HTTP_PROXY` / `HTTPS_PROXY` environment variables. A process inside the sandbox that explicitly `unset`s those vars, or makes a raw socket call without consulting the proxy env, will connect directly to the network and bypass pipelock's scanning pipeline. Pipelock emits a loud startup `WARNING` line alongside the `DEGRADED` status whenever this path is taken, on both `pipelock sandbox` and `pipelock mcp proxy --sandbox-best-effort`. For deployments that need kernel-level enforcement, either (1) make `CLONE_NEWUSER` available (adjust the runtime's seccomp profile or set `kernel.unprivileged_userns_clone=1`) so pipelock can run full 3/3 containment, or (2) use the companion-proxy topology from `pipelock init sidecar` — putting pipelock in a separate pod with a NetworkPolicy that restricts the agent pod's egress to the pipelock Service IP is the kernel-enforced equivalent of a network namespace. That equivalence depends on your CNI enforcing the policy, so verify it rather than assuming it; see [NetworkPolicy Semantics](cli/init-sidecar.md#networkpolicy-semantics).
 
@@ -2983,12 +3778,14 @@ dashboard_snapshot:
 | `dir` | (empty) | Directory for evidence files. Recorder is inert until set; `pipelock init` generates one. |
 | `checkpoint_interval` | `1000` | Entries between signed checkpoints |
 | `retention_days` | `0` | Auto-expire raw-escrow sidecars after N days. JSONL receipt-chain shards are preserved for offline verification. 0 = keep forever. |
-| `redact` | `true` | DLP-redact evidence content before writing. Receipt entries get field-level redaction (target/pattern scrubbed, signature preserved). |
-| `require_receipts` | `false` | Require allow-path receipt emission before forwarding traffic. When true, signing/recorder failures block with `receipt_emission_failed`; this includes TLS-intercepted CONNECT inner HTTP requests before their upstream request. Block-path receipts remain best-effort because the action is already denied. |
+| `redact` | `true` | DLP-redact evidence content before writing. Signed receipts are scanned on their content fields only; Pipelock's own hashes, signatures, keys, nonces, generated IDs, run-session suffixes and computed policy hashes are never scanned. A matching content field is redacted before signing; a matching identity field (action, request, session or defer ID) or a match that spans fields refuses that one receipt with `receipt content rejected` and leaves the chain healthy. Session roots and signed decision records are never redacted: a match refuses them. A principal, actor, supplied policy hash or session base that matches is refused at startup, reload, or receipt group and Guard activation (`configuration content trips the receipt detector`, naming the field and pattern); Guard refuses the run even without `require_receipts`. The receipt detector is fixed when the recorder starts; reloads do not replace it. See [Receipt content boundary](guides/receipt-verification.md#receipt-content-boundary). |
+| `require_receipts` | `false` | Require durable allow-path receipts from every configured receipt family before forwarding traffic or executing an MCP redirect handler. This includes TLS-intercepted CONNECT inner HTTP requests and accepted legacy MCP HTTP DELETE requests before their upstream request; a legacy GET that only opens the server event stream is not itself an action, and each event delivered on it confirms its own receipt. Response-scan warnings, successful prompt-injection strips, warned generic SSE events, image metadata and MIME rewrites, authenticated artifact and unscannable passthrough exceptions, Browser Shield decisions, and permitted A2A findings and verified card signatures also confirm receipts before delivery. Accepted Agent Card baselines confirm receipts before adoption. Signing/recorder failures block with `receipt_emission_failed`. Block-path receipts remain best-effort because the action is already denied; explicitly durable deferred-resolution receipts must confirm every configured family before the journal commits the resolution. |
 | `require_containment_evidence` | `false` | Require a readable containment proof signed by the pinned `posture_signer_key` before signed receipts start. `absent`, `unreadable`, a proof without containment evidence, and a proof signed by another key refuse startup when this is true. Requires `enabled: true`, `dir`, `signing_key_path`, and `posture_signer_key`. It is startup-only; reload changes are ignored until restart. |
 | `posture_signer_key` | (empty) | Pinned Ed25519 public key, as 64 hex characters or a public-key file, used to verify containment proofs when `require_containment_evidence: true`. The runtime reads and pins the key at startup; it is not needed for ordinary receipt operation. `PIPELOCK_POSTURE_PROOF` can select an absolute proof path, but in required mode that proof must verify with this pinned key. |
 | `sign_checkpoints` | `true` | Ed25519 sign checkpoint entries |
-| `signing_key_path` | (empty) | Ed25519 private key for signed action receipts. When set, blocks produce signed receipts; allow receipts also require `require_receipts: true`, and clean stream frames are summarized. Without a key, the flight recorder can still write non-receipt evidence entries. Generate a key with `pipelock keygen <name>`. Verify receipts with `pipelock verify-receipt <file> --key <signer.pub>` (pin the signer key — an unpinned run is structural-only and exits non-zero unless you pass `--allow-unpinned`). In `pipelock run`, changing the configured path requires restart; reload re-reads updated key bytes only when the same path stays configured. |
+| `signing_key_path` | (empty) | Ed25519 private key for signed action receipts. When set, blocks and allows produce signed receipts, even when `require_receipts` is false. `require_receipts: true` is needed for allow-receipt references in `X-Pipelock-Receipt` response headers. Clean stream frames are summarized. Without a key, the flight recorder can still write non-receipt evidence entries. Generate a deployment receipt key with `pipelock signing key generate --purpose receipt-signing --out /etc/pipelock/keys/receipt-signing.json`; `pipelock keygen <agent-name>` creates a separate per-agent keystore key. Verify receipts with `pipelock verify-receipt <file> --key <signer.pub>` (pin the signer key; an unpinned run is structural-only and exits non-zero unless you pass `--allow-unpinned`). In `pipelock run`, changing the configured path requires restart; reload re-reads updated key bytes only when the same path stays configured. |
+| `receipt_chains` | `1` | Number of independently signed receipt chains per process, from 1 to 32; `0` also uses one chain. Values above 1 require `signing_key_path` and `sign_checkpoints: true`, and cannot use single-chain auto-anchoring. Verify the complete group with pinned signer keys. Multi-chain startup verifies prior history before listening, so restart time grows with recorded history; independent shard checks run in parallel and report actual verification progress to systemd. The [native evidence verifier](../internal/ael/verify.go) refuses a run stream above 256 MiB. [Multi-chain startup](../internal/receipt/group_startup_session.go) uses that verifier, so a proxy whose previous run passed that size fails to start. The [writer](../internal/ael/emitter.go) doesn't enforce that byte ceiling, so restart on a schedule that keeps each run well inside it. See [Receipt groups with multiple chains](guides/receipt-verification.md#receipt-groups-with-multiple-chains) for the exact checks. One chain keeps the existing receipt bytes. |
+| `receipt_group_prior_signer_keys` | `[]` | Lowercase hex Ed25519 public keys of explicitly trusted predecessor receipt groups after signing-key rotation. Set the retiring group's public key before starting a successor with a new signing key. An untrusted opening is rejected at startup. Applies to multi-chain receipt groups. |
 | `max_entries_per_file` | `10000` | Rotate to a new file after this many entries |
 | `raw_escrow` | `false` | Encrypt raw (pre-redaction) detail to sidecar files |
 | `escrow_public_key` | (required if raw_escrow) | X25519 public key (hex) for escrow encryption |
@@ -3005,8 +3802,10 @@ dashboard_snapshot:
 
 Configuring an anchor point is the complete opt-in. Without `anchor.rekor_url`
 or `anchor.local_log`, the section is inert. Auto-anchor failures degrade
-evidence health and retry later; they never block or delay proxy traffic or
-receipt emission. Rekor uses v1 `hashedrekord`, and only the checkpoint's
+evidence health and retry later. Capturing a confirmed receipt head waits for
+outstanding durable writes and can briefly queue new receipt emissions behind
+those writes. History verification and anchor publication hold no writer lock.
+Rekor uses v1 `hashedrekord`, and only the checkpoint's
 SHA-512 digest and signature leave the box, never receipt content. A self-hosted
 log provides durability and tamper evidence but not operator independence; a
 public log can provide an independent witness but publishes checkpoint metadata
@@ -3075,7 +3874,7 @@ For the end-to-end operator flow, see [Learn-and-Lock](guides/learn-and-lock.md)
 
 ### Live lock (runtime active-set)
 
-The `learn` block above governs the observation, compile, and shadow phases. The `learn_lock` block governs the runtime path: which active-manifest directory the proxy watches, which roster pins the signing keys, and which mode the gate runs in. The two blocks are independent and can be enabled separately. `learn_lock` is opt-in and default-off; with it disabled the proxy never resolves an active contract and behaves identically to v2.3 (scanner-only).
+The `learn` block above governs the observation, compile, and shadow phases. The `learn_lock` block governs the runtime path: which active-manifest directory the proxy loads, which roster pins the signing keys, and which mode the gate runs in. The two blocks are independent and can be enabled separately. `learn_lock` is opt-in and default-off; with it disabled the proxy never resolves an active contract and behaves identically to v2.3 (scanner-only).
 
 ```yaml
 learn_lock:
@@ -3096,7 +3895,7 @@ learn_lock:
 |-------|---------|-------------|
 | `enabled` | `false` | Enable the live-lock runtime. When false, the proxy ignores any active manifest and runs as scanner-only. When true, every other field below is required; partial config is rejected at startup so a half-wired lock never silently downgrades. |
 | `mode` | `shadow` (when `enabled` is true) | Gate semantics: `live` enforces (block on contract deny), `shadow` evaluates and emits drift but never blocks, `capture` is silent. Empty values use `shadow`; unknown values are rejected so a misspelled lock mode cannot silently change enforcement. |
-| `store_dir` | `""` | Absolute path to the active-manifest store (the directory containing `active.json` plus the `history/` chain). Required when `enabled` is true. The runtime watches this directory via fsnotify with a 100ms debounce and a 2s maximum-debounce cap; reload is fail-closed on initial load and missed-promote recovery walks the accepted-history chain. |
+| `store_dir` | `""` | Absolute path to the active-manifest store (the directory containing `active.json` plus the `history/` chain). Required when `enabled` is true. The runtime watches this directory (fsnotify) in both `pipelock run` and `pipelock mcp proxy`, so a promoted manifest applies live without a restart or config reload. A rejected or unreadable promotion is logged and the previous manifest stays in force. Loading is fail-closed. A loader that already holds a manifest recovers a skipped promotion on reload by walking the accepted-history chain; a fresh start reads and validates `active.json` directly. |
 | `roster_path` | `""` | Absolute path to the deployment-level roster JSON file naming which signing keys are authorised for which purposes. Required when `enabled` is true. The roster's root fingerprint must match `pinned_root_fingerprint`. |
 | `environment.id` | `""` | Deployment environment identifier (e.g., `production`, `staging`). Required key when `enabled` is true; non-empty value enforced by validation. |
 | `environment.tenant` | `""` | Tenant scope for contract activation. Required key when `enabled` is true; explicit empty string means intentionally unscoped tenant. |
@@ -3108,7 +3907,7 @@ The `environment` block is a required nested mapping with all three keys present
 
 Mode resolution: `EffectiveMode()` reads the field above, returning `live`, `shadow`, or `capture`; any other value resolves to `shadow`. This means a typo in `mode` does not silently enable enforcement.
 
-Restart vs reload: `enabled`, `store_dir`, `roster_path`, `environment.*`, and `pinned_root_fingerprint` require a process restart to change. `mode` and `minimum_signatures` are picked up by the next active-manifest reload.
+Restart vs reload: every `learn_lock` setting, including `mode` and `minimum_signatures`, requires a process restart to change. A `pipelock run` config reload that changes the block logs a warning and keeps the previous settings. A reload still rebuilds the contract loader from the running settings and moves the manifest watcher onto the new loader. This is separate from picking up a promoted manifest, which needs neither a restart nor a reload because the store is watched.
 
 ## Health Watchdog
 
@@ -3148,9 +3947,9 @@ a2a_scanning:
   action: block
   scan_agent_cards: true
   detect_card_drift: true
-  session_smuggling_detection: true
-  max_context_messages: 100
-  max_contexts: 1000
+  session_smuggling_detection: true   # reserved, not enforced
+  max_context_messages: 100          # reserved, not enforced
+  max_contexts: 1000                 # reserved, not enforced
   scan_raw_parts: true
   max_raw_size: 1048576
   # Agent Card signature verification (independent attestation). See below.
@@ -3165,18 +3964,22 @@ a2a_scanning:
 | Field | Default | Description |
 |-------|---------|-------------|
 | `enabled` | `false` | Enable A2A protocol detection and scanning |
-| `action` | `warn` | Action on findings: `block` or `warn`. Immutable core DLP findings in an A2A body hard-block regardless of this action, including on the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. Non-core findings follow this action. |
+| `action` | `warn` | Action on findings: `block` or `warn`. Immutable core DLP findings in an A2A body hard-block regardless of this action, including on the branch where `request_body_scanning` is disabled and A2A scanning alone carries the body floor. Non-core findings follow this action. A response finding never gets a weaker action than response scanning would apply to the same response: when `response_scanning` is enabled, the stricter of this action and the response action wins, including a per-server MCP trust action and, for event streams, `response_scanning.sse_streaming.action`. With `response_scanning` disabled, a core response pattern finding still blocks. |
 | `scan_agent_cards` | `true` | Scan Agent Card skill descriptions for injection |
 | `detect_card_drift` | `true` | Detect Agent Card modification mid-session (rug-pull). Evaluates what a change introduced rather than blocking on the fact of a change — see below. |
-| `session_smuggling_detection` | `true` | Track contextId to detect session smuggling |
-| `max_context_messages` | `100` | Per-context message cap |
-| `max_contexts` | `1000` | Total tracked contexts |
+| `session_smuggling_detection` | `true` | Reserved, not enforced: no transport tracks `contextId` across messages, so this setting has no effect on scanning. Each A2A message is still scanned on its own. Turning it off does not lower protection. |
+| `max_context_messages` | `100` | Reserved, not enforced (companion to `session_smuggling_detection`) |
+| `max_contexts` | `1000` | Reserved, not enforced (companion to `session_smuggling_detection`) |
 | `scan_raw_parts` | `true` | Reserved, not yet enforced: `Part.raw` is not base64-decoded for scanning. The raw value still passes through general content scanning as an opaque string. |
 | `max_raw_size` | `1048576` | Reserved, not yet enforced (companion to `scan_raw_parts`) |
 | `require_signed_agent_cards` | `false` | Treat an **unsigned** Agent Card as a finding (enforced at `action`). When `false`, unsigned cards keep their existing scan/drift behavior. |
 | `trusted_agent_card_keys` | _(none)_ | Operator-pinned Ed25519 signing keys, each scoped to one or more origins. When non-empty, signed cards are cryptographically verified. |
 
-A2A detection works on the forward proxy (CONNECT and plain HTTP) and MCP HTTP proxy paths. Agent Cards are scanned for skill description poisoning. Card drift detection tracks cards by URL + auth fingerprint and evaluates mid-session changes.
+Agent Cards reject exact duplicate keys and noncanonical case aliases of schema fields before scanning or drift comparison, even when `scan_agent_cards` is disabled. Keys inside free-form maps, including JSON Schema `properties`, remain case-sensitive.
+
+A2A detection works on the forward proxy (CONNECT and plain HTTP) and MCP HTTP proxy paths. It recognizes Agent Card paths `/.well-known/agent-card.json` and `/extendedAgentCard`, including tenant-prefixed forms such as `/tenant/.well-known/agent-card.json` and `/tenant/extendedAgentCard`. Agent Cards are scanned for skill description poisoning. Card drift detection tracks cards by URL + auth fingerprint and evaluates mid-session changes.
+
+A2A JSON inspection accepts at most 10 MiB after trimming surrounding whitespace and has a fixed nesting depth limit of 64, counting the root value at depth zero. A smaller proxy request or response body limit still applies; increasing `request_body_scanning.max_body_bytes` or `fetch_proxy.max_response_mb` doesn't raise the A2A inspection limit. Reduce the upstream payload size or nesting to resolve a limit refusal. These limits are independent of `redaction.limits.max_depth`; neither `a2a_scanning.action: warn` nor `enforce: false` permits incomplete inspection. Invalid JSON and duplicate object keys also refuse the body. On an event stream, an incomplete scan withholds the affected event and records a `response_scan_error` block; HTTP headers already sent retain the upstream status, so that status alone does not indicate that the event passed inspection.
 
 #### Agent Card drift: what adopts silently, what blocks
 
@@ -3184,7 +3987,7 @@ An Agent Card carries endpoints and auth by construction (`url`, `provider`, `se
 
 A change is **adopted silently as the new baseline** (no block, and the change is recorded for audit) only when it is confined to descriptive free text — the card name, the card description, and skill names and descriptions — and introduces no cue class. A refined description or a reworded skill description adopts. A bare `version` bump is not compared at all: neither view covers `version`, so a version-only change is ignored rather than adopted, and it records no drift and no adoption.
 
-A change **blocks** and preserves the prior baseline (so repeated fetches keep blocking until an operator accepts the new card) when it is an endpoint or structural change — `url`, `securitySchemes`, capabilities, default input/output modes, or the set of skill ids and their schemas — or when a descriptive change introduces a cue class such as an instruction-injection or tool-poison pattern, an embedded egress instruction, a concealment instruction, or a reference to another tool. Adding a new skill is a structural change (a new capability surface) and blocks. The block reason names the axis for a structural change and the introduced cue classes for a descriptive one. A card that cannot be re-parsed fails closed.
+A change is **rejected as drift** and preserves the prior baseline (so every later fetch reports drift again until the proxy restarts) when it is an endpoint or structural change — `url`, `supportedInterfaces`, `securitySchemes`, `securityRequirements`, capabilities and capability extensions (including their descriptions), default input/output modes, or the set of skill ids and their schemas — or when a descriptive change introduces a cue class such as an instruction-injection or tool-poison pattern, an embedded egress instruction, a concealment instruction, or a reference to another tool. Adding a new skill is a structural change (a new capability surface) and blocks. The verdict follows `a2a_scanning.action`, or a stricter response action as described under `action` above: under `block` the card is refused; under the default `warn` it is forwarded and logged. The block reason names the axis for a structural change and the introduced cue classes for a descriptive one. A card that cannot be re-parsed fails closed. The card baseline is held in memory for the life of the process; there is no operator command to accept a changed card while it runs, so the drift keeps reporting (and, under `block`, keeps blocking) until the proxy restarts.
 
 Fields the semantic hash does not currently cover (`provider`, `documentationUrl`, `iconUrl`) are outside drift comparison, unchanged from prior releases; widening drift to them is a separate change.
 
@@ -3203,11 +4006,12 @@ Configure one or more `trusted_agent_card_keys`:
 Behavior when at least one trusted key is configured:
 
 - **Signed card, signature verifies** against a trusted key scoped to the card's origin → allowed; a positive attestation receipt is emitted (`a2a_card_signature` layer).
-- **Signed card, no trusted-and-valid signature** (forged, wrong key, untrusted, substituted, origin mismatch, `alg: none`, non-EdDSA, empty/short signature, duplicate top-level keys, trailing tokens) → finding + receipt, **enforced at `a2a_scanning.action`**. Set `action: block` to reject. The preimage is the card with its `signatures` member removed, canonicalized per RFC 8785 (JCS).
+- **Signed card, no trusted-and-valid signature** (forged, wrong key, untrusted, substituted, origin mismatch, `alg: none`, non-EdDSA, empty/short signature, duplicate top-level keys, trailing tokens) → finding + receipt, **enforced at `a2a_scanning.action`** or a stricter response action. Set `action: block` to reject. The preimage is the card with its `signatures` member removed, canonicalized per RFC 8785 (JCS).
 - **Unsigned card** → existing scan/drift behavior, unless `require_signed_agent_cards: true`, in which case it is a finding enforced at `action`.
 
 Notes and honest scope:
 
+- A signature that verifies is not scanned for credential patterns. Its 64 bytes are fixed by the signer's key and the card, and an occasional valid signature happens to spell a credential-shaped run, such as a Hugging Face token, in base64url. Only the one `signatures[].signature` string that verified is left out, found by its position in the card; the same characters anywhere else, the card body, `protected` (including `kid`), the unprotected `header`, signature entries that did not verify, and entries past the first 16 are all still scanned. With no trusted key, a wrong origin, or a failed verification, nothing is left out.
 - Only `EdDSA` (Ed25519) signatures are verified. Cards signed with other algorithms cannot match a trusted key and therefore fail verification when verification is active.
 - `require_signed_agent_cards: true` requires at least one trusted key (otherwise every card would be rejected); this combination is rejected at config load.
 - Verification fires on every surface that delivers an Agent Card as a single body: forward proxy (plain HTTP and CONNECT/TLS-intercept) and MCP HTTP. A2A SSE streams carry task/message events, not Agent Cards, so there is no card-signature step on the SSE path.
@@ -3304,6 +4108,10 @@ Profile lifecycle: `observe` → `learn` → `ratify` → `locked`. Enforcement 
 
 Classifies each session by how recently it observed untrusted content and escalates scrutiny on protected operations. Under `strict` or `balanced`, a session that fetched untrusted content from a non-allowlisted source is evaluated before it edits a file under `*/auth/*`: a protected write returns `PolicyAsk` when authority is below `AuthorityUserExact`, and `PolicyAllow` with exact user authority. An allowlisted source does not raise taint, and hostile taint returns `PolicyBlock` for sensitive actions. Under `permissive` the taint is still recorded and the operation is allowed (`taint_permissive_observe_only`), so that policy observes without restricting. Runs across fetch, forward proxy, reverse proxy, WebSocket, MCP stdio, MCP HTTP/SSE, and A2A.
 
+MCP history requires an active taint recorder. Standalone `pipelock mcp proxy` creates its session store only with `session_profiling.enabled: true`; taint enabled alone doesn't create one. Subprocess stdio and stdio-to-HTTP/WS upstreams use invocation-scoped, in-memory state. Listener state uses authenticated principals or the legacy session partition described above. These scopes don't promise persistence across process restarts or state expiry/eviction. `pipelock doctor`, `explain mcp-response`, and the dashboard report configuration prerequisites without claiming live coverage.
+
+For subprocess stdio, content origin is **undeclared**. Clean responses default to `internal_generated`; that label doesn't establish that the content was generated locally or is trustworthy. The embedding API's `TaintExternalSource` option can declare external content, but `mcp proxy` has no corresponding CLI flag. HTTP/SSE and WS upstreams declare external content by default. `taint.trusted_mcp_servers` accepts risk for future clean responses from the resolved server; it doesn't clear existing hostile history, and prompt-injection hits can still raise hostile taint unless `prompt_injection_detection` is off or warn-only. No classification default changes based on these diagnostics.
+
 ```yaml
 taint:
   enabled: true                        # default: true
@@ -3314,7 +4122,7 @@ taint:
     - "docs.anthropic.com"
     - "docs.github.com"
     - "developer.mozilla.org"
-  trusted_mcp_servers:                 # MCP --server-name values that do NOT raise session taint
+  trusted_mcp_servers:                 # MCP server names (--server-name labels or registered names) that do NOT raise session taint
     - "docs-cache"
   protected_paths:                     # tainted sessions are blocked (or escalated) on these paths
     - "*/auth/*"
@@ -3348,7 +4156,7 @@ taint:
 | `recent_sources` | int | `10` | How many recent taint sources to keep per session for receipt reporting. |
 | `fail_safe_classification` | bool | `false` | When true, unknown or low-confidence read/tool classifications are treated as protected instead of passing the read-only shortcut. |
 | `allowlisted_domains` | []string | 3 high-trust documentation domains | Responses from these domains do not raise taint. Supports `MatchDomain` wildcards. |
-| `trusted_mcp_servers` | []string | empty | MCP server names whose clean responses do not raise session taint. Entries match `pipelock mcp proxy --server-name`; URLs and slashes are rejected. This does not disable MCP response scanning, and prompt-injection hits can still raise hostile taint. |
+| `trusted_mcp_servers` | []string | empty | MCP server names whose clean responses do not raise session taint. Entries match the server name, the `pipelock mcp proxy --server-name` operator label or a registered `mcp_identities` name; URLs and slashes are rejected. This does not disable MCP response scanning, and prompt-injection hits can still raise hostile taint unless `prompt_injection_detection` is off or warn-only. |
 | `protected_paths` | []string | 7 patterns (see above) | Globs for file paths or tool args that are blocked for tainted sessions. |
 | `elevated_paths` | []string | `*/config/*`, `*/middleware*` | Globs that trigger warn/ask rather than block. |
 | `trust_overrides` | []object | empty | Narrow exemptions (see below). |
@@ -3397,6 +4205,10 @@ deployments such as Docker or Kubernetes, there is no terminal to ask, so `ask`
 fails closed and blocks; configure an allowlist, a narrow trust override, or
 `taint.policy: permissive` during tuning, then retry the request.
 
+MCP stdio uses stdin for JSON-RPC: inline terminal approval is unavailable and ask fails closed. Every MCP session (stdio, HTTP/WS bridges, and listener principal, token and legacy partitions) is invocation-scoped, so admin task boundaries and runtime trust grants are rejected for all of them. The only configured override for existing hostile history is an action-scoped taint.trust_overrides entry without source_match (MCP sources record no origin URL), optionally expiring. pipelock run applies it on reload; standalone pipelock mcp proxy reads taint config only at startup, and the restart that applies an override also discards that invocation's in-memory history. Source trust affects only future clean observations; it does not clear hostile history. Inline approval cannot override a hostile block.
+
+Configured overrides accept risk only within their matching scope and expiry (for MCP, only the action scope can match); they don't remove taint or override another scanner or identity gate. Deferred tool approvals aren't recovery for a taint refusal.
+
 ### Trust overrides
 
 `trust_overrides` grants a scoped, time-limited exemption that lets a tainted session perform an otherwise-blocked action.
@@ -3420,7 +4232,7 @@ Task boundaries are surfaced on every emitted receipt as `session_task_id`, and 
 
 ### Classification details
 
-- **Taint level** is raised when a response arrives from a non-allowlisted domain, when an MCP tool returns content from an external source, or when prompt-injection signals fire on response content. `taint.allowlisted_domains` applies to URL/HTTP response sources only; MCP response taint is keyed by the proxy's `--server-name` value through `taint.trusted_mcp_servers`.
+- **Taint level** is raised when a response arrives from a non-allowlisted domain, when an MCP tool returns content from an external source, or when prompt-injection signals fire on response content. `taint.allowlisted_domains` applies to URL/HTTP response sources only; MCP response taint is keyed by the server name (the proxy's `--server-name` label, or the registered `mcp_identities` name) through `taint.trusted_mcp_servers`.
 - **Action sensitivity** is derived from the target path (or tool-argument path) against `protected_paths` and `elevated_paths`.
 - **Authority kind** records which authority tier gated the action: `external`, `policy`, `user_broad`, `user_exact`, or `operator_override`.
 
@@ -3526,7 +4338,7 @@ When enabled, the envelope carries these wire fields:
 
 **Inbound stripping:** Pipelock strips any inbound `Pipelock-Mediation` header and any `pipelock`-prefixed members from `Signature` and `Signature-Input` headers before processing. This prevents agents or upstream proxies from forging mediation metadata. The strip path parses `Signature` / `Signature-Input` as RFC 8941 dictionaries via httpsfv so commas inside quoted parameter values do not corrupt surviving members.
 
-**Redirect refresh:** On every allowed redirect through the fetch or forward proxy, pipelock rebuilds the `Pipelock-Mediation` header on the redirected request so `@target-uri`, `hop`, `ph`, and `action` reflect the redirected leg. Stale `Content-Digest` is dropped and the signature is re-attached when signing is enabled. The `hop` dictionary key counts refresh hops; original requests omit it.
+**Redirect refresh:** On internally followed, allowed fetch-proxy redirects, pipelock rebuilds the `Pipelock-Mediation` header so `@target-uri`, `hop`, `ph`, and `action` reflect the redirected leg. Stale `Content-Digest` is dropped and the signature is re-attached when signing is enabled. The `hop` dictionary key counts refresh hops; original requests omit it. Absolute-URI forwarding retains existing target admission for redirects the outbound client could follow, then scans the origin's `3xx` response before returning `Location` and its separate `Set-Cookie` headers to the client. Responses already left unfollowed, such as a `307`/`308` with a non-replayable body, keep that behavior. Each client-followed request has full admission, a fresh action/receipt ID and a fresh envelope, without an inherited redirect hop. The browser owns cookie state and the redirect limit; the internal fetch-chain counter does not span these separate requests. Preflight approval is not reused, so confirmation policies can prompt again for the actual request.
 
 **Reverse-proxy signing:** Envelope signing runs in an `http.RoundTripper` wrapper installed on `httputil.ReverseProxy.Transport`, so `@target-uri` reflects the post-Director upstream URL rather than the inbound relative path.
 
@@ -3540,12 +4352,13 @@ Browser Shield is opt-in. By default, `browser_shield.enabled` is `false`.
 The other Browser Shield defaults are populated so operators can enable the
 feature with a small config change instead of defining every rewrite knob.
 
-Browser Shield rewrites shieldable HTML, JavaScript, and SVG responses before
-they reach the agent browser. It strips browser-extension probes, hidden
-agent-trap content, tracking pixels/beacons, and SVG active content covered by
-the shield pipeline. It does not attempt to solve CAPTCHAs, bypass bot
-management, forge browser integrity telemetry, or make unsupported websites
-accessible to automation.
+Browser Shield sanitizes shieldable HTML and SVG responses before they reach
+the agent browser. It removes hidden agent traps, tracking image elements,
+prefetch links, and SVG active content. Existing inline scripts and standalone
+JavaScript responses keep their original bytes. JavaScript still goes through
+normal response scanning. Browser Shield doesn't attempt to solve CAPTCHAs,
+bypass bot management, forge browser integrity telemetry, or make unsupported
+websites accessible to automation.
 
 ```yaml
 browser_shield:
@@ -3576,11 +4389,11 @@ browser_shield:
 | `strictness` | string | `standard` | Rewrite posture: `minimal`, `standard`, or `aggressive` |
 | `max_shield_bytes` | int | `5242880` (5 MiB) | Normal maximum shieldable response body size before `oversize_action` applies. On forward, TLS-intercepted, and reverse traffic, matching `response_scanning.size_exempt_domains` use the bounded `size_exempt_scan_max_bytes` ceiling for whole-body shielding. |
 | `oversize_action` | string | `scan_head` | Oversize behavior: `block`, `scan_head`, or `warn`; `warn` is only valid with `strictness: minimal` |
-| `exempt_domains` | []string | challenge providers plus common developer documentation/browser IDE hosts | Hostnames that bypass Browser Shield entirely |
-| `strip_extension_probing` | bool | `true` | Remove browser-extension probing URLs and runtime probes |
-| `strip_hidden_traps` | bool | `true` | Remove hidden prompt-trap DOM content |
-| `strip_tracking_pixels` | bool | `true` | Remove tracking pixels and beacon-style calls |
-| `inject_fingerprint_shims` | bool | `false` | Inject browser fingerprinting defense shims where supported |
+| `exempt_domains` | []string | challenge providers plus common developer documentation/browser IDE hosts | Hostnames that skip Browser Shield rewriting only; other response policies still apply, and forward, TLS-intercepted, and reverse traffic still refuses incomplete responses |
+| `strip_extension_probing` | bool | `true` | Remove browser-extension URLs outside existing scripts. No script is injected: replacing the page's `fetch` or `XMLHttpRequest` is what bot-verification services such as Cloudflare test for, so a shielded browser would be challenged on ordinary navigation |
+| `strip_hidden_traps` | bool | `true` | Remove hidden prompt-trap content. A CSS-hidden or `aria-hidden="true"` `div`, `span` or `p` whose text, read with tags removed and character references decoded, carries an instruction word such as "ignore" or "disregard" is removed whole. When it holds interface markup (a form, input, button, link, image, list, table or similar) it is an application view waiting to be shown, so its markup stays and only the text carrying those words is removed. An `aria-hidden="true"` element of another tag whose own text carries such a word, and an HTML comment that does, are also removed. Markup is read with the HTML tokenizer, so text inside a comment, an attribute value, or a `script`, `style`, `textarea` or `title` body is never treated as an element. Response scanning is a separate control: it can be disabled independently, its default action is `warn`, and its patterns are narrower than these words |
+| `strip_tracking_pixels` | bool | `true` | Remove 1x1 tracking images and prefetch links outside existing scripts |
+| `inject_fingerprint_shims` | bool | `false` | Inject an HTML browser-fingerprinting shim where supported; the shim suppresses `sendBeacon` at runtime but doesn't rewrite the page's JavaScript. The shim returns fixed canvas and WebGL values, which bot-verification services such as Cloudflare Turnstile read as a tampered browser, so leave it off for a browser that must pass those checks |
 | `tracking_domains` | []string | `[]` | Additional tracking hostnames for the shield engine. Exact hostnames only: entries are matched literally, so a wildcard is refused at load rather than accepted and silently never matched. |
 
 For production soak, start with:
@@ -3597,7 +4410,13 @@ movement, block deltas, and application breakage before moving to the standard
 fail-closed posture. Use `oversize_action: warn` only for short, explicitly
 scoped diagnostics because it returns oversized shieldable bodies unchanged.
 
-When Browser Shield rewrites a response, Pipelock adds `X-Pipelock-Shield-Rewrite` before sending it to the client. Its value lists non-zero rewrite categories in fixed order, for example `extension=1,tracking=1,trap=2`; clean and unchanged responses omit the header. `extension` includes an injected extension-defense shim, and `trap` includes hidden traps plus SVG active-content removals. The fetch endpoint also returns the same value in its `shield_rewrite` JSON field. The header is available on buffered fetch, forward-proxy, TLS-intercepted CONNECT, and reverse-proxy responses; streaming responses are not rewritten and therefore never carry it.
+Forward, TLS-intercepted, and reverse proxy traffic refuses every partial (`206`) or not-modified (`304`) response with `response_incomplete` before response-scan exemptions, Shield exemptions, media policy, or budget truncation. Request the complete resource. On those three transports, `browser_shield.exempt_domains` skips Shield rewriting only and cannot permit a partial response. Fetch does not apply this refusal. When Shield is enabled, fetch blocks a partial HTML or SVG response that Shield would rewrite, because rewriting a fragment invalidates its upstream byte range even when the body length stays the same. A Shield-exempt host skips that check, so a partial HTML response can be delivered; a declared SVG is still refused by media policy until Shield validates a complete body. When Shield is disabled, fetch delivers partial HTML unless another policy refuses it.
+
+On fetch, other response policies also preserve byte-range integrity: a partial response is blocked if response-scanning strip would change it, if its encoded body would need decoding for inspection, or if an agent byte budget would truncate it. On forward, TLS-intercepted, and reverse traffic, the earlier `response_incomplete` refusal applies to every `206` and `304`, regardless of those conditions. These refusals do not affect complete responses.
+
+When Browser Shield rewrites a response, Pipelock adds `X-Pipelock-Shield-Rewrite` before sending it to the client. Its value lists non-zero rewrite categories in fixed order, for example `extension=1,tracking=1,trap=2`; clean and unchanged responses omit the header. `extension` counts stripped extension URLs plus the opt-in fingerprint shim when it is injected, and `trap` includes hidden traps plus SVG active-content removals. The fetch endpoint also returns the same value in its `shield_rewrite` JSON field. The header is available on buffered fetch, forward-proxy, TLS-intercepted CONNECT, and reverse-proxy responses; streaming responses are not rewritten and therefore never carry it.
+
+Response injection findings survive Browser Shield rewriting and still follow the configured response action. Fetch scans the title and readable text together, plus hidden content. When Shield changes the body, fetch also scans those original representations, including its existing raw HTML fallback when readability yields no text. Forward, CONNECT and reverse proxy paths scan response bytes. Successful readability extraction excludes executable inline JavaScript and markup. Images are scanned as the existing media policy leaves them: metadata and trailing bytes that policy removes are not retained, while metadata it keeps (policy off, metadata stripping off, or a shipped challenge host) is. Fetch continues to refuse a response when it detects hidden injection and can't extract readable content. That refusal is one block receipt and, except on an exempt domain, the hard-block adaptive signal, including when the configured action is warn, strip, or ask. An exempt domain still does not escalate, and it still does not deliver the response. Each response produces one combined response-scanning decision for adaptive enforcement. Scanner stripping operates on the rewritten content, so it can't restore bytes Shield removed. Fetch strips content only when the separately delivered title remains safe. The `browser_shield_rewrite` receipt's pattern field includes retained injection classifications.
 
 ## Media Policy (v2.1)
 
@@ -3626,9 +4445,11 @@ All boolean fields use nil-means-security-default semantics: omitting a field fr
 | `strip_audio` | *bool | `true` | Reject all `audio/*` responses |
 | `strip_video` | *bool | `true` | Reject all `video/*` responses |
 | `allowed_image_types` | []string | `["image/png", "image/jpeg"]` | Image media types allowed when `strip_images` is false |
-| `strip_image_metadata` | *bool | `true` | Remove EXIF/XMP/IPTC/ICC metadata from allowed images |
+| `strip_image_metadata` | *bool | `true` | Remove EXIF/XMP/IPTC/ICC metadata from allowed images. Images from Cloudflare's challenge host `challenges.cloudflare.com` are passed through unmodified, because a bot-verification challenge may read them byte for byte; type and size limits still apply |
 | `max_image_bytes` | int64 | `5242880` (5 MiB) | Reject images larger than this before parsing (decompression bomb defense) |
 | `log_media_exposure` | *bool | `true` | Emit `media_exposure` events for allowed media responses |
+
+Media policy blocks a partial (`206`) image response only when stripping would change its bytes. On forward, TLS-intercepted, and reverse proxy traffic, the earlier full-response policy refuses every `206`, including unchanged images and hosts exempt from Shield rewriting. Request the complete image; `media_policy.strip_image_metadata: false` does not bypass that refusal.
 
 ### Metadata stripping
 
@@ -3638,7 +4459,11 @@ For PNG images: strips tEXt, iTXt, zTXt (text metadata), and eXIf (EXIF) chunks.
 
 ### SVG active content hardening
 
-SVG (`image/svg+xml`) is never in the allowed image types list. SVG is active content handled by the browser shield pipeline, which strips `<foreignObject>` elements (XSS/injection vector), `on*` event handler attributes, external `xlink:href` and `href` references, hidden `<text>` elements (invisible prompt injection), `<script>` blocks, and animation injection (`<set>`/`<animate>` targeting href).
+SVG (`image/svg+xml`) is never in the allowed image types list. SVG is active content, so its delivery is owned by Browser Shield rather than `allowed_image_types`: an SVG response reaches the client only after Browser Shield parsed and validated the complete body, and the rewritten body it delivers, as an SVG document with no active content. This applies on the fetch endpoint, the forward proxy, TLS-intercepted CONNECT, and the reverse proxy.
+
+Validation refuses the whole response (`403`, block reason `media_policy`) when the document contains a script, `foreignObject`, or embedded-frame element in any namespace; an animation that targets anything other than a geometry, transform, or paint attribute (for example `href`, an `on*` handler, `style`, or `xml:base`); an XHTML or MathML element; an `on*` event handler; a fetching reference (`href` on `use`, `image`, `pattern`, `feImage`, `textPath`, and similar elements) that is not an in-document `#fragment`; a hyperlink with a scheme other than `http`, `https`, or `mailto`; a CSS `url()` that is not a `#fragment` (in a `style` attribute, a presentation attribute such as `fill`, or a `<style>` element), `@import`, or a CSS escape in a stylesheet; a DOCTYPE internal subset or other directive; a processing instruction other than the XML declaration; a charset other than UTF-8 or UTF-16; or malformed XML. The block reason names the construct, never the document's content. Ordinary tool output, including namespace declarations, RDF metadata, editor namespaces, gradient `url(#id)` references, and hyperlinks, is accepted.
+
+SVG is refused, whatever the document contains, whenever that complete validation did not happen: Browser Shield disabled (the default) or the host listed in `browser_shield.exempt_domains`, a partial (`206`) response, a body over its whole-body Shield limit under every `oversize_action` (`max_shield_bytes`, or `response_scanning.size_exempt_scan_max_bytes` for a `size_exempt_domains` host on forward, TLS-intercepted, and reverse traffic), or a compressed body that cannot be decoded. A response is treated as SVG when any `Content-Type` value a browser would use declares it, including a comma-combined or repeated header. To deliver SVG, enable Browser Shield. `media_policy.enabled: false` does not remove this requirement. Hosts in `response_scanning.exempt_domains` stream other complete responses through without inspection, but a response that declares SVG still takes the buffered Browser Shield validation path.
 
 ### Validation
 
@@ -3728,7 +4553,7 @@ The following are enforced at startup:
 
 - Strict mode requires a non-empty `api_allowlist`
 - All DLP and response patterns must compile as valid regex
-- `secrets_file` must exist and not be world-readable (mode 0600 or stricter)
+- `secrets_file` must exist and be a regular file. On Unix it must not grant group write or execute, or any access to other users. Modes 0600 and 0640 pass, and group read is allowed for Kubernetes Secret volumes. Windows doesn't check its permissions.
 - MCP tool policy requires at least one rule if enabled
 - Kill switch `api_listen` must differ from the main proxy listen address
 - WebSocket `strip_compression` must be true when scanning is enabled
@@ -3794,11 +4619,14 @@ pipelock run --reverse-proxy --reverse-upstream http://localhost:7899 --reverse-
 
 ### Scanning behavior
 
+For buffered response scanning, the reverse proxy has a fixed 1 MiB ceiling. A larger response blocks unless its host is in `response_scanning.size_exempt_domains`, which uses the configured bounded scan ceiling. A response that exceeds that larger limit still blocks before any upstream bytes are delivered.
+
 - **Request bodies:** Scanned for DLP patterns (secret exfiltration) using the `request_body_scanning` config
 - **Request headers:** Scanned when `request_body_scanning.scan_headers` is enabled
 - **Response bodies:** Scanned for prompt injection using the `response_scanning` config
 - **Request bodies:** Image, audio, and video uploads are scanned under `request_body_scanning`; a valid media signature is not an exemption. This detects plaintext secrets appended to a media file, not secrets steganographically embedded in its pixels or samples.
-- **Compressed bodies:** Fail-closed (blocked) on both request and response
+- **Compressed request bodies:** Fail-closed (blocked)
+- **Compressed response bodies:** Decoded (gzip/deflate) and scanned when scanning is active; compressed SSE and undecodable encodings are blocked
 - **Oversized request bodies:** Bodies above `request_body_scanning.max_body_bytes` are denied. Known oversized `Content-Length` values are rejected before reading; chunked bodies are bounded while read and also consume the reverse-proxy in-flight scan budget.
 - **Scan admission exhaustion:** A request that cannot reserve capacity within `max_inflight_scan_bytes` is refused with 503 before its body is read, matching how Pipelock reports other temporary unavailability such as an engaged kill switch. This differs from the 413 an oversized body receives: 413 says the body will never be accepted at this cap, 503 says the instance is busy and the request is worth retrying.
 
@@ -3859,8 +4687,8 @@ pipelock keygen agent-b
 pipelock signing roster build \
   --root /etc/pipelock/keys/fleet-root.json \
   --include id=activation-primary,key=/etc/pipelock/keys/activation.json,purpose=contract-activation-signing,role=operator \
-  --include id=compile-agent-a,key=$HOME/.pipelock/agents/agent-a/id_ed25519.pub,purpose=contract-compile-signing \
-  --include id=compile-agent-b,key=$HOME/.pipelock/agents/agent-b/id_ed25519.pub,purpose=contract-compile-signing \
+  --include id=agent-a,key=$HOME/.pipelock/agents/agent-a/id_ed25519.pub,purpose=contract-compile-signing \
+  --include id=agent-b,key=$HOME/.pipelock/agents/agent-b/id_ed25519.pub,purpose=contract-compile-signing \
   --data-class internal \
   --out /etc/pipelock/roster.json
 

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/signing"
 	"gopkg.in/yaml.v3"
 )
@@ -207,6 +208,98 @@ func TestMigratePipelockConfigForContain_PreservesApprovedMetricsExposure(t *tes
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("migrated config missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestMigratePipelockConfigForContain_AcceptsNullMetricsExposure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{name: "omitted", body: "containment: {}\n"},
+		{name: "null", body: "containment:\n  metrics_exposure: null\n"},
+		{name: "blank", body: "containment:\n  metrics_exposure:\n"},
+		{name: "tilde", body: "containment:\n  metrics_exposure: ~\n"},
+		{name: "uppercase null", body: "containment:\n  metrics_exposure: NULL\n"},
+		{name: "null containment", body: "containment: null\n"},
+		{name: "blank containment", body: "containment:\n"},
+		{name: "aliased null containment", body: "agents: &absent null\ncontainment: *absent\n"},
+		{name: "aliased null metrics policy", body: "containment:\n  loopback_services: &absent null\n  metrics_exposure: *absent\n"},
+		{name: "aliased null loopback services", body: "containment:\n  metrics_exposure: &absent null\n  loopback_services: *absent\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			original, err := config.LoadBytes([]byte(tc.body))
+			if err != nil {
+				t.Fatalf("runtime config rejects fixture: %v", err)
+			}
+			if original.Containment.MetricsExposure != nil {
+				t.Fatal("fixture unexpectedly authorizes metrics exposure")
+			}
+			env, _, _ := newFakeEnv(t)
+			home := t.TempDir()
+			origLookup := env.lookupUser
+			env.lookupUser = func(name string) (*user.User, error) {
+				if name == containInstallOperatorUser {
+					return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+				}
+				return origLookup(name)
+			}
+			out, artifacts, err := migratePipelockConfigForContain(env, filepath.Join(home, "pipelock.yaml"), []byte(tc.body))
+			if err != nil {
+				t.Fatalf("migrate runtime-valid config: %v", err)
+			}
+			if len(artifacts) != 0 {
+				t.Fatalf("unexpected migrated artifacts: %+v", artifacts)
+			}
+			loaded, err := config.LoadBytes(out)
+			if err != nil {
+				t.Fatalf("load migrated config: %v", err)
+			}
+			if loaded.MetricsListen != containMetricsListen || loaded.Containment.MetricsExposure != nil {
+				t.Fatalf("migration changed metrics authority: listen=%q policy=%+v", loaded.MetricsListen, loaded.Containment.MetricsExposure)
+			}
+			if _, err := containServiceReadOnlyPaths(out, env.proxyPort); err != nil {
+				t.Fatalf("validate migrated service config: %v", err)
+			}
+			if _, _, err := migratePipelockConfigForContain(env, filepath.Join(home, "pipelock.yaml"), []byte("metrics_listen: 192.0.2.20:9191\n"+tc.body)); err == nil {
+				t.Fatal("missing metrics policy authorized a non-loopback listener")
+			}
+		})
+	}
+}
+
+func TestMigratePipelockConfigForContain_RejectsNonMappingContainmentPolicies(t *testing.T) {
+	const metricsPolicyTypeError = "containment.metrics_exposure must be a mapping"
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "quoted null policy", body: "containment:\n  metrics_exposure: \"null\"\n", want: metricsPolicyTypeError},
+		{name: "empty string policy", body: "containment:\n  metrics_exposure: \"\"\n", want: metricsPolicyTypeError},
+		{name: "boolean policy", body: "containment:\n  metrics_exposure: false\n", want: metricsPolicyTypeError},
+		{name: "sequence policy", body: "containment:\n  metrics_exposure: []\n", want: metricsPolicyTypeError},
+		{name: "quoted null containment", body: "containment: \"null\"\n", want: "containment must be a mapping"},
+		{name: "sequence containment", body: "containment: []\n", want: "containment must be a mapping"},
+		{name: "quoted null containment alias", body: "agents: &not_null \"null\"\ncontainment: *not_null\n", want: "containment must be a mapping"},
+		{name: "quoted null metrics alias", body: "containment:\n  loopback_services: &not_null \"null\"\n  metrics_exposure: *not_null\n", want: metricsPolicyTypeError},
+		{name: "recursive metrics alias", body: "containment: &self\n  metrics_exposure: *self\n", want: metricsPolicyTypeError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _, _ := newFakeEnv(t)
+			home := t.TempDir()
+			origLookup := env.lookupUser
+			env.lookupUser = func(name string) (*user.User, error) {
+				if name == containInstallOperatorUser {
+					return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+				}
+				return origLookup(name)
+			}
+			_, _, err := migratePipelockConfigForContain(env, filepath.Join(home, "pipelock.yaml"), []byte(tc.body))
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("migrate error = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
 
@@ -962,5 +1055,61 @@ func assertContainFlightRecorderPublicKeySidecar(t *testing.T, keyPath string) {
 		if got := info.Mode().Perm(); got != modeConfigSecret {
 			t.Fatalf("public key sidecar mode = %s, want %s", got, modeConfigSecret)
 		}
+	}
+}
+
+// TestMigrateTLSCA_FollowsPipelockHome pins that contain migration copies the
+// CA the operator's proxy actually loads. With PIPELOCK_HOME set, that is the
+// CA under PIPELOCK_HOME, not an older one left in ~/.pipelock.
+func TestMigrateTLSCA_FollowsPipelockHome(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		pipelockHome func(home string) string
+		want         string
+		wantErr      string
+	}{
+		{name: "no pipelock home keeps the operator default", pipelockHome: func(string) string { return "" }, want: "OLD-CA\n"},
+		{name: "PIPELOCK_HOME inside the operator home wins", pipelockHome: func(home string) string { return filepath.Join(home, "plhome") }, want: "NEW-CA\n"},
+		{name: "PIPELOCK_HOME outside the operator home is refused", pipelockHome: func(string) string { return filepath.Join(os.TempDir(), "external-plhome") }, wantErr: "set tls_interception.ca_cert and ca_key explicitly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, _, _ := newFakeEnv(t)
+			home := t.TempDir()
+			origLookup := env.lookupUser
+			env.lookupUser = func(name string) (*user.User, error) {
+				if name == containInstallOperatorUser {
+					return &user.User{Uid: "1000", Gid: "1000", Username: name, HomeDir: home}, nil
+				}
+				return origLookup(name)
+			}
+			mustWriteFile(t, filepath.Join(home, ".pipelock", "ca.pem"), "OLD-CA\n")
+			mustWriteFile(t, filepath.Join(home, ".pipelock", "ca-key.pem"), "OLD-KEY\n")
+			mustWriteFile(t, filepath.Join(home, "plhome", "ca.pem"), "NEW-CA\n")
+			mustWriteFile(t, filepath.Join(home, "plhome", "ca-key.pem"), "NEW-KEY\n")
+			orig := signing.PipelockHome
+			signing.PipelockHome = ""
+			t.Cleanup(func() { signing.PipelockHome = orig })
+			t.Setenv("PIPELOCK_HOME", tc.pipelockHome(home))
+
+			configDir := filepath.Join(home, ".config", "pipelock")
+			data := []byte("tls_interception:\n  enabled: true\n")
+			_, _, err := migratePipelockConfigForContain(env, filepath.Join(configDir, "pipelock.yaml"), data)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("migrate err = %v, want containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("migrate: %v", err)
+			}
+			got, err := os.ReadFile(filepath.Join(env.configDir, "tls", "ca.pem"))
+			if err != nil {
+				t.Fatalf("read migrated CA: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("migrated CA = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

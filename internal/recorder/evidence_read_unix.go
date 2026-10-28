@@ -35,6 +35,16 @@ func lockEvidenceFileForWrite(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_SH)
 }
 
+func lockEvidenceAppend(f *os.File) error {
+	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+		return errAppendLockBusy
+	}
+	return err
+}
+
+func unlockEvidenceAppend(f *os.File) error { return unlockEvidenceFile(f) }
+
 // unlockEvidenceFile releases a writer-presence lock.
 func unlockEvidenceFile(f *os.File) error {
 	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)

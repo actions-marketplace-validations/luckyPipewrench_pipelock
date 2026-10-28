@@ -28,7 +28,7 @@ MIN_SAFE_INTEGER = -((1 << 53) - 1)
 HEX_DIGEST_LEN = 64
 
 
-class StrictParseError(Exception):
+class StrictParseError(ValueError):
     """The input is not strict JSON (duplicate key, trailing token, bad syntax)."""
 
 
@@ -66,9 +66,12 @@ class IJSONNumber:
 def _reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     """object_pairs_hook that raises on a repeated key at any depth."""
     obj: dict[str, Any] = {}
+    seen: set[str] = set()
     for key, value in pairs:
-        if key in obj:
+        folded = key
+        if folded in seen:
             raise StrictParseError(f"duplicate key in JSON object: {key!r}")
+        seen.add(folded)
         obj[key] = value
     return obj
 

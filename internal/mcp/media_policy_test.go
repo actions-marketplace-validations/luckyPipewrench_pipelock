@@ -786,6 +786,30 @@ func TestApplyMCPMediaPolicy_ExplicitTextPreserved(t *testing.T) {
 	}
 }
 
+func TestApplyMCPMediaPolicy_EmptyImagePasses(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	verdict := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", nil, testMCPMediaTransport)
+	if verdict.Blocked {
+		t.Fatalf("empty MCP image payload blocked: %s", verdict.BlockReason)
+	}
+	if verdict.StripResult != nil {
+		t.Fatal("empty MCP image payload must not enter metadata surgery")
+	}
+}
+
+func TestApplyMCPMediaPolicy_SignatureMismatchIsDiagnosed(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	verdict := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", []byte{0x00, 0x01}, testMCPMediaTransport)
+	if !verdict.Blocked {
+		t.Fatal("declared MCP PNG with non-PNG bytes must be blocked")
+	}
+	if !strings.Contains(verdict.BlockReason, `declared image type "image/png" does not match response bytes (bytes look like application/octet-stream)`) {
+		t.Errorf("block reason = %q, want declared-type mismatch", verdict.BlockReason)
+	}
+}
+
 func TestCanonicalMCPContentType(t *testing.T) {
 	t.Parallel()
 
@@ -1127,5 +1151,88 @@ func TestForwardScanned_MediaPolicyBlockReceiptFailureLogsAuditGap(t *testing.T)
 	}
 	if !strings.Contains(log.String(), "audit_gap=true") {
 		t.Fatalf("missing audit_gap marker in log: %s", log.String())
+	}
+}
+
+func TestApplyMCPMediaPolicy_RelabeledAllowedRasterPasses(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	body := append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+	verdict := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", body, testMCPMediaTransport)
+	if verdict.Blocked {
+		t.Fatalf("MCP WebP payload declared as image/png blocked: %s", verdict.BlockReason)
+	}
+	html := []byte("<!DOCTYPE html><html><body>x</body></html>")
+	if v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", html, testMCPMediaTransport); !v.Blocked {
+		t.Fatal("MCP HTML payload declared as image/png was forwarded")
+	}
+}
+
+func TestApplyMCPResponseMediaPolicy_RelabelsProvenImageType(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	webp := append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+	b64 := base64.StdEncoding.EncodeToString(webp)
+	for _, tc := range []struct{ name, line, want string }{
+		{"image block", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"` + b64 + `","mimeType":"image/png"}]}}`, `"mimeType":"image/webp"`},
+		{"image block with mediaType", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"` + b64 + `","mimeType":"image/png","mediaType":"image/png"}]}}`, `"mediaType":"image/webp"`},
+		{"resource blob", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"resource","resource":{"uri":"file:///x.png","mimeType":"image/png","blob":"` + b64 + `"}}]}}`, `"mimeType":"image/webp"`},
+		{"resource blob with parent mediaType", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"resource","mediaType":"image/png","resource":{"uri":"file:///x.png","mimeType":"image/png","mediaType":"image/png","blob":"` + b64 + `"}}]}}`, `"mediaType":"image/webp"`},
+		{"image block with contentType", `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"image","data":"` + b64 + `","mimeType":"image/png","contentType":"image/png"}]}}`, `"contentType":"image/webp"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result := applyMCPResponseMediaPolicy([]byte(tc.line), &cfg.MediaPolicy, testMCPMediaTransport)
+			if result.Blocked {
+				t.Fatalf("relabeled WebP blocked: %s", result.BlockReason)
+			}
+			if !result.Changed || !strings.Contains(string(result.Line), tc.want) || strings.Contains(string(result.Line), `"image/png"`) {
+				t.Fatalf("mimeType not rewritten to the proven type: changed=%v %s", result.Changed, result.Line)
+			}
+		})
+	}
+}
+
+func TestSetMCPMediaMimeTypeRejectsUnparseableResource(t *testing.T) {
+	block := map[string]json.RawMessage{"type": json.RawMessage(`"resource"`), "resource": json.RawMessage(`"not-an-object"`)}
+	if err := setMCPMediaMimeType(block, "resource.blob", "image/webp"); err == nil {
+		t.Fatal("unparseable embedded resource accepted")
+	}
+	good := map[string]json.RawMessage{"resource": json.RawMessage(`{"blob":"AA==","mimeType":"image/png"}`)}
+	if err := setMCPMediaMimeType(good, "resource.blob", "image/webp"); err != nil {
+		t.Fatalf("positive control: %v", err)
+	}
+	if !strings.Contains(string(good["resource"]), `"image/webp"`) {
+		t.Fatalf("resource mimeType not relabeled: %s", good["resource"])
+	}
+}
+
+func TestApplyMCPMediaPolicy_RelabeledDisallowedBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg"}
+	body := append([]byte("RIFF\x24\x00\x00\x00WEBPVP8 \x18\x00\x00\x00"), make([]byte, 24)...)
+	v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", body, testMCPMediaTransport)
+	if !v.Blocked || !strings.Contains(v.BlockReason, "image/webp") {
+		t.Fatalf("MCP disallowed WebP labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
+	}
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/webp"}
+	if v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", body, testMCPMediaTransport); v.Blocked {
+		t.Fatalf("positive control: allowed WebP labeled PNG blocked: %s", v.BlockReason)
+	}
+}
+
+func TestApplyMCPMediaPolicy_ICOUnderPNGLabelBlockedWithoutStripping(t *testing.T) {
+	t.Parallel()
+	cfg := config.Defaults()
+	off := false
+	cfg.MediaPolicy.StripImageMetadata = &off
+	cfg.MediaPolicy.AllowedImageTypes = []string{"image/png", "image/jpeg", "image/x-icon"}
+	ico := append([]byte{0, 0, 1, 0, 1, 0}, make([]byte, 32)...)
+	if v := applyMCPMediaPolicy(&cfg.MediaPolicy, "image/png", ico, testMCPMediaTransport); !v.Blocked || !strings.Contains(v.BlockReason, "image/x-icon") {
+		t.Fatalf("ICO labeled PNG with stripping off: blocked=%v %q", v.Blocked, v.BlockReason)
 	}
 }

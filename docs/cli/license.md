@@ -220,10 +220,10 @@ lets the runtime reject licenses (and revoked intermediate signing certificates)
 that have been pulled before their natural expiry.
 
 CRLs are **issued (signed) by the cluster license-service**, which owns the
-canonical revocation list. The CLI deliberately does **not** sign CRLs: a CRL is
-a whole-list snapshot with no monotonic generation number, so an offline signer
-that could mint a smaller list would be a revocation-rollback footgun. The CLI
-provides only the read side.
+canonical revocation list. The CLI deliberately does **not** sign CRLs: CLI
+issuance stays out because the license-service owns that canonical list, and a
+CRL generation number does not make it safe for an offline signer to issue an
+arbitrary subset of it. The CLI provides only the read side.
 
 ### `pipelock license crl inspect FILE`
 
@@ -266,6 +266,21 @@ TOKEN` and confirm with `pipelock license status`. A refund revokes the
 evaluation or trial through the signed revocation list and the runtime tears the
 paid features back down to free; a refunded trial keeps its email's slot occupied
 until the original 60 days would have ended.
+
+## License-service audit reports
+
+The separate enterprise `license-service` binary can summarize its local JSONL audit ledger without daemon configuration, signing keys, or database access:
+
+```bash
+license-service audit-summary --ledger /data/audit.jsonl
+license-service audit-summary --ledger /data/audit.jsonl --format json --fail-on-errors
+```
+
+Use `--since` and `--until` with RFC3339 timestamps to select a reporting window. The start is inclusive and the end is exclusive. Reports count known event types and group unfamiliar types under `unknown_events`; customer addresses, tokens, event details, and unfamiliar event names are omitted.
+
+By default, recorded errors do not change the exit status. `--fail-on-errors` returns a nonzero status after printing the report when the selected window contains `error` or `email_failed` events. Unknown events are counted separately and do not trigger that flag. This is a summary of an unsigned local ledger, not a service-health check: an empty window does not prove the service is healthy.
+
+Input and output failures return a nonzero status. The reader rejects malformed records, incomplete final lines, and lines exceeding its 1 MiB resource limit rather than printing a partial report. It reads up to the file size observed when opened. For a ledger receiving concurrent writes, use a stable, complete copy; an append observed partway through a record can otherwise produce an incomplete-line error. Keep the original ledger intact when investigating rejected input.
 
 ## See also
 

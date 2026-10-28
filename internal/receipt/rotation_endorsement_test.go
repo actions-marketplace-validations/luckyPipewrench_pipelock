@@ -23,12 +23,16 @@ func buildSessionBoundRotatedChain(t *testing.T, keys ...ed25519.PrivateKey) ([]
 	t.Helper()
 	dir := t.TempDir()
 	boundaries := make([]int, 0, len(keys)-1)
+	prior := ""
 	for keyIndex, key := range keys {
 		rec, err := recorder.New(recorder.Config{Enabled: true, Dir: dir, CheckpointInterval: 1000}, nil, key)
 		if err != nil {
 			t.Fatalf("recorder.New: %v", err)
 		}
-		emitter := NewEmitter(EmitterConfig{Recorder: rec, PrivKey: key, Principal: "test", Actor: "test"})
+		// Each rotation models a signer-rotating reload: the new emitter is
+		// told the key the previous one signed with.
+		emitter := NewEmitter(EmitterConfig{Recorder: rec, PrivKey: key, Principal: "test", Actor: "test", PriorSignerKeys: []string{prior}})
+		prior = fmt.Sprintf("%x", key.Public().(ed25519.PublicKey))
 		if err := emitter.InitError(); err != nil {
 			t.Fatalf("emitter InitError: %v", err)
 		}
@@ -192,6 +196,47 @@ func TestVerifyChainWithEndorsements_RequiresPinnedRoot(t *testing.T) {
 	result = VerifyChainWithEndorsements("proxy", single, nil, nil)
 	if result.Valid || !strings.Contains(result.Error, "requires at least one trusted root key") {
 		t.Fatalf("unpinned single-segment chain was accepted by endorsement verifier: %+v", result)
+	}
+}
+
+func TestVerifyBase_UnpinnedInChainEndorsementIsEvaluated(t *testing.T) {
+	t.Parallel()
+	pubA, privA := generateTestKey(t)
+	_, privB := generateTestKey(t)
+	chain, boundaries := buildSessionBoundRotatedChain(t, privA, privB)
+	endorsement := endorsementForBoundary(t, chain, boundaries[0], privA)
+	dir := t.TempDir()
+	var lines []byte
+	prev := recorder.GenesisHash
+	for i, rcpt := range chain {
+		entry := recorder.Entry{Version: recorder.EntryVersion, Sequence: uint64(i), Timestamp: time.Now().UTC(), SessionID: "proxy", Type: recorderEntryType, Detail: rcpt, PrevHash: prev}
+		entry.Hash = recorder.ComputeHash(entry)
+		prev = entry.Hash
+		line, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(append(lines, line...), '\n')
+	}
+	if err := os.WriteFile(filepath.Join(dir, "evidence-proxy-0.jsonl"), lines, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	verify := func(keys []string, endorsements []RotationEndorsement) BaseReport {
+		t.Helper()
+		r, err := VerifyBase(dir, "proxy", BaseVerifyOptions{TrustedKeys: keys, Endorsements: endorsements})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	if r := verify(nil, nil); r.Healthy() {
+		t.Fatal("rotation without endorsement was accepted")
+	}
+	if r := verify(nil, []RotationEndorsement{endorsement}); findingKinds(r)[FindingCorruptChain] == 0 || !strings.Contains(r.Findings[0].Detail, "requires at least one trusted root key") {
+		t.Fatalf("unpinned endorsement was ignored instead of requiring a root: %+v", r.Findings)
+	}
+	if r := verify([]string{hex.EncodeToString(pubA)}, []RotationEndorsement{endorsement}); !r.Healthy() {
+		t.Fatalf("pinned endorsement rejected: %+v", r.Findings)
 	}
 }
 
@@ -421,6 +466,15 @@ func TestRotationEndorsementRejectsMalformedFields(t *testing.T) {
 		t.Fatalf("SignRotationEndorsement: %v", err)
 	}
 
+	bodyAlias, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliased := append([]byte(`{"VERSION":99,`), bodyAlias[1:]...)
+	if _, err := UnmarshalRotationEndorsement(aliased); err == nil {
+		t.Fatal("signed rotation endorsement with case-variant alias accepted")
+	}
+
 	cases := map[string]struct {
 		mutate  func(*RotationEndorsement)
 		wantErr string
@@ -472,5 +526,51 @@ func TestLoadRotationEndorsementFileBoundaries(t *testing.T) {
 	}
 	if _, err := LoadRotationEndorsementFile(over); err == nil || !strings.Contains(err.Error(), "exceeds") {
 		t.Fatalf("oversized file error = %v", err)
+	}
+}
+
+// The endorsement path is read as the operating system opens it:
+// "link/../rot/e.json" names the file under the link's target.
+func TestLoadRotationEndorsementFileResolvesSymlinkBeforeDotDot(t *testing.T) {
+	valid, err := os.ReadFile(filepath.Join("..", "..", "sdk", "conformance", "testdata", "g1-rotation-endorsement.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := UnmarshalRotationEndorsement(valid); err != nil {
+		t.Fatalf("fixture endorsement does not verify: %v", err)
+	}
+	dir := t.TempDir()
+	for _, sub := range []string{filepath.Join("a", "rot"), filepath.Join("b", "rot"), filepath.Join("b", "sub")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(filepath.Join(dir, "b", "sub"), filepath.Join(dir, "a", "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	sep := string(filepath.Separator)
+	input := filepath.Join(dir, "a", "link") + sep + ".." + sep + "rot" + sep + "e.json"
+	lexical := filepath.Join(dir, "a", "rot", "e.json")
+	opened := filepath.Join(dir, "b", "rot", "e.json")
+	for _, tc := range []struct {
+		name              string
+		lexData, openData []byte
+		wantOK            bool
+	}{
+		{name: "valid at the opened path", lexData: []byte("{}"), openData: valid, wantOK: true},
+		{name: "valid only at the lexical path", lexData: valid, openData: []byte("{}")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := os.WriteFile(lexical, tc.lexData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(opened, tc.openData, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := LoadRotationEndorsementFile(input)
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("want ok=%t, got %v", tc.wantOK, err)
+			}
+		})
 	}
 }

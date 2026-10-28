@@ -23,13 +23,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	readability "github.com/go-shiori/go-readability"
+	"golang.org/x/net/html"
+
 	"github.com/luckyPipewrench/pipelock/internal/audit"
 	"github.com/luckyPipewrench/pipelock/internal/authority"
 	"github.com/luckyPipewrench/pipelock/internal/blockreason"
@@ -40,6 +42,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/contract/proxydecision"
 	contractruntime "github.com/luckyPipewrench/pipelock/internal/contract/runtime"
 	"github.com/luckyPipewrench/pipelock/internal/decide"
+	"github.com/luckyPipewrench/pipelock/internal/dialfallback"
 	"github.com/luckyPipewrench/pipelock/internal/edition"
 	"github.com/luckyPipewrench/pipelock/internal/envelope"
 	"github.com/luckyPipewrench/pipelock/internal/health"
@@ -47,12 +50,16 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/identitykey"
 	"github.com/luckyPipewrench/pipelock/internal/killswitch"
 	"github.com/luckyPipewrench/pipelock/internal/mcp"
+	"github.com/luckyPipewrench/pipelock/internal/media"
 	"github.com/luckyPipewrench/pipelock/internal/metrics"
 	"github.com/luckyPipewrench/pipelock/internal/posturebinding"
+	"github.com/luckyPipewrench/pipelock/internal/proxyhealth"
 	"github.com/luckyPipewrench/pipelock/internal/receipt"
+	"github.com/luckyPipewrench/pipelock/internal/receiptcontent"
 	"github.com/luckyPipewrench/pipelock/internal/recorder"
 	"github.com/luckyPipewrench/pipelock/internal/redact"
 	"github.com/luckyPipewrench/pipelock/internal/reqpolicy"
+	"github.com/luckyPipewrench/pipelock/internal/responseencoding"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 	"github.com/luckyPipewrench/pipelock/internal/session"
 	"github.com/luckyPipewrench/pipelock/internal/shield"
@@ -72,6 +79,7 @@ const (
 	ctxKeyAgentConfig  // per-agent resolved config for redirect scanning
 	ctxKeyAgentScanner // per-agent resolved scanner for redirect scanning
 	ctxKeyAgentContractLoader
+	ctxKeyCorrelation // vetted emit.correlation_header tag (audit.CorrelationID)
 
 	// ctxKeyReverseEnvelopeOpts stores the envelope.BuildOpts that the
 	// reverse proxy pre-computes in ServeHTTP so the signing
@@ -141,6 +149,9 @@ const (
 	// its exact admitted HTTPS destination. CheckRedirect refuses a replay to
 	// any other route because 307/308 preserve the already-scanned body.
 	ctxKeyEntropyWarnRoute
+	// ctxKeyReceiptShard carries one admission-time choice through reverse
+	// response and error callbacks, which run outside the request handler.
+	ctxKeyReceiptShard
 
 	// ctxKeySSRFDialScanSnapshot carries the DNS answers from an allowed
 	// scanner SSRF pass into the later dial-time re-resolution. The safe
@@ -175,7 +186,7 @@ var (
 	shieldReceiptOpaquePathTokenRe  = regexp.MustCompile(`(?i)^[A-F0-9]{32,}$|^[A-Za-z0-9_-]{40,}$`)
 )
 
-// requestCounter provides monotonic request IDs.
+// requestCounter numbers request IDs when a proven ID cannot be minted.
 var requestCounter atomic.Uint64
 
 const (
@@ -195,6 +206,15 @@ type blockedRequestError struct {
 	detail string
 	target string
 	taint  *taintDecision
+	// receiptPattern retains the decisive pattern when reason includes diagnostics.
+	receiptPattern string
+}
+
+func (e *blockedRequestError) decisivePattern() string {
+	if e.receiptPattern != "" {
+		return e.receiptPattern
+	}
+	return e.reason
 }
 
 func (e *blockedRequestError) Error() string {
@@ -266,7 +286,7 @@ func newReceiptEmissionBlockedRequest(err error) *blockedRequestError {
 	return newBlockedRequestError(
 		blockLayerReceiptEmission,
 		receiptEmissionBlockReason,
-		receiptEmissionBlockReason+": "+err.Error(),
+		receiptEmissionBlockReason+": failure="+receiptFailureClass(err),
 	)
 }
 
@@ -309,40 +329,178 @@ func redirectReceiptTarget(blockedErr *blockedRequestError, fallback string) str
 	return fallback
 }
 
-// Regex patterns for extracting content from HTML hiding spots that
-// readability strips (comments, script bodies, style bodies). We scan
-// only these extracted fragments for injection, not the full HTML markup,
-// to avoid false positives on legitimate HTML tags and attributes.
-var (
-	reHTMLComment   = regexp.MustCompile(`(?s)<!--(.*?)-->`)
-	reScriptBody    = regexp.MustCompile(`(?si)<script[^>]*>(.*?)</script>`)
-	reStyleBody     = regexp.MustCompile(`(?si)<style[^>]*>(.*?)</style>`)
-	reHiddenElement = regexp.MustCompile(`(?si)<[a-z][a-z0-9]*\b` +
-		`(?:[^>]*?(?:display\s*:\s*none|visibility\s*:\s*hidden)|[^>]*?\shidden)` +
-		`[^>]*>(.*?)</`)
-)
+// The hidden-content surface: text an HTML page can keep away from a human
+// reader while still aiming it at a model. Comments, style and noscript
+// bodies, non-executable data script bodies, and elements the page renders
+// invisible all qualify. Only those fragments reach the injection scanner,
+// never the whole markup, so ordinary tags and attributes do not trip it.
+//
+// Executable JavaScript bodies are deliberately off this surface.
+// Fetch hands the agent readability text, so a minified JS bundle reaches
+// neither the rendered page nor the agent, and scanning it blocked clean
+// responses (~858KB of HTML behind ~6.6KB of rendered text). Injection living
+// only in executable JS is still covered when readability yields nothing: the
+// follow-up scan then runs against the raw HTML body.
+//
+// The surface is computed from a real parse tree, never from regexes or
+// hand-rolled tag scanning over the source. That is a security property
+// rather than a tidiness one. This code decides what NOT to scan, so every
+// construct it models differently from a browser is a fail-open, and in
+// hand-rolled scanning that set has no bound: script-data escape states,
+// foreign-content namespaces, HTML integration points, self-closing rules and
+// attribute quoting each hid a payload during review of this change.
+// html.Parse resolves all of them the way a browser does. It also retires the
+// decoy class by construction, because markup written inside a JavaScript
+// string is a text node in the tree and can never re-enter the surface as a
+// comment, a style body or a hidden element.
 
-// extractHiddenContent pulls text from HTML elements that readability
-// strips: comments, script bodies, and style bodies. Returns the
-// concatenated text from these hiding spots (empty if none found).
-func extractHiddenContent(html string) string {
+// isExecutableJavaScriptMIME reports whether a <script type="..."> value is
+// executable JavaScript. Empty/default and the exact HTML special "module"
+// (ASCII case-insensitive, before any MIME parameters) are executable.
+// Parameterized values such as "module;charset=utf-8" are data blocks per
+// WHATWG HTML. MIME aliases join media.IsJavaScriptMediaType (RFC 9239 §6)
+// so historical aliases are not under-covered. Unknown types are treated as
+// data carriers, which fails closed because their bodies stay scanned.
+func isExecutableJavaScriptMIME(typeAttr string) bool {
+	t := strings.ToLower(strings.TrimSpace(typeAttr))
+	if t == "" {
+		return true
+	}
+	// Exact "module" token only — check before stripping ;params.
+	if t == "module" {
+		return true
+	}
+	if i := strings.IndexByte(t, ';'); i >= 0 {
+		t = strings.TrimSpace(t[:i])
+	}
+	return media.IsJavaScriptMediaType(t)
+}
+
+// nodeAttr returns the value of the first attribute named key (the one the
+// parser resolved as authoritative) and whether it was present at all.
+// Presence matters on its own for boolean attributes such as hidden.
+func nodeAttr(n *html.Node, key string) (string, bool) {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val, true
+		}
+	}
+	return "", false
+}
+
+// isExecutableScriptNode reports whether n is a <script> element whose body
+// the browser executes rather than exposes as data. Namespace is irrelevant:
+// an SVG script executes by the same rule an HTML one does.
+func isExecutableScriptNode(n *html.Node) bool {
+	if n.Data != "script" {
+		return false
+	}
+	typ, _ := nodeAttr(n, "type")
+	return isExecutableJavaScriptMIME(typ)
+}
+
+// elementConcealsText reports whether n keeps its text out of the rendered
+// page: a raw-text carrier readability strips (style, noscript, and the data
+// scripts that reach here), or an element the page hides.
+//
+// Hiding is read from parsed attributes, so only the boolean hidden attribute
+// counts and a value cannot change that (HTML defines hidden="false" as
+// hidden). An unrelated attribute that merely ends in the word, such as
+// aria-hidden, is not a match, matching the behavior this replaced.
+func elementConcealsText(n *html.Node) bool {
+	switch n.Data {
+	case "script", "style", "noscript":
+		return true
+	}
+	if _, ok := nodeAttr(n, "hidden"); ok {
+		return true
+	}
+	style, ok := nodeAttr(n, "style")
+	if !ok {
+		return false
+	}
+	// Collapse whitespace so "display : none" reads the same as "display:none".
+	var sb strings.Builder
+	for i := 0; i < len(style); i++ {
+		if c := style[i]; !isASCIISpace(c) {
+			sb.WriteByte(c)
+		}
+	}
+	flat := strings.ToLower(sb.String())
+	return strings.Contains(flat, "display:none") ||
+		strings.Contains(flat, "visibility:hidden")
+}
+
+// isASCIISpace reports whether b is ASCII whitespace.
+func isASCIISpace(b byte) bool {
+	switch b {
+	case ' ', '\t', '\n', '\v', '\f', '\r':
+		return true
+	default:
+		return false
+	}
+}
+
+// collectHiddenContent walks the parse tree appending every fragment on the
+// hidden surface. concealed carries down from an ancestor that hides its
+// subtree, so text nested inside a display:none container is collected too.
+//
+// Comments are always collected wherever they sit. A comment inside an
+// executable script is impossible by construction: the tokenizer makes that
+// region raw text, so the walk never reaches it as a comment node.
+func collectHiddenContent(b *strings.Builder, n *html.Node, concealed bool) {
+	switch n.Type {
+	case html.CommentNode:
+		writeHiddenFragment(b, n.Data)
+		return
+	case html.TextNode:
+		if concealed {
+			writeHiddenFragment(b, n.Data)
+		}
+		return
+	case html.ElementNode:
+		if isExecutableScriptNode(n) {
+			// The executed body itself leaves the surface, so stop concealing
+			// and let the text children fall through unwritten. Children are
+			// still walked: in SVG and MathML a script body is parsed as
+			// markup, so a nested <script type="application/json"> is a real
+			// element whose data the browser never executes. Returning here
+			// instead would drop that data block from the scan.
+			concealed = false
+		} else if !concealed && elementConcealsText(n) {
+			concealed = true
+		}
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		collectHiddenContent(b, c, concealed)
+	}
+}
+
+// writeHiddenFragment appends one fragment and the newline that keeps
+// adjacent fragments from fusing into a match that exists in neither.
+func writeHiddenFragment(b *strings.Builder, s string) {
+	if s == "" {
+		return
+	}
+	b.WriteString(s)
+	b.WriteByte('\n')
+}
+
+// extractHiddenContent returns the concatenated hidden surface of an HTML
+// document for injection scanning.
+//
+// The error branch fails closed by handing the scanner the whole document. It
+// is unreachable as called: html.Parse reports only reader errors and a
+// strings.Reader has none, and the HTML parsing algorithm is defined to
+// recover from any byte sequence rather than reject one. It stays because the
+// failure direction has to be right if this ever reads from a network body.
+func extractHiddenContent(doc string) string {
+	root, err := html.Parse(strings.NewReader(doc))
+	if err != nil {
+		return doc
+	}
 	var b strings.Builder
-	for _, m := range reHTMLComment.FindAllStringSubmatch(html, -1) {
-		b.WriteString(m[1])
-		b.WriteByte('\n')
-	}
-	for _, m := range reScriptBody.FindAllStringSubmatch(html, -1) {
-		b.WriteString(m[1])
-		b.WriteByte('\n')
-	}
-	for _, m := range reStyleBody.FindAllStringSubmatch(html, -1) {
-		b.WriteString(m[1])
-		b.WriteByte('\n')
-	}
-	for _, m := range reHiddenElement.FindAllStringSubmatch(html, -1) {
-		b.WriteString(m[1])
-		b.WriteByte('\n')
-	}
+	collectHiddenContent(&b, root, false)
 	return b.String()
 }
 
@@ -353,7 +511,12 @@ func requestMeta(r *http.Request) (clientIP, requestID string) {
 	if host, _, err := net.SplitHostPort(clientIP); err == nil {
 		clientIP = host
 	}
-	requestID = fmt.Sprintf("req-%d", requestCounter.Add(1))
+	// A minted ID carries this process's origin proof, so receipt content
+	// scanning knows it is Pipelock's own and skips it. If minting fails the
+	// counter ID is used, which receipts scan as ordinary content.
+	if requestID = receiptcontent.NewRequestID(); requestID == "" {
+		requestID = fmt.Sprintf("%s%d", receiptcontent.RequestIDPrefix, requestCounter.Add(1))
+	}
 	return
 }
 
@@ -390,13 +553,13 @@ func newHTTPAuditContext(reqCtx context.Context, logger *audit.Logger, ev httpAu
 		// Build the fallback once and grade it before logging. Logging an
 		// ungraded fallback and returning a graded one would make the error
 		// event itself the only record claiming unknown provenance.
-		fallback := audit.NewMethodLogContext(ev.Method).WithActorAuth(grade)
+		fallback := audit.NewMethodLogContext(ev.Method).WithActorAuth(grade).WithCorrelation(correlationFromContext(reqCtx))
 		if logger != nil {
 			logger.LogError(fallback, err)
 		}
 		return fallback
 	}
-	return ctx.WithActorAuth(grade)
+	return ctx.WithActorAuth(grade).WithCorrelation(correlationFromContext(reqCtx))
 }
 
 // agentAuthFromContext returns the provenance grade recorded alongside the
@@ -418,13 +581,13 @@ func newConnectAuditContext(reqCtx context.Context, logger *audit.Logger, target
 	grade := agentAuthFromContext(reqCtx)
 	ctx, err := audit.NewConnectLogContext(target, clientIP, requestID, agent)
 	if err != nil {
-		fallback := audit.NewMethodLogContext(http.MethodConnect).WithActorAuth(grade)
+		fallback := audit.NewMethodLogContext(http.MethodConnect).WithActorAuth(grade).WithCorrelation(correlationFromContext(reqCtx))
 		if logger != nil {
 			logger.LogError(fallback, err)
 		}
 		return fallback
 	}
-	return ctx.WithActorAuth(grade)
+	return ctx.WithActorAuth(grade).WithCorrelation(correlationFromContext(reqCtx))
 }
 
 const defaultVersion = "0.0.0-dev.unknown"
@@ -454,6 +617,7 @@ type editionSnapshot struct{ edition.Edition }
 // Proxy is the Pipelock fetch proxy server.
 type Proxy struct {
 	cfgPtr               atomic.Pointer[config.Config]
+	issuerCookieRuntime  atomic.Pointer[issuerCookieRuntime]
 	scannerPtr           atomic.Pointer[scanner.Scanner]
 	editionPtr           atomic.Pointer[editionSnapshot]
 	sessionMgrPtr        atomic.Pointer[SessionManager]         // nil when profiling disabled
@@ -464,6 +628,7 @@ type Proxy struct {
 	redactMatcherPtr     atomic.Pointer[redact.Matcher]         // nil when redaction disabled
 	reqPolicyPtr         atomic.Pointer[reqpolicy.Matcher]      // nil when request_policy disabled
 	contractLoaderPtr    atomic.Pointer[contractruntime.Loader] // nil when learn_lock is disabled
+	contractWatch        contractWatchState                     // active-manifest watcher for the published loader
 	authorityVerifier    authority.Verifier                     // nil preserves pre-authority forwarding behavior
 	logger               *audit.Logger
 	metrics              *metrics.Metrics
@@ -486,11 +651,17 @@ type Proxy struct {
 	captureObs           capture.CaptureObserver
 	sizeExemptScanBudget sizeExemptScanBudget
 	recorder             *recorder.Recorder                    // flight recorder for tamper-evident evidence (nil = disabled)
+	session              string                                // recorder session this process records under; "proxy" when unset (see WithSession)
+	recoveredSession     atomic.Pointer[string]                // fresh run session adopted after torn-tail recovery; overrides session
 	receiptEmitterPtr    atomic.Pointer[receipt.Emitter]       // v1 action receipt emitter (nil = disabled)
 	v2EmitterPtr         atomic.Pointer[proxydecision.Emitter] // v2 proxy_decision emitter, dual-emitted with v1 (nil = disabled)
+	receiptGroupPtr      atomic.Pointer[receiptGroupRuntime]   // paired per-shard emitters; nil uses the legacy single chain
 	receiptKeyPath       string                                // active signing key path, for reload comparison
+	receiptKeysMu        sync.Mutex                            // guards receiptKeysHeld
+	receiptKeysHeld      []string                              // hex public keys this process has loaded to sign receipts
 	envelopeEmitterPtr   atomic.Pointer[envelope.Emitter]      // mediation envelope emitter (nil = disabled)
 	envelopeVerifierPtr  atomic.Pointer[envelope.Verifier]     // inbound mediation envelope verifier (nil = disabled)
+	envelopeReplayState  *envelope.Verifier                    // last enabled verifier; guarded by reloadSerialMu
 	shieldEngine         *shield.Engine                        // browser shield HTML/JS rewriter (nil = not initialized)
 	frozenTools          *FrozenToolRegistry                   // frozen tool inventories for airlock hard tier
 	wd                   *health.Watchdog                      // wedge-detection watchdog (nil = disabled)
@@ -542,11 +713,59 @@ func WithRecorder(rec *recorder.Recorder) Option {
 	return func(p *Proxy) { p.recorder = rec }
 }
 
+// WithSession sets the recorder session this process records its own
+// decision entries under. Callers set this to the SAME run session ID
+// returned by recorder.AcquireRunSession for the recorder passed to
+// WithRecorder, so this proxy's own decision entries land in the same
+// chain as the receipt and proxy_decision emitters built from that
+// recorder. Leaving it unset keeps the historical literal "proxy".
+// recordingSession is the session this proxy records under: a run adopted by
+// torn-tail recovery, else the configured session, else the default base.
+func (p *Proxy) recordingSession() string {
+	if s := p.recoveredSession.Load(); s != nil && *s != "" {
+		return *s
+	}
+	if p.session != "" {
+		return p.session
+	}
+	return recorder.DefaultSessionBase
+}
+
+func WithSession(session string) Option {
+	return func(p *Proxy) { p.session = session }
+}
+
 // WithReceiptEmitter sets the action receipt emitter. When non-nil, the proxy
 // emits signed action receipts for every enforcement decision to the flight
 // recorder. Pass nil to disable (default).
 func WithReceiptEmitter(e *receipt.Emitter) Option {
-	return func(p *Proxy) { p.receiptEmitterPtr.Store(e) }
+	return func(p *Proxy) {
+		p.receiptEmitterPtr.Store(e)
+		p.noteReceiptSignerKey(e.SignerKeyHex())
+	}
+}
+
+// noteReceiptSignerKey records a key this process loaded to sign receipts.
+// A reload may resume a session tail signed by any recorded key: each one is
+// a key this process held, whereas a key found only in the evidence
+// directory proves nothing about who wrote it.
+func (p *Proxy) noteReceiptSignerKey(key string) {
+	if key == "" {
+		return
+	}
+	p.receiptKeysMu.Lock()
+	defer p.receiptKeysMu.Unlock()
+	if !slices.Contains(p.receiptKeysHeld, key) {
+		p.receiptKeysHeld = append(p.receiptKeysHeld, key)
+	}
+}
+
+// receiptSignerKeysHeld returns a copy of the keys recorded by
+// noteReceiptSignerKey.
+func (p *Proxy) receiptSignerKeysHeld() []string {
+	p.receiptKeysMu.Lock()
+	defer p.receiptKeysMu.Unlock()
+	return slices.Clone(p.receiptKeysHeld)
 }
 
 // WithV2ReceiptEmitter sets the v2 proxy_decision emitter. When non-nil, the
@@ -655,6 +874,16 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 		p.captureObs = capture.NopObserver{}
 	}
 	p.cfgPtr.Store(cfg)
+	issuerStore := newIssuerBoundCookieStore()
+	if issuerCookieEnabled(cfg) {
+		issuerStore = newPersistentIssuerCookieStore(logger)
+	} else if path, pathErr := issuerCookieStatePath(); pathErr == nil {
+		// Do not leave evidence available to a later enabled startup.
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) && logger != nil {
+			logger.LogError(audit.NewMethodLogContext("ISSUER_COOKIE"), fmt.Errorf("issuer cookie state reset failed: %w", removeErr))
+		}
+	}
+	p.issuerCookieRuntime.Store(&issuerCookieRuntime{cfg: cfg, store: issuerStore, query: p.newObservedIssuerQueryStore()})
 	p.scannerPtr.Store(sc)
 	p.refreshMetricsDialTarget(cfg.MetricsListen)
 
@@ -711,6 +940,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 		return nil, fmt.Errorf("inbound envelope verifier init: %w", err)
 	}
 	p.envelopeVerifierPtr.Store(verifier)
+	p.envelopeReplayState = verifier
 
 	// Build edition (agent registry in enterprise, noop in OSS).
 	ed, edErr := edition.NewEditionFunc(cfg, sc)
@@ -779,6 +1009,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				_, id := p.resolveAgentFromRequest(r)
 				return id
 			},
+			Config: p.cfgPtr.Load,
 		})
 	}
 
@@ -822,7 +1053,7 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 			clientIP, _ := req.Context().Value(ctxKeyClientIP).(string)
 			requestID, _ := req.Context().Value(ctxKeyRequestID).(string)
 			agentName, _ := req.Context().Value(ctxKeyAgent).(string)
-			logger.LogRedirect(originalURL, redirectURL, clientIP, requestID, agentName, len(via))
+			logger.WithCorrelation(correlationFromContext(req.Context())).LogRedirect(originalURL, redirectURL, clientIP, requestID, agentName, len(via))
 			// Scan redirect URL with the per-agent scanner when available.
 			// Handlers attach the resolved agent config/scanner to the
 			// request context so redirect enforcement matches the agent
@@ -870,13 +1101,27 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				redirectWarnCtx.Transport = TransportFetch
 			}
 			redirectScanCtx := scanner.WithDLPWarnContext(req.Context(), redirectWarnCtx)
-			result := currentScanner.Scan(redirectScanCtx, redirectURL)
+			redirectScanCtx = scanner.WithOAuthAuthorizationMethod(redirectScanCtx, req.Method)
+			// Forward redirects are returned to the client, so this admission
+			// must not spend a slot for an unissued request. The client's next
+			// request calls Scan and atomically consumes its own slot. Fetch
+			// redirects dispatch here and keep consuming in this callback.
+			var result scanner.Result
+			if redirectTransport == TransportForward {
+				result = currentScanner.ScanPreflight(redirectScanCtx, redirectURL)
+			} else {
+				result = currentScanner.Scan(redirectScanCtx, redirectURL)
+			}
 			redirectAuditCtx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
-			p.recordCredentialAudienceAllows(redirectAuditCtx, result.CredentialAudienceAllows, redirectTransport, req.Method, redirectURL, requestID, agentName)
+			if err := p.recordCredentialAudienceAllows(currentCfg, redirectAuditCtx, result.CredentialAudienceAllows, redirectTransport, req.Method, redirectURL, requestID, agentName, receiptShardFromContext(req.Context())); err != nil {
+				blockedErr := newCredentialAudienceReceiptBlockedRequest(err)
+				logger.LogBlocked(redirectAuditCtx, blockedErr.layer, blockedErr.detail)
+				return blockedErr
+			}
 			*req = *req.WithContext(withAllowedSSRFDialScanSnapshot(redirectScanCtx, currentScanner, req.URL.Hostname(), effectiveURLPort(req.URL), result))
 			if !result.Allowed {
 				actx := redirectAuditCtx
-				if currentCfg.EnforceEnabled() {
+				if urlResultBlocks(currentCfg, currentScanner, redirectURL, result) {
 					// Preserve the originating scanner label (SSRF,
 					// DLP, blocklist, …) in the typed block error so
 					// receipts, metrics, and /fetch hints can tell
@@ -889,6 +1134,20 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				logger.LogAnomaly(actx, result.Scanner, fmt.Sprintf("redirect from %s: %s", originalURL, result.Reason), result.Score)
 			}
 			scannerMatched := !result.Allowed
+			// net/http copies custom headers to redirected requests. Recheck
+			// destination-bound credentials against this hop before dispatch.
+			if currentCfg.RequestBodyScanning.Enabled && currentCfg.RequestBodyScanning.ScanHeaders {
+				if headerResult := scanRequestHeadersForTarget(req.Context(), req.Header, currentCfg, currentScanner, redirectURL); headerResult != nil {
+					action, hardBlock := headerDLPDecision(headerResult, currentCfg)
+					if hardBlock || (action == config.ActionBlock && currentCfg.EnforceEnabled()) {
+						redirectReason := headerResult.withAudienceExplanation("redirect headers are not allowed at destination")
+						logger.LogBlocked(redirectAuditCtx, "header_dlp", redirectReason)
+						blockedErr := newRedirectBlockedRequest("header_dlp", redirectReason)
+						blockedErr.receiptPattern = "redirect blocked: redirect headers are not allowed at destination"
+						return blockedErr
+					}
+				}
+			}
 
 			// A 307/308 redirect preserves the original method and body. A
 			// git-receive-pack POST therefore remains a push on the redirected
@@ -932,14 +1191,14 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				redirectAirlockSess = sm.SessionByKey(redirectAirlockKey)
 			}
 			if redirectAirlockSess == nil {
-				redirectAirlockSess = p.airlockSessionForIdentity(agentName, clientIP, envelope.ActorAuth(agentAuthFromContext(req.Context())))
+				redirectAirlockSess = p.airlockSessionForIdentity(currentCfg, agentName, clientIP, envelope.ActorAuth(agentAuthFromContext(req.Context())))
 			}
 			if redirectSess := redirectAirlockSess; redirectSess != nil {
 				tier := airlockTierForScope(redirectSess, adaptiveScopeForHost(req.URL.Hostname()))
 				if allowed, reason := ClassifyAction(tier, req.Method, redirectTransport, false); !allowed {
 					logger.LogAirlockDeny(redirectSess.key, tier, redirectTransport, req.Method, clientIP, requestID)
 					p.metrics.RecordAirlockDenial(tier, redirectTransport, req.Method)
-					return newRedirectBlockedRequest("airlock", reason)
+					return newRedirectBlockedRequest("airlock", reason+"; "+airlockBlockDetail(adaptiveAudit{logger, clientIP, requestID}, redirectSess, currentCfg, adaptiveScopeForHost(req.URL.Hostname()), tier))
 				}
 			}
 
@@ -959,7 +1218,8 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				Agent:       agentName,
 				AuditCtx:    newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName}),
 				Emit: func(opts receipt.EmitOpts) error {
-					return p.emitRequestPolicyReceipt(withReceiptPolicyHash(opts, currentCfg.CanonicalPolicyHash()))
+					// The outer handler also records the final block on this shard.
+					return p.emitRequestPolicyReceipt(withReceiptConfig(withReceiptShard(opts, receiptShardFromContext(req.Context())), currentCfg))
 				},
 			}); rpRes.Block {
 				return newRedirectBlockedRequest(blockLayerRequestPolicy, rpRes.Reason)
@@ -992,6 +1252,24 @@ func New(cfg *config.Config, logger *audit.Logger, sc *scanner.Scanner, m *metri
 				actx := newHTTPAuditContext(req.Context(), logger, httpAuditEvent{Method: req.Method, TargetURL: redirectURL, ClientIP: clientIP, RequestID: requestID, Agent: agentName})
 				logger.LogBlocked(actx, blockLayerContract, "redirect from "+originalURL+" blocked: "+reason)
 				return newRedirectBlockedRequest(blockLayerContract, reason)
+			}
+			// A forward proxy must deliver this origin's redirect to its
+			// client so Location and Set-Cookie retain their browser origin
+			// and navigation semantics. Admission above refuses unsafe targets
+			// when net/http constructs a redirect request; non-replayable
+			// 307/308 responses skip this callback. The original 3xx body/headers
+			// still pass through the normal response scanner.
+			// Any client-followed request is admitted and signed separately;
+			// do not sign an unissued hop or share cookie state in p.client.
+			// Fetch mode alone follows internally and refreshes its envelope.
+			if redirectTransport == TransportForward {
+				// net/http has already opened GetBody for a 307/308. Its
+				// ErrUseLastResponse path leaves that unissued body open.
+				// Close it here, not req.Response.Body, which is scanned next.
+				if req.Body != nil {
+					safeClose(req.Body, "unissued redirect body", p.logger)
+				}
+				return http.ErrUseLastResponse
 			}
 			// Mediation envelope refresh: on every allowed redirect,
 			// rebuild the envelope on req so ph, hop, and @target-uri
@@ -1274,8 +1552,18 @@ func (p *Proxy) recordDecision(verdict, layer, pattern, transport, requestID str
 		summary += " (" + pattern + ")"
 	}
 
-	_ = p.recorder.Record(recorder.Entry{
-		SessionID: "proxy",
+	session := p.recordingSession()
+
+	// The comment above this method already promised these errors are
+	// "logged but never block the proxy hot path". They were discarded
+	// instead (`_ =`), which meant a recorder write failure here - most
+	// notably a session_id mismatch when this entry's session and the
+	// recorder's acquired session disagree - was invisible. Actually log
+	// it, at audit-error severity like every other post-decision recorder
+	// failure in this file, rather than silently dropping tamper-evident
+	// coverage of a real enforcement verdict.
+	if err := p.recorder.Record(recorder.Entry{
+		SessionID: session,
 		Type:      "decision",
 		Transport: transport,
 		Summary:   summary,
@@ -1285,7 +1573,10 @@ func (p *Proxy) recordDecision(verdict, layer, pattern, transport, requestID str
 			"pattern":    pattern,
 			"request_id": requestID,
 		},
-	})
+	}); err != nil && p.logger != nil {
+		p.logger.LogError(audit.NewRequestLogContext(requestID),
+			fmt.Errorf("recording decision entry (verdict=%s layer=%s transport=%s): %w", verdict, layer, transport, err))
+	}
 }
 
 // emitReceipt creates and records a signed action receipt for a proxy decision.
@@ -1304,7 +1595,7 @@ func (p *Proxy) recordDecision(verdict, layer, pattern, transport, requestID str
 // this and fail toward silence.
 func (p *Proxy) emitRecordedReceipt(opts receipt.EmitOpts) bool {
 	if cfg := p.cfgPtr.Load(); cfg != nil {
-		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		opts = withReceiptConfig(opts, cfg)
 	}
 	e := p.receiptEmitterPtr.Load()
 	return e != nil && p.emitReceiptWithEmitter(opts, e) == nil
@@ -1312,7 +1603,7 @@ func (p *Proxy) emitRecordedReceipt(opts receipt.EmitOpts) bool {
 
 func (p *Proxy) emitReceipt(opts receipt.EmitOpts) error {
 	if cfg := p.cfgPtr.Load(); cfg != nil {
-		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		opts = withReceiptConfig(opts, cfg)
 	}
 	return p.emitReceiptWithEmitter(opts, p.receiptEmitterPtr.Load())
 }
@@ -1361,12 +1652,17 @@ func requiredReceiptBlockMetricReason(err error) string {
 	if errors.Is(err, recorder.ErrDurability) {
 		return "durability"
 	}
+	// Kept apart from "durability" so the durability blocks counted against
+	// gated fsync failures stay one per storage failure.
+	if errors.Is(err, recorder.ErrDurabilityInherited) {
+		return receipt.FailReasonDurabilityInherited
+	}
 	return "emit_error"
 }
 
 func (p *Proxy) emitRequiredReceipt(opts receipt.EmitOpts) error {
 	if cfg := p.cfgPtr.Load(); cfg != nil {
-		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		opts = withReceiptConfig(opts, cfg)
 	}
 	e := p.receiptEmitterPtr.Load()
 	if e == nil {
@@ -1386,18 +1682,29 @@ func (p *Proxy) emitRequiredReceiptWithEmitter(opts receipt.EmitOpts, e *receipt
 		return nil
 	}
 	opts.DecisionPhase = receipt.DecisionPhaseIntent
-	if err := e.EmitDurable(opts); err != nil {
+	var err error
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		err = group.shards.EmitDurable(opts)
+	} else {
+		err = e.EmitDurable(opts)
+	}
+	if err != nil {
 		p.logReceiptChannelBroken(opts, err)
+		if group := p.receiptGroupPtr.Load(); group != nil {
+			selected, selectErr := group.shards.SelectedEmitter(opts)
+			if errors.Is(err, receipt.ErrReceiptPostAdvance) || selectErr == nil && selected.HealthError() != nil {
+				group.failRequired(err)
+			}
+		}
 		// v1 stays authoritative: skip v2 when v1 failed to record, so a
 		// proxy_decision never outlives its action_receipt sibling.
 		return err
 	}
 	// Dual-emit the v2 proxy_decision receipt (expand phase; v1 stays live).
 	if err := p.emitRequiredV2Receipt(opts); err != nil {
-		if markerErr := p.emitReceiptFailureMarker(e, opts, "proxydecision receipt emission failed", config.ActionBlock); markerErr != nil {
-			return errors.Join(err, markerErr)
-		}
-		return err
+		markerErr := p.emitReceiptFailureMarker(e, opts, "proxydecision receipt emission failed", config.ActionBlock)
+		failRequiredReceiptGroup(p.receiptGroupPtr.Load(), opts, errors.Join(err, markerErr))
+		return errors.Join(err, markerErr)
 	}
 	return nil
 }
@@ -1429,17 +1736,30 @@ func (p *Proxy) emitOutcomeReceipt(cfg *config.Config, opts receipt.EmitOpts, st
 	opts.Verdict = config.ActionAllow
 	opts.Layer = receiptOutcomeLayer
 	opts.Pattern = receiptOutcomePattern(status, bytesTransferred, reason)
-	opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+	opts = withReceiptConfig(opts, cfg)
 	e := p.receiptEmitterPtr.Load()
 	if e == nil {
 		return
 	}
-	if err := e.Emit(opts); err != nil {
+	var err error
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		err = group.shards.Emit(opts)
+	} else {
+		err = e.Emit(opts)
+	}
+	if err != nil {
 		p.logReceiptChannelBroken(opts, err)
+		if group := p.receiptGroupPtr.Load(); group != nil {
+			selected, selectErr := group.shards.SelectedEmitter(opts)
+			if errors.Is(err, receipt.ErrReceiptPostAdvance) || selectErr == nil && selected.HealthError() != nil {
+				group.failRequired(err)
+			}
+		}
 		return
 	}
 	if err := p.emitV2Receipt(opts); err != nil {
-		_ = p.emitReceiptFailureMarker(e, opts, "outcome receipt emission failed", config.ActionAllow)
+		markerErr := p.emitReceiptFailureMarker(e, opts, "outcome receipt emission failed", config.ActionAllow)
+		failRequiredReceiptGroup(p.receiptGroupPtr.Load(), opts, errors.Join(err, markerErr))
 	}
 }
 
@@ -1447,7 +1767,13 @@ func (p *Proxy) emitReceiptWithEmitter(opts receipt.EmitOpts, e *receipt.Emitter
 	if e == nil {
 		return nil
 	}
-	if err := e.Emit(opts); err != nil {
+	var err error
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		err = group.shards.Emit(opts)
+	} else {
+		err = e.Emit(opts)
+	}
+	if err != nil {
 		p.logReceiptEmissionFailure(opts, err)
 		// v1 stays authoritative: skip v2 when v1 failed to record, so a
 		// proxy_decision never outlives its action_receipt sibling.
@@ -1490,6 +1816,14 @@ func emitReceiptFailureMarkerWithLogger(e *receipt.Emitter, opts receipt.EmitOpt
 }
 
 func (p *Proxy) emitReceiptFailureMarker(e *receipt.Emitter, opts receipt.EmitOpts, pattern, verdict string) error {
+	if group := p.receiptGroupPtr.Load(); group != nil {
+		marker := receiptEmissionFailureMarkerOpts(opts, pattern, verdict)
+		if err := group.shards.EmitDurable(marker); err != nil {
+			p.logReceiptEmissionFailure(marker, err)
+			return err
+		}
+		return nil
+	}
 	return emitReceiptFailureMarkerWithLogger(e, opts, pattern, verdict, p.logReceiptEmissionFailure)
 }
 
@@ -1534,16 +1868,82 @@ func (p *Proxy) logReceiptChannelBroken(opts receipt.EmitOpts, err error) {
 	logReceiptChannelBrokenTo(p.logger, opts, err)
 }
 
+// Receipt failure diagnostics name only bounded labels. The receipt options
+// and the emitter's error can carry request text (method, target, pattern) or
+// the content that caused the refusal, so neither is written to the log.
 func receiptEmissionError(opts receipt.EmitOpts, err error) error {
-	return fmt.Errorf("emit receipt action_id=%s verdict=%s layer=%s pattern=%q transport=%s method=%s: %w",
-		opts.ActionID, opts.Verdict, opts.Layer, opts.Pattern,
-		opts.Transport, opts.Method, err)
+	return fmt.Errorf("emit receipt verdict=%s phase=%s layer=%s failure=%s",
+		receiptVerdictLabel(opts.Verdict), receiptPhaseLabel(opts.DecisionPhase), receiptLayerLabel(opts.Layer), receiptFailureClass(err))
 }
 
 func receiptChannelBrokenError(opts receipt.EmitOpts, err error) error {
-	return fmt.Errorf("event=receipt_channel_broken audit_gap=true action_id=%s verdict=%s phase=%s layer=%s pattern=%q transport=%s method=%s: %w",
-		opts.ActionID, opts.Verdict, opts.DecisionPhase, opts.Layer,
-		opts.Pattern, opts.Transport, opts.Method, err)
+	return fmt.Errorf("event=receipt_channel_broken audit_gap=true verdict=%s phase=%s layer=%s failure=%s",
+		receiptVerdictLabel(opts.Verdict), receiptPhaseLabel(opts.DecisionPhase), receiptLayerLabel(opts.Layer), receiptFailureClass(err))
+}
+
+const receiptLabelOther = "other"
+
+// receiptFailureClass reduces a receipt emission failure to a fixed label.
+// An uncertain write outranks a pre-write refusal: a joined error that holds
+// both reports the write that may have reached the disk. A durability
+// failure is also post-advance, so it is checked first.
+func receiptFailureClass(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, recorder.ErrDurability):
+		return "durability"
+	case errors.Is(err, recorder.ErrDurabilityInherited):
+		// Checked before post-advance, which the deferred path also wraps:
+		// it matches the durability_inherited block metric reason.
+		return "durability_inherited"
+	case errors.Is(err, receipt.ErrReceiptPostAdvance):
+		return "post_advance"
+	case errors.Is(err, errReceiptEmitterUnavailable):
+		return "emitter_unavailable"
+	case errors.Is(err, recorder.ErrSerializedEntryTooLarge):
+		return "entry_too_large"
+	case errors.Is(err, receipt.ErrChainSealed):
+		return "chain_sealed"
+	case errors.Is(err, errV2ReceiptEmit):
+		return "v2_emit"
+	default:
+		return receiptLabelOther
+	}
+}
+
+func receiptVerdictLabel(verdict string) string {
+	switch verdict {
+	case config.ActionAllow, config.ActionBlock, config.ActionWarn, config.ActionAsk,
+		config.ActionStrip, config.ActionForward, config.ActionRedirect, config.ActionDefer:
+		return verdict
+	default:
+		return receiptLabelOther
+	}
+}
+
+// receiptLayerLabel names only the receipt layers this package owns; any
+// other layer text is reported as "other".
+func receiptLayerLabel(layer string) string {
+	switch layer {
+	case "":
+		return "none"
+	case receiptOutcomeLayer, receiptEmissionFailedLayer:
+		return layer
+	default:
+		return receiptLabelOther
+	}
+}
+
+func receiptPhaseLabel(phase string) string {
+	switch phase {
+	case "":
+		return "none"
+	case receipt.DecisionPhaseIntent, receipt.DecisionPhaseOutcome, receipt.DecisionPhaseDefer, receipt.DecisionPhaseResolution:
+		return phase
+	default:
+		return receiptLabelOther
+	}
 }
 
 // receiptEmitterStage is the staged result of a receipt-emitter reload.
@@ -1551,6 +1951,9 @@ func receiptChannelBrokenError(opts receipt.EmitOpts, err error) error {
 // either, so a failure in the second stage cannot leave the first already
 // stored under p.envelopeEmitterPtr while the config is still the old one.
 type receiptEmitterStage struct {
+	// tornRecovery means the old run remains damaged and must not be closed
+	// by appending a terminal record. The replacement owns a fresh run.
+	tornRecovery bool
 	// emitter is the new *receipt.Emitter to install. A nil value means
 	// "receipts are intentionally disabled for this cfg" - either no
 	// signing key path is set or the recorder is nil. The caller should
@@ -1608,14 +2011,65 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 	if err != nil {
 		return receiptEmitterStage{}, fmt.Errorf("loading receipt signing key %q: %w", keyPath, err)
 	}
+	activeSession := p.recordingSession()
+	keys := append(p.receiptSignerKeysHeld(), p.receiptEmitterPtr.Load().SignerKeyHex(), fmt.Sprintf("%x", privKey.Public().(ed25519.PublicKey)))
+	tornRecovery := p.receiptEmitterPtr.Load() != nil && p.receiptEmitterPtr.Load().SessionID() != activeSession
+	tailErr := receipt.CheckSessionTail(p.recorder, activeSession, keys)
+	if tailErr == nil && p.recorder.DurabilityFailed() {
+		// The current run's sync failed. Its bytes may read back intact while
+		// earlier pages were lost, so it is recovered like a torn run: kept
+		// as is, and a fresh run takes over.
+		tailErr = fmt.Errorf("%w: %w", recorder.ErrTornTail, recorder.ErrDurabilityInherited)
+	}
+	if tailErr != nil {
+		if !errors.Is(tailErr, recorder.ErrTornTail) {
+			p.receiptEmitterPtr.Load().MarkUnhealthy(tailErr)
+			return receiptEmitterStage{}, fmt.Errorf("resuming receipt chain: %w", tailErr)
+		}
+		var torn *recorder.TornTailError
+		if errors.As(tailErr, &torn) {
+			p.metrics.RecordEvidenceTornTail(torn.Path, torn.Offset)
+		}
+		base := activeSession
+		if runBase, ok := receipt.RunSessionBase(activeSession); ok {
+			base = runBase
+		}
+		// Mark the old emitter before moving the recorder. Any concurrent
+		// admission still holding it must fail rather than attest lost bytes.
+		p.receiptEmitterPtr.Load().MarkUnhealthy(tailErr)
+		activeSession, err = p.recorder.RecoverTornRunSession(base)
+		if err != nil {
+			return receiptEmitterStage{}, fmt.Errorf("fresh receipt run unavailable; inspect flight_recorder.dir storage (flight_recorder.require_receipts remains enforced): %w", err)
+		}
+		// The recorder now writes only the fresh run. Adopt it so decision
+		// entries follow it, while a configured session that merely disagrees
+		// with the recorder still surfaces as a logged mismatch.
+		recovered := activeSession
+		p.recoveredSession.Store(&recovered)
+		tornRecovery = true
+		p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+			fmt.Errorf("receipt evidence tail damaged; preserving shard and starting fresh run %s: %w", activeSession, tailErr))
+	}
 
 	// Carry the v2 chain head forward across reload so the v2 proxy_decision
 	// chain stays continuous within the process when the emitter is rebuilt
 	// (e.g. key rotation). Cross-restart the chain restarts at genesis; the
 	// recorder's outer hash chain provides tamper-evidence across restarts.
 	resumeSeq, resumePrev := p.v2EmitterPtr.Load().ChainState()
+	if tornRecovery {
+		resumeSeq, resumePrev = 0, recorder.GenesisHash
+	}
+	if healthErr := p.v2EmitterPtr.Load().HealthError(); healthErr != nil && !tornRecovery {
+		return receiptEmitterStage{}, fmt.Errorf("resume proxy_decision chain: %w", healthErr)
+	}
 	currentKeyHex := fmt.Sprintf("%x", privKey.Public().(ed25519.PublicKey))
-	if current := p.receiptEmitterPtr.Load(); current != nil && current.InitError() == nil && current.HealthError() == nil && current.SignerKeyHex() == currentKeyHex {
+	if current := p.receiptEmitterPtr.Load(); !tornRecovery && current != nil && current.InitError() == nil && current.HealthError() == nil && current.SignerKeyHex() == currentKeyHex {
+		// The reused emitter will stamp the new policy hash on every receipt.
+		// Validate it with the emitter's retained content before publication,
+		// so a refusal keeps the old generation instead of refusing receipts.
+		if err := current.ValidateConfigHash(cfg.Hash()); err != nil {
+			return receiptEmitterStage{}, err
+		}
 		v2 := p.v2EmitterPtr.Load()
 		if v2 == nil {
 			v2 = proxydecision.NewEmitter(proxydecision.EmitterConfig{
@@ -1626,6 +2080,7 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 				Actor:          "pipelock",
 				ResumeSeq:      resumeSeq,
 				ResumePrevHash: resumePrev,
+				Session:        activeSession,
 			})
 		}
 		return receiptEmitterStage{
@@ -1655,15 +2110,28 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 		PostureBinding:      postureResult.Binding,
 		PostureAvailability: string(postureResult.Availability),
 		HeartbeatSeconds:    cfg.FlightRecorder.HeartbeatIntervalSecondsForReceipt(),
+		Session:             activeSession,
+		// A tail under a different key is resumed only when this process
+		// itself loaded that key. The published emitter's key is not enough
+		// on its own: a reload whose session_open was written but not
+		// confirmed leaves its key on the tail while the old emitter stays.
+		PriorSignerKeys: append(p.receiptSignerKeysHeld(), p.receiptEmitterPtr.Load().SignerKeyHex()),
 	})
 	if emitter != nil {
-		if initErr := emitter.InitError(); initErr != nil {
+		if initErr := emitter.InitError(); errors.Is(initErr, receipt.ErrRetainedContent) {
+			return receiptEmitterStage{}, fmt.Errorf("flight_recorder: %w", initErr)
+		} else if initErr != nil {
 			return receiptEmitterStage{}, fmt.Errorf("resuming receipt chain: %w", initErr)
 		}
 	}
+	// Recorded only once the emitter initialized, so a key whose emitter was
+	// refused never becomes a prior key. It is recorded before publication,
+	// so a session_open written by a reload that then fails still counts.
+	p.noteReceiptSignerKey(emitter.SignerKeyHex())
 
 	return receiptEmitterStage{
-		emitter: emitter,
+		tornRecovery: tornRecovery,
+		emitter:      emitter,
 		v2: proxydecision.NewEmitter(proxydecision.EmitterConfig{
 			Recorder:       p.recorder,
 			Signer:         proxydecision.NewKeyedSigner(privKey),
@@ -1672,6 +2140,7 @@ func (p *Proxy) buildReceiptEmitter(cfg *config.Config) (receiptEmitterStage, er
 			Actor:          "pipelock",
 			ResumeSeq:      resumeSeq,
 			ResumePrevHash: resumePrev,
+			Session:        activeSession,
 		}),
 		keyPath: keyPath,
 	}, nil
@@ -1793,10 +2262,8 @@ func buildInboundEnvelopeVerifier(cfg *config.Config) (*envelope.Verifier, error
 		return nil, fmt.Errorf("parse inbound envelope replay window: %w", err)
 	}
 	skew := time.Duration(cfg.MediationEnvelope.CreatedSkewSeconds) * time.Second
-	// MaxSignatureLifetime caps signature lifetime to the replay
-	// window plus skew so a captured signature cannot outlive its
-	// nonce in the cache. The config validator already enforces the
-	// matching constraint on the signer side.
+	// Limit declared lifetime to bound replay-cache occupancy. Nonces remain
+	// retained through the actual signed expiry plus clock skew.
 	return envelope.NewVerifier(envelope.VerifierConfig{
 		TrustedKeys:          keys,
 		ReplayCache:          envelope.NewReplayCache(window, verify.ReplayCache.MaxEntries),
@@ -1969,6 +2436,10 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		return false
 	}
 	envelopeVerifier, envVerifyErr := buildInboundEnvelopeVerifier(cfg)
+	if envVerifyErr == nil {
+		envelopeVerifier.PreserveReplayState(p.envelopeReplayState)
+	}
+
 	if envVerifyErr != nil {
 		p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
 			fmt.Errorf("inbound envelope verifier reload failed, keeping old config: %w", envVerifyErr))
@@ -2043,6 +2514,8 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		airlockCfg = &cfg.Airlock
 	}
 	var stagedSessionMgr *SessionManager
+	var reconfigureBaseline *SessionManager
+	var applyBaseline func()
 	if oldCfg != nil {
 		wasSessionProfilingEnabled := oldCfg.SessionProfiling.Enabled
 		isSessionProfilingEnabled := cfg.SessionProfiling.Enabled
@@ -2064,17 +2537,18 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 				stagedSessionMgr.WarnUnproducibleBaselineProfiles(baselineConfiguredIdentityNames(cfg))
 			}
 		case wasSessionProfilingEnabled && isSessionProfilingEnabled:
-			if sm := p.sessionMgrPtr.Load(); sm != nil {
-				if err := sm.ReconfigureBaseline(&cfg.BehavioralBaseline); err != nil {
-					p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
-						fmt.Errorf("baseline reload failed, keeping old config: %w", err))
+			reconfigureBaseline = p.sessionMgrPtr.Load()
+			if reconfigureBaseline != nil {
+				var err error
+				applyBaseline, err = reconfigureBaseline.PrepareBaselineReconfigure(&cfg.BehavioralBaseline)
+				if err != nil {
+					p.logger.LogError(audit.NewMethodLogContext("RELOAD"), fmt.Errorf("baseline reload failed, keeping old config: %w", err))
 					sc.Close()
 					if newEd != nil {
 						newEd.Close()
 					}
 					return false
 				}
-				sm.WarnUnproducibleBaselineProfiles(baselineConfiguredIdentityNames(cfg))
 			}
 		}
 	}
@@ -2093,7 +2567,7 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	// replacement open is persisted only after this close succeeds, so aborting
 	// here cannot leave the current receipt chain behind a staged record.
 	currentReceiptEmitter := p.receiptEmitterPtr.Load()
-	if current := currentReceiptEmitter; current != nil && !receiptStage.reuseExisting && current != receiptStage.emitter {
+	if current := currentReceiptEmitter; current != nil && !receiptStage.tornRecovery && !receiptStage.reuseExisting && current != receiptStage.emitter {
 		if err := current.RetireNativeAEL(); err != nil {
 			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
 				fmt.Errorf("native AEL rotation close failed, keeping old config: %w", err))
@@ -2106,6 +2580,9 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	}
 	if cfg.FlightRecorder.SigningKeyPath != "" && p.recorder != nil && !receiptStage.reuseExisting && receiptStage.emitter != nil {
 		if err := receiptStage.emitter.EmitSessionOpen(); err != nil {
+			if receiptStage.tornRecovery {
+				err = fmt.Errorf("fresh receipt run could not open; inspect flight_recorder.dir storage and flight_recorder.signing_key_path (flight_recorder.require_receipts remains enforced): %w", err)
+			}
 			// The old AEL run is already terminal. If the replacement receipt was
 			// written before its paired AEL open failed, the old emitter's chain
 			// head is stale. Brick it explicitly so no later request can fork the
@@ -2122,6 +2599,35 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 			return false
 		}
 	}
+	// Requests emit v2 receipts without reloadMu, so the chain head staged
+	// above can be stale by now. Retire the live emitter as the last fallible
+	// step and resume its replacement from the head it actually reached; a
+	// request still holding the old pointer then fails instead of forking.
+	if receiptStage.tornRecovery {
+		// The old run cannot receive another receipt; its v2 state is not
+		// adopted by the fresh run. Stop stale pointers without appending.
+		_, _, _ = p.v2EmitterPtr.Load().Retire()
+	}
+	if oldV2 := p.v2EmitterPtr.Load(); cfg.FlightRecorder.SigningKeyPath != "" && p.recorder != nil &&
+		oldV2 != nil && receiptStage.v2 != nil && receiptStage.v2 != oldV2 && !receiptStage.tornRecovery {
+		seq, prev, err := oldV2.Retire()
+		if err != nil {
+			p.logger.LogError(audit.NewMethodLogContext("RELOAD"),
+				fmt.Errorf("proxy_decision chain hand-off failed, keeping old config: %w", err))
+			sc.Close()
+			if newEd != nil {
+				newEd.Close()
+			}
+			return false
+		}
+		receiptStage.v2.ResumeAt(seq, prev)
+	}
+	// Apply only after receipt emission and chain hand-off succeed. Preparation
+	// completed validation and I/O before either receipt was written.
+	if applyBaseline != nil {
+		applyBaseline()
+		reconfigureBaseline.WarnUnproducibleBaselineProfiles(baselineConfiguredIdentityNames(cfg))
+	}
 
 	// Publish both emitters now that staging has fully succeeded. The
 	// atomic.Pointer swaps are individually atomic; between them, a
@@ -2135,6 +2641,9 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.envelopeEmitterPtr.Store(nil)
 	}
 	p.envelopeVerifierPtr.Store(envelopeVerifier)
+	if envelopeVerifier != nil {
+		p.envelopeReplayState = envelopeVerifier
+	}
 	// Receipt publish: Store the staged emitter (may be nil) and
 	// mirror the receiptKeyPath field. When the recorder is missing
 	// we leave p.receiptKeyPath untouched so the startup-time invariant
@@ -2194,6 +2703,38 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 		p.cfgPtr.Store(cfg)
 		p.contractLoaderPtr.Store(contractLoader)
 	}
+	// Move the active-manifest watcher onto the loader just published and
+	// stop the replaced loader's watcher.
+	p.syncContractWatcher()
+	oldIssuer := p.issuerCookieRuntime.Load()
+	issuerStore := newIssuerBoundCookieStore()
+	if issuerCookieEnabled(cfg) && oldIssuer != nil && issuerCookieEnabled(oldIssuer.cfg) {
+		issuerStore = oldIssuer.store
+	} else if oldIssuer != nil && oldIssuer.store.hasPath() {
+		// A disabled prerequisite closes the evidence window, including its
+		// durable copy. Re-enabling this process starts with an empty store.
+		issuerStore.setPath(oldIssuer.store.retire())
+		issuerStore.logError = oldIssuer.store.logError
+		issuerStore.flush(time.Now(), true)
+		issuerStore.retire()
+	} else if issuerCookieEnabled(cfg) {
+		// The previous runtime was disabled; old on-disk evidence is not
+		// admissible even when this is the first enabled reload.
+		if path, pathErr := issuerCookieStatePath(); pathErr == nil {
+			issuerStore.setPath(path)
+			issuerStore.logError = func(err error) {
+				if p.logger != nil {
+					p.logger.LogError(audit.NewMethodLogContext("ISSUER_COOKIE"), err)
+				}
+			}
+			issuerStore.flush(time.Now(), true)
+		}
+	}
+	queryStore := p.newObservedIssuerQueryStore()
+	if issuerCookieEnabled(cfg) && oldIssuer != nil && issuerCookieEnabled(oldIssuer.cfg) {
+		queryStore = oldIssuer.query
+	}
+	p.issuerCookieRuntime.Store(&issuerCookieRuntime{cfg: cfg, store: issuerStore, query: queryStore})
 	p.refreshMetricsDialTarget(cfg.MetricsListen)
 	p.disableCEE(&cfg.CrossRequestDetection)
 	if p.wd != nil {
@@ -2217,6 +2758,11 @@ func (p *Proxy) Reload(cfg *config.Config, sc *scanner.Scanner) bool {
 	}
 
 	if prevEdSnap := p.editionPtr.Swap(&editionSnapshot{newEd}); prevEdSnap != nil {
+		if !config.SameLicenseInputs(oldCfg, cfg) {
+			if receiver, ok := prevEdSnap.Edition.(edition.LicenseRevocationReceiver); ok {
+				receiver.SetLicenseRevoked(true)
+			}
+		}
 		prevEdSnap.Close()
 	}
 
@@ -2311,6 +2857,7 @@ type ceeAdmitRequest struct {
 	ActorAuth            envelope.ActorAuth
 	Outbound             []byte
 	BodyFragmentPayloads map[string][]byte
+	BodyFragmentLeaves   map[string][]ceeJSONLeaf
 	PartitionReason      string
 	KeyPayload           []byte
 	PathPayload          *ceePathPayload
@@ -2347,7 +2894,8 @@ func (p *Proxy) admitCurrentCEE(ctx context.Context, req ceeAdmitRequest) ceeAdm
 	}
 	return ceeAdmission{
 		Result: ceeAdmit(ctx, ceeAdmitOptions{
-			ActorAuth: req.ActorAuth, Outbound: req.Outbound, BodyFragmentPayloads: req.BodyFragmentPayloads, PartitionReason: req.PartitionReason, KeyPayload: req.KeyPayload,
+			IdentityConfig: cfg,
+			ActorAuth:      req.ActorAuth, Outbound: req.Outbound, BodyFragmentPayloads: req.BodyFragmentPayloads, BodyFragmentLeaves: req.BodyFragmentLeaves, PartitionReason: req.PartitionReason, KeyPayload: req.KeyPayload,
 			PathPayload: req.PathPayload, TargetURL: req.TargetURL, Agent: req.Agent,
 			ClientIP: req.ClientIP, RequestID: req.RequestID, Config: ceeCfg,
 			Entropy: p.entropyTrackerPtr.Load(), Fragments: fb, Scanner: p.scannerPtr.Load(),
@@ -2436,6 +2984,23 @@ func (p *Proxy) LoadCertCache(cfg *config.Config) error {
 // listeners, so Start()'s shutdown goroutine can gracefully stop them.
 func (p *Proxy) RegisterAgentServer(srv *http.Server) {
 	p.agentServers = append(p.agentServers, srv)
+}
+
+// SetLicenseRevoked publishes a runtime license check serialized with reload.
+// A failure remains applicable across unrelated reloads of the same license
+// verification inputs. Recovery must use the current snapshot so an old check
+// cannot clear a newer revocation.
+func (p *Proxy) SetLicenseRevoked(cfg *config.Config, revoked bool) bool {
+	p.reloadSerialMu.Lock()
+	defer p.reloadSerialMu.Unlock()
+	current := p.cfgPtr.Load()
+	if current != cfg && (!revoked || !config.SameLicenseInputs(current, cfg)) {
+		return false
+	}
+	if receiver, ok := p.Edition().(edition.LicenseRevocationReceiver); ok {
+		receiver.SetLicenseRevoked(revoked)
+	}
+	return true
 }
 
 // ShutdownAgentServers gracefully shuts down all registered agent servers.
@@ -2592,6 +3157,10 @@ func (p *Proxy) updateCEEStats() {
 }
 
 func (p *Proxy) Close() {
+	p.stopContractWatcher()
+	if runtime := p.issuerCookieRuntime.Load(); runtime != nil {
+		runtime.store.flush(time.Now(), true)
+	}
 	if p.wd != nil {
 		p.wd.Stop()
 	}
@@ -2702,12 +3271,14 @@ func (p *Proxy) resolveAgentFromRequest(r *http.Request) (*edition.ResolvedAgent
 // resolveAgentRuntimeFromRequest snapshots the request's resolved agent state
 // and envelope emitter under the reload lock. The request then keeps that
 // emitter for its forwarding and redirect path so a reload cannot pair the
-// old config with a newly disabled or rotated emitter.
-func (p *Proxy) resolveAgentRuntimeFromRequest(r *http.Request) (*edition.ResolvedAgent, edition.AgentIdentity, *envelope.Emitter, *contractruntime.Loader) {
+// old config with a newly disabled or rotated emitter. Every consumer receives
+// the entitlement-bound request context and releases it when handling ends.
+func (p *Proxy) resolveAgentRuntimeFromRequest(r *http.Request) (*edition.ResolvedAgent, edition.AgentIdentity, *envelope.Emitter, *contractruntime.Loader, *http.Request, context.CancelFunc) {
 	p.reloadMu.RLock()
 	defer p.reloadMu.RUnlock()
 	resolved, id := p.resolveAgentFromRequest(r)
-	return resolved, id, p.envelopeEmitterPtr.Load(), p.contractLoaderPtr.Load()
+	ctx, release := agentLicenseContext(r.Context(), resolved)
+	return resolved, id, p.envelopeEmitterPtr.Load(), p.contractLoaderPtr.Load(), r.WithContext(ctx), release
 }
 
 // pinResolvedScanner registers in-flight scanner use on a resolved-agent
@@ -2788,6 +3359,8 @@ func inboundEnvelopeFailurePattern(err error) string {
 			return "inbound_verify_replay"
 		case envelope.VerificationFailureReplayCapacity:
 			return "inbound_verify_replay_capacity"
+		case envelope.VerificationFailureReplayState:
+			return "inbound_verify_replay_state"
 		case envelope.VerificationFailureExpired:
 			return "inbound_verify_expired"
 		case envelope.VerificationFailureNotTrusted:
@@ -2983,17 +3556,18 @@ func (p *Proxy) recordSessionActivity(clientIP, agent, hostname, requestID strin
 }
 
 type sessionActivityOptions struct {
-	ClientIP   string
-	Agent      string
-	Hostname   string
-	Scope      string
-	RequestID  string
-	UserAgent  string
-	ActorAuth  envelope.ActorAuth
-	Result     scanner.Result
-	Config     *config.Config
-	Logger     *audit.Logger
-	DeferClean bool
+	ClientIP    string
+	Agent       string
+	Hostname    string
+	Scope       string
+	RequestID   string
+	UserAgent   string
+	ActorAuth   envelope.ActorAuth
+	Result      scanner.Result
+	Config      *config.Config
+	Logger      *audit.Logger
+	DeferClean  bool
+	ObserveOnly bool // caller forwards this configured finding rather than enforcing it
 }
 
 // Returns a SessionResult with Blocked set when the request should be rejected
@@ -3019,7 +3593,7 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 		return SessionResult{}
 	}
 
-	key := sessionKeyFor(agent, clientIP, opts.ActorAuth)
+	key := sessionKeyFor(cfg, agent, clientIP, opts.ActorAuth)
 	sess := sm.GetOrCreate(key)
 	if sess == nil {
 		return SessionResult{capacityDenied: true, Blocked: true, Detail: session.ErrCapacity.Error()}
@@ -3112,6 +3686,8 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 			// resolver). Neither proves anything about threat posture, and
 			// treating resolver instability as a threat cascade can push
 			// otherwise benign sessions into airlock lockdown.
+		} else if opts.ObserveOnly {
+			_ = recordScopedAdaptiveSignal(sess, scope, session.SignalWarning, ep)
 		} else if result.IsConfigMismatch() {
 			// Bounded signal: config-mismatch blocks (SSRF on an
 			// allowlisted domain) are not real attacks, but repeated
@@ -3134,7 +3710,7 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 				sess.SetScopedBlockAll(scope, decide.UpgradeAction("", sess.EffectiveEscalationLevel(scope), &adaptiveCfg) == config.ActionBlock)
 			}
 		} else if result.Score > 0 {
-			if to := recordScopedAdaptiveSignal(sess, scope, session.SignalNearMiss, ep); to != "" {
+			if to := recordScopedAdaptiveSignal(sess, scope, session.SignalWarning, ep); to != "" {
 				escalatedTo = to
 				sess.SetScopedBlockAll(scope, decide.UpgradeAction("", sess.EffectiveEscalationLevel(scope), &adaptiveCfg) == config.ActionBlock)
 			}
@@ -3146,13 +3722,16 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 		}
 	}
 
-	if cfg.AdaptiveEnforcement.Enabled && !result.IsAdaptiveNeutral() && !isAdaptiveExempt(hostname, cfg.AdaptiveEnforcement.ExemptDomains) {
+	if cfg.AdaptiveEnforcement.Enabled && (!result.IsAdaptiveNeutral() || result.IsEntropyOnly()) && !isAdaptiveExempt(hostname, cfg.AdaptiveEnforcement.ExemptDomains) {
 		cooperativeBurst := (cfg.AdaptiveEnforcement.CooperativeToolDownweight && isCooperativeToolBurstUserAgent(userAgent)) ||
 			opts.ActorAuth.TrustedForIdentity()
 		for _, a := range anomalies {
 			sig, ok := signalForSessionAnomaly(a.Type, cooperativeBurst)
 			if !ok || a.Score <= 0 {
 				continue
+			}
+			if cfg.SessionProfiling.AnomalyAction != config.ActionBlock || !cfg.EnforceEnabled() {
+				sig = session.SignalWarning
 			}
 			if to := recordScopedAdaptiveSignal(sess, scope, sig, ep); to != "" {
 				escalatedTo = to
@@ -3193,16 +3772,29 @@ func (p *Proxy) recordSessionActivityWithUserAgent(opts sessionActivityOptions) 
 		}
 	}
 
-	// Record a block event on any non-allowed scanner result so inspect/
-	// explain operators can see the specific evidence that drove escalation.
-	// Score-neutral cases (protective, config-mismatch) still record so the
-	// operator trail reflects the full picture; empty Reason is preserved.
+	// Preserve scanner findings for inspect/explain, distinguishing enforced
+	// denials from observations that the caller forwards. An observed finding
+	// is still refused when this level upgrades it (upgrade_warn, or block_all
+	// for entropy-only findings, which callers never upgrade), using the same
+	// level the caller receives as SessionResult.Level.
 	if !result.Allowed {
+		observed := opts.ObserveOnly
+		if observed {
+			callerAction := config.ActionWarn
+			if result.IsEntropyOnly() {
+				callerAction = ""
+			}
+			observed = decide.UpgradeAction(callerAction, level, &cfg.AdaptiveEnforcement) != config.ActionBlock
+		}
+		kind, severity := config.ActionBlock, config.SeverityCritical
+		if observed {
+			kind, severity = "anomaly", config.SeverityWarn
+		}
 		sess.RecordEvent(SessionEvent{
-			Kind:     "block",
+			Kind:     kind,
 			Target:   hostname,
 			Detail:   result.Reason,
-			Severity: "critical",
+			Severity: severity,
 			Score:    result.Score,
 		})
 	}
@@ -3458,12 +4050,12 @@ func airlockTierForScope(sess *SessionState, scope string) string {
 // identities fold to the source IP so rotating a name cannot escape airlock.
 // Admission is lookup-only: a request cannot materialize session state merely
 // by presenting high-cardinality names or destinations.
-func (p *Proxy) airlockSessionForIdentity(agent, clientIP string, auth envelope.ActorAuth) *SessionState {
+func (p *Proxy) airlockSessionForIdentity(cfg *config.Config, agent, clientIP string, auth envelope.ActorAuth) *SessionState {
 	sm := p.sessionMgrPtr.Load()
 	if sm == nil {
 		return nil
 	}
-	return sm.SessionByKey(responseTaintSessionKey(agent, clientIP, auth))
+	return sm.SessionByKey(responseTaintSessionKey(cfg, agent, clientIP, auth))
 }
 
 // shieldBlockResult carries the actual refusal through each response transport.
@@ -3481,18 +4073,51 @@ func shieldCapacityBlock() *shieldBlockResult {
 	}
 }
 
-// applyShield runs Browser Shield rewriting on a response body when enabled
-// and the hostname is not exempt. A nonnil block result prevents delivery and
-// supplies the transport's status, reason, and receipt classification.
-func (p *Proxy) applyShield(body []byte, contentType, hostname string, respHeaders http.Header, cfg *config.Config, actx audit.LogContext, clientIP, requestID, transport, parentActionID string) ([]byte, *receipt.ShieldSummary, *shieldBlockResult) {
+func shieldUninspectableBlock(reason string) *shieldBlockResult {
+	return &shieldBlockResult{
+		info:   blockInfoFor(blockreason.BrowserShieldUninspectable, shieldUninspectableLayer),
+		status: http.StatusForbidden,
+		reason: reason,
+	}
+}
+
+// blockShieldPartialResponse refuses shieldable ranges before any rewrite can
+// make their upstream Content-Range metadata misleading.
+func (p *Proxy) blockShieldPartialResponse(resp *http.Response, body []byte, hostname string, cfg *config.Config, actx audit.LogContext) *shieldBlockResult {
+	active := p.shieldEngine != nil && cfg.BrowserShield.Enabled && !isShieldExempt(hostname, cfg.BrowserShield.ExemptDomains)
+	if !shieldPartialResponseNeedsBlock(resp.StatusCode, resp.Header, body, active) {
+		return nil
+	}
+	p.logger.LogBlocked(actx, shieldUninspectableLayer, shieldPartialResponseBlockReason)
+	return shieldUninspectableBlock(shieldPartialResponseBlockReason)
+}
+
+type shieldResponseContext struct {
+	admittedScanLimit                              int
+	scanOriginal                                   func([]byte, http.Header) *scanner.ResponseScanResult
+	retainedScan                                   *scanner.ResponseScanResult
+	hostname                                       string
+	actx                                           audit.LogContext
+	clientIP, requestID, transport, parentActionID string
+	shard                                          receipt.EmitOpts
+}
+
+// applyShieldResponse runs Browser Shield rewriting on a response body when
+// enabled and the hostname is not exempt. A nonnil block result prevents
+// delivery and supplies the transport's status, reason, and receipt
+// classification.
+func (p *Proxy) applyShieldResponse(body []byte, contentType string, respHeaders http.Header, cfg *config.Config, response shieldResponseContext) ([]byte, *receipt.ShieldSummary, bool, *shieldBlockResult) {
+	hostname, actx := response.hostname, response.actx
+	clientIP, requestID, transport := response.clientIP, response.requestID, response.transport
+
 	if p.shieldEngine == nil || !cfg.BrowserShield.Enabled {
-		return body, nil, nil
+		return body, nil, false, nil
 	}
 
 	// Exempt domains: skip shield entirely.
 	if isShieldExempt(hostname, cfg.BrowserShield.ExemptDomains) {
 		p.metrics.RecordShieldSkipped("exempt_domain")
-		return body, nil, nil
+		return body, nil, false, nil
 	}
 
 	// Content-type gate: skip shield entirely for non-shieldable media
@@ -3504,124 +4129,129 @@ func (p *Proxy) applyShield(body []byte, contentType, hostname string, respHeade
 	// on the rewrite path; we short-circuit here for binary bodies so the
 	// oversize ceiling only applies to content the shield would actually
 	// rewrite (HTML, JS, SVG).
-	prefixLen := len(body)
-	if prefixLen > 512 {
-		prefixLen = 512
-	}
-	if shield.DetectPipeline(contentType, body[:prefixLen]) == shield.PipelineNone {
+	pipeline := detectShieldPipelineForResponse(contentType, body, respHeaders)
+	if shieldLeavesBodyUnchanged(pipeline) {
 		p.metrics.RecordShieldSkipped("non_shieldable_content")
-		return body, nil, nil
+		return body, nil, false, nil
 	}
-
+	var originalHeaders http.Header
+	if response.scanOriginal != nil {
+		originalHeaders = respHeaders.Clone()
+	}
 	// Max shield bytes: enforce oversize action. A size-exempt response already
 	// admitted to the bounded whole-buffer path can reuse that path's larger
 	// ceiling. Over-cap bodies retain the inflight reservation until this work
 	// finishes; under-cap bodies remain bounded by the normal scan ceiling.
-	shieldMaxBytes := shieldMaxBytesForResponse(cfg, hostname, transport)
+	var shieldMaxBytes int
+	if response.admittedScanLimit > 0 {
+		shieldMaxBytes = shieldMaxBytesForAdmittedResponse(cfg, hostname, transport, response.admittedScanLimit)
+	} else {
+		shieldMaxBytes = shieldMaxBytesForResponse(cfg, hostname, transport)
+	}
+	if pipeline == shield.PipelineSVG && shieldMaxBytes > 0 && len(body) > shieldMaxBytes {
+		p.logger.LogBlocked(actx, "media_policy", svgIncompleteValidationReason)
+		return nil, nil, false, svgValidationBlock(svgIncompleteValidationReason)
+	}
 	if shieldMaxBytes > 0 && len(body) > shieldMaxBytes {
 		p.metrics.RecordShieldSkipped("oversize")
 		switch cfg.BrowserShield.OversizeAction {
 		case config.ShieldOversizeScanHead:
+			if isShieldUTF16Response(body, contentType) {
+				p.logger.LogBlocked(actx, shieldUninspectableLayer, shieldUTF16ScanHeadBlockReason)
+				return nil, nil, false, shieldUninspectableBlock(shieldUTF16ScanHeadBlockReason)
+			}
 			p.metrics.RecordShieldOversizeScanHead(transport)
 			// Rewrite only the head; append the unshielded tail so the full
 			// response body is returned intact.
 			head, summary := p.runShieldPipelineResult(body[:shieldMaxBytes], contentType, respHeaders, &cfg.BrowserShield, p.metrics, actx, clientIP, requestID, transport)
+			if summary == nil {
+				summary = partialShieldSummary(nil, body[:shieldMaxBytes], contentType, len(body), shieldMaxBytes)
+			}
 			if summary != nil {
+				if response.scanOriginal != nil && !bytes.Equal(body[:shieldMaxBytes], head) {
+					response.retainedScan = response.scanOriginal(body, originalHeaders)
+				}
 				summary.BodyBytes = len(body)
 				summary.ScannedBytes = shieldMaxBytes
 				summary.Partial = true
-				if !p.recordShieldIntervention(summary, cfg, hostname, actx, clientIP, requestID, transport, parentActionID) {
-					return nil, summary, shieldCapacityBlock()
+				if blocked := p.confirmShieldIntervention(summary, cfg, response); blocked != nil {
+					return nil, summary, false, blocked
 				}
 			}
-			return append(head, body[shieldMaxBytes:]...), summary, nil
+			return append(head, body[shieldMaxBytes:]...), summary, false, nil
 		case config.ShieldOversizeWarn:
+			reason := shieldOversizeBlockReason(hostname, len(body), shieldMaxBytes)
+			if err := p.confirmResponseDecision(cfg, withReceiptShard(receipt.EmitOpts{ActionID: receipt.NewActionID(), ParentActionID: response.parentActionID, Verdict: config.ActionAllow, Layer: "shield_oversize", Pattern: reason, Shield: partialShieldSummary(nil, body, contentType, len(body), 0), Transport: transport, Method: actx.Method(), Target: shieldReceiptTarget(firstNonEmptyString(actx.URL(), actx.Target(), hostname)), RequestID: requestID, Agent: actx.Agent()}, response.shard)); err != nil {
+				return nil, nil, false, p.shieldReceiptBlock(err, transport)
+			}
 			p.logger.LogAnomaly(actx, "shield_oversize", fmt.Sprintf("response body %d bytes exceeds shield ceiling %d", len(body), shieldMaxBytes), 0)
-			return body, nil, nil
+			return body, nil, false, nil
 		default: // block: fail-closed, return 403
 			p.logger.LogBlocked(actx, "shield_oversize", shieldOversizeBlockReason(hostname, len(body), shieldMaxBytes))
-			return nil, nil, &shieldBlockResult{
+			return nil, nil, false, &shieldBlockResult{
 				info:   blockInfoFor(blockreason.BrowserShieldOversize, "shield_oversize"),
 				status: http.StatusForbidden, reason: shieldOversizeBlockReason(hostname, len(body), shieldMaxBytes),
 			}
 		}
 	}
 
-	rewritten, summary := p.runShieldPipelineResult(body, contentType, respHeaders, &cfg.BrowserShield, p.metrics, actx, clientIP, requestID, transport)
+	shieldStart := time.Now()
+	result := runShieldPipelineWithEncoding(p.shieldEngine, body, contentType, respHeaders, &cfg.BrowserShield, p.metrics, transport)
+	p.metrics.RecordShieldLatency(transport, time.Since(shieldStart))
+	if result.uninspectableReason != "" {
+		p.logger.LogBlocked(actx, shieldUninspectableLayer, result.uninspectableReason)
+		return nil, nil, false, shieldUninspectableBlock(result.uninspectableReason)
+	}
+	if result.svgRefusal != "" {
+		// Name the construct that failed. The validator's reasons are compiled
+		// strings describing SVG structure, never response content, so they
+		// are safe to surface and make a false positive diagnosable.
+		p.logger.LogBlocked(actx, "media_policy", result.svgRefusal)
+		return nil, nil, false, svgValidationBlock(result.svgRefusal)
+	}
+	p.logShieldRewriteSummary(result.summary, actx, clientIP, requestID, transport)
+	rewritten, summary := result.body, result.summary
+	if response.scanOriginal != nil && !bytes.Equal(body, rewritten) {
+		response.retainedScan = response.scanOriginal(body, originalHeaders)
+	}
 	if summary != nil {
 		summary.BodyBytes = len(body)
 		summary.ScannedBytes = len(body)
-		if !p.recordShieldIntervention(summary, cfg, hostname, actx, clientIP, requestID, transport, parentActionID) {
-			return nil, summary, shieldCapacityBlock()
+		if blocked := p.confirmShieldIntervention(summary, cfg, response); blocked != nil {
+			return nil, summary, false, blocked
 		}
 	}
-	return rewritten, summary, nil
+	return rewritten, summary, result.svgValidated, nil
 }
 
 // runShieldPipelineResult applies Browser Shield and returns an optional
 // summary for receipts and adaptive scoring when the response changed.
 func (p *Proxy) runShieldPipelineResult(body []byte, contentType string, respHeaders http.Header, cfg *config.BrowserShield, m *metrics.Metrics, actx audit.LogContext, clientIP, requestID, transport string) ([]byte, *receipt.ShieldSummary) {
 	shieldStart := time.Now()
-	prefixLen := len(body)
-	if prefixLen > 512 {
-		prefixLen = 512
-	}
-	pipeline := shield.DetectPipeline(contentType, body[:prefixLen])
-	if pipeline == shield.PipelineNone {
-		return body, nil
-	}
-	// Extract CSP nonce from response headers (preferred over body extraction).
-	headerNonce := shield.ExtractCSPNonce(respHeaders)
-	shieldResult := p.shieldEngine.RewriteWithNonce(string(body), pipeline, cfg, headerNonce)
-	if shieldResult.Rewritten {
-		body = []byte(shieldResult.Content)
-		if shieldResult.ExtensionHits > 0 {
-			m.RecordShieldRewrite("extension", transport)
-			p.logger.LogShieldRewrite("extension", shieldResult.ExtensionHits, transport, actx.URL(), clientIP, requestID)
-		}
-		if shieldResult.TrackingHits > 0 {
-			m.RecordShieldRewrite("tracking", transport)
-			p.logger.LogShieldRewrite("tracking", shieldResult.TrackingHits, transport, actx.URL(), clientIP, requestID)
-		}
-		if shieldResult.TrapHits > 0 {
-			m.RecordShieldRewrite("trap", transport)
-			p.logger.LogShieldRewrite("trap", shieldResult.TrapHits, transport, actx.URL(), clientIP, requestID)
-		}
-		if shieldResult.ShimInjected {
-			m.RecordShieldShimInjected(transport)
-		}
-	}
+	result := runShieldPipelineWithEncoding(p.shieldEngine, body, contentType, respHeaders, cfg, m, transport)
+	p.logShieldRewriteSummary(result.summary, actx, clientIP, requestID, transport)
 	m.RecordShieldLatency(transport, time.Since(shieldStart))
-	return body, shieldSummaryFromResult(shieldResult)
+	return result.body, result.summary
+}
+
+func (p *Proxy) logShieldRewriteSummary(summary *receipt.ShieldSummary, actx audit.LogContext, clientIP, requestID, transport string) {
+	if summary == nil {
+		return
+	}
+	if summary.ExtensionProbes > 0 {
+		p.logger.WithCorrelation(actx.Correlation()).LogShieldRewrite("extension", summary.ExtensionProbes, transport, actx.URL(), clientIP, requestID)
+	}
+	if summary.TrackingBeacons > 0 {
+		p.logger.WithCorrelation(actx.Correlation()).LogShieldRewrite("tracking", summary.TrackingBeacons, transport, actx.URL(), clientIP, requestID)
+	}
+	if summary.AgentTraps > 0 {
+		p.logger.WithCorrelation(actx.Correlation()).LogShieldRewrite("trap", summary.AgentTraps, transport, actx.URL(), clientIP, requestID)
+	}
 }
 
 func runShieldPipelineSharedResult(engine *shield.Engine, body []byte, contentType string, respHeaders http.Header, cfg *config.BrowserShield, m *metrics.Metrics, transport string) ([]byte, *receipt.ShieldSummary) {
-	prefixLen := len(body)
-	if prefixLen > 512 {
-		prefixLen = 512
-	}
-	pipeline := shield.DetectPipeline(contentType, body[:prefixLen])
-	if pipeline == shield.PipelineNone {
-		return body, nil
-	}
-	headerNonce := shield.ExtractCSPNonce(respHeaders)
-	shieldResult := engine.RewriteWithNonce(string(body), pipeline, cfg, headerNonce)
-	if shieldResult.Rewritten {
-		body = []byte(shieldResult.Content)
-		if shieldResult.ExtensionHits > 0 {
-			m.RecordShieldRewrite("extension", transport)
-		}
-		if shieldResult.TrackingHits > 0 {
-			m.RecordShieldRewrite("tracking", transport)
-		}
-		if shieldResult.TrapHits > 0 {
-			m.RecordShieldRewrite("trap", transport)
-		}
-		if shieldResult.ShimInjected {
-			m.RecordShieldShimInjected(transport)
-		}
-	}
-	return body, shieldSummaryFromResult(shieldResult)
+	result := runShieldPipelineWithEncoding(engine, body, contentType, respHeaders, cfg, m, transport)
+	return result.body, result.summary
 }
 
 func shieldSummaryFromResult(result shield.Result) *receipt.ShieldSummary {
@@ -3632,6 +4262,7 @@ func shieldSummaryFromResult(result shield.Result) *receipt.ShieldSummary {
 		result.TrackingHits +
 		result.TrapHits +
 		result.SVGForeignObjectHits +
+		result.SVGScriptHits +
 		result.SVGEventHandlerHits +
 		result.SVGXlinkExternalHits +
 		result.SVGHiddenTextHits +
@@ -3644,7 +4275,7 @@ func shieldSummaryFromResult(result shield.Result) *receipt.ShieldSummary {
 		TotalRewrites:           total,
 		ExtensionProbes:         result.ExtensionHits,
 		TrackingBeacons:         result.TrackingHits,
-		AgentTraps:              result.TrapHits,
+		AgentTraps:              result.TrapHits + result.SVGScriptHits,
 		FingerprintShimInjected: result.ShimInjected,
 		SVGForeignObjects:       result.SVGForeignObjectHits,
 		SVGEventHandlers:        result.SVGEventHandlerHits,
@@ -3655,8 +4286,8 @@ func shieldSummaryFromResult(result shield.Result) *receipt.ShieldSummary {
 }
 
 // shieldRewriteHeaderValue renders the bounded, client-visible summary for a
-// rewritten Browser Shield response. Extension includes an injected extension
-// defense shim; trap includes SVG active-content removals, which are the
+// rewritten Browser Shield response. Extension counts stripped extension URLs
+// plus the opt-in fingerprint shim when injected; trap includes SVG active-content removals, which are the
 // shield's SVG-specific trap class.
 func shieldRewriteHeaderValue(summary *receipt.ShieldSummary) string {
 	if summary == nil {
@@ -3690,18 +4321,46 @@ func shieldRewriteHeaderValue(summary *receipt.ShieldSummary) string {
 // proxy relays upstream trailers after the body, so a forged marker there would
 // otherwise survive the header strip.
 func stripUpstreamShieldRewriteMarker(resp *http.Response) {
+	stripUpstreamResponseNames(resp, func(name string) bool {
+		return strings.EqualFold(name, shieldRewriteHeader)
+	})
+}
+
+// pipelockHeaderPrefix is the namespace Pipelock reserves for its own response
+// headers: the block-reason set, the recorded-receipt handle, hints and the
+// shield marker. An upstream has no business writing into it.
+const pipelockHeaderPrefix = "x-pipelock-"
+
+func isPipelockNamespaceName(name string) bool {
+	return len(name) >= len(pipelockHeaderPrefix) &&
+		strings.EqualFold(name[:len(pipelockHeaderPrefix)], pipelockHeaderPrefix)
+}
+
+// stripUpstreamPipelockNamespace removes every upstream-supplied X-Pipelock-*
+// name from a response: headers, trailer keys, and the names in the announced
+// Trailer list, including trailers that only appear once the body is read.
+// Only Pipelock's own values, applied after this runs, may carry the namespace.
+func stripUpstreamPipelockNamespace(resp *http.Response) {
+	stripUpstreamResponseNames(resp, isPipelockNamespaceName)
+}
+
+func stripUpstreamResponseNames(resp *http.Response, match func(name string) bool) {
 	if resp == nil {
 		return
 	}
 	if resp.Header != nil {
-		resp.Header.Del(shieldRewriteHeader)
+		for name := range resp.Header {
+			if match(name) {
+				delete(resp.Header, name)
+			}
+		}
 		if announced := resp.Header.Values("Trailer"); len(announced) > 0 {
 			kept := make([]string, 0, len(announced))
 			for _, value := range announced {
 				var names []string
 				for _, name := range strings.Split(value, ",") {
 					name = strings.TrimSpace(name)
-					if name == "" || strings.EqualFold(name, shieldRewriteHeader) {
+					if name == "" || match(name) {
 						continue
 					}
 					names = append(names, name)
@@ -3716,28 +4375,35 @@ func stripUpstreamShieldRewriteMarker(resp *http.Response) {
 			}
 		}
 	}
-	if resp.Trailer != nil {
-		resp.Trailer.Del(shieldRewriteHeader)
-	}
+	deleteMatchingTrailers(resp, match)
 	// The transport fills resp.Trailer only once the body reaches EOF, and the
 	// reverse proxy copies trailers after the body, so the delete above runs
 	// too early for a real trailer. Wrap the body to delete again at EOF.
 	if resp.Body != nil {
-		resp.Body = &shieldTrailerStrippingBody{ReadCloser: resp.Body, resp: resp}
+		resp.Body = &trailerStrippingBody{ReadCloser: resp.Body, resp: resp, match: match}
 	}
 }
 
-// shieldTrailerStrippingBody removes the marker from the response trailer map
-// the moment the body is exhausted, before any relay reads the trailers.
-type shieldTrailerStrippingBody struct {
-	io.ReadCloser
-	resp *http.Response
+func deleteMatchingTrailers(resp *http.Response, match func(name string) bool) {
+	for name := range resp.Trailer {
+		if match(name) {
+			delete(resp.Trailer, name)
+		}
+	}
 }
 
-func (b *shieldTrailerStrippingBody) Read(p []byte) (int, error) {
+// trailerStrippingBody removes matching names from the response trailer map
+// the moment the body is exhausted, before any relay reads the trailers.
+type trailerStrippingBody struct {
+	io.ReadCloser
+	resp  *http.Response
+	match func(name string) bool
+}
+
+func (b *trailerStrippingBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil && b.resp.Trailer != nil {
-		b.resp.Trailer.Del(shieldRewriteHeader)
+		deleteMatchingTrailers(b.resp, b.match)
 	}
 	return n, err
 }
@@ -3752,9 +4418,23 @@ func setShieldRewriteHeader(headers http.Header, summary *receipt.ShieldSummary)
 	}
 }
 
+// shieldLeavesBodyUnchanged reports whether the shield would return this body
+// byte for byte, so no size ceiling needs to apply to it.
+//
+// PipelineNone is content the shield does not handle at all. PipelineJS is
+// JavaScript, which the shield identifies for reporting and never edits: the
+// response scanner owns that content. Enforcing the oversize ceiling on either
+// one buys no protection and costs availability, and on JavaScript the cost is
+// severe, because a browser application's bundle is routinely larger than
+// max_shield_bytes and oversize_action: block would return 403 for it. Response
+// scanning still runs on both; only the shield's own ceiling is skipped.
+func shieldLeavesBodyUnchanged(pipeline shield.PipelineType) bool {
+	return pipeline == shield.PipelineNone || pipeline == shield.PipelineJS
+}
+
 func shieldPipelineLabel(pipeline shield.PipelineType) string {
 	switch pipeline {
-	case shield.PipelineHTML:
+	case shield.PipelineHTML, shield.PipelineXHTML:
 		return "html"
 	case shield.PipelineJS:
 		return "javascript"
@@ -3768,8 +4448,20 @@ func shieldPipelineLabel(pipeline shield.PipelineType) string {
 // recordShieldIntervention refuses delivery when enabled adaptive recording
 // cannot obtain a session. A disabled or absent store does not require one.
 func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *config.Config, hostname string, actx audit.LogContext, clientIP, requestID, transport, parentActionID string) bool {
+	return p.confirmShieldIntervention(summary, cfg, shieldResponseContext{hostname: hostname, actx: actx, clientIP: clientIP, requestID: requestID, transport: transport, parentActionID: parentActionID}) == nil
+}
+
+func (p *Proxy) shieldReceiptBlock(err error, transport string) *shieldBlockResult {
+	p.recordRequiredReceiptBlock(err, transport)
+	return &shieldBlockResult{info: blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer), status: http.StatusForbidden, reason: receiptEmissionBlockReason}
+}
+
+func (p *Proxy) confirmShieldIntervention(summary *receipt.ShieldSummary, cfg *config.Config, response shieldResponseContext) *shieldBlockResult {
+	hostname, actx := response.hostname, response.actx
+	clientIP, requestID, transport, parentActionID := response.clientIP, response.requestID, response.transport, response.parentActionID
+
 	if summary == nil {
-		return true
+		return nil
 	}
 	signals := 0
 	if cfg != nil && cfg.AdaptiveEnforcement.Enabled && !isAdaptiveExempt(hostname, cfg.AdaptiveEnforcement.ExemptDomains) {
@@ -3782,7 +4474,7 @@ func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *co
 		}
 	}
 	var sess *SessionState
-	sessionKey := sessionKeyFor(actx.Agent(), clientIP, envelope.NormalizeActorAuth(actx.AgentAuth()))
+	sessionKey := sessionKeyFor(cfg, actx.Agent(), clientIP, envelope.NormalizeActorAuth(actx.AgentAuth()))
 	if signals > 0 {
 		if sm := p.sessionMgrPtr.Load(); sm != nil {
 			sess = sm.GetOrCreate(sessionKey)
@@ -3790,7 +4482,7 @@ func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *co
 				summary.AdaptiveSignalsRecorded = 0
 				summary.AdaptiveSignalMaxPerBody = browserShieldAdaptiveSignalCap
 				p.logger.LogBlocked(actx, sessionCapacityLayer, session.ErrCapacity.Error())
-				return false
+				return shieldCapacityBlock()
 			}
 		}
 		if sess == nil {
@@ -3808,12 +4500,12 @@ func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *co
 		target = hostname
 	}
 	target = shieldReceiptTarget(target)
-	_ = p.emitReceipt(receipt.EmitOpts{
+	err := p.confirmResponseDecision(cfg, withReceiptShard(receipt.EmitOpts{
 		ActionID:       receipt.NewActionID(),
 		ParentActionID: parentActionID,
 		Verdict:        config.ActionAllow,
 		Layer:          browserShieldLayer,
-		Pattern:        browserShieldPattern,
+		Pattern:        shieldReceiptPattern(response.retainedScan),
 		Severity:       browserShieldSeverity,
 		Shield:         summary,
 		Transport:      transport,
@@ -3821,10 +4513,13 @@ func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *co
 		Target:         target,
 		RequestID:      requestID,
 		Agent:          actx.Agent(),
-	})
+	}, response.shard))
+	if err != nil {
+		return p.shieldReceiptBlock(err, transport)
+	}
 
 	if signals == 0 {
-		return true
+		return nil
 	}
 	for i := 0; i < signals; i++ {
 		recordAdaptiveSignalForScope(sess, adaptiveScopeForHost(hostname), session.SignalShieldRewrite, &cfg.AdaptiveEnforcement, &cfg.Airlock, decide.EscalationParams{
@@ -3836,7 +4531,7 @@ func (p *Proxy) recordShieldIntervention(summary *receipt.ShieldSummary, cfg *co
 			RequestID: requestID,
 		})
 	}
-	return true
+	return nil
 }
 
 func shieldReceiptTarget(target string) string {
@@ -4351,8 +5046,21 @@ func (p *Proxy) ssrfSafeDialContext(ctx context.Context, network, addr string) (
 		}
 	}
 
-	// Connect to the first validated IP.
-	return p.dialer.DialContext(ctx, network, net.JoinHostPort(ips[0], port))
+	// Every address above passed validation in this call. Try them in resolver
+	// order until one connects, for at most dialfallback.MaxAttempts attempts
+	// and not past the context's deadline; never re-resolve. Each attempt is
+	// also bounded by the dialer's own Timeout.
+	addrs := make([]string, len(ips))
+	for i, ipStr := range ips {
+		addrs[i] = net.JoinHostPort(ipStr, port)
+	}
+	conn, err := dialfallback.Dial(ctx, addrs, func(ctx context.Context, dialAddr string) (net.Conn, error) {
+		return p.dialer.DialContext(ctx, network, dialAddr)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("ssrfSafeDialContext: dial %s: %w", host, err)
+	}
+	return conn, nil
 }
 
 // buildHandler wraps a ServeMux to intercept CONNECT and absolute-URI forward
@@ -4362,15 +5070,14 @@ func (p *Proxy) buildHandler(mux *http.ServeMux) http.Handler {
 		// Kill switch: deny all requests when active (except exempt endpoints/IPs).
 		if p.ks != nil {
 			if d := p.ks.IsActiveHTTP(r); d.Active {
-				clientIP, _ := requestMeta(r)
-				p.logger.LogKillSwitchDeny(schemeHTTP, r.URL.Path, d.Source, d.Message, clientIP)
+				clientIP, requestID := requestMeta(r)
+				p.logger.LogKillSwitchDeny(schemeHTTP, r.URL.Path, d.Source, d.Message, clientIP, requestID)
 				p.metrics.RecordKillSwitchDenial(schemeHTTP, r.URL.Path)
 				if r.URL.IsAbs() && r.URL.Host != "" {
 					// Absolute-URI forward proxy requests bypass
 					// handleForwardHTTP entirely under kill switch,
 					// so emit a forward receipt here to keep the
 					// audit chain unbroken.
-					requestID, _ := r.Context().Value(ctxKeyRequestID).(string)
 					actionID := receipt.NewActionID()
 					if p.emitRecordedReceipt(forwardKillSwitchReceiptOpts(
 						actionID,
@@ -4381,10 +5088,11 @@ func (p *Proxy) buildHandler(mux *http.ServeMux) http.Handler {
 						blockreason.SetRecordedReceipt(w.Header(), actionID)
 					}
 					writeBlockedError(w,
-						blockInfoFor(blockreason.KillSwitchActive, "kill_switch"),
+						blockInfoFor(blockreason.KillSwitchActive, "kill_switch").WithRequestID(requestID),
 						"blocked: kill_switch_active", http.StatusForbidden)
 					return
 				}
+				blockInfoFor(blockreason.KillSwitchActive, "kill_switch").WithRequestID(requestID).SetHeaders(w.Header())
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_ = json.NewEncoder(w).Encode(map[string]string{
@@ -4466,6 +5174,8 @@ func (p *Proxy) buildMux() *http.ServeMux {
 	}
 	// Register session admin API routes only when NOT on a separate port.
 	if p.sessionAPI != nil && cfg.KillSwitch.APIListen == "" {
+		mux.HandleFunc("/api/v1/config/status", p.sessionAPI.HandleConfigStatus)
+		mux.HandleFunc("/api/v1/config/reload", p.sessionAPI.HandleConfigReload)
 		mux.HandleFunc("/api/v1/adaptive/status", p.sessionAPI.HandleAdaptiveStatus)
 		mux.HandleFunc("/api/v1/adaptive/flush", p.sessionAPI.HandleAdaptiveFlush)
 		mux.HandleFunc("/api/v1/adaptive/whoami", p.sessionAPI.HandleAdaptiveWhoami)
@@ -4534,6 +5244,7 @@ func (p *Proxy) start(ctx context.Context, ln net.Listener) error {
 		p.wd.Start(ctx)
 	}
 
+	p.startContractWatcher(ctx)
 	handler := p.buildHandler(p.buildMux())
 
 	// CONNECT tunnels and WebSocket connections need to live beyond any single
@@ -4632,13 +5343,15 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	// Pre-generate a single ActionID for correlation between envelope and receipt.
 	actionID := receipt.NewActionID()
+	selectedReceiptShard := p.admitReceiptShard()
 
 	// Resolve per-agent config and scanner from a single registry snapshot.
 	// This prevents TOCTOU races during hot-reload where knownProfiles()
 	// and resolveAgent() could read different registries. The contract
 	// loader is captured here too so the URL scan and contract gate use
 	// one coherent policy revision.
-	resolved, id, envEmitter, snapshotContractLoader := p.resolveAgentRuntimeFromRequest(r)
+	resolved, id, envEmitter, snapshotContractLoader, r, releaseLicense := p.resolveAgentRuntimeFromRequest(r)
+	defer releaseLicense()
 	cfg := resolved.Config
 	agent := id.Name
 	if agent == "" {
@@ -4649,7 +5362,8 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// it only at fetch time would report "unknown" for each event on the way.
 	r = r.WithContext(context.WithValue(r.Context(), ctxKeyAgentAuth, string(id.Auth)))
 	emitFetchReceipt := func(opts receipt.EmitOpts) {
-		opts = withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash())
+		opts = withReceiptShard(opts, selectedReceiptShard)
+		opts = withReceiptConfig(opts, cfg)
 		if e := p.receiptEmitterPtr.Load(); e != nil && p.emitReceiptWithEmitter(opts, e) == nil {
 			if opts.Verdict == config.ActionBlock {
 				blockreason.SetRecordedReceipt(w.Header(), opts.ActionID)
@@ -4679,7 +5393,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		p.logger.LogError(audit.NewMethodLogContext(r.Method),
 			fmt.Errorf("inbound envelope verify rejected fetch: %w", err))
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.EnvelopeVerifyFailed, blockLayerMediationEnvelope),
+			blockInfoFor(blockreason.EnvelopeVerifyFailed, blockLayerMediationEnvelope).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				Blocked:    true,
 				Error:      "inbound mediation envelope verification failed",
@@ -4694,6 +5408,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	agentLabel := id.Profile // bounded cardinality for Prometheus labels
 	sc, releaseScanner, scOK := p.pinResolvedScanner(resolved)
 	defer releaseScanner()
+	r, correlation := attachRequestCorrelation(r, cfg, sc)
 	if !scOK {
 		p.recordDecision(config.ActionBlock, scannerLabelUnavailable, scannerPatternUnavailable, TransportFetch, requestID)
 		emitFetchReceipt(receipt.EmitOpts{
@@ -4708,7 +5423,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.PatternUnavailable, scannerLabelUnavailable),
+			blockInfoFor(blockreason.PatternUnavailable, scannerLabelUnavailable).WithRequestID(requestID),
 			http.StatusServiceUnavailable, FetchResponse{
 				Blocked:    true,
 				Error:      scannerPatternUnavailable,
@@ -4718,7 +5433,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create a per-request sub-logger tagged with the agent name
-	log := p.logger.With("agent", agent)
+	log := p.logger.With("agent", agent).WithCorrelation(correlation)
 
 	if r.Method != http.MethodGet {
 		writeJSON(w, http.StatusMethodNotAllowed, FetchResponse{
@@ -4755,6 +5470,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// /fetch reaches the origin outside TLS interception, so record its URL
+	// as sent: a value it carries must never later mint as a server-issued ID.
+	p.recordIssuerFetchSent(cfg, agent, clientIP, id.Auth, parsed)
+
 	// Fully decode the URL for display in responses and logs. The scanner
 	// internally decodes for matching, but targetURL retains partial decoding
 	// from Go's query parsing. Operators should see the final resolved URL.
@@ -4766,9 +5485,23 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		Method: http.MethodGet, URL: targetURL, ClientIP: clientIP,
 		RequestID: requestID, Agent: agent, Transport: "fetch", PolicyHash: cfg.CanonicalPolicyHash(),
 	})
+	scanCtx = scanner.WithOAuthAuthorizationMethod(scanCtx, http.MethodGet)
 	r = r.WithContext(scanCtx)
 	result := sc.Scan(scanCtx, targetURL)
-	p.recordCredentialAudienceAllows(actx, result.CredentialAudienceAllows, TransportFetch, http.MethodGet, targetURL, requestID, agent)
+	if err := p.recordCredentialAudienceAllows(cfg, actx, result.CredentialAudienceAllows, TransportFetch, http.MethodGet, targetURL, requestID, agent, selectedReceiptShard); err != nil {
+		blockedErr := newCredentialAudienceReceiptBlockedRequest(err)
+		p.logger.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
+		p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
+		writeBlockedJSON(w,
+			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
+			http.StatusForbidden, FetchResponse{
+				URL:         displayURL,
+				Agent:       agent,
+				Blocked:     true,
+				BlockReason: blockedErr.reason,
+			})
+		return
+	}
 
 	// Capture observer: record URL verdict for policy replay.
 	urlFindings := urlResultToFindings(result)
@@ -4799,17 +5532,19 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// so RecordClean is NOT applied inside recordSessionActivity: header DLP,
 	// CEE, and response scanning may still find something after this point, and
 	// a clean decay before those stages would incorrectly counteract a later signal.
+	urlBlocked := urlResultBlocks(cfg, sc, targetURL, result)
 	sr := p.recordSessionActivityWithUserAgent(sessionActivityOptions{
-		ClientIP:   clientIP,
-		Agent:      agent,
-		Hostname:   parsed.Hostname(),
-		RequestID:  requestID,
-		UserAgent:  r.UserAgent(),
-		ActorAuth:  id.Auth,
-		Result:     result,
-		Config:     cfg,
-		Logger:     log,
-		DeferClean: true,
+		ClientIP:    clientIP,
+		Agent:       agent,
+		Hostname:    parsed.Hostname(),
+		RequestID:   requestID,
+		UserAgent:   r.UserAgent(),
+		ActorAuth:   id.Auth,
+		Result:      result,
+		ObserveOnly: !result.Allowed && !urlBlocked,
+		Config:      cfg,
+		Logger:      log,
+		DeferClean:  true,
 	})
 
 	// Look up the live session recorder for Fix 4+5: use EscalationLevel() at
@@ -4818,7 +5553,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// RecordClean at the end when no finding was detected.
 	var fetchRec session.Recorder
 	if sm := p.sessionMgrPtr.Load(); sm != nil {
-		sess := sm.GetOrCreate(responseTaintSessionKey(agent, clientIP, id.Auth))
+		sess := sm.GetOrCreate(responseTaintSessionKey(cfg, agent, clientIP, id.Auth))
 		if sess == nil {
 			log.LogBlocked(actx, sessionCapacityLayer, session.ErrCapacity.Error())
 			p.metrics.RecordBlocked(parsed.Hostname(), sessionCapacityLayer, time.Since(start), agentLabel)
@@ -4827,7 +5562,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				Pattern: session.ErrCapacity.Error(), Transport: TransportFetch,
 				Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
 			})
-			writeBlockedJSON(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer), http.StatusServiceUnavailable,
+			writeBlockedJSON(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).WithRequestID(requestID), http.StatusServiceUnavailable,
 				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: session.ErrCapacity.Error()})
 			return
 		}
@@ -4842,7 +5577,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	denyFetchAirlock := func() bool {
 		// A finding belongs to its recorder even after replacement, while
 		// another request may have quarantined the current session meanwhile.
-		for _, fetchSess := range [3]*SessionState{sr.recorder, fetchAirlockSess, p.airlockSessionForIdentity(agent, clientIP, id.Auth)} {
+		for _, fetchSess := range [3]*SessionState{sr.recorder, fetchAirlockSess, p.airlockSessionForIdentity(cfg, agent, clientIP, id.Auth)} {
 			if fetchSess == nil {
 				continue
 			}
@@ -4851,10 +5586,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				p.logger.LogAirlockDeny(fetchSess.key, tier, TransportFetch, r.Method, clientIP, requestID)
 				p.metrics.RecordAirlockDenial(tier, TransportFetch, "read")
 				writeBlockedJSON(w,
-					blockInfoFor(blockreason.AirlockActive, ""),
+					blockInfoFor(blockreason.AirlockActive, "").WithRequestID(requestID),
 					http.StatusForbidden, FetchResponse{
 						URL: displayURL, Agent: agent, Blocked: true,
-						BlockReason: "session in airlock drain",
+						BlockReason: "session in airlock drain; " + airlockBlockDetail(adaptiveAudit{log, clientIP, requestID}, fetchSess, cfg, adaptiveScopeForHost(parsed.Hostname()), tier),
 					})
 				return true
 			}
@@ -4872,11 +5607,14 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// both protective enforcement (rate limiting) AND infrastructure errors (DNS
 	// resolver timeouts) from the finding classification - neither is evidence
 	// of threat.
-	hasFinding := (!result.Allowed && !result.IsAdaptiveNeutral()) || (result.Score > 0 && result.Allowed)
+	hasFinding := (!result.Allowed && (!result.IsAdaptiveNeutral() || result.IsEntropyOnly())) || (result.Score > 0 && result.Allowed)
+	fetchReceiptVerdict := config.ActionAllow
+	fetchReceiptLayer := ""
+	fetchReceiptPattern := ""
 	var fetchGate ContractGateOutput
 
 	if !result.Allowed {
-		if cfg.EnforceEnabled() {
+		if urlBlocked {
 			log.LogBlockedDetail(actx, result.Scanner, result.Reason, auditDetailFromResult(result))
 			p.recordDecision(config.ActionBlock, result.Scanner, result.Reason, "fetch", requestID)
 			emitFetchReceipt(receipt.EmitOpts{
@@ -4924,17 +5662,21 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			if cfg.ExplainBlocksEnabled() {
 				resp.Hint = result.Hint
 			}
-			writeBlockedJSON(w, blockInfo(result.Scanner), status, resp)
+			writeBlockedJSON(w, blockInfoForResult(result).WithRequestID(requestID), status, resp)
 			return
 		}
 		// Audit mode: base action is "warn". Adaptive escalation may upgrade to block.
 		baseAction := config.ActionWarn
-		effectiveAction := decide.UpgradeAction(baseAction, sr.Level, &cfg.AdaptiveEnforcement)
+		effectiveAction := baseAction
+		if !result.IsEntropyOnly() {
+			effectiveAction = decide.UpgradeAction(baseAction, sr.Level, &cfg.AdaptiveEnforcement)
+		}
 		if effectiveAction == config.ActionBlock {
-			sessionKey := sessionKeyFor(agent, clientIP, id.Auth)
+			sessionKey := sessionKeyFor(cfg, agent, clientIP, id.Auth)
 			recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sr.Level), FromAction: baseAction, ToAction: effectiveAction, Scanner: result.Scanner, ClientIP: clientIP, RequestID: requestID})
 			adaptiveDetail := fmt.Sprintf("%s (escalated by %s level=%s auto_recover_at=%s hint=%s)", result.Reason, adaptiveEnforcementLayer, session.EscalationLabel(sr.Level), sr.AutoRecoverAt.Format(time.RFC3339), adaptiveRecoverHint)
-			log.LogBlockedDetail(actx, adaptiveEnforcementLayer, adaptiveDetail, auditDetailFromResult(result))
+			responseDetail := decide.AdaptiveBlockMessage(result.Scanner)
+			log.LogBlockedDetail(actx, adaptiveEnforcementLayer, adaptiveDetail+"; "+adaptiveAuditDetail(sr.recorder, cfg, adaptiveScopeForHost(parsed.Hostname()), result.Scanner), auditDetailFromResult(result))
 			p.metrics.RecordBlocked(parsed.Hostname(), result.Scanner, time.Since(start), agentLabel)
 			emitFetchReceipt(receipt.EmitOpts{
 				ActionID:            receipt.NewActionID(),
@@ -4965,12 +5707,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				escalatedEchoURL = audit.RedactContentBearingURL(displayURL)
 			}
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer),
+				blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer).WithRequestID(requestID),
 				escalatedStatus, FetchResponse{
 					URL:         escalatedEchoURL,
 					Agent:       agent,
 					Blocked:     true,
-					BlockReason: adaptiveBlockedReason,
+					BlockReason: responseDetail,
 					Layer:       adaptiveEnforcementLayer,
 				})
 			return
@@ -5005,7 +5747,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 		})
 		writeBlockedJSON(w,
-			info, status, FetchResponse{
+			info.WithRequestID(requestID), status, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,
@@ -5018,10 +5760,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// session is at an escalation level with block_all=true. UpgradeAction
 	// with an empty base action returns "block" only when block_all is set.
 	if sr.Level > 0 && decide.UpgradeAction("", sr.Level, &cfg.AdaptiveEnforcement) == config.ActionBlock {
-		sessionKey := sessionKeyFor(agent, clientIP, id.Auth)
+		sessionKey := sessionKeyFor(cfg, agent, clientIP, id.Auth)
 		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sr.Level), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
 		adaptiveDetail := fmt.Sprintf("session escalation level %s; auto_recover_at=%s; hint=%s", session.EscalationLabel(sr.Level), sr.AutoRecoverAt.Format(time.RFC3339), adaptiveRecoverHint)
-		log.LogBlocked(actx, adaptiveEnforcementLayer, adaptiveDetail)
+		responseDetail := decide.AdaptiveBlockMessage(adaptiveEnforcementLayer)
+		log.LogBlocked(actx, adaptiveEnforcementLayer, adaptiveDetail+"; "+adaptiveAuditDetail(sr.recorder, cfg, adaptiveScopeForHost(parsed.Hostname()), adaptiveEnforcementLayer))
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:            receipt.NewActionID(),
 			Verdict:             config.ActionBlock,
@@ -5043,12 +5786,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer),
+			blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,
-				BlockReason: adaptiveBlockedReason,
+				BlockReason: responseDetail,
 				Layer:       adaptiveEnforcementLayer,
 			})
 		return
@@ -5057,10 +5800,24 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Request header DLP scanning (fetch is GET-only, no body to scan).
 	// hadFinding is true even in audit/warn mode so RecordClean is not applied
 	// when a header DLP match was detected.
-	headerBlocked, headerHadFinding := p.evalHeaderDLP(r.Context(), headerDLPParams{
+	headerBlocked, headerHadFinding, headerReason, headerReceiptErr := p.evalHeaderDLP(r.Context(), headerDLPParams{
 		headers: r.Header, cfg: cfg, sc: sc, logger: log, actx: actx,
 		hostname: parsed.Hostname(), target: displayURL, metricAgent: agentLabel, start: start,
 	})
+	if headerReceiptErr != nil {
+		blockedErr := newCredentialAudienceReceiptBlockedRequest(headerReceiptErr)
+		log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
+		p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
+		writeBlockedJSON(w,
+			blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
+			http.StatusForbidden, FetchResponse{
+				URL:         displayURL,
+				Agent:       agent,
+				Blocked:     true,
+				BlockReason: blockedErr.reason,
+			})
+		return
+	}
 
 	// Capture observer: record header DLP verdict for policy replay.
 	{
@@ -5089,9 +5846,14 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 	if headerHadFinding {
 		hasFinding = true
+		if !headerBlocked {
+			fetchReceiptVerdict = config.ActionWarn
+			fetchReceiptLayer = "dlp_header"
+			fetchReceiptPattern = "request_header_secret"
+		}
 		if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled {
-			// Blocked header DLP → SignalBlock (high confidence); warn-mode → SignalNearMiss.
-			headerSignal := session.SignalNearMiss
+			// Blocked header DLP → SignalBlock (high confidence); warn-mode → SignalWarning.
+			headerSignal := session.SignalWarning
 			if headerBlocked {
 				headerSignal = session.SignalBlock
 			}
@@ -5105,7 +5867,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				// bound or config-default one keeps its agent namespace. Either
 				// way an operator who copies this into `pipelock session reset`
 				// reaches the session that was escalated.
-				Session:       sessionKeyFor(agent, clientIP, id.Auth),
+				Session:       sessionKeyFor(cfg, agent, clientIP, id.Auth),
 				ClientIP:      clientIP,
 				RequestID:     requestID,
 				DenialScanner: scanner.ScannerDLP,
@@ -5136,12 +5898,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP),
+			blockInfoFor(blockreason.DLPMatch, scanner.ScannerDLP).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,
-				BlockReason: "request header contains secret",
+				BlockReason: headerReason,
 			})
 		return
 	}
@@ -5156,7 +5918,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled &&
 		decide.UpgradeAction("", fetchLevel, &cfg.AdaptiveEnforcement) == config.ActionBlock {
-		headerSessionKey := sessionKeyFor(agent, clientIP, id.Auth)
+		headerSessionKey := sessionKeyFor(cfg, agent, clientIP, id.Auth)
 		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: headerSessionKey, Level: session.EscalationLabel(fetchLevel), FromAction: "", ToAction: config.ActionBlock, Scanner: adaptiveSessionDeny, ClientIP: clientIP, RequestID: requestID})
 		emitFetchReceipt(receipt.EmitOpts{
 			ActionID:            receipt.NewActionID(),
@@ -5179,12 +5941,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer),
+			blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
 				Blocked:     true,
-				BlockReason: adaptiveBlockedReason,
+				BlockReason: adaptiveBlockDetail(adaptiveAudit{log, clientIP, requestID}, fetchRec, cfg, adaptiveScopeForHost(parsed.Hostname()), adaptiveEnforcementLayer),
 				Layer:       adaptiveEnforcementLayer,
 			})
 		return
@@ -5217,7 +5979,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.DataBudget, "budget"),
+			blockInfoFor(blockreason.DataBudget, "budget").WithRequestID(requestID),
 			http.StatusTooManyRequests, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -5237,7 +5999,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	})
 	if admission.Active {
 		ceeRes := admission.Result
-		sessionKey := ceeSessionKey(agent, clientIP, id.Auth)
+		sessionKey := ceeSessionKey(cfg, agent, clientIP, id.Auth)
 
 		// Capture observer: record CEE verdict for policy replay.
 		ceeFindings := ceeResultToFindings(ceeRes)
@@ -5309,7 +6071,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.CrossRequestDeny, "cross_request"),
+				blockInfoFor(blockreason.CrossRequestDeny, "cross_request").WithRequestID(requestID),
 				http.StatusForbidden, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
@@ -5331,7 +6093,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 					Pattern: session.ErrCapacity.Error(), Transport: TransportFetch,
 					Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
 				})
-				writeBlockedJSON(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer), http.StatusServiceUnavailable,
+				writeBlockedJSON(w, blockInfoFor(blockreason.DataBudget, sessionCapacityLayer).WithRequestID(requestID), http.StatusServiceUnavailable,
 					FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: session.ErrCapacity.Error(), Layer: sessionCapacityLayer})
 				return
 			}
@@ -5358,12 +6120,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer),
+				blockInfoFor(blockreason.EscalationLevel, adaptiveEnforcementLayer).WithRequestID(requestID),
 				http.StatusForbidden, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
 					Blocked:     true,
-					BlockReason: adaptiveBlockedReason,
+					BlockReason: adaptiveBlockDetail(adaptiveAudit{log, clientIP, requestID}, ceeRec, cfg, adaptiveScopeForHost(parsed.Hostname()), adaptiveEnforcementLayer),
 					Layer:       adaptiveEnforcementLayer,
 				})
 			return
@@ -5388,11 +6150,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		Agent:     agent,
 		AuditCtx:  actx,
 		Emit: func(opts receipt.EmitOpts) error {
-			return p.emitRequestPolicyReceipt(withReceiptPolicyHash(opts, cfg.CanonicalPolicyHash()))
+			return p.emitRequestPolicyReceipt(withReceiptConfig(withReceiptShard(opts, selectedReceiptShard), cfg))
 		},
 	}); rpRes.Block {
 		p.metrics.RecordBlocked(parsed.Hostname(), blockLayerRequestPolicy, time.Since(start), agentLabel)
-		writeBlockedJSON(w, rpRes.Info, http.StatusForbidden, FetchResponse{
+		writeBlockedJSON(w, rpRes.Info.WithRequestID(requestID), http.StatusForbidden, FetchResponse{
 			URL:         displayURL,
 			Agent:       agent,
 			Blocked:     true,
@@ -5450,7 +6212,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:       agent,
 			Blocked:     true,
 			BlockReason: reason,
-		})
+		}, requestID)
 		return
 	}
 	if err := p.authorizeForward(r.Context(), authorityRef, authorityCarrierErr, authority.Request{
@@ -5482,7 +6244,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		})
 		p.metrics.RecordBlocked(parsed.Hostname(), blockLayerAuthority, time.Since(start), agentLabel)
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority),
+			blockInfoFor(blockreason.AuthorityMismatch, blockLayerAuthority).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -5501,6 +6263,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	ctx = context.WithValue(ctx, ctxKeyAgentScanner, sc)
 	ctx = context.WithValue(ctx, ctxKeyAgentContractLoader, snapshotContractLoader)
 	ctx = context.WithValue(ctx, ctxKeyRedirectTransport, TransportFetch)
+	ctx = context.WithValue(ctx, ctxKeyReceiptShard, selectedReceiptShard)
 	ctx = context.WithValue(ctx, ctxKeyRedirectSessionRecorder, fetchRec)
 	if fetchAirlockSess != nil {
 		ctx = context.WithValue(ctx, ctxKeyRedirectAirlockSession, fetchAirlockSess.key)
@@ -5548,7 +6311,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "fetch",
 				Method:              http.MethodGet,
 				Target:              displayURL,
@@ -5566,7 +6329,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			})
 			p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer),
+				blockInfoFor(blockreason.OutboundEnvelopeFailed, blockedErr.layer).WithRequestID(requestID),
 				http.StatusForbidden, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
@@ -5582,9 +6345,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// CONNECT / WebSocket / MCP). Every field here is request-side, so the
 	// pre-egress receipt is identical to the terminal one below; the terminal
 	// emit is skipped when require_receipts is on to avoid a duplicate.
-	fetchAllowReceipt := receipt.EmitOpts{
+	fetchAllowReceipt := withReceiptShard(receipt.EmitOpts{
 		ActionID:            actionID,
-		Verdict:             config.ActionAllow,
+		Verdict:             fetchReceiptVerdict,
+		Layer:               fetchReceiptLayer,
+		Pattern:             fetchReceiptPattern,
 		Transport:           "fetch",
 		Method:              http.MethodGet,
 		Target:              displayURL,
@@ -5599,17 +6364,17 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		TaintDecision:       fetchTaint.Result.Decision.String(),
 		TaintDecisionReason: fetchTaint.Result.Reason,
 		TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
-	}
+	}, selectedReceiptShard)
 	if fetchGate.HasContractContext() {
 		fetchAllowReceipt = withContractReceipt(fetchGate, fetchAllowReceipt)
 	}
 	if cfg.FlightRecorder.RequireReceipts {
-		if rcptErr := p.emitRequiredReceipt(withReceiptPolicyHash(fetchAllowReceipt, cfg.CanonicalPolicyHash())); rcptErr != nil {
+		if rcptErr := p.emitRequiredReceipt(withReceiptConfig(fetchAllowReceipt, cfg)); rcptErr != nil {
 			blockedErr := newReceiptEmissionBlockedRequest(rcptErr)
 			log.LogBlocked(actx, blockedErr.layer, blockedErr.detail)
 			p.metrics.RecordBlocked(parsed.Hostname(), blockedErr.layer, time.Since(start), agentLabel)
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer),
+				blockInfoFor(blockreason.ReceiptEmissionFailed, blockedErr.layer).WithRequestID(requestID),
 				http.StatusForbidden, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
@@ -5627,6 +6392,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		p.emitOutcomeReceipt(cfg, fetchAllowReceipt, outcomeStatus, outcomeBytes, outcomeReason)
 	}()
 
+	responseencoding.RequestIdentity(req.Header)
 	resp, err := p.client.Do(req) //nolint:gosec // G704: URL validated by scanner pipeline before reaching here
 	if err != nil {
 		var ssrfErr *ssrfDialBlockError
@@ -5654,7 +6420,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				TaskOverrideApplied: fetchTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
-				ssrfErr.blockInfo(),
+				ssrfErr.blockInfo().WithRequestID(requestID),
 				http.StatusForbidden, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
@@ -5692,7 +6458,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				ActionID:            actionID,
 				Verdict:             config.ActionBlock,
 				Layer:               blockedErr.layer,
-				Pattern:             blockedErr.reason,
+				Pattern:             blockedErr.decisivePattern(),
 				Transport:           "fetch",
 				Method:              http.MethodGet,
 				Target:              redirectReceiptTarget(blockedErr, displayURL),
@@ -5709,7 +6475,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				TaskOverrideApplied: redirectTaint.TaskOverrideApplied,
 			})
 			writeBlockedJSON(w,
-				redirectBlockedInfo(blockedErr),
+				redirectBlockedInfo(blockedErr).WithRequestID(requestID),
 				http.StatusForbidden, resp)
 			outcomeStatus = strconv.Itoa(http.StatusForbidden)
 			outcomeReason = blockedErr.layer
@@ -5727,14 +6493,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	defer safeClose(resp.Body, "resp.Body", p.logger)
 
-	// Fail closed on compressed responses before reading the body. p.client
-	// is shared between forward proxy and /fetch and now sets
-	// DisableCompression: true so the upstream Content-Encoding survives
-	// transparent decompression. Without this guard, a gzip/br/zstd response
-	// would flow into readability extraction and the response scanner as
-	// binary garbage, bypassing both. Forward proxy already runs the same
-	// guard in forward.go; this completes parity on the fetch surface.
-	if hasNonIdentityEncoding(resp.Header.Get("Content-Encoding")) {
+	// Decode supported single-layer encodings before the existing decoded-body
+	// size limit and scanners. Unsupported, stacked, and malformed encodings
+	// remain fail-closed instead of reaching readability as opaque bytes.
+	if err := responseencoding.DecodeResponse(resp); err != nil {
 		log.LogBlocked(actx, responseScanLayer, "compressed response cannot be scanned")
 		p.metrics.RecordBlocked(parsed.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
@@ -5749,7 +6511,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.CompressedResponse, responseScanLayer),
+			blockInfoFor(blockreason.CompressedResponse, responseScanLayer).WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -5761,9 +6523,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	responsePromptHit := false
+	var responseFindingKinds []session.HostileFindingKind
+	responseTaintType := responseTaintContentType(resp.Header)
 	defer func() {
-		observeHTTPResponseTaint(fetchRec, cfg, resp.Request.URL.String(), resp.Header.Get("Content-Type"), "fetch_response", responsePromptHit)
+		observeHTTPResponseFindings(fetchRec, cfg, resp.Request.URL.String(), responseTaintType, "fetch_response", responseFindingKinds)
 	}()
 
 	// Limit response body size: use the tighter of max_response_mb and the
@@ -5792,7 +6555,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if remaining < 0 || configMaxBytes <= remaining {
 			// Config max_response_mb was the limiter, not budget.
 			// Return 502 (response too large) without recording against budget.
-			reason := responseSizeBlockReason(parsed.Hostname(), int64(len(body)), configMaxBytes, "fetch_proxy.max_response_mb", false)
+			reason := responseSizeObservedBlockReason(parsed.Hostname(), int64(len(body)), configMaxBytes, "fetch_proxy.max_response_mb", false, false)
 			log.LogBlocked(actx, "response_size", reason)
 			p.metrics.RecordBlocked(parsed.Hostname(), "response_size", time.Since(start), agentLabel)
 			emitFetchReceipt(receipt.EmitOpts{
@@ -5807,7 +6570,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 				Agent:     agent,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.ResponseSize, "response_size"),
+				blockInfoFor(blockreason.ResponseSize, "response_size").WithRequestID(requestID),
 				http.StatusBadGateway, FetchResponse{
 					URL:         displayURL,
 					Agent:       agent,
@@ -5835,7 +6598,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.DataBudget, "budget"),
+			blockInfoFor(blockreason.DataBudget, "budget").WithRequestID(requestID),
 			http.StatusTooManyRequests, FetchResponse{
 				URL:         displayURL,
 				Agent:       agent,
@@ -5848,10 +6611,16 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := resp.Header.Get("Content-Type")
-	title := ""
-
-	isHTML := strings.Contains(contentType, "text/html") || strings.Contains(contentType, "application/xhtml")
+	contentType := responseContentType(resp.Header)
+	var preShieldScan *fetchResponseScan
+	scanOriginal := func(original []byte, headers http.Header) *scanner.ResponseScanResult {
+		if !sc.ResponseScanningEnabled() {
+			return nil
+		}
+		scanned := scanFetchBeforeShield(r.Context(), sc, cfg, original, headers, resp.Request.URL)
+		preShieldScan = &scanned
+		return &scanned.result
+	}
 
 	// Browser Shield: strip fingerprinting, extension probing, and agent traps
 	// before the content reaches readability extraction and response scanning.
@@ -5859,7 +6628,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// URL. An exempt origin that 302s to a non-exempt host must still be shielded.
 	shieldHost := resp.Request.URL.Hostname()
 	shieldBodyBytes := int64(len(body))
-	body, shieldSummary, shieldBlocked := p.applyShield(body, contentType, shieldHost, resp.Header, cfg, actx, clientIP, requestID, TransportFetch, actionID)
+	shieldBlocked := p.blockShieldPartialResponse(resp, body, shieldHost, cfg, actx)
+	var shieldSummary *receipt.ShieldSummary
+	svgShielded := false
+	if shieldBlocked == nil {
+		body, shieldSummary, svgShielded, shieldBlocked = p.applyShieldResponse(body, contentType, resp.Header, cfg, shieldResponseContext{scanOriginal: scanOriginal, hostname: shieldHost, actx: actx, clientIP: clientIP, requestID: requestID, transport: TransportFetch, parentActionID: actionID, shard: selectedReceiptShard})
+	}
 	if shieldBlocked != nil {
 		reason := shieldBlocked.reason
 		p.metrics.RecordBlocked(shieldHost, shieldBlocked.info.Layer, time.Since(start), agentLabel)
@@ -5875,7 +6649,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			shieldBlocked.info,
+			shieldBlocked.info.WithRequestID(requestID),
 			shieldBlocked.status, FetchResponse{
 				URL: displayURL, Agent: agent, Blocked: true,
 				BlockReason: reason,
@@ -5885,12 +6659,14 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		outcomeReason = shieldBlocked.info.Layer
 		return
 	}
+	contentType = responseContentType(resp.Header)
 
 	// Media policy on fetched responses. Runs after shield so HTML passes
 	// through unchanged and image/audio/video responses get transport-
 	// agnostic enforcement. Blocks yield a structured FetchResponse so the
 	// client sees the policy reason, not a generic 403.
-	mediaVerdict := applyMediaPolicy(cfg, contentType, body)
+	mediaVerdict := applyMediaPolicy(cfg, contentType, body, mediaPolicyOptions{svgShielded: svgShielded, headers: resp.Header, host: shieldHost})
+	mediaVerdict = refusePartialMediaRewrite(resp.StatusCode, mediaVerdict)
 	logMediaExposureIfPresent(log, actx, mediaVerdict, "fetch")
 	if mediaVerdict.Blocked {
 		log.LogBlocked(actx, "media_policy", mediaVerdict.BlockReason)
@@ -5912,7 +6688,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.MediaPolicy, ""),
+			blockInfoFor(blockreason.MediaPolicy, "").WithRequestID(requestID),
 			http.StatusForbidden, FetchResponse{
 				URL: displayURL, Agent: agent, Blocked: true,
 				BlockReason: mediaVerdict.BlockReason,
@@ -5922,93 +6698,91 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		outcomeReason = "media_policy"
 		return
 	}
+	if mediaVerdict.Relabeled != "" || (mediaVerdict.StripResult != nil && mediaVerdict.StripResult.Changed()) {
+		if cfg.FlightRecorder.RequireReceipts {
+			if err := p.confirmResponseDecision(cfg, mediaRewriteReceipt(withReceiptShard(receipt.EmitOpts{ParentActionID: actionID, Transport: TransportFetch, Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent}, selectedReceiptShard))); err != nil {
+				p.recordRequiredReceiptBlock(err, TransportFetch)
+				writeBlockedJSON(w, blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).WithRequestID(requestID), http.StatusForbidden, FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: receiptEmissionBlockReason})
+				outcomeStatus, outcomeBytes, outcomeReason = strconv.Itoa(http.StatusForbidden), 0, receiptEmissionFailedLayer
+				return
+			}
+		}
+	}
+	applyRelabeledContentType(resp.Header, mediaVerdict)
+	if mediaVerdict.Relabeled != "" && !mediaVerdict.Blocked {
+		// The fetch contract publishes contentType in its JSON, not the header.
+		contentType = mediaVerdict.Relabeled
+	}
 	if mediaVerdict.StripResult != nil && mediaVerdict.StripResult.Changed() {
 		body = mediaVerdict.Body
 	}
-	scanAsHTML := isHTML && !scanner.IsVerifiedImageResponseBody(body)
-	content := string(body)
-
-	// Extract text from HTML hiding spots (comments, script/style bodies)
-	// that readability strips. Scan only those fragments for injection,
-	// not the full HTML markup, to avoid false positives on legitimate tags.
-	// Use the final response origin after redirects, not the original request
-	// URL. An exempt origin that 302s to a non-exempt host must still be scanned.
+	surface := deriveFetchResponse(body, contentType, resp.Request.URL)
+	content, title := surface.content, surface.title
+	if surface.extractionErr != nil {
+		log.LogAnomaly(actx, "", fmt.Sprintf("readability extraction failed: %v", surface.extractionErr), 0.3)
+	}
 	finalHost := resp.Request.URL.Hostname()
 	finalResponseURL := resp.Request.URL.String()
+	_, responseLevel := adaptiveBlockState(fetchRec, adaptiveScopeForHost(finalHost))
 	responseScanExempt := isResponseScanExempt(finalHost, cfg.ResponseScanning.ExemptDomains)
 	if sc.ResponseScanningEnabled() && responseScanExempt {
 		log.LogResponseScanExempt(actx, finalHost)
 		p.metrics.RecordResponseScanExempt(ExemptReasonDomain, TransportFetch)
 	}
-	var hiddenInjectionFound bool
-	if sc.ResponseScanningEnabled() && scanAsHTML {
-		hidden := extractHiddenContent(content)
-		if hidden != "" {
-			rawResult := sc.ScanResponseWithSuppress(r.Context(), hidden, finalResponseURL, cfg.Suppress)
-			recordSuppressedResponseScanExempts(p.metrics, rawResult.SuppressedMatches, TransportFetch)
-			recordDroppedResponseScanMatches(p.metrics, log, actx, rawResult.SuppressedMatches, TransportFetch)
-			// Use live escalation level so mid-request CEE escalations are reflected.
-			// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
-			blocked, _, found, scanFailed := p.filterAndActOnResponseScan(responseScanContext{
-				requestContext: r.Context(),
-				writer:         w,
-				result:         rawResult,
-				content:        content,
-				displayURL:     displayURL,
-				responseURL:    finalResponseURL,
-				agent:          agent,
-				actorAuth:      id.Auth,
-				clientIP:       clientIP,
-				requestID:      requestID,
-				actionID:       actionID,
-				scanner:        sc,
-				config:         cfg,
-				logger:         log,
-				sessionLevel:   recEscalationLevel(fetchRec),
-				exempt:         responseScanExempt,
-			})
-			if blocked {
-				outcomeLayer := responseScanLayer
-				outcomeCode := http.StatusForbidden
-				if scanFailed {
-					outcomeLayer = "response_scan_error"
-					outcomeCode = http.StatusServiceUnavailable
-				}
-				p.metrics.RecordBlocked(parsed.Hostname(), outcomeLayer, time.Since(start), agentLabel)
-				outcomeStatus = strconv.Itoa(outcomeCode)
-				outcomeBytes = int64(len(body))
-				outcomeReason = outcomeLayer
-				return
+	scanned := fetchResponseScan{}
+	if sc.ResponseScanningEnabled() {
+		scanned = scanFetchResponse(r.Context(), sc, cfg, surface, finalResponseURL)
+		if preShieldScan != nil {
+			scanned.result = retainShieldScan(&preShieldScan.result, scanned.result, []byte(content))
+			hidden := scanner.ResponseScanResult{Clean: true}
+			if scanned.hidden != nil {
+				hidden = *scanned.hidden
 			}
-			if found {
-				hasFinding = true
-			}
-			hiddenInjectionFound = found
-			responsePromptHit = responsePromptHit || found
+			hidden = retainShieldScan(preShieldScan.hidden, hidden, nil)
+			scanned.hidden = &hidden
 		}
 	}
+	hiddenScanResult := scanned.hidden
+	hiddenInjectionFound := hiddenScanResult != nil && !hiddenScanResult.Clean && !hiddenScanResult.Failed()
 
-	// Use go-readability for HTML content extraction.
-	readabilityOK := false
-	if scanAsHTML {
-		article, err := readability.FromReader(strings.NewReader(content), parsed)
-		if err != nil {
-			log.LogAnomaly(actx, "", fmt.Sprintf("readability extraction failed: %v", err), 0.3)
-		} else if article.TextContent != "" {
-			title = article.Title
-			content = article.TextContent
-			readabilityOK = true
-		}
-	}
-
-	// Fail-closed: if hidden injection was detected in HTML comments/script/
+	// Fail-closed: if hidden injection was detected in comments/data-scripts/
 	// style/hidden elements but readability failed to strip them, block rather
 	// than delivering raw HTML with embedded injection. The pre-scan's
 	// TransformedContent cannot map back to the full HTML (it operates on
 	// concatenated fragments), so strip cannot function here.
-	if hiddenInjectionFound && !readabilityOK {
-		responsePromptHit = true
-		reason := "hidden injection detected and readability extraction failed (fail-closed)"
+	if hiddenInjectionFound && !surface.readabilityOK {
+		responseFindingKinds = session.MergeFindingKinds(responseFindingKinds, responseScanFindingKinds(*hiddenScanResult))
+		// Preserve scoring and named audit/receipt evidence when readability
+		// cannot produce a deliverable representation. Discard strip output:
+		// hidden-fragment offsets do not address the full HTML.
+		recordSuppressedResponseScanExempts(p.metrics, hiddenScanResult.SuppressedMatches, TransportFetch)
+		recordDroppedResponseScanMatches(p.metrics, log, actx, hiddenScanResult.SuppressedMatches, TransportFetch)
+		recordObservedCoreResponseMatches(p.metrics, log, actx, hiddenScanResult.ObservedCoreMatches, TransportFetch)
+		p.filterAndActOnResponseScan(responseScanContext{
+			requestContext: r.Context(),
+			shard:          selectedReceiptShard,
+			writer:         w,
+			result:         *hiddenScanResult,
+			content:        content,
+			displayURL:     displayURL,
+			responseURL:    finalResponseURL,
+			agent:          agent,
+			actorAuth:      id.Auth,
+			clientIP:       clientIP,
+			requestID:      requestID,
+			actionID:       actionID,
+			scanner:        sc,
+			config:         cfg,
+			logger:         log,
+			sessionLevel:   responseLevel,
+			exempt:         responseScanExempt,
+			refusing:       true,
+		})
+		patternNames := make([]string, len(hiddenScanResult.Matches))
+		for i, match := range hiddenScanResult.Matches {
+			patternNames[i] = match.PatternName
+		}
+		reason := "hidden injection detected and readability extraction failed (fail-closed): " + strings.Join(patternNames, ", ")
 		log.LogBlocked(actx, responseScanLayer, reason)
 		p.metrics.RecordBlocked(parsed.Hostname(), responseScanLayer, time.Since(start), agentLabel)
 		emitFetchReceipt(receipt.EmitOpts{
@@ -6023,7 +6797,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.PromptInjection, ""),
+			blockInfoFor(blockreason.PromptInjection, "").WithRequestID(requestID),
 			http.StatusForbidden,
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
 		outcomeStatus = strconv.Itoa(http.StatusForbidden)
@@ -6036,16 +6810,12 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Exempt domains are still scanned for visibility (findings logged as warn)
 	// but adaptive scoring is skipped and actions are not upgraded.
 	if sc.ResponseScanningEnabled() {
-		var scanResult scanner.ResponseScanResult
-		if scanAsHTML {
-			scanResult = sc.ScanResponseWithSuppress(r.Context(), content, finalResponseURL, cfg.Suppress)
-		} else {
-			scanResult = sc.ScanResponseBodyWithSuppress(r.Context(), []byte(content), finalResponseURL, cfg.Suppress)
-		}
+		scanResult := scanned.result
 		recordSuppressedResponseScanExempts(p.metrics, scanResult.SuppressedMatches, TransportFetch)
 		recordDroppedResponseScanMatches(p.metrics, log, actx, scanResult.SuppressedMatches, TransportFetch)
+		recordObservedCoreResponseMatches(p.metrics, log, actx, scanResult.ObservedCoreMatches, TransportFetch)
 		if !scanResult.Clean && !scanResult.Failed() {
-			responsePromptHit = true
+			responseFindingKinds = session.MergeFindingKinds(responseFindingKinds, responseScanFindingKinds(scanResult))
 		}
 
 		// Capture observer: record response scan verdict for policy replay.
@@ -6055,7 +6825,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		}
 		if scanResult.Clean {
 			respAction = config.ActionAllow
-		} else if scanResult.Failed() {
+		} else if scanResult.Failed() || (respAction == config.ActionStrip && scanResult.TransformedContent == "") {
 			// An incomplete scan is a fail-closed runtime error, not a
 			// response-scanning match. Keep replay/capture from presenting it
 			// as a warn/allow verdict.
@@ -6081,8 +6851,10 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 
 		// Use live escalation level so mid-request CEE escalations are reflected.
 		// Exempt domains: scan for visibility but pin to warn, no adaptive scoring.
-		blocked, newContent, found, scanFailed := p.filterAndActOnResponseScan(responseScanContext{
+		_, responseLevel = adaptiveBlockState(fetchRec, adaptiveScopeForHost(finalHost))
+		blocked, newContent, found, scanFailureLayer := p.filterAndActOnResponseScan(responseScanContext{
 			requestContext: r.Context(),
+			shard:          selectedReceiptShard,
 			writer:         w,
 			result:         scanResult,
 			content:        content,
@@ -6096,7 +6868,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 			scanner:        sc,
 			config:         cfg,
 			logger:         log,
-			sessionLevel:   recEscalationLevel(fetchRec),
+			sessionLevel:   responseLevel,
 			exempt:         responseScanExempt,
 		})
 		if found {
@@ -6105,9 +6877,11 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 		if blocked {
 			outcomeLayer := responseScanLayer
 			outcomeCode := http.StatusForbidden
-			if scanFailed {
-				outcomeLayer = "response_scan_error"
-				outcomeCode = http.StatusServiceUnavailable
+			if scanFailureLayer != "" {
+				outcomeLayer = scanFailureLayer
+				if scanFailureLayer == "response_scan_error" {
+					outcomeCode = http.StatusServiceUnavailable
+				}
 			}
 			p.metrics.RecordBlocked(parsed.Hostname(), outcomeLayer, time.Since(start), agentLabel)
 			outcomeStatus = strconv.Itoa(outcomeCode)
@@ -6124,7 +6898,7 @@ func (p *Proxy) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if fetchRec != nil && cfg.AdaptiveEnforcement.Enabled && !hasFinding {
 		fetchScope := adaptiveScopeForHost(finalHost)
 		recordCleanForAdaptiveScope(fetchRec, fetchScope, &cfg.AdaptiveEnforcement, sc.ResponseScanningEnabled() && !responseScanExempt, adaptiveRecoveryContext{
-			sessionKey: sessionKeyFor(agent, clientIP, id.Auth),
+			sessionKey: sessionKeyFor(cfg, agent, clientIP, id.Auth),
 			scope:      fetchScope,
 			reason:     adaptiveRecoveryClean,
 			clientIP:   clientIP,
@@ -6188,10 +6962,37 @@ func recordDroppedResponseScanMatches(m *metrics.Metrics, log *audit.Logger, act
 	}
 }
 
+// ExemptReasonCoreObserved labels evidence for a core-floor finding that an
+// operator's declared exception downgraded from block to observe. It is
+// deliberately NOT ExemptReasonSuppress: ordinary suppression cannot reach the
+// immutable floor at all, so an auditor must be able to separate the two
+// without reading config.
+const ExemptReasonCoreObserved = "core_observed"
+
+// recordObservedCoreResponseMatches emits evidence for every core-floor finding
+// withheld from blocking by a declared exception. The scan ran and matched;
+// this is the record that it did, and that an operator accepted it. Like its
+// suppression sibling it is observational and tolerates nil dependencies.
+func recordObservedCoreResponseMatches(m *metrics.Metrics, log *audit.Logger, actx audit.LogContext, observed []scanner.ObservedCoreMatch, surface string) {
+	for _, entry := range observed {
+		if log != nil {
+			log.LogCoreResponseObserved(actx, entry.Match.PatternName, surface, audit.CoreObserveAuthorization{
+				Host:    entry.Host,
+				Reason:  entry.Reason,
+				Owner:   entry.Owner,
+				Expires: entry.Expires,
+			})
+		}
+		m.RecordResponseScanExempt(ExemptReasonCoreObserved, surface)
+		m.RecordResponseSuppressedMatch(entry.Match.PatternName, surface, ExemptReasonCoreObserved)
+	}
+}
+
 // responseScanContext groups the fetch response state used to enforce a scan result.
 // Keep both keyed literals complete: omitted fields compile as zero values, and some
 // zero values are valid runtime state.
 type responseScanContext struct {
+	shard          receipt.EmitOpts
 	requestContext context.Context
 	writer         http.ResponseWriter
 	result         scanner.ResponseScanResult
@@ -6208,17 +7009,22 @@ type responseScanContext struct {
 	logger         *audit.Logger
 	sessionLevel   int
 	exempt         bool
+	// refusing marks a caller that refuses delivery whatever the action
+	// decides. The helper records the hard-block signal and leaves the
+	// single refusal receipt and response to that caller.
+	refusing bool
 }
 
 // filterAndActOnResponseScan applies suppression filtering and the configured
 // response scanning action to a scan result. Returns blocked=true if the
 // request was blocked (HTTP response already written), the output content
 // (possibly stripped), and found=true if unsuppressed findings remain.
+// failureLayer distinguishes incomplete scanning from required receipt failure.
 // sessionLevel is the current adaptive escalation level from recordSessionActivity.
 // exempt indicates the domain was in exempt_domains: findings are logged as
 // warn but adaptive scoring is skipped and UpgradeAction is not applied.
 // This preserves operator visibility without triggering escalation death spirals.
-func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool, out string, found, scanFailed bool) {
+func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool, out string, found bool, failureLayer string) {
 	reqCtx := in.requestContext
 	w := in.writer
 	result := in.result
@@ -6243,7 +7049,7 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 	}
 
 	if result.Clean {
-		return false, out, false, false
+		return false, out, false, ""
 	}
 	if result.Failed() {
 		reason := "response scan failed: " + result.ScanError
@@ -6253,10 +7059,10 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 			Transport: "fetch", Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.ParseError, "response_scan_error"),
+			blockInfoFor(blockreason.ParseError, "response_scan_error").WithRequestID(requestID),
 			http.StatusServiceUnavailable,
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-		return true, "", false, true
+		return true, "", false, "response_scan_error"
 	}
 
 	patternNames := make([]string, len(result.Matches))
@@ -6270,19 +7076,27 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 	// overrides adaptive escalation. This prevents death spirals where LLM
 	// responses naturally contain instruction-like text.
 	action := sc.ResponseAction()
-	if exempt {
-		action = config.ActionWarn
-	}
 	originalAction := action
-	if !exempt {
-		action = decide.UpgradeAction(action, sessionLevel, &cfg.AdaptiveEnforcement)
-	}
-	if action != originalAction {
-		sessionKey := sessionKeyFor(agent, clientIP, actorAuth)
-		recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionLevel), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: clientIP, RequestID: requestID})
-	}
-	if action == config.ActionStrip && result.TransformedContent == "" {
-		action = config.ActionBlock
+	if !in.refusing {
+		if exempt {
+			action = config.ActionWarn
+		}
+		originalAction = action
+		if !exempt {
+			action = decide.UpgradeAction(action, sessionLevel, &cfg.AdaptiveEnforcement)
+		}
+		if action != originalAction {
+			if sm := p.sessionMgrPtr.Load(); sm != nil {
+				if parsedResponseURL, err := url.Parse(firstNonEmptyString(in.responseURL, displayURL)); err == nil {
+					setAdaptiveBlockDetail(w, adaptiveAudit{log, clientIP, requestID}, sm.GetOrCreate(sessionKeyFor(cfg, agent, clientIP, actorAuth)), cfg, adaptiveScopeForHost(parsedResponseURL.Hostname()), responseScanLayer)
+				}
+			}
+			sessionKey := sessionKeyFor(cfg, agent, clientIP, actorAuth)
+			recordAdaptiveUpgrade(log, p.metrics, adaptiveUpgrade{SessionKey: sessionKey, Level: session.EscalationLabel(sessionLevel), FromAction: originalAction, ToAction: action, Scanner: responseScanLayer, ClientIP: clientIP, RequestID: requestID})
+		}
+		if action == config.ActionStrip && result.TransformedContent == "" {
+			action = config.ActionBlock
+		}
 	}
 
 	// recordResponseSignal records an adaptive enforcement signal for the
@@ -6297,7 +7111,7 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 			return
 		}
 		if sm := p.sessionMgrPtr.Load(); sm != nil && cfg.AdaptiveEnforcement.Enabled {
-			sessionKey := sessionKeyFor(agent, clientIP, actorAuth)
+			sessionKey := sessionKeyFor(cfg, agent, clientIP, actorAuth)
 			sess := sm.GetOrCreate(sessionKey)
 			recordAdaptiveSignalForScope(sess, responseScope, sig, &cfg.AdaptiveEnforcement, &cfg.Airlock, decide.EscalationParams{
 				Threshold: cfg.AdaptiveEnforcement.EscalationThreshold,
@@ -6309,10 +7123,17 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 			})
 		}
 	}
+	if in.refusing {
+		// SignalBlock is the hard-block signal in session.SignalPoints.
+		// Warn, strip, and an exempt warn pin describe deliveries this
+		// caller does not make, so none of those verdicts is signed.
+		recordResponseSignal(session.SignalBlock)
+		return false, "", true, ""
+	}
 
 	switch action {
 	case config.ActionBlock:
-		recordResponseSignal(session.SignalBlock)
+		recordResponseSignal(decide.UpgradedWarningSignal(originalAction, session.SignalBlock))
 		reason := fmt.Sprintf("response contains prompt injection: %s", strings.Join(patternNames, ", "))
 		log.LogBlocked(newHTTPAuditContext(reqCtx, p.logger, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), responseScanLayer, reason)
 		emitResponseReceipt(receipt.EmitOpts{
@@ -6327,10 +7148,10 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 			Agent:     agent,
 		})
 		writeBlockedJSON(w,
-			blockInfoFor(blockreason.PromptInjection, responseScanLayer),
+			blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(requestID),
 			http.StatusForbidden,
 			FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-		return true, "", true, false
+		return true, "", true, ""
 	case config.ActionAsk:
 		if p.approver == nil {
 			recordResponseSignal(session.SignalBlock)
@@ -6348,10 +7169,10 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 				Agent:     agent,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.PromptInjection, responseScanLayer),
+				blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(requestID),
 				http.StatusForbidden,
 				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-			return true, "", true, false
+			return true, "", true, ""
 		}
 		preview := content
 		if len(preview) > 200 {
@@ -6366,6 +7187,7 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 		})
 		switch d {
 		case hitl.DecisionAllow:
+			action = config.ActionAllow
 			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:allow", len(result.Matches), patternNames, bundleRules)
 		case hitl.DecisionStrip:
 			if result.TransformedContent == "" {
@@ -6377,12 +7199,13 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 					Transport: "fetch", Method: http.MethodGet, Target: displayURL, RequestID: requestID, Agent: agent,
 				})
 				writeBlockedJSON(w,
-					blockInfoFor(blockreason.PromptInjection, responseScanLayer),
+					blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(requestID),
 					http.StatusForbidden,
 					FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-				return true, "", true, false
+				return true, "", true, ""
 			}
 			out = result.TransformedContent
+			action = config.ActionStrip
 			log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), "ask:strip", len(result.Matches), patternNames, bundleRules)
 		default:
 			recordResponseSignal(session.SignalBlock)
@@ -6400,23 +7223,37 @@ func (p *Proxy) filterAndActOnResponseScan(in responseScanContext) (blocked bool
 				Agent:     agent,
 			})
 			writeBlockedJSON(w,
-				blockInfoFor(blockreason.PromptInjection, responseScanLayer),
+				blockInfoFor(blockreason.PromptInjection, responseScanLayer).WithRequestID(requestID),
 				http.StatusForbidden,
 				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: reason})
-			return true, "", true, false
+			return true, "", true, ""
 		}
 	case config.ActionStrip:
 		recordResponseSignal(session.SignalStrip)
 		out = result.TransformedContent
 		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), config.ActionStrip, len(result.Matches), patternNames, bundleRules)
 	case config.ActionWarn:
-		recordResponseSignal(session.SignalNearMiss)
+		recordResponseSignal(session.SignalWarning)
 		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), config.ActionWarn, len(result.Matches), patternNames, bundleRules)
 	default:
-		recordResponseSignal(session.SignalNearMiss)
+		recordResponseSignal(session.SignalWarning)
 		log.LogResponseScan(newHTTPAuditContext(reqCtx, log, httpAuditEvent{Method: http.MethodGet, TargetURL: displayURL, ClientIP: clientIP, RequestID: requestID, Agent: agent}), action, len(result.Matches), patternNames, bundleRules)
 	}
-	return false, out, true, false
+	if cfg.FlightRecorder.RequireReceipts {
+		err := p.emitAllowPathReceipt(cfg, withReceiptShard(receipt.EmitOpts{
+			ActionID: receipt.NewActionID(), ParentActionID: actionID, Verdict: action,
+			Layer: responseScanLayer, Pattern: strings.Join(patternNames, ", "),
+			Transport: TransportFetch, Method: http.MethodGet, Target: displayURL,
+			RequestID: requestID, Agent: agent,
+		}, firstReceiptShard(in.shard, receiptShardFromContext(reqCtx))))
+		if err != nil {
+			p.recordRequiredReceiptBlock(err, TransportFetch)
+			writeBlockedJSON(w, blockInfoFor(blockreason.ReceiptEmissionFailed, receiptEmissionFailedLayer).WithRequestID(requestID), http.StatusForbidden,
+				FetchResponse{URL: displayURL, Agent: agent, Blocked: true, BlockReason: receiptEmissionBlockReason})
+			return true, "", true, receiptEmissionFailedLayer
+		}
+	}
+	return false, out, true, ""
 }
 
 // stripFetchControlChars removes C0 control characters (0x00-0x1F) and DEL
@@ -6487,20 +7324,21 @@ func extractRawURLParam(rawQuery string) string {
 // map; when disabled, Subsystems is omitted and Status is always "healthy"
 // (preserving the legacy shape).
 type healthResponse struct {
-	Status                 string          `json:"status"`
-	Version                string          `json:"version"`
-	Mode                   string          `json:"mode"`
-	UptimeSeconds          float64         `json:"uptime_seconds"`
-	DLPPatterns            int             `json:"dlp_patterns"`
-	ResponseScanEnabled    bool            `json:"response_scan_enabled"`
-	GitProtectionEnabled   bool            `json:"git_protection_enabled"`
-	RateLimitEnabled       bool            `json:"rate_limit_enabled"`
-	ForwardProxyEnabled    bool            `json:"forward_proxy_enabled"`
-	WebSocketProxyEnabled  bool            `json:"websocket_proxy_enabled"`
-	RequestBodyScanEnabled bool            `json:"request_body_scan_enabled"`
-	TLSInterceptionEnabled bool            `json:"tls_interception_enabled"`
-	KillSwitchActive       bool            `json:"kill_switch_active"`
-	Subsystems             map[string]bool `json:"subsystems,omitempty"`
+	Status                 string                `json:"status"`
+	Version                string                `json:"version"`
+	Mode                   string                `json:"mode"`
+	UptimeSeconds          float64               `json:"uptime_seconds"`
+	DLPPatterns            int                   `json:"dlp_patterns"`
+	ResponseScanEnabled    bool                  `json:"response_scan_enabled"`
+	GitProtectionEnabled   bool                  `json:"git_protection_enabled"`
+	RateLimitEnabled       bool                  `json:"rate_limit_enabled"`
+	ForwardProxyEnabled    bool                  `json:"forward_proxy_enabled"`
+	WebSocketProxyEnabled  bool                  `json:"websocket_proxy_enabled"`
+	RequestBodyScanEnabled bool                  `json:"request_body_scan_enabled"`
+	TLSInterceptionEnabled bool                  `json:"tls_interception_enabled"`
+	KillSwitchActive       bool                  `json:"kill_switch_active"`
+	Subsystems             map[string]bool       `json:"subsystems,omitempty"`
+	Identity               *proxyhealth.Identity `json:"identity,omitempty"`
 }
 
 const (
@@ -6515,7 +7353,22 @@ const (
 // signal even if the HTTP handler itself is fine.
 func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 	cfg := p.cfgPtr.Load()
+	var identity *proxyhealth.Identity
+	if _, requested := r.URL.Query()["identity"]; requested {
+		query, err := url.ParseQuery(r.URL.RawQuery)
+		if err != nil || len(query["identity"]) != 1 || query.Get("identity") != "1" {
+			http.Error(w, "invalid identity diagnostic query", http.StatusBadRequest)
+			return
+		}
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		identity = p.requestIdentityStatus(r)
+		w.Header().Set("Cache-Control", "no-store")
+	}
 	resp := healthResponse{
+		Identity:      identity,
 		Status:        healthStatusHealthy,
 		Version:       Version,
 		UptimeSeconds: time.Since(p.startTime).Seconds(),
@@ -6531,16 +7384,11 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 		resp.RequestBodyScanEnabled = cfg.RequestBodyScanning.Enabled
 		resp.TLSInterceptionEnabled = cfg.TLSInterception.Enabled
 	}
-	if p.ks != nil {
-		// Read-only kill switch status - no auth needed. Lets operators
-		// see kill switch state from the main port even when the API
-		// is on a separate port.
-		for _, active := range p.ks.Sources() {
-			if active {
-				resp.KillSwitchActive = true
-				break
-			}
-		}
+	if p.ks != nil && p.ks.IsActive() {
+		// Read-only kill switch status, with no auth. This matches enforcement,
+		// including a reload candidate that is already blocking traffic, rather
+		// than the current config sources alone.
+		resp.KillSwitchActive = true
 	}
 
 	status := http.StatusOK

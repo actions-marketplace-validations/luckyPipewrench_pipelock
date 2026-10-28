@@ -515,21 +515,21 @@ func TestEmitMCPDecision_V2EmitErrorSurfacesAfterV1(t *testing.T) {
 	}
 }
 
-func TestEmitMCPDecision_RequiredV1SuccessSatisfiesV2EmitError(t *testing.T) {
+// A v1 receipt cannot satisfy the required durable v2 receipt for an egressing
+// decision. Both writers share the real recorder; only the second sync fails.
+func TestEmitMCPDecision_RequiredV2SyncFailureBlocksAfterV1Success(t *testing.T) {
 	h := newMCPDecisionReceiptHarness(t)
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("GenerateKey: %v", err)
-	}
-	v2 := proxydecision.NewEmitter(proxydecision.EmitterConfig{
-		Recorder: failingMCPV2Recorder{},
-		Signer:   proxydecision.NewKeyedSigner(priv),
+	var syncCalls int
+	h.rec.SetSyncForTest(func(*os.File) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return errors.New("v2 sync failure")
+		}
+		return nil
 	})
-	if v2 == nil {
-		t.Fatal("expected v2 emitter")
-	}
-
-	_, err = EmitMCPDecision(h.v1, v2, nil, MCPDecision{
+	inbound := []byte(`{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"fetch","arguments":{}}}`)
+	envEmitter := envelope.NewEmitter(envelope.EmitterConfig{ConfigHash: "policy-h"})
+	out, err := EmitMCPDecision(h.v1, h.v2, envEmitter, MCPDecision{
 		Receipt: receipt.EmitOpts{
 			ActionID:   "mcp-v2-required-error",
 			Verdict:    config.ActionAllow,
@@ -539,10 +539,18 @@ func TestEmitMCPDecision_RequiredV1SuccessSatisfiesV2EmitError(t *testing.T) {
 			ToolName:   "fetch",
 			PolicyHash: mcpTestPolicyHash,
 		},
+		Envelope:       &envelope.BuildOpts{ActionID: "mcp-v2-required-error", Action: "tool_call", Verdict: config.ActionAllow},
+		InboundMsg:     inbound,
 		RequireReceipt: true,
 	})
-	if err != nil {
-		t.Fatalf("EmitMCPDecision error = %v, want nil because v1 emitted", err)
+	if !errors.Is(err, ErrReceiptRequired) || !errors.Is(err, recorder.ErrDurability) {
+		t.Fatalf("EmitMCPDecision error = %v, want required v2 durability error", err)
+	}
+	if !bytes.Equal(out, inbound) {
+		t.Fatalf("outbound mutated despite failed v2 sync: %s", out)
+	}
+	if syncCalls != 2 {
+		t.Fatalf("sync calls = %d, want v1 and v2", syncCalls)
 	}
 	receipts := decisionReceiptLogFor(t, h.dir)
 	if len(receipts) != 1 {
@@ -553,11 +561,15 @@ func TestEmitMCPDecision_RequiredV1SuccessSatisfiesV2EmitError(t *testing.T) {
 	}
 }
 
-func TestEmitMCPDecision_RequiredV2SuccessSatisfiesV1EmitError(t *testing.T) {
+// A required decision is not satisfied by the v2 family alone when v1 is
+// configured and failed: v2 carries no action ID, phase or native AEL activity,
+// so the intent would be forwarded with no v1 record to pair it with.
+func TestEmitMCPDecision_RequiredV1FailureNotSatisfiedByV2(t *testing.T) {
 	h := newMCPDecisionReceiptHarness(t)
 	h.v1.MarkUnhealthy(errors.New("v1 unavailable"))
+	inbound := []byte(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fetch","arguments":{}}}`)
 
-	_, err := EmitMCPDecision(h.v1, h.v2, nil, MCPDecision{
+	out, err := EmitMCPDecision(h.v1, h.v2, nil, MCPDecision{
 		Receipt: receipt.EmitOpts{
 			ActionID:   "mcp-v1-required-error",
 			Verdict:    config.ActionAllow,
@@ -567,13 +579,84 @@ func TestEmitMCPDecision_RequiredV2SuccessSatisfiesV1EmitError(t *testing.T) {
 			ToolName:   "fetch",
 			PolicyHash: mcpTestPolicyHash,
 		},
+		InboundMsg:     inbound,
+		RequireReceipt: true,
+	})
+	if !errors.Is(err, ErrReceiptRequired) {
+		t.Fatalf("EmitMCPDecision error = %v, want ErrReceiptRequired", err)
+	}
+	if !bytes.Equal(out, inbound) {
+		t.Fatalf("outbound mutated despite failed v1 receipt: %s", out)
+	}
+	if receipts := decisionReceiptLogFor(t, h.dir); len(receipts) != 0 {
+		t.Fatalf("v1 receipts = %d, want 0 from the unhealthy emitter", len(receipts))
+	}
+}
+
+// Block-path receipts stay best-effort under required mode (the action is
+// already denied, see docs/configuration.md require_receipts): one recorded
+// family is enough, so a failed v2 record on a block does not raise an error.
+func TestEmitMCPDecision_RequiredBlockPathStaysBestEffort(t *testing.T) {
+	h := newMCPDecisionReceiptHarness(t)
+	if _, _, err := h.v2.Retire(); err != nil {
+		t.Fatalf("Retire v2: %v", err)
+	}
+
+	_, err := EmitMCPDecision(h.v1, h.v2, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:   "mcp-v2-required-block-error",
+			Verdict:    config.ActionBlock,
+			Transport:  transportMCPStdio,
+			Target:     "response:3",
+			PolicyHash: mcpTestPolicyHash,
+		},
 		RequireReceipt: true,
 	})
 	if err != nil {
-		t.Fatalf("EmitMCPDecision error = %v, want nil because v2 emitted", err)
+		t.Fatalf("EmitMCPDecision error = %v, want nil for a best-effort block receipt", err)
 	}
-	if receipts := mcpV2Receipts(t, h); len(receipts) != 1 {
-		t.Fatalf("v2 receipts = %d, want 1", len(receipts))
+	if receipts := decisionReceiptLogFor(t, h.dir); len(receipts) != 1 {
+		t.Fatalf("v1 receipts = %d, want 1", len(receipts))
+	}
+}
+
+// Configured required mode reaches the same rule through MCPProxyOpts.
+func TestMCPProxyOpts_RequiredModeDoesNotForwardWithoutV1Receipt(t *testing.T) {
+	h := newMCPDecisionReceiptHarness(t)
+	h.v1.MarkUnhealthy(errors.New("v1 unavailable"))
+	opts := MCPProxyOpts{ReceiptEmitter: h.v1, V2ReceiptEmitter: h.v2, RequireReceipts: true}
+	_, err := opts.emitReceiptDecision(MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID:   receipt.NewActionID(),
+			Verdict:    config.ActionAllow,
+			Transport:  transportMCPStdio,
+			Target:     "fetch",
+			MCPMethod:  methodToolsCall,
+			ToolName:   "fetch",
+			PolicyHash: mcpTestPolicyHash,
+		},
+		InboundMsg:     []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call"}`),
+		RequireReceipt: true,
+		RequiredMode:   true,
+	})
+	if !errors.Is(err, ErrReceiptRequired) {
+		t.Fatalf("emitReceiptDecision error = %v, want ErrReceiptRequired", err)
+	}
+}
+
+func TestEmitMCPDecision_RequiredV2MustSyncBeforeEgress(t *testing.T) {
+	h := newMCPDecisionReceiptHarness(t)
+	h.rec.SetSyncForTest(func(*os.File) error { return errors.New("injected sync failure") })
+	_, err := EmitMCPDecision(h.v1, h.v2, nil, MCPDecision{
+		Receipt: receipt.EmitOpts{
+			ActionID: "mcp-v2-sync-failure", Verdict: config.ActionAllow,
+			Transport: transportMCPStdio, Target: "fetch", MCPMethod: methodToolsCall,
+			ToolName: "fetch", PolicyHash: mcpTestPolicyHash,
+		},
+		RequireReceipt: true,
+	})
+	if !errors.Is(err, ErrReceiptRequired) {
+		t.Fatalf("err = %v, want ErrReceiptRequired", err)
 	}
 }
 
@@ -622,6 +705,122 @@ func TestEmitMCPDecision_RequiredNeitherEmitterEmitsFailsClosed(t *testing.T) {
 	}
 }
 
+func TestEmitMCPGroupDecision_RequiresBothShardWrites(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		broken string
+	}{
+		{name: "paired success"},
+		{name: "v1 failure", broken: "v1"},
+		{name: "v2 failure", broken: "v2"},
+		{name: "v1 durability failure", broken: "v1 durability"},
+		{name: "v2 durability failure", broken: "v2 durability"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, key, err := ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rec, err := recorder.New(recorder.Config{Enabled: true, Dir: t.TempDir(), SignCheckpoints: true}, nil, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = rec.Close() })
+			shards, err := receipt.OpenInitialReceiptShardSet(receipt.EmitterConfig{
+				Recorder: rec, PrivKey: key, ConfigHash: mcpTestPolicyHash,
+				Principal: "local", Actor: "pipelock",
+			}, "proxy", 2, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			opening, _ := shards.Opening()
+			group := MCPReceiptGroup{Shards: shards, V2: make([]*proxydecision.Emitter, 2)}
+			var cancelCalls int
+			group.OnRequiredFailure = func(error) { cancelCalls++ }
+			for i, shard := range opening.Shards {
+				writer := proxydecision.Recorder(rec)
+				if i == 1 && test.broken == "v2" {
+					writer = failingMCPV2Recorder{}
+				}
+				group.V2[i] = proxydecision.NewEmitter(proxydecision.EmitterConfig{
+					Recorder: writer, Signer: proxydecision.NewKeyedSigner(key),
+					Principal: "local", Actor: "pipelock", Session: shard.SessionID,
+				})
+			}
+			if test.broken == "v1" {
+				shards.Emitters()[1].MarkUnhealthy(errors.New("v1 unavailable"))
+			}
+			if test.broken == "v1 durability" || test.broken == "v2 durability" {
+				var syncCalls int
+				rec.SetSyncForTest(func(*os.File) error {
+					syncCalls++
+					if (test.broken == "v1 durability" && syncCalls == 1) || (test.broken == "v2 durability" && syncCalls == 2) {
+						return errors.New("shard sync failure")
+					}
+					return nil
+				})
+			}
+			opts := receipt.EmitOpts{
+				ActionID: "group-decision", Verdict: config.ActionAllow,
+				Transport: transportMCPStdio, Target: "fetch", MCPMethod: methodToolsCall,
+				ToolName: "fetch", PolicyHash: mcpTestPolicyHash,
+				ShardIndex: 1, ShardSelected: true,
+			}
+			inbound := []byte(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"fetch","arguments":{}}}`)
+			out, err := EmitMCPGroupDecision(group, envelope.NewEmitter(envelope.EmitterConfig{ConfigHash: "h"}), MCPDecision{
+				Receipt: opts, RequireReceipt: true, RequiredMode: true, InboundMsg: inbound,
+				Envelope: &envelope.BuildOpts{ActionID: opts.ActionID, Verdict: config.ActionAllow},
+			})
+			if test.broken == "" {
+				if err != nil || bytes.Equal(out, inbound) {
+					t.Fatalf("paired emit err=%v, envelope unchanged=%t", err, bytes.Equal(out, inbound))
+				}
+				emitMCPOutcomeReceipt(nil, nil, &group, nil, opts, "ok", 12, "complete", true)
+				if err := rec.Close(); err != nil {
+					t.Fatal(err)
+				}
+				for i, shard := range opening.Shards {
+					paths, globErr := filepath.Glob(filepath.Join(rec.Dir(), "evidence-"+shard.SessionID+"-*.jsonl"))
+					if globErr != nil || len(paths) != 1 {
+						t.Fatalf("shard %d evidence files=%v err=%v", i, paths, globErr)
+					}
+					entries, readErr := recorder.ReadEntries(paths[0])
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					var decisions int
+					for _, entry := range entries {
+						if (entry.Type == "action_receipt" || entry.Type == "evidence_receipt") && bytes.Contains(entry.RawDetail, []byte("group-decision")) {
+							decisions++
+						}
+					}
+					if want := 0; i == 1 {
+						want = 2 // v1 decision and outcome; v2 does not carry action ID.
+						if decisions != want {
+							t.Fatalf("shard %d decision records=%d, want %d", i, decisions, want)
+						}
+					} else if decisions != want {
+						t.Fatalf("shard %d decision records=%d, want %d", i, decisions, want)
+					}
+				}
+			} else if !errors.Is(err, ErrReceiptRequired) || !bytes.Equal(out, inbound) {
+				t.Fatalf("broken %s pair err=%v, outbound=%s", test.broken, err, out)
+			}
+			if test.broken == "v1 durability" || test.broken == "v2 durability" {
+				if cancelCalls != 1 || shards.Emitters()[0].HealthError() == nil {
+					t.Fatalf("durability failure cancel calls=%d, other shard health=%v", cancelCalls, shards.Emitters()[0].HealthError())
+				}
+			} else if test.broken == "v1" {
+				if cancelCalls != 1 {
+					t.Fatalf("sticky v1 failure cancellation calls=%d", cancelCalls)
+				}
+			} else if cancelCalls != 0 {
+				t.Fatalf("unexpected group cancellation after %s: %d", test.broken, cancelCalls)
+			}
+		})
+	}
+}
+
 func TestEmitMCPV2Decision_RequiredDerivationFailureFailsClosed(t *testing.T) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -641,7 +840,7 @@ func TestEmitMCPV2Decision_RequiredDerivationFailureFailsClosed(t *testing.T) {
 		Transport: transportMCPStdio,
 		// Target intentionally empty: v1 currently rejects this too, but the
 		// required v2 helper must not silently skip configured v2 emission.
-	}, true)
+	}, true, true)
 	if !errors.Is(err, errMCPV2ReceiptEmit) {
 		t.Fatalf("emitMCPV2Decision error = %v, want errMCPV2ReceiptEmit", err)
 	}
@@ -783,13 +982,14 @@ func TestMCPV2DecisionFromReceipt_ProvenanceBranches(t *testing.T) {
 }
 
 // The durable pre-egress guarantee must cover every forwardable verdict, not
-// just allow: warn, forward, and strip all egress upstream, so their required
+// just allow: warn/forward send upstream, strip returns bytes, and redirect
+// executes a handler, so their required
 // decision receipt must be fsync-confirmed before the bytes leave. Only the
 // durable (RecordDurable) path calls File.Sync, so an injected Sync failure
 // makes a required forwardable verdict fail closed with recorder.ErrDurability
 // while a non-forwardable verdict (no Sync call) is unaffected.
 func TestEmitMCPDecision_ForwardableVerdictsEmitDurable(t *testing.T) {
-	for _, verdict := range []string{config.ActionWarn, config.ActionForward, config.ActionStrip} {
+	for _, verdict := range []string{config.ActionWarn, config.ActionForward, config.ActionStrip, config.ActionRedirect} {
 		t.Run(verdict, func(t *testing.T) {
 			recEmitter, rec, _, _ := newReceiptTestHarness(t)
 			syncErr := errors.New("injected durable sync failure")
@@ -843,10 +1043,10 @@ func TestEmitMCPDecision_NonForwardableVerdictStaysNonDurable(t *testing.T) {
 }
 
 // Only allow carries DecisionPhaseIntent (paired with a downstream outcome);
-// warn/forward/strip must stay single-phase so the completeness verifier counts
+// warn/forward/strip/redirect must stay single-phase so the completeness verifier counts
 // them as neither an intent nor an outcome (no unmatched-intent).
 func TestEmitMCPDecision_ForwardableVerdictsStaySinglePhase(t *testing.T) {
-	for _, verdict := range []string{config.ActionWarn, config.ActionForward, config.ActionStrip} {
+	for _, verdict := range []string{config.ActionWarn, config.ActionForward, config.ActionStrip, config.ActionRedirect} {
 		t.Run(verdict, func(t *testing.T) {
 			recEmitter, _, dir, _ := newReceiptTestHarness(t)
 			_, err := EmitMCPDecision(recEmitter, nil, nil, MCPDecision{

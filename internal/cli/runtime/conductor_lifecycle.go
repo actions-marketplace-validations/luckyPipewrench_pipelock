@@ -89,6 +89,15 @@ func (s *Server) teardownConductor(reason string) {
 		s.conductorLifeMu.Unlock()
 		return
 	}
+	// Publish strict denial before the stopped state, under the same lock
+	// used by consistency completion. A stale check already in flight may
+	// clear its own source after cancellation, so retain the independent gate
+	// until restart as well.
+	if s.conductorStaleStrictDeny.Load() && s.killswitch != nil {
+		const message = "conductor fleet entitlement lost under strict stale policy; denying all traffic (fail-closed)"
+		s.killswitch.SetConductorApplyFailure(true, message)
+		s.killswitch.SetConductorStale(true, message)
+	}
 	s.conductorDown.Store(true)
 	cancel := s.conductorCancel
 	wait := s.conductorWait
@@ -108,19 +117,6 @@ func (s *Server) teardownConductor(reason string) {
 	s.conductorAuditQueue = nil
 	s.conductorLifeMu.Unlock()
 
-	// Fail closed on strict stale policy BEFORE cancelling the pollers. The
-	// stale enforcer's ticker is about to stop and can never re-engage once the
-	// fleet entitlement is permanently gone; a strict follower whose active
-	// bundle later ages past grace would otherwise serve stale config forever.
-	// Engage the conductor_stale kill-switch source now so the deny is in place
-	// before the enforcer dies, closing the teardown fail-open window. This is an
-	// independent OR-composed source: it stays engaged regardless of any later
-	// clear of conductor_remote. Under continue_last_known_good the flag is false
-	// and the existing serve-last-config semantics are preserved.
-	if s.conductorStaleStrictDeny.Load() && s.killswitch != nil {
-		s.killswitch.SetConductorStale(true,
-			"conductor fleet entitlement lost under strict stale policy; denying all traffic (fail-closed)")
-	}
 	// Stop the follower pollers. Their Run loops return context.Canceled, which
 	// the Start error branches treat as a clean stop (no process-wide cancel).
 	if cancel != nil {
@@ -158,6 +154,51 @@ func closeConductorAuditQueue(auditQueue any) {
 	}
 }
 
+// finishConductorAudit runs after listeners and Conductor runners have joined
+// and recorder.Close has emitted the final checkpoint. Finalize the producer
+// before giving those last batches one bounded delivery opportunity. Constructor
+// cleanup and entitlement teardown must never initiate a drain.
+func (s *Server) finishConductorAudit() {
+	s.conductorLifeMu.Lock()
+	producer := s.conductorProducer
+	queue := s.conductorAuditQueue
+	s.conductorProducer = nil
+	s.conductorAuditQueue = nil
+	drainer, canDrain := s.conductorAudit.(interface{ Drain(context.Context) error })
+	canDrain = canDrain && queue != nil && s.conductorWait != nil && !s.conductorDown.Load()
+	var ctx context.Context
+	var cancel context.CancelFunc
+	var done chan struct{}
+	if canDrain {
+		ctx, cancel = context.WithTimeout(context.Background(), serverShutdownTimeout)
+		done = make(chan struct{})
+		// Ordinary shutdown has cancelled the Run context. Publish a distinct,
+		// bounded final-drain context under the same revocation gate. Teardown
+		// cancels it immediately and joins it before returning; this function
+		// owns the queue lock until the drain has stopped.
+		s.conductorCancel = cancel
+		s.conductorWait = func() { <-done }
+	}
+	s.conductorLifeMu.Unlock()
+	defer func() {
+		if cancel != nil {
+			cancel()
+		}
+		closeConductorAuditQueue(queue)
+		if done != nil {
+			close(done)
+		}
+	}()
+	if producer != nil {
+		_ = producer.Close()
+	}
+	if canDrain {
+		if err := drainer.Drain(ctx); err != nil && s.opts.Stderr != nil {
+			_, _ = fmt.Fprintf(s.opts.Stderr, "pipelock: final conductor audit delivery incomplete; inspect the durable queue: %v\n", err)
+		}
+	}
+}
+
 func (s *Server) hasConductorRuntime() bool {
 	return s.conductorApply != nil ||
 		s.conductorAuditQueue != nil ||
@@ -178,6 +219,7 @@ func (s *Server) expireLicensedRuntime() {
 		return
 	}
 	if s.proxy != nil {
+		s.proxy.SetLicenseRevoked(s.proxy.CurrentConfig(), true)
 		s.proxy.ShutdownAgentServers()
 	}
 	s.teardownConductor("expired")

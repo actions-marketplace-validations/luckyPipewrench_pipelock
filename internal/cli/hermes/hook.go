@@ -17,6 +17,7 @@ import (
 	"github.com/luckyPipewrench/pipelock/internal/cliutil"
 	"github.com/luckyPipewrench/pipelock/internal/config"
 	"github.com/luckyPipewrench/pipelock/internal/extract"
+	"github.com/luckyPipewrench/pipelock/internal/jsonnumber"
 	"github.com/luckyPipewrench/pipelock/internal/rules"
 	"github.com/luckyPipewrench/pipelock/internal/scanner"
 )
@@ -66,9 +67,10 @@ type HookEvent struct {
 // Context is reserved for the pre_llm_call hook contract but is unused at this
 // release.
 type HookDecision struct {
-	Decision string `json:"decision,omitempty"`
-	Reason   string `json:"reason,omitempty"`
-	Context  string `json:"context,omitempty"`
+	warnings []string // operator records written to stderr, outside the decision schema
+	Decision string   `json:"decision,omitempty"`
+	Reason   string   `json:"reason,omitempty"`
+	Context  string   `json:"context,omitempty"`
 }
 
 // hookCmd returns the `pipelock hermes hook` subcommand. Hermes invokes it as
@@ -152,14 +154,12 @@ func runHook(ctx context.Context, cmd *cobra.Command, configFile string) error {
 		return emitDecision(stdout, blockDecision(fmt.Sprintf("pipelock hermes hook: config load failed: %v", err)))
 	}
 
+	var bundleErr error
 	cfg, _ = runtimeconfig.ResolveAndReportConfig(cfg, config.RuntimeResolveOpts{
 		Mode: config.RuntimeMCPScan,
 		MergeBundles: func(c *config.Config) {
-			// Bundle merge errors are surfaced via stderr only; an empty
-			// bundle set still produces a valid (core-pattern-only) scanner.
-			// Blocking the whole hook on a bundle parse error would be a
-			// hostile-rules denial-of-service vector.
 			result := rules.MergeIntoConfig(c, cliutil.Version)
+			bundleErr = rules.StrictIntegrityError(c, result)
 			for _, e := range result.Errors {
 				_, _ = fmt.Fprintf(stderr, "pipelock hermes hook: warning: bundle %s: %s\n", e.Name, e.Reason)
 			}
@@ -168,14 +168,31 @@ func runHook(ctx context.Context, cmd *cobra.Command, configFile string) error {
 			}
 		},
 	}, stderr, "hermes hook")
+	if bundleErr != nil {
+		return emitDecision(stdout, blockDecision("pipelock hermes hook: "+bundleErr.Error()))
+	}
 
-	sc, err := scanner.New(cfg)
+	// A terminal command is code about to run, and a tool result or gateway
+	// message is text the agent receives; neither is sent anywhere as written.
+	// There, an assignment whose whole statement is one environment lookup is
+	// code, not a credential. Other tools' arguments can be sent to a server
+	// as literal bytes, so they keep the full check, as do the proxy's scanners.
+	toolCommand := event.HookEventName != HookPreToolCall || event.ToolName == hermesTerminalTool
+	sc, err := scanner.NewWithOptions(cfg, scanner.Options{ToolCommandEnvLookups: toolCommand})
 	if err != nil {
 		return emitDecision(stdout, blockDecision(fmt.Sprintf("pipelock hermes hook: scanner startup failed: %v", err)))
 	}
 	defer sc.Close()
+	// Global warn-only wording findings never change the decision; report
+	// them by pattern name so warn-only is not silent.
+	sc.SetInjectionWarnHook(func(_ context.Context, names []string) {
+		_, _ = fmt.Fprintf(stderr, "pipelock: warning: warn-only prompt-injection wording match: %s\n", strings.Join(names, ", "))
+	})
 
 	decision := evaluate(ctx, sc, &event)
+	for _, warning := range decision.warnings {
+		_, _ = fmt.Fprintln(stderr, warning)
+	}
 	return emitDecision(stdout, decision)
 }
 
@@ -197,27 +214,27 @@ func evaluate(ctx context.Context, sc *scanner.Scanner, event *HookEvent) HookDe
 	switch event.HookEventName {
 	case HookPreToolCall:
 		// Outbound: the agent is invoking a tool; arguments may egress.
-		text, truncated := extractToolInputText(event.ToolInput)
+		text, cards, truncated := extractToolInputViews(event.ToolInput)
 		if truncated {
 			return blockDecision("pipelock: tool arguments exceed maximum inspectable nesting depth")
 		}
-		return scanCombined(ctx, sc, text,
+		return scanCombinedViews(ctx, sc, hookScanViews{text: text, cards: cards, raw: event.ToolInput},
 			fmt.Sprintf("tool %q arguments", event.ToolName), directionOutbound)
 	case HookTransformToolResult:
 		// Inbound: a tool result flowing back to the agent.
-		text, truncated := extractToolInputText(event.ToolInput)
+		text, cards, truncated := extractToolInputViews(event.ToolInput)
 		if truncated {
 			return blockDecision("pipelock: tool result exceeds maximum inspectable nesting depth")
 		}
-		return scanCombined(ctx, sc, text,
+		return scanCombinedViews(ctx, sc, hookScanViews{text: text, cards: cards, raw: event.ToolInput},
 			fmt.Sprintf("tool %q result", event.ToolName), directionInbound)
 	case HookPreGatewayDispatch:
 		// Inbound: an operator->agent message being dispatched.
-		text, truncated := extractToolInputText(event.ToolInput)
+		text, cards, truncated := extractToolInputViews(event.ToolInput)
 		if truncated {
 			return blockDecision("pipelock: gateway dispatch exceeds maximum inspectable nesting depth")
 		}
-		return scanCombined(ctx, sc, text,
+		return scanCombinedViews(ctx, sc, hookScanViews{text: text, cards: cards, raw: event.ToolInput},
 			"inbound gateway dispatch", directionInbound)
 	case HookOnSessionStart, HookOnSessionEnd:
 		// Observer hooks. The current release emits no decision; a follow-up
@@ -256,7 +273,51 @@ const (
 // (see scanDirection). Empty text short-circuits to allow: nothing to scan
 // means nothing to flag, and a spurious block on an empty-arguments tool call
 // would be a denial of service.
+// hermesTerminalTool is the Hermes tool whose arguments are a local command.
+const hermesTerminalTool = "terminal"
+
 func scanCombined(ctx context.Context, sc *scanner.Scanner, text, surface string, dir scanDirection) HookDecision {
+	return scanCombinedViews(ctx, sc, hookScanViews{text: text, cards: text}, surface, dir)
+}
+
+type hookScanViews struct {
+	text, cards string
+	raw         json.RawMessage
+}
+
+func scanCombinedViews(ctx context.Context, sc *scanner.Scanner, views hookScanViews, surface string, dir scanDirection) (decision HookDecision) {
+	numberOnly := false
+	defer func() {
+		if numberOnly {
+			decision.warnings = []string{"pipelock: warning: informational JSON card run detected (action=warn)"}
+		}
+	}()
+	text, cards := views.text, views.cards
+	// Inspect the original document and complete JSON documents stored in
+	// individual string leaves, before envelope text joins erase their shape.
+	documents := []string{string(views.raw)}
+	leaves := extract.AllStringsFromJSONResult(views.raw)
+	for _, leaf := range leaves.Strings {
+		trimmed := strings.TrimSpace(leaf)
+		if len(trimmed) > 0 && (trimmed[0] == '{' || trimmed[0] == '[') {
+			documents = append(documents, leaf)
+		}
+	}
+	var cardBlock *scanner.TextDLPMatch
+	for _, document := range documents {
+		for _, match := range sc.ScanJSONCardRuns(ctx, document) {
+			if match.IsInformational() {
+				numberOnly = true
+				continue
+			}
+			if cardBlock == nil {
+				cardBlock = &match
+			}
+		}
+	}
+	if cardBlock != nil {
+		return blockDecision(dlpBlockReason(surface, *cardBlock))
+	}
 	if strings.TrimSpace(text) == "" {
 		return allowDecision()
 	}
@@ -266,19 +327,48 @@ func scanCombined(ctx context.Context, sc *scanner.Scanner, text, surface string
 	// an inbound event would run the exfil checks and emit warn telemetry before
 	// being discarded. Injection scanning (ScanResponse) runs regardless: a
 	// poisoned tool result or operator message is the real inbound threat.
+	firstEnforceable := func(dlp scanner.TextDLPResult, scanned string) *scanner.TextDLPMatch {
+		if len(dlp.Matches) == 0 {
+			return nil
+		}
+		var enforceable []scanner.TextDLPMatch
+		for _, match := range dlp.Matches {
+			if match.IsInformational() {
+				numberOnly = true
+			} else {
+				enforceable = append(enforceable, match)
+			}
+		}
+		if dir == directionInbound {
+			enforceable = scanner.EnforceableInboundTextDLPMatches(scanned, enforceable)
+		}
+		if len(enforceable) == 0 {
+			return nil
+		}
+		return &enforceable[0]
+	}
 	var dlp scanner.TextDLPResult
 	if dir == directionInbound {
-		dlp = sc.ScanTextForDLPInbound(ctx, text)
+		dlp = sc.ScanTextForDLPInboundWithTypedCardView(ctx, text, cards)
 	} else {
-		dlp = sc.ScanTextForDLP(ctx, text)
+		dlp = sc.ScanTextForDLPWithTypedCardView(ctx, text, cards)
 	}
-	if !dlp.Clean && len(dlp.Matches) > 0 {
-		enforceable := dlp.Matches
+	if match := firstEnforceable(dlp, text); match != nil {
+		return blockDecision(dlpBlockReason(surface, *match))
+	}
+	// A joined view cannot retain each leaf's scalar spelling, so a string
+	// leaf holding an exponent card spelling reads as ordinary text once a
+	// key precedes it. Inspect leaves independently with their card views,
+	// as MCP input and the scan API do.
+	for _, atom := range leaves.Atoms {
+		var leaf scanner.TextDLPResult
 		if dir == directionInbound {
-			enforceable = scanner.EnforceableInboundTextDLPMatches(text, dlp.Matches)
+			leaf = sc.ScanTextForDLPInboundWithCardView(ctx, atom.Text, atom.Card)
+		} else {
+			leaf = sc.ScanTextForDLPWithCardView(ctx, atom.Text, atom.Card)
 		}
-		if len(enforceable) > 0 {
-			return blockDecision(dlpBlockReason(surface, enforceable[0]))
+		if match := firstEnforceable(leaf, atom.Text); match != nil {
+			return blockDecision(dlpBlockReason(surface, *match))
 		}
 	}
 
@@ -310,26 +400,31 @@ func dlpBlockReason(surface string, match scanner.TextDLPMatch) string {
 // extractToolInputText collapses the structured tool_input JSON value into a
 // single text blob for the scanner. It reuses extract.AllStringsFromJSON so
 // JSON object keys are scanned too: an agent can exfiltrate by putting secrets
-// in argument names just as easily as in values. Strings are joined with
-// newlines so adjacent values aren't concatenated into a substring no field
-// actually contains.
+// in argument names just as easily as in values. Newlines retain the existing
+// injection and split-secret views; the card-only view uses spaces to preserve
+// value boundaries through card normalization.
 func extractToolInputText(raw json.RawMessage) (string, bool) {
+	text, _, truncated := extractToolInputViews(raw)
+	return text, truncated
+}
+
+func extractToolInputViews(raw json.RawMessage) (string, string, bool) {
 	if len(raw) == 0 {
-		return "", false
+		return "", "", false
 	}
 	// Some Hermes events carry tool_input as a plain JSON string (gateway
 	// text, simple shell commands). Try the string case first so we don't
 	// drop into the recursive walker for what is already a leaf value.
 	var asString string
 	if err := json.Unmarshal(raw, &asString); err == nil {
-		return asString, false
+		return asString, jsonnumber.EscapeCardBoundaries(asString), false
 	}
 	extracted := extract.AllStringsFromJSONResult(raw)
 	strs := extracted.Strings
 	if len(strs) == 0 {
-		return "", extracted.Truncated
+		return "", "", extracted.Truncated
 	}
-	return strings.Join(strs, "\n"), extracted.Truncated
+	return strings.Join(strs, "\n"), extract.JoinCardAtoms(extracted.Atoms, " "), extracted.Truncated
 }
 
 // readAllWithCtx is io.ReadAll bounded by ctx and a byte ceiling. If ctx fires

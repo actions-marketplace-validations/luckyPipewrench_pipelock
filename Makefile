@@ -6,6 +6,7 @@ GIT_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 GO_VERSION := $(shell go version | awk '{print $$3}')
 LICENSE_PUBLIC_KEY ?=
 RULES_KEYRING_HEX ?=
+RELEASE_KEYRING_HEX ?=
 LDFLAGS := -ldflags "-s -w \
 	-X $(MODULE)/internal/cliutil.Version=$(VERSION) \
 	-X $(MODULE)/internal/cliutil.BuildDate=$(BUILD_DATE) \
@@ -13,7 +14,8 @@ LDFLAGS := -ldflags "-s -w \
 	-X $(MODULE)/internal/cliutil.GoVersion=$(GO_VERSION) \
 	-X $(MODULE)/internal/proxy.Version=$(VERSION) \
 	-X $(MODULE)/internal/license.PublicKeyHex=$(LICENSE_PUBLIC_KEY) \
-	-X $(MODULE)/internal/rules.KeyringHex=$(RULES_KEYRING_HEX)"
+	-X $(MODULE)/internal/rules.KeyringHex=$(RULES_KEYRING_HEX) \
+	-X $(MODULE)/internal/release.PublicKeyringHex=$(RELEASE_KEYRING_HEX)"
 
 .PHONY: all build build-verifier verify-examples test test-wasm-verifier bench bench-baseline bench-regression bench-egress bench-egress-long bench-egress-release lint test-stability-check clean docker install fmt vet tidy-check fuzz stats docs-check brand-assets brand-check source-header-check reproducible-build-check \
 	test-runtime-critical test-replay-harness test-sharded test-sharded-enterprise release-audit runtime-policy-audit debt-check release-check hermes-e2e test-liveproof
@@ -49,22 +51,23 @@ test-wasm-verifier:
 test-runtime-critical:
 	scripts/run-race-test.sh --packages "./internal/config ./internal/cli ./internal/mcp ./internal/proxy"
 
-# Test shards mirror CI (scripts/ci_test_packages.py): the three heavy packages
-# (proxy, scanner, mcp) plus three balanced rest shards. Their union is the same
-# package set as `make test`. The proxy shard runs its two packages sequentially
-# to match CI's peak-memory cap. Use these to reproduce one CI shard locally, or
+# Test shards mirror CI (scripts/ci_test_packages.py): the four heavy package
+# trees (proxy, scanner, mcp and cli/runtime, each split by measured test time
+# into sub-shards) plus three balanced rest shards. Their union is the same test set as
+# `make test`. The proxy sub-shards run their two packages sequentially to match
+# CI's peak-memory cap. Use these to reproduce one CI shard locally, or
 # to run the full suite in scoped chunks instead of the single monolithic
 # `go test ./...` invocation that becomes a long pole if reused in one CI step.
 # `make test` stays the canonical full local run.
-TEST_SHARDS := proxy scanner mcp rest-0 rest-1 rest-2
+TEST_SHARDS := proxy-0 proxy-1 proxy-2 proxy-3 proxy-4 proxy-5 scanner-0 scanner-1 scanner-2 scanner-3 mcp-0 mcp-1 mcp-2 mcp-3 mcp-4 mcp-5 runtime-0 runtime-1 rest-0 rest-1 rest-2 rest-3
 .PHONY: FORCE
 FORCE:
 
-# Run one CI-equivalent OSS shard, e.g. `make test-shard-proxy`.
+# Run one CI-equivalent OSS shard, e.g. `make test-shard-proxy-0`.
 test-shard-%: FORCE
 	scripts/run-race-test.sh --shard $*
 
-# Run one CI-equivalent enterprise shard, e.g. `make test-shard-enterprise-mcp`.
+# Run one CI-equivalent enterprise shard, e.g. `make test-shard-enterprise-mcp-0`.
 test-shard-enterprise-%: FORCE
 	scripts/run-race-test.sh --tags enterprise --shard $*
 
@@ -101,13 +104,20 @@ test-cover:
 # loads, enables, and blocks an adversarial tool call. Requires python3 +
 # network (pip). Behind the hermes_e2e build tag so it never runs in `make test`.
 hermes-e2e:
-	go test -tags hermes_e2e -run TestHermesLiveE2E -count=1 -v ./internal/cli/hermes/...
+	# -timeout must clear the test's own scaled deadline. Its context is
+	# testwait.Deadline(6m), which is 24m when CI is set, and go test
+	# defaults to 10m: without this the binary panics on the outer timeout
+	# before the test can report which step hung.
+	go test -tags hermes_e2e -timeout 35m -run TestHermesLiveE2E -count=1 -v ./internal/cli/hermes/...
 
 # test-liveproof runs the shipped-binary live-proof harness. It is build-tagged
 # because it builds a real pipelock binary, writes real configs, binds real
 # ephemeral ports, and is slower/portful enough to keep out of default CI.
 test-liveproof:
-	go test -tags liveproof -run TestLiveProof -count=1 -v ./internal/liveproof/...
+	# Same reason as hermes-e2e: the longest scaled deadline here is
+	# testwait.Deadline(2m), which is 8m under CI against a 10m default,
+	# leaving no room for the rest of the run.
+	go test -tags liveproof -timeout 20m -run TestLiveProof -count=1 -v ./internal/liveproof/...
 
 bench:
 	go test -bench=. -benchmem -count=3 -run=^$$ ./internal/scanner/ ./internal/mcp/
@@ -127,25 +137,9 @@ bench-egress-long:
 bench-egress-release:
 	bash bench/egress/run-all.sh --release
 
-# The pinned linter version is read from the workflow rather than repeated here,
-# so the two cannot drift apart. A second copy of a version is a second thing to
-# forget.
-GOLANGCI_LINT_PIN := $(shell sed -n 's/[[:space:]]*version:[[:space:]]*v\([0-9][0-9.]*\).*/\1/p' .github/workflows/ci.yaml | head -1)
-
 .PHONY: check-lint-version
 check-lint-version:
-	@pin='$(GOLANGCI_LINT_PIN)'; \
-	if [ -z "$$pin" ]; then \
-	  printf 'warning: could not read the pinned golangci-lint version from the CI workflow, so local and CI formatting are unchecked.\n' >&2; \
-	  exit 0; \
-	fi; \
-	have=$$(golangci-lint --version 2>/dev/null | sed -n 's/.*version v\{0,1\}\([0-9][0-9.]*\).*/\1/p' | head -1); \
-	if [ -z "$$have" ]; then \
-	  printf 'warning: could not read the local golangci-lint version; CI pins %s.\n' "$$pin" >&2; \
-	elif [ "$$have" != "$$pin" ]; then \
-	  printf 'warning: golangci-lint %s locally, CI pins %s. Formatting and lint results can differ from CI.\n' \
-	    "$$have" "$$pin" >&2; \
-	fi
+	@python3 scripts/check_lint_version.py .github/workflows/ci.yaml .github/workflows/hardening-report.yaml
 
 fmt: check-lint-version
 	# Format with the gofumpt that golangci-lint bundles, not whatever gofumpt
@@ -157,7 +151,7 @@ fmt: check-lint-version
 vet:
 	go vet ./...
 
-lint: vet
+lint: check-lint-version vet
 	golangci-lint run ./...
 	./scripts/check-test-stability.sh
 
@@ -170,14 +164,13 @@ release-audit:
 runtime-policy-audit:
 	./scripts/runtime-policy-audit.sh
 
-debt-check:
+debt-check: check-lint-version
 	golangci-lint run --enable-only dupl,gocyclo,gocognit,maintidx ./...
 
 release-check: test lint release-audit runtime-policy-audit
 
 tidy-check:
-	go mod tidy
-	git diff --exit-code go.mod go.sum
+	@go mod tidy -diff
 
 clean:
 	rm -f $(BINARY) $(VERIFIER_BINARY) coverage.out coverage.html
@@ -189,6 +182,7 @@ docker:
 		--build-arg GIT_COMMIT=$(GIT_COMMIT) \
 		--build-arg LICENSE_PUBLIC_KEY=$(LICENSE_PUBLIC_KEY) \
 		--build-arg RULES_KEYRING_HEX=$(RULES_KEYRING_HEX) \
+		--build-arg RELEASE_KEYRING_HEX=$(RELEASE_KEYRING_HEX) \
 		-t $(BINARY):$(VERSION) -t $(BINARY):latest .
 
 fuzz:

@@ -23,6 +23,47 @@ import (
 
 const containMetricsListen = "127.0.0.1:9091"
 
+// agentListenerFromConfigBytes reads the managed listener without resolving
+// unrelated runtime files. An invalid declaration must not remove its guard.
+func agentListenerFromConfigBytes(data []byte) (string, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if errors.Is(err, io.EOF) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("parse managed config: %w", err)
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return "", errors.New("managed config must be a YAML mapping")
+	}
+	var fields struct {
+		Containment struct {
+			AgentListener string `yaml:"agent_listener"`
+		} `yaml:"containment"`
+	}
+	if err := mapping.Decode(&fields); err != nil {
+		return "", fmt.Errorf("decode containment.agent_listener: %w", err)
+	}
+	listener := fields.Containment.AgentListener
+	if listener == "" {
+		return "", nil
+	}
+	host, portText, err := net.SplitHostPort(listener)
+	if err != nil {
+		return "", fmt.Errorf("containment.agent_listener: %w", err)
+	}
+	ip := net.ParseIP(host)
+	port, err := strconv.Atoi(portText)
+	if ip == nil || !ip.IsLoopback() || err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("containment.agent_listener %q must be a numeric loopback address with a valid port", listener)
+	}
+	if ip.To4() != nil && strings.Contains(host, ":") {
+		return "", fmt.Errorf("containment.agent_listener %q uses an IPv4-mapped IPv6 address; write it as 127.0.0.1", listener)
+	}
+	return listener, nil
+}
+
 type migratedConfigArtifact struct {
 	path string
 	dir  bool
@@ -33,6 +74,7 @@ type configMigrationContext struct {
 	configDir    string
 	operatorHome string
 	artifacts    []migratedConfigArtifact
+	preview      bool // rewrite writable paths without creating migration artifacts
 }
 
 func migratePipelockConfigForContain(env *installEnv, configSource string, data []byte) ([]byte, []migratedConfigArtifact, error) {
@@ -113,29 +155,14 @@ func migratePipelockConfigForContain(env *installEnv, configSource string, data 
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := config.ValidateContainmentLoopbackServices(loopbackServices, proxyPort, time.Now()); err != nil {
+	// An expired declaration is a lapsed grant: staging the config must not
+	// refuse because of it, or an operator cannot re-run install to retire it.
+	// Malformed, duplicate, and proxy-port entries still refuse.
+	if _, _, err := config.ResolveContainmentLoopbackServices(loopbackServices, proxyPort, time.Now()); err != nil {
 		return nil, nil, err
 	}
 
-	if err := migrateScalarDir(ctx, mapping, []string{"rules", "rules_dir"}, filepath.Join(env.dataDir, "rules")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateScalarDir(ctx, mapping, []string{"flight_recorder", "dir"}, filepath.Join(env.dataDir, "recorder")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateScalarDir(ctx, mapping, []string{"learn", "capture_dir"}, filepath.Join(env.dataDir, "captures", "local")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateScalarDir(ctx, mapping, []string{"behavioral_baseline", "profile_dir"}, filepath.Join(env.dataDir, "baselines")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateScalarDir(ctx, mapping, []string{"learn_lock", "store_dir"}, filepath.Join(env.dataDir, "contracts", "active")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateScalarDir(ctx, mapping, []string{"mcp_tool_policy", "quarantine_dir"}, filepath.Join(env.dataDir, "quarantine")); err != nil {
-		return nil, nil, err
-	}
-	if err := migrateLoggingFile(ctx, mapping); err != nil {
+	if err := migrateContainWritablePaths(ctx, mapping); err != nil {
 		return nil, nil, err
 	}
 	migrateRedirectProfiles(ctx, mapping)
@@ -145,6 +172,54 @@ func migratePipelockConfigForContain(env *installEnv, configSource string, data 
 		return nil, nil, err
 	}
 	return out, ctx.artifacts, nil
+}
+
+// previewContainWritablePaths applies the same path rewrites as migration before
+// install can create users, directories, keys, or staging files.
+func previewContainWritablePaths(env *installEnv, source string, data []byte) ([]byte, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, errors.New("pipelock config must be a YAML mapping")
+	}
+	home, err := operatorHomeDir(env)
+	if err != nil {
+		return nil, err
+	}
+	ctx := &configMigrationContext{env: env, configDir: filepath.Dir(source), operatorHome: home, preview: true}
+	if err := migrateContainWritablePaths(ctx, mapping); err != nil {
+		return nil, err
+	}
+	return encodeYAML(root)
+}
+
+func migrateContainWritablePaths(ctx *configMigrationContext, mapping *yaml.Node) error {
+	env := ctx.env
+	if err := migrateScalarDir(ctx, mapping, []string{"rules", "rules_dir"}, filepath.Join(env.dataDir, "rules")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"flight_recorder", "dir"}, filepath.Join(env.dataDir, "recorder")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"learn", "capture_dir"}, filepath.Join(env.dataDir, "captures", "local")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"behavioral_baseline", "profile_dir"}, filepath.Join(env.dataDir, "baselines")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"learn_lock", "store_dir"}, filepath.Join(env.dataDir, "contracts", "active")); err != nil {
+		return err
+	}
+	if err := migrateScalarDir(ctx, mapping, []string{"mcp_tool_policy", "quarantine_dir"}, filepath.Join(env.dataDir, "quarantine")); err != nil {
+		return err
+	}
+	if err := migrateLoggingFile(ctx, mapping); err != nil {
+		return err
+	}
+	return nil
 }
 
 func migrateFileSentryWatchPaths(ctx *configMigrationContext, root *yaml.Node) error {
@@ -199,16 +274,29 @@ func containServiceReadOnlyPaths(data []byte, proxyPort int) ([]string, error) {
 	return containServiceReadOnlyPathsFromMapping(mapping)
 }
 
+// absentContainmentValue recognizes omitted values and parsed YAML nulls,
+// including aliases to null. Other alias targets retain strict type checks.
+func absentContainmentValue(node *yaml.Node) bool {
+	if node == nil {
+		return true
+	}
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	return node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!null"
+}
+
 func containmentMetricsExposureFromMapping(root *yaml.Node) (*config.ContainmentMetricsExposure, error) {
 	containment := mappingValue(root, "containment")
-	if containment == nil {
+	if absentContainmentValue(containment) {
 		return nil, nil
 	}
 	if containment.Kind != yaml.MappingNode {
 		return nil, errors.New("containment must be a mapping")
 	}
 	exposure := mappingValue(containment, "metrics_exposure")
-	if exposure == nil {
+	// Match config.Load: a null optional policy grants no metrics exposure.
+	if absentContainmentValue(exposure) {
 		return nil, nil
 	}
 	if exposure.Kind != yaml.MappingNode {
@@ -228,13 +316,24 @@ func containmentMetricsExposureFromMapping(root *yaml.Node) (*config.Containment
 }
 
 // parseContainmentLoopbackServicesFromConfigBytes parses and validates
-// containment.loopback_services out of raw managed-config YAML bytes. It is
-// the single source both contain install (declaredContainmentLoopbackServices,
+// containment.loopback_services out of raw managed-config YAML bytes and
+// returns the EFFECTIVE set: expired entries are dropped, never returned. It
+// is the single source both contain install (declaredContainmentLoopbackServices,
 // which fails install closed on any error) and the boot/operator nft
 // reconciler (which instead falls back to zero declared services on any
 // error, logging why) call, so both consumers agree on exactly what counts
-// as a usable declared exception.
+// as a usable declared exception. An expired entry is a lapsed grant, not an
+// error; callers that must name it use the WithLapsed form.
 func parseContainmentLoopbackServicesFromConfigBytes(data []byte, proxyPort int, now time.Time) ([]config.ContainmentLoopbackService, error) {
+	active, _, err := parseContainmentLoopbackServicesWithLapsed(data, proxyPort, now)
+	return active, err
+}
+
+// parseContainmentLoopbackServicesWithLapsed is the partitioning form of
+// parseContainmentLoopbackServicesFromConfigBytes: the usable entries, plus
+// the well-formed entries whose expires_at has passed. A malformed,
+// duplicate, or proxy-port entry is still an error, expired or not.
+func parseContainmentLoopbackServicesWithLapsed(data []byte, proxyPort int, now time.Time) ([]config.ContainmentLoopbackService, []config.LapsedContainmentGrant, error) {
 	root, err := parseSingleYAMLDocument(data)
 	if err != nil {
 		// A document with no YAML content at all -- empty, or only
@@ -242,22 +341,19 @@ func parseContainmentLoopbackServicesFromConfigBytes(data []byte, proxyPort int,
 		// containment key. Reporting that as an unhonorable declaration is a
 		// much louder claim than the file supports.
 		if errors.Is(err, io.EOF) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, fmt.Errorf("parse managed config: %w", err)
+		return nil, nil, fmt.Errorf("parse managed config: %w", err)
 	}
 	mapping := documentMapping(root)
 	if mapping == nil {
-		return nil, errors.New("managed config must be a YAML mapping")
+		return nil, nil, errors.New("managed config must be a YAML mapping")
 	}
 	declared, err := containmentLoopbackServicesFromMapping(mapping)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if err := config.ValidateContainmentLoopbackServices(declared, proxyPort, now); err != nil {
-		return nil, err
-	}
-	return declared, nil
+	return config.ResolveContainmentLoopbackServices(declared, proxyPort, now)
 }
 
 // containmentLoopbackServicesFromMapping is the outbound-exception sibling of
@@ -267,23 +363,20 @@ func parseContainmentLoopbackServicesFromConfigBytes(data []byte, proxyPort int,
 // config load / contain install time rather than silently ignored.
 func containmentLoopbackServicesFromMapping(root *yaml.Node) ([]config.ContainmentLoopbackService, error) {
 	containment := mappingValue(root, "containment")
-	if containment == nil {
+	if absentContainmentValue(containment) {
 		return nil, nil
 	}
 	if containment.Kind != yaml.MappingNode {
 		return nil, errors.New("containment must be a mapping")
 	}
 	services := mappingValue(containment, "loopback_services")
-	if services == nil {
-		return nil, nil
-	}
 	// An explicit YAML null means the same thing as an absent key: no
 	// declared services. config.Load already decodes it that way into a nil
 	// slice, and refusing it here made the two disagree about one file --
 	// `pipelock check` accepted it while `contain install --config` failed
 	// before staging anything, leaving the operator to discover that only
 	// omitting the key or writing [] would work.
-	if services.Kind == yaml.ScalarNode && services.Tag == "!!null" {
+	if absentContainmentValue(services) {
 		return nil, nil
 	}
 	if services.Kind != yaml.SequenceNode {
@@ -431,6 +524,71 @@ func documentMapping(root *yaml.Node) *yaml.Node {
 		return nil
 	}
 	return root
+}
+
+// applyFreshFilesystemDefault writes containment.filesystem.mode enforce only
+// when the managed config does not exist yet and the candidate never set the
+// key. An explicit off, enforce, null, or blank value is left as written.
+// A stat error other than absence fails closed instead of guessing fresh.
+func applyFreshFilesystemDefault(env *installEnv, data []byte) ([]byte, error) {
+	if env == nil || env.stat == nil {
+		return nil, errors.New("stat managed config: filesystem default requires a stat function")
+	}
+	dst := managedPipelockConfigPath(env)
+	_, err := env.stat(dst)
+	if err == nil {
+		return data, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("stat managed config %s: %w", dst, err)
+	}
+	return injectFreshFilesystemMode(data)
+}
+
+func injectFreshFilesystemMode(data []byte) ([]byte, error) {
+	root, err := parseSingleYAMLDocument(data)
+	if err != nil {
+		return nil, err
+	}
+	mapping := documentMapping(root)
+	if mapping == nil {
+		return nil, errors.New("pipelock config must be a YAML mapping")
+	}
+	if getMappingPath(mapping, []string{"containment", "filesystem", "mode"}) != nil {
+		return data, nil
+	}
+	containment, err := ensureYAMLMapping(mapping, "containment")
+	if err != nil {
+		return nil, err
+	}
+	filesystem, err := ensureYAMLMapping(containment, "filesystem")
+	if err != nil {
+		return nil, err
+	}
+	setMappingScalar(filesystem, "mode", config.ContainmentFilesystemModeEnforce)
+	return encodeYAML(root)
+}
+
+func ensureYAMLMapping(parent *yaml.Node, key string) (*yaml.Node, error) {
+	if parent == nil || parent.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("containment config %q must be a mapping to set filesystem.mode", key)
+	}
+	if n := mappingValue(parent, key); n != nil {
+		if n.Kind == yaml.ScalarNode && (n.Tag == "!!null" || strings.TrimSpace(n.Value) == "" || n.Value == "~" || n.Value == "null") {
+			n.Kind = yaml.MappingNode
+			n.Tag = "!!map"
+			n.Value = ""
+			n.Content = nil
+			return n, nil
+		}
+		if n.Kind != yaml.MappingNode {
+			return nil, fmt.Errorf("containment config %q must be a mapping to set filesystem.mode", key)
+		}
+		return n, nil
+	}
+	n := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	parent.Content = append(parent.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, n)
+	return n, nil
 }
 
 func operatorHomeDir(env *installEnv) (string, error) {
@@ -627,8 +785,10 @@ func migrateScalarDir(ctx *configMigrationContext, root *yaml.Node, path []strin
 	if !ok {
 		return nil
 	}
-	if err := copyConfigDir(ctx, src, dest); err != nil {
-		return fmt.Errorf("migrate %s: %w", strings.Join(path, "."), err)
+	if !ctx.preview {
+		if err := copyConfigDir(ctx, src, dest); err != nil {
+			return fmt.Errorf("migrate %s: %w", strings.Join(path, "."), err)
+		}
 	}
 	n.Value = dest
 	return nil
@@ -668,12 +828,28 @@ func migrateTLSCA(ctx *configMigrationContext, root *yaml.Node) error {
 	if certValue == "" && keyValue == "" && !yamlBool(getMappingPath(tlsNode, []string{"enabled"})) {
 		return nil
 	}
+	// Empty CA fields resolve the way the proxy resolves them: --home or
+	// PIPELOCK_HOME when set, otherwise the operator's ~/.pipelock. Using a
+	// different default here would copy a different CA than the one the
+	// operator's proxy was running with. resolveMigratablePath still refuses
+	// to copy anything outside the operator's home.
+	caDir := filepath.Join(ctx.operatorHome, signing.DefaultPipelockDir)
+	if home := signing.ResolvedHome(); home != "" {
+		caDir = home
+		// Migration copies only from inside the operator home, so a default
+		// under an external pipelock home would be written into the contained
+		// config without its files. Refuse instead of installing a CA path the
+		// contained proxy may be unable to read.
+		if (certValue == "" || keyValue == "") && !pathWithin(ctx.operatorHome, caDir) {
+			return fmt.Errorf("tls_interception: pipelock home %s is outside the operator home %s; set tls_interception.ca_cert and ca_key explicitly", caDir, ctx.operatorHome)
+		}
+	}
 	if certValue == "" {
-		certValue = filepath.Join(ctx.operatorHome, ".pipelock", "ca.pem")
+		certValue = filepath.Join(caDir, "ca.pem")
 		certNode = setMappingScalar(tlsNode, "ca_cert", certValue)
 	}
 	if keyValue == "" {
-		keyValue = filepath.Join(ctx.operatorHome, ".pipelock", "ca-key.pem")
+		keyValue = filepath.Join(caDir, "ca-key.pem")
 		keyNode = setMappingScalar(tlsNode, "ca_key", keyValue)
 	}
 	if err := migrateScalarFileValue(ctx, certNode, certValue, filepath.Join(ctx.env.configDir, "tls", "ca.pem"), modeConfigSecret); err != nil {
@@ -707,8 +883,10 @@ func migrateLoggingFile(ctx *configMigrationContext, root *yaml.Node) error {
 		return nil
 	}
 	dest := filepath.Join(ctx.env.dataDir, "logs", "audit.log")
-	if err := ensureMigratedDir(ctx, filepath.Dir(dest), migrationDirMode(ctx.env, filepath.Dir(dest))); err != nil {
-		return err
+	if !ctx.preview {
+		if err := ensureMigratedDir(ctx, filepath.Dir(dest), migrationDirMode(ctx.env, filepath.Dir(dest))); err != nil {
+			return err
+		}
 	}
 	n.Value = dest
 	return nil

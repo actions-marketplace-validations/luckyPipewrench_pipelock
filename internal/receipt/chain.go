@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"path/filepath"
 	"strings"
@@ -396,16 +397,23 @@ type chainVerifier struct {
 	segBaseSeq uint64 // chain_seq of the current segment's first receipt
 	prevHash   string // expected chain_prev_hash for the next receipt
 
-	signerKeys []string
-	segments   []ChainSegment
-	curSeg     *ChainSegment
-	index      int
-	runNonces  map[string]string
-	closedRuns map[string]bool
-	activeRun  string
-	activeOpen string
+	signerKeys   []string
+	signerKeySet map[string]struct{}
+	segments     []ChainSegment
+	curSeg       *ChainSegment
+	index        int
+	runNonces    map[string]string
+	closedRuns   map[string]bool
+	activeRun    string
+	activeOpen   string
+	runStore     *boundedRunStore
+	compact      bool
+	segmentStart uint64
 
 	integrityOnly bool
+	// trustChainKeys trusts exactly the set VerifyChainTrusted builds from
+	// every signer key in the chain, without first collecting that set.
+	trustChainKeys bool
 }
 
 // StreamingVerifier verifies a v1 receipt chain one receipt at a time.  It is
@@ -540,10 +548,12 @@ func (v *chainVerifier) add(r Receipt, index uint64) (ChainResult, bool) {
 	v.index = int(index)
 	marker := r.ActionRecord.KeyTransition
 	if index == 0 {
+		v.segmentStart = index
 		if res, ok := v.startFirstSegment(r); !ok {
 			return res, false
 		}
 	} else if marker != nil {
+		v.segmentStart = index
 		if res, ok := v.startRotatedSegment(r, marker); !ok {
 			return res, false
 		}
@@ -568,7 +578,7 @@ func (v *chainVerifier) startFirstSegment(r Receipt) (ChainResult, bool) {
 	// Trust-on-first-use: when no trusted set was supplied, adopt the first
 	// receipt's signer_key as the sole trusted key. Otherwise the first
 	// segment's key must already be in the trusted set.
-	if len(v.trusted) == 0 {
+	if len(v.trusted) == 0 && !v.trustChainKeys {
 		v.trusted = map[string]struct{}{r.SignerKey: {}}
 	}
 	if !v.keyTrusted(r.SignerKey) {
@@ -650,6 +660,14 @@ func (v *chainVerifier) startRotatedSegment(r Receipt, marker *KeyTransition) (C
 }
 
 func (v *chainVerifier) keyTrusted(key string) bool {
+	if v.trustChainKeys {
+		// The trusted set is every signer key the chain itself names, after
+		// normalizeTrustedKeys trims each one. A key trims to itself or is
+		// absent from that trimmed set, so membership needs no lookahead.
+		// An empty key fails normalization for the whole chain instead; the
+		// caller reports that.
+		return key == strings.TrimSpace(key)
+	}
 	_, ok := v.trusted[key]
 	return ok
 }
@@ -770,11 +788,14 @@ func (v *chainVerifier) validateSessionControl(r Receipt) (ChainResult, bool) {
 		return ChainResult{}, true
 	}
 	if open == nil {
-		openNonce, ok := v.runNonces[r.ActionRecord.RunNonce]
+		openNonce, closed, ok, err := v.readRun(r.ActionRecord.RunNonce)
+		if err != nil {
+			return v.brokenAtKind(r, fmt.Sprintf("read session lifecycle state: %v", err), ChainFailureLifecycle), false
+		}
 		if !ok {
 			return v.brokenAtKind(r, "run_nonce first receipt is not a matching session_open", ChainFailureLifecycleOpen), false
 		}
-		if v.closedRuns[r.ActionRecord.RunNonce] {
+		if closed {
 			return v.brokenAtKind(r, "record observed after session_close", ChainFailureLifecycle), false
 		}
 		if heartbeat != nil {
@@ -831,7 +852,9 @@ func (v *chainVerifier) validateSessionControl(r Receipt) (ChainResult, bool) {
 			}
 			v.activeRun = ""
 			v.activeOpen = ""
-			v.closedRuns[r.ActionRecord.RunNonce] = true
+			if err := v.writeRun(r.ActionRecord.RunNonce, openNonce, true); err != nil {
+				return v.brokenAtKind(r, fmt.Sprintf("write session lifecycle state: %v", err), ChainFailureLifecycle), false
+			}
 		}
 		return ChainResult{}, true
 	}
@@ -841,11 +864,16 @@ func (v *chainVerifier) validateSessionControl(r Receipt) (ChainResult, bool) {
 	if open.OpenNonce == "" {
 		return v.brokenAtKind(r, "session_open open_nonce is empty", ChainFailureLifecycle), false
 	}
-	if _, exists := v.runNonces[r.ActionRecord.RunNonce]; exists {
+	_, _, exists, err := v.readRun(r.ActionRecord.RunNonce)
+	if err != nil {
+		return v.brokenAtKind(r, fmt.Sprintf("read session lifecycle state: %v", err), ChainFailureLifecycle), false
+	}
+	if exists {
 		return v.brokenAtKind(r, "duplicate session_open for run_nonce", ChainFailureLifecycle), false
 	}
-	v.runNonces[r.ActionRecord.RunNonce] = open.OpenNonce
-	v.closedRuns[r.ActionRecord.RunNonce] = false
+	if err := v.writeRun(r.ActionRecord.RunNonce, open.OpenNonce, false); err != nil {
+		return v.brokenAtKind(r, fmt.Sprintf("write session lifecycle state: %v", err), ChainFailureLifecycle), false
+	}
 	v.activeRun = open.RunNonce
 	v.activeOpen = open.OpenNonce
 	return ChainResult{}, true
@@ -904,6 +932,9 @@ func (v *chainVerifier) advanceReceiptHash(r Receipt) (ChainResult, bool) {
 // curSegStartIndex returns the slice index at which the current segment began,
 // derived from segments already closed plus the count of the open segment.
 func (v *chainVerifier) curSegStartIndex() uint64 {
+	if v.compact {
+		return v.segmentStart
+	}
 	var n uint64
 	for _, s := range v.segments {
 		n += s.Count
@@ -923,12 +954,24 @@ func (v *chainVerifier) beginSegment(r Receipt, boundary bool) {
 
 func (v *chainVerifier) closeSegment() {
 	if v.curSeg != nil {
-		v.segments = append(v.segments, *v.curSeg)
+		if !v.compact {
+			v.segments = append(v.segments, *v.curSeg)
+		}
 		v.curSeg = nil
 	}
 }
 
 func (v *chainVerifier) appendSignerKey(key string) {
+	if v.compact {
+		if v.signerKeySet == nil {
+			v.signerKeySet = make(map[string]struct{})
+		}
+		if _, seen := v.signerKeySet[key]; !seen {
+			v.signerKeySet[key] = struct{}{}
+			v.signerKeys = append(v.signerKeys, key)
+		}
+		return
+	}
 	for _, k := range v.signerKeys {
 		if k == key {
 			return
@@ -956,13 +999,13 @@ func (v *chainVerifier) brokenAtKind(r Receipt, msg string, kind ChainFailureKin
 // action_receipt entries as Receipt structs, in file order.
 func ExtractReceipts(path string) ([]Receipt, error) {
 	clean := filepath.Clean(path)
-	entries, err := recorder.ReadEntries(clean)
+	entries, err := recorder.ReadHistoryEntries(clean)
 	if err != nil {
 		// A truncated read must not fall through to the raw-JSONL
 		// compatibility path: that path would return the receipts it managed
 		// to parse as though they were the whole chain. Mirrors
 		// ExtractReceiptsBytes.
-		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) || recorder.IsEvidenceUnavailable(err) {
 			return nil, fmt.Errorf("reading entries: %w", err)
 		}
 		rawReceipts, rawErr := extractRawReceiptsJSONLFile(clean)
@@ -989,12 +1032,19 @@ func ExtractReceipts(path string) ([]Receipt, error) {
 // bytes using the same accepted formats as ExtractReceipts: recorder entries
 // first, then raw receipt JSONL as the compatibility fallback.
 func ExtractReceiptsBytes(data []byte) ([]Receipt, error) {
-	entries, err := recorder.ReadEntriesFromReader(bytes.NewReader(data))
+	return ExtractReceiptsFromReader(bytes.NewReader(data))
+}
+
+// ExtractReceiptsFromReader is ExtractReceipts over an already-opened input.
+// A caller holding a secured snapshot uses it so the receipts come from the
+// bytes that snapshot checks, not from a second open of the pathname.
+func ExtractReceiptsFromReader(input io.ReadSeeker) ([]Receipt, error) {
+	entries, err := recorder.ReadHistoryEntriesFromReader(input)
 	if err != nil {
-		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) {
+		if errors.Is(err, recorder.ErrEvidenceReadLimitExceeded) || recorder.IsEvidenceUnavailable(err) {
 			return nil, fmt.Errorf("reading entries: %w", err)
 		}
-		rawReceipts, rawErr := extractRawReceiptsJSONLBytes(data)
+		rawReceipts, rawErr := extractRawReceiptsJSONLFrom(input)
 		if rawErr != nil {
 			return nil, rawErr
 		}
@@ -1007,7 +1057,14 @@ func ExtractReceiptsBytes(data []byte) ([]Receipt, error) {
 	if err != nil || len(receipts) > 0 {
 		return receipts, err
 	}
-	return extractRawReceiptsJSONLBytes(data)
+	return extractRawReceiptsJSONLFrom(input)
+}
+
+func extractRawReceiptsJSONLFrom(input io.ReadSeeker) ([]Receipt, error) {
+	if _, err := input.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("rewind evidence: %w", err)
+	}
+	return extractRawReceiptsJSONLReader(input)
 }
 
 // WholeRecorderResult describes a verified recorder file or selected recorder
@@ -1061,7 +1118,7 @@ func VerifyWholeRecorderEntries(entries []recorder.Entry) (WholeRecorderResult, 
 // compatibility fallback: whole recorder verification requires real recorder
 // entries.
 func ExtractAndVerifyWholeRecorderBytes(data []byte) ([]Receipt, error) {
-	entries, err := recorder.ReadEntriesFromReader(bytes.NewReader(data))
+	entries, err := recorder.ReadHistoryEntriesFromReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("reading entries: %w", err)
 	}
@@ -1077,7 +1134,7 @@ func ExtractAndVerifyWholeRecorderBytes(data []byte) ([]Receipt, error) {
 // comes from the recorder entry metadata, which is lost in plain ExtractReceipts.
 // Returns an empty session ID when the file contains no entries.
 func ExtractReceiptsWithSessionID(path string) ([]Receipt, string, error) {
-	entries, err := recorder.ReadEntries(filepath.Clean(path))
+	entries, err := recorder.ReadHistoryEntries(filepath.Clean(path))
 	if err != nil {
 		return nil, "", fmt.Errorf("reading entries: %w", err)
 	}
@@ -1096,20 +1153,23 @@ func ExtractReceiptsWithSessionID(path string) ([]Receipt, string, error) {
 
 // ExtractReceiptsFromSessionDir reads all evidence files for a session from a
 // recorder directory and returns the action receipts in chain order.
+//
+// It reads the session's complete history through the authoritative walk, so
+// neither unrelated files in the directory nor the session's own length can
+// refuse or truncate it. It is the extraction verification and anchoring use;
+// the Bounded and WithLimits variants are for display.
 func ExtractReceiptsFromSessionDir(dir, sessionID string) ([]Receipt, error) {
-	receipts, truncated, err := ExtractReceiptsFromSessionDirBounded(dir, sessionID, 0)
+	location, err := recorder.ResolveEvidenceLocation(filepath.Clean(dir), "")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying session receipts: resolve evidence location: %w", err)
 	}
-	if truncated {
-		return nil, fmt.Errorf("%w: evidence session %s exceeded bounded read limits", recorder.ErrEvidenceReadLimitExceeded, sessionID)
-	}
-	return receipts, nil
+	return ExtractReceiptsFromResolvedSessionDir(location, sessionID)
 }
 
 // ExtractReceiptsFromSessionDirBounded reads action receipts for a session with
 // an optional hard ceiling on parsed recorder entries. The returned boolean is
-// true when the ceiling was reached before the full session was loaded.
+// true when the ceiling was reached before the full session was loaded. It is
+// a bounded display read; verification uses ExtractReceiptsFromSessionDir.
 func ExtractReceiptsFromSessionDirBounded(dir, sessionID string, maxEntriesRead int) ([]Receipt, bool, error) {
 	return ExtractReceiptsFromSessionDirWithLimits(dir, sessionID, maxEntriesRead, 0)
 }
@@ -1145,14 +1205,23 @@ func extractReceiptsFromResolvedSessionDirWithLimits(location recorder.EvidenceL
 	return receipts, result.Truncated, err
 }
 
-// ExtractReceiptsFromResolvedSessionDir reads an already-resolved evidence location.
+// ExtractReceiptsFromResolvedSessionDir reads the complete receipt chain of
+// one session in an already-resolved evidence location through the
+// authoritative walk. Only the receipts are retained.
 func ExtractReceiptsFromResolvedSessionDir(location recorder.EvidenceLocation, sessionID string) ([]Receipt, error) {
-	receipts, truncated, err := extractReceiptsFromResolvedSessionDirWithLimits(location, sessionID, 0, 0)
+	var receipts []Receipt
+	err := recorder.WalkSessionHistoryResolved(location, sessionID, func(e recorder.Entry) error {
+		r, ok, err := receiptFromChainEntry(e)
+		if err != nil {
+			return err
+		}
+		if ok {
+			receipts = append(receipts, r)
+		}
+		return nil
+	})
 	if err != nil {
-		return nil, err
-	}
-	if truncated {
-		return nil, fmt.Errorf("%w: evidence session %s exceeded bounded read limits", recorder.ErrEvidenceReadLimitExceeded, sessionID)
+		return nil, fmt.Errorf("querying session receipts: %w", err)
 	}
 	return receipts, nil
 }
@@ -1201,37 +1270,55 @@ func knownRecorderEntryType(t string) bool {
 func extractReceiptsFromEntries(entries []recorder.Entry) ([]Receipt, error) {
 	var receipts []Receipt
 	for _, e := range entries {
-		if e.Type == recorderEntryType {
-			r, err := receiptFromEntry(e)
-			if err != nil {
-				return nil, fmt.Errorf("receipt at seq %d: %w", e.Sequence, err)
-			}
-			receipts = append(receipts, *r)
-			continue
+		r, ok, err := receiptFromChainEntry(e)
+		if err != nil {
+			return nil, err
 		}
-		if !knownRecorderEntryType(e.Type) {
-			return nil, fmt.Errorf("%w: %q at seq %d", ErrUnexpectedRecorderEntryType, e.Type, e.Sequence)
+		if ok {
+			receipts = append(receipts, r)
 		}
 	}
 	return receipts, nil
 }
 
+// receiptFromChainEntry is one step of extractReceiptsFromEntries: ok is
+// false for a known operational entry type, and an entry outside the recorder
+// taxonomy is an error.
+func receiptFromChainEntry(e recorder.Entry) (Receipt, bool, error) {
+	if e.Type == recorderEntryType {
+		r, err := receiptFromEntry(e)
+		if err != nil {
+			return Receipt{}, false, fmt.Errorf("receipt at seq %d: %w", e.Sequence, err)
+		}
+		return *r, true, nil
+	}
+	if !knownRecorderEntryType(e.Type) {
+		return Receipt{}, false, fmt.Errorf("%w: %q at seq %d", ErrUnexpectedRecorderEntryType, e.Type, e.Sequence)
+	}
+	return Receipt{}, false, nil
+}
+
 func extractRawReceiptsJSONLFile(path string) ([]Receipt, error) {
-	data, err := recorder.ReadEvidenceFileBounded(filepath.Clean(path), recorder.MaxEvidenceReadFileBytes)
+	var receipts []Receipt
+	err := recorder.WalkEvidenceFileReader(filepath.Clean(path), func(input io.ReadSeeker) error {
+		var parseErr error
+		receipts, parseErr = extractRawReceiptsJSONLReader(input)
+		return parseErr
+	})
 	if err != nil {
 		return nil, fmt.Errorf("reading raw receipts: %w", err)
 	}
-	return extractRawReceiptsJSONLBytes(data)
+	return receipts, nil
 }
 
-func extractRawReceiptsJSONLBytes(data []byte) ([]Receipt, error) {
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+func extractRawReceiptsJSONLReader(input io.Reader) ([]Receipt, error) {
+	scanner := bufio.NewScanner(input)
 	scanner.Buffer(make([]byte, 0, 64<<10), 10<<20)
 	var receipts []Receipt
 	line := 0
 	for scanner.Scan() {
 		line++
-		raw := bytes.TrimSpace(scanner.Bytes())
+		raw := []byte(recorder.TrimEntryLine(string(scanner.Bytes())))
 		if len(raw) == 0 {
 			continue
 		}

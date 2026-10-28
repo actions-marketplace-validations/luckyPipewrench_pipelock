@@ -5,12 +5,20 @@
 
 package runtime
 
-import "io"
+import (
+	"io"
 
-func sdNotify(_ string) (bool, error) { return false, nil }
+	"github.com/luckyPipewrench/pipelock/internal/sdnotify"
+)
+
+func sdNotifySafeStatus(text string) string { return text }
+
+func sdNotify(state string) (bool, error) { return sdnotify.Send(state) }
 
 func sdNotifyOrLog(_ io.Writer, _ string) {}
 
 func sdNotifyReloading(_ io.Writer) {}
 
 func sdNotifyReloadComplete(_ io.Writer, _ error) {}
+
+func sdNotifyConfigComplete(_ io.Writer, _ string) {}
